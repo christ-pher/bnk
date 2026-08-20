@@ -10,7 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 )
 
-func newNodeKey(t *testing.T) NodeKey {
+func newNodeKey(t testing.TB) NodeKey {
 	t.Helper()
 	var k NodeKey
 	if _, err := rand.Read(k[:]); err != nil {
@@ -21,7 +21,7 @@ func newNodeKey(t *testing.T) NodeKey {
 
 // openBind opens b on a random loopback port and returns its receive
 // functions and bound address.
-func openBind(t *testing.T, b *Bind) ([]conn.ReceiveFunc, netip.AddrPort) {
+func openBind(t testing.TB, b *Bind) ([]conn.ReceiveFunc, netip.AddrPort) {
 	t.Helper()
 	fns, port, err := b.Open(0)
 	if err != nil {

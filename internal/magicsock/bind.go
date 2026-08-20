@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
 
 	"vpnmesh/internal/disco"
@@ -50,6 +51,9 @@ type relayPacket struct {
 type Bind struct {
 	mu        sync.Mutex
 	pc        *net.UDPConn
+	br        *ipv6.PacketConn // batch reader/writer over pc (recvmmsg/sendmmsg)
+	rmsgs     []ipv6.Message   // receive staging; owned by the single receive goroutine
+	smsgPool  sync.Pool        // *[]ipv6.Message for concurrent senders
 	port      uint16
 	peers     map[NodeKey]netip.AddrPort // identity → current direct address
 	byAddr    map[netip.AddrPort]NodeKey // reverse map for tagging receives
@@ -87,13 +91,22 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		return nil, 0, err
 	}
 	b.pc = pc
+	b.br = ipv6.NewPacketConn(pc)
+	b.smsgPool.New = func() any {
+		msgs := make([]ipv6.Message, conn.IdealBatchSize)
+		for i := range msgs {
+			msgs[i].Buffers = make([][]byte, 1)
+		}
+		return &msgs
+	}
 	b.port = uint16(pc.LocalAddr().(*net.UDPAddr).Port)
 	b.closeCh = make(chan struct{})
 	return []conn.ReceiveFunc{b.receive, b.receiveRelay}, b.port, nil
 }
 
 // receiveRelay surfaces packets handed in by DeliverRelay as the Bind's
-// second receive path (the same way Tailscale plumbs DERP receives).
+// second receive path (the same way Tailscale plumbs DERP receives). It
+// drains whatever has queued up to the batch size before returning.
 func (b *Bind) receiveRelay(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 	b.mu.Lock()
 	closeCh := b.closeCh
@@ -101,60 +114,99 @@ func (b *Bind) receiveRelay(packets [][]byte, sizes []int, eps []conn.Endpoint) 
 	if closeCh == nil {
 		return 0, net.ErrClosed
 	}
+	fill := func(i int, rp relayPacket) {
+		sizes[i] = copy(packets[i], rp.pkt)
+		eps[i] = &endpoint{key: rp.key}
+	}
 	select {
 	case <-closeCh:
 		return 0, net.ErrClosed
 	case rp := <-b.relayCh:
-		n := copy(packets[0], rp.pkt)
-		sizes[0] = n
-		eps[0] = &endpoint{key: rp.key}
-		return 1, nil
+		fill(0, rp)
+		n := 1
+		for n < len(packets) {
+			select {
+			case rp := <-b.relayCh:
+				fill(n, rp)
+				n++
+			default:
+				return n, nil
+			}
+		}
+		return n, nil
 	}
 }
 
-// receive reads datagrams until one comes from a known peer, tagging it with
-// that peer's identity endpoint. Unknown sources are dropped: only the path
-// table (fed by the control plane and, later, proven disco paths) grants a
-// source address a peer identity.
+// receive reads datagrams in batches (recvmmsg) until at least one comes
+// from a known peer, tagging each with that peer's identity endpoint.
+// Unknown sources are dropped: only the path table (fed by the control
+// plane and proven disco paths) grants a source address a peer identity.
+// Called serially from a single wireguard-go goroutine.
 func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 	b.mu.Lock()
-	pc := b.pc
+	pc, br := b.pc, b.br
 	b.mu.Unlock()
 	if pc == nil {
 		return 0, net.ErrClosed
 	}
+	if len(b.rmsgs) < len(packets) {
+		b.rmsgs = make([]ipv6.Message, len(packets))
+	}
 	for {
-		n, src, err := pc.ReadFromUDPAddrPort(packets[0])
+		msgs := b.rmsgs[:len(packets)]
+		for i := range msgs {
+			// Read straight into the caller's buffers; kept packets from a
+			// mixed batch are compacted below.
+			msgs[i].Buffers = [][]byte{packets[i]}
+			msgs[i].Addr = nil
+			msgs[i].N = 0
+		}
+		n, err := br.ReadBatch(msgs, 0)
 		if err != nil {
 			return 0, err
 		}
-		// Disco traffic peels off before any peer check: hole-punch probes
-		// arrive from source addresses no table knows yet.
-		if disco.IsDisco(packets[0][:n]) {
-			b.mu.Lock()
-			h := b.onDisco
-			b.mu.Unlock()
-			if h != nil {
-				h(normalize(src), append([]byte(nil), packets[0][:n]...))
+		out := 0
+		for i := 0; i < n; i++ {
+			pkt := packets[i][:msgs[i].N]
+			ua, ok := msgs[i].Addr.(*net.UDPAddr)
+			if !ok {
+				continue
 			}
-			continue
-		}
-		if isSTUN(packets[0][:n]) {
-			b.mu.Lock()
-			h := b.onSTUN
-			b.mu.Unlock()
-			if h != nil {
-				h(append([]byte(nil), packets[0][:n]...))
+			src := ua.AddrPort()
+			// Disco traffic peels off before any peer check: hole-punch
+			// probes arrive from source addresses no table knows yet.
+			if disco.IsDisco(pkt) {
+				b.mu.Lock()
+				h := b.onDisco
+				b.mu.Unlock()
+				if h != nil {
+					h(normalize(src), append([]byte(nil), pkt...))
+				}
+				continue
 			}
-			continue
+			if isSTUN(pkt) {
+				b.mu.Lock()
+				h := b.onSTUN
+				b.mu.Unlock()
+				if h != nil {
+					h(append([]byte(nil), pkt...))
+				}
+				continue
+			}
+			key, ok := b.lookupAddr(src)
+			if !ok {
+				continue
+			}
+			if out != i {
+				copy(packets[out], pkt)
+			}
+			sizes[out] = len(pkt)
+			eps[out] = &endpoint{key: key}
+			out++
 		}
-		key, ok := b.lookupAddr(src)
-		if !ok {
-			continue
+		if out > 0 {
+			return out, nil
 		}
-		sizes[0] = n
-		eps[0] = &endpoint{key: key}
-		return 1, nil
 	}
 }
 
@@ -197,6 +249,7 @@ func (b *Bind) Close() error {
 	b.closeCh = nil
 	err := b.pc.Close()
 	b.pc = nil
+	b.br = nil
 	return err
 }
 
@@ -222,12 +275,7 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	}
 	switch {
 	case direct:
-		for _, buf := range bufs {
-			if _, err := pc.WriteToUDPAddrPort(buf, addr); err != nil {
-				return err
-			}
-		}
-		return nil
+		return b.sendBatch(bufs, addr)
 	case hasRelay && relaySend != nil:
 		for _, buf := range bufs {
 			if err := relaySend(relayID, buf); err != nil {
@@ -241,8 +289,40 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	}
 }
 
+// sendBatch writes bufs to addr with as few syscalls as possible
+// (sendmmsg). Send is called concurrently by per-peer goroutines, so the
+// message headers come from a pool rather than the Bind.
+func (b *Bind) sendBatch(bufs [][]byte, addr netip.AddrPort) error {
+	b.mu.Lock()
+	br := b.br
+	b.mu.Unlock()
+	if br == nil {
+		return net.ErrClosed
+	}
+	ua := net.UDPAddrFromAddrPort(addr)
+	msgsp := b.smsgPool.Get().(*[]ipv6.Message)
+	defer b.smsgPool.Put(msgsp)
+	msgs := *msgsp
+	for len(bufs) > 0 {
+		chunk := min(len(bufs), len(msgs))
+		for i := 0; i < chunk; i++ {
+			msgs[i].Buffers[0] = bufs[i]
+			msgs[i].Addr = ua
+		}
+		for sent := 0; sent < chunk; {
+			n, err := br.WriteBatch(msgs[sent:chunk], 0)
+			if err != nil {
+				return err
+			}
+			sent += n
+		}
+		bufs = bufs[chunk:]
+	}
+	return nil
+}
+
 func (b *Bind) BatchSize() int {
-	return 1
+	return conn.IdealBatchSize
 }
 
 // LocalPort reports the UDP port the Bind is listening on, or 0 if closed.
