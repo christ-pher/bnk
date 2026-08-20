@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"text/tabwriter"
 	"time"
@@ -35,11 +36,15 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vpnd <serve|key|node> [flags]")
+		return fmt.Errorf("usage: vpnd <up|down|serve|key|node|acl> [flags]")
 	}
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
+	case "up":
+		return systemctl("start")
+	case "down":
+		return systemctl("stop")
 	case "key":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: vpnd key <new|ls|revoke> ...")
@@ -80,6 +85,22 @@ func run(args []string) error {
 
 func stateDirFlag(fs *flag.FlagSet) *string {
 	return fs.String("state-dir", "/var/lib/vpnd", "directory for state, cert, and admin socket")
+}
+
+// systemctl starts or stops the vpnd service: `vpnd up` / `vpnd down`
+// control the control server without remembering systemd incantations.
+func systemctl(verb string) error {
+	cmd := exec.Command("systemctl", verb, "vpnd")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("systemctl %s vpnd: %w (is the vpnd service installed? see install-server.sh)", verb, err)
+	}
+	if verb == "start" {
+		fmt.Println("vpnd is up")
+	} else {
+		fmt.Println("vpnd is down (run `vpnd up` to start it again)")
+	}
+	return nil
 }
 
 func serve(args []string) error {

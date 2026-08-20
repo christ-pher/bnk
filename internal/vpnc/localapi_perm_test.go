@@ -13,7 +13,8 @@ func TestLocalAPISocketWorldAccessible(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sock := filepath.Join(t.TempDir(), "run", "vpn.sock")
-	if err := serveLocalAPI(ctx, sock, "self", &netmapCache{}, nil, ""); err != nil {
+	c := &controller{cfg: Config{Hostname: "self"}, cache: &netmapCache{}, kick: make(chan struct{}, 1)}
+	if err := serveLocalAPI(ctx, sock, c); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(sock)

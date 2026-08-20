@@ -9,8 +9,11 @@ import (
 
 // Status is served on the local unix socket for the vpn CLI.
 type Status struct {
-	Self  SelfStatus   `json:"self"`
-	Peers []PeerStatus `json:"peers"`
+	// Running reports whether the tunnel is up. False after `vpn down`:
+	// the daemon still answers, but there is no interface or session.
+	Running bool         `json:"running"`
+	Self    SelfStatus   `json:"self"`
+	Peers   []PeerStatus `json:"peers"`
 }
 
 type SelfStatus struct {

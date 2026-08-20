@@ -75,6 +75,13 @@ func (h *tnetHolder) factory(prefix netip.Prefix, mtu int) (tun.Device, func() e
 	return dev, func() error { return nil }, nil
 }
 
+// peek returns the current TUN net without waiting.
+func (h *tnetHolder) peek() (*netstack.Net, netip.Addr) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tnet, h.ip
+}
+
 func (h *tnetHolder) get(t *testing.T) (*netstack.Net, netip.Addr) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -115,13 +122,14 @@ func runClient(t *testing.T, ctx context.Context, tc *testControl, name, stateDi
 func echoOverTunnel(t *testing.T, a, b *tnetHolder) {
 	t.Helper()
 	bnet, bip := b.get(t)
-	anet, _ := a.get(t)
 
 	ln, err := bnet.ListenTCPAddrPort(netip.AddrPortFrom(bip, 4242))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	// Cleanup, not defer: dialEcho may be called again later in the test
+	// (e.g. after a down/up cycle) and needs the listener alive.
+	t.Cleanup(func() { ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -138,6 +146,15 @@ func echoOverTunnel(t *testing.T, a, b *tnetHolder) {
 		}
 	}()
 
+	dialEcho(t, a, b)
+}
+
+// dialEcho dials b's echo listener (started by echoOverTunnel) from a's
+// current tunnel and verifies a round trip.
+func dialEcho(t *testing.T, a, b *tnetHolder) {
+	t.Helper()
+	_, bip := b.get(t)
+	anet, _ := a.get(t)
 	// Generous: the full -race suite runs packages in parallel and can
 	// starve handshake timers.
 	deadline := time.Now().Add(45 * time.Second)

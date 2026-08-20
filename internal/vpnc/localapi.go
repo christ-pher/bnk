@@ -38,7 +38,7 @@ func (c *netmapCache) get() netmap.Netmap {
 // socket is world-accessible (0666, dir 0755) so status and diagnostics
 // don't need root; private key material lives elsewhere. It shuts down
 // when ctx is canceled.
-func serveLocalAPI(ctx context.Context, sock, selfName string, cache *netmapCache, engine *dataplane.Engine, serverURL string) error {
+func serveLocalAPI(ctx context.Context, sock string, c *controller) error {
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
 		return err
 	}
@@ -51,15 +51,58 @@ func serveLocalAPI(ctx context.Context, sock, selfName string, cache *netmapCach
 		ln.Close()
 		return err
 	}
+
+	// withEngine gates handlers that need a live tunnel.
+	withEngine := func(h func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			engine := c.getEngine()
+			if engine == nil {
+				http.Error(w, "vpn is down (run `vpn up` to connect)", http.StatusServiceUnavailable)
+				return
+			}
+			h(w, r, engine)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(buildStatus(cache.get(), selfName, engine.PeerPaths()))
+		engine := c.getEngine()
+		if engine == nil {
+			st := c.state()
+			json.NewEncoder(w).Encode(Status{Self: SelfStatus{ID: st.NodeID, Name: c.cfg.Hostname, IP: st.IP}})
+			return
+		}
+		out := buildStatus(c.cache.get(), c.cfg.Hostname, engine.PeerPaths())
+		out.Running = true
+		json.NewEncoder(w).Encode(out)
 	})
-	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /up", func(w http.ResponseWriter, r *http.Request) {
+		if err := c.setDown(false); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !c.waitEngine(r.Context(), true, 15*time.Second) {
+			http.Error(w, "still connecting; check daemon logs (journalctl -u vpn)", http.StatusGatewayTimeout)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"running": true})
+	})
+	mux.HandleFunc("POST /down", func(w http.ResponseWriter, r *http.Request) {
+		if err := c.setDown(true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !c.waitEngine(r.Context(), false, 15*time.Second) {
+			http.Error(w, "tunnel did not shut down in time", http.StatusGatewayTimeout)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"running": false})
+	})
+	mux.HandleFunc("GET /ping", withEngine(func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine) {
 		name := r.URL.Query().Get("peer")
 		var key magicsock.NodeKey
 		found := false
-		for _, p := range cache.get().Peers {
+		for _, p := range c.cache.get().Peers {
 			if p.Name == name {
 				key, found = magicsock.NodeKey(p.NodeKey), true
 			}
@@ -87,11 +130,11 @@ func serveLocalAPI(ctx context.Context, sock, selfName string, cache *netmapCach
 			"addr":   res.Addr.String(),
 			"rtt_ms": float64(res.RTT.Microseconds()) / 1000,
 		})
-	})
-	mux.HandleFunc("GET /netcheck", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("GET /netcheck", withEngine(func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine) {
 		tx, rx := engine.RelayStats()
 		peers := map[string]any{}
-		for _, p := range cache.get().Peers {
+		for _, p := range c.cache.get().Peers {
 			if d, ok := engine.PeerDebug(magicsock.NodeKey(p.NodeKey)); ok {
 				lastPong := "never"
 				if d.HasPong {
@@ -114,13 +157,13 @@ func serveLocalAPI(ctx context.Context, sock, selfName string, cache *netmapCach
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		if observed, err := stunQuery(ctx, engine, serverURL); err == nil {
+		if observed, err := stunQuery(ctx, engine, c.state().ServerURL); err == nil {
 			out["stun_observed"] = observed.String()
 		} else {
 			out["stun_error"] = err.Error()
 		}
 		json.NewEncoder(w).Encode(out)
-	})
+	}))
 	go func() {
 		<-ctx.Done()
 		ln.Close()

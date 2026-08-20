@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -42,7 +43,9 @@ type Config struct {
 	EndpointsOverride []netip.AddrPort
 }
 
-// Run brings the node up and blocks until ctx is canceled.
+// Run starts the daemon: it serves the local API immediately and keeps
+// the tunnel matching the persisted desired state (`vpn up`/`vpn down`)
+// until ctx is canceled.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.MTU == 0 {
 		cfg.MTU = 1280
@@ -93,18 +96,95 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		tlsConf = pin.ClientTLSConfig(st.Fingerprint)
 	}
-	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}
 
-	enrolled := st.NodeID != 0 && st.IP.IsValid()
-	if !enrolled {
-		if secret == "" {
+	c := &controller{
+		cfg:     cfg,
+		secret:  secret,
+		tlsConf: tlsConf,
+		hc:      &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}},
+		pub:     pub,
+		st:      st,
+		cache:   &netmapCache{},
+		kick:    make(chan struct{}, 1),
+	}
+
+	sock := cfg.SocketPath
+	if sock == "" {
+		sock = filepath.Join(cfg.StateDir, "vpn.sock")
+	}
+	if err := serveLocalAPI(ctx, sock, c); err != nil {
+		return err
+	}
+	return c.supervise(ctx)
+}
+
+// controller owns the tunnel lifecycle. The local API flips its desired
+// state; supervise reconciles the tunnel to match.
+type controller struct {
+	cfg     Config
+	secret  string
+	tlsConf *tls.Config
+	hc      *http.Client
+	pub     netmap.Key
+	cache   *netmapCache
+	kick    chan struct{} // wakes supervise after a desired-state change
+
+	mu         sync.Mutex
+	st         state
+	engine     *dataplane.Engine  // nil while the tunnel is down
+	stopTunnel context.CancelFunc // cancels the running tunnel, if any
+}
+
+// supervise runs tunnels while the desired state is up, and idles while
+// it is down, until ctx is canceled. A tunnel error while wanted up is
+// fatal so the service manager can restart the daemon.
+func (c *controller) supervise(ctx context.Context) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if c.wantsUp() {
+			tctx, cancel := context.WithCancel(ctx)
+			c.mu.Lock()
+			c.stopTunnel = cancel
+			c.mu.Unlock()
+			err := c.runTunnel(tctx)
+			cancel()
+			c.mu.Lock()
+			c.stopTunnel = nil
+			c.mu.Unlock()
+			if ctx.Err() != nil {
+				return err
+			}
+			if tctx.Err() == nil && err != nil {
+				return err
+			}
+			c.cfg.Logf("down: tunnel torn down")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.kick:
+		}
+	}
+}
+
+// runTunnel enrolls if needed, brings the interface up, and runs the
+// coordination session until ctx is canceled.
+func (c *controller) runTunnel(ctx context.Context) error {
+	c.mu.Lock()
+	st := c.st
+	c.mu.Unlock()
+
+	if st.NodeID == 0 || !st.IP.IsValid() {
+		if c.secret == "" {
 			return fmt.Errorf("vpnc: not enrolled and no enrollment key given")
 		}
-		resp, err := client.Enroll(ctx, st.ServerURL, hc, coord.EnrollRequest{
-			EnrollKey: secret,
-			Hostname:  cfg.Hostname,
+		resp, err := client.Enroll(ctx, st.ServerURL, c.hc, coord.EnrollRequest{
+			EnrollKey: c.secret,
+			Hostname:  c.cfg.Hostname,
 			OS:        osName(),
-			NodeKey:   pub,
+			NodeKey:   c.pub,
 			DiscoKey:  st.DiscoPub,
 		})
 		if err != nil {
@@ -112,37 +192,96 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		st.NodeID, st.IP, st.Prefix = resp.NodeID, resp.IP, resp.Prefix
 	}
-	if err := saveState(cfg.StateDir, st); err != nil {
+	if err := saveState(c.cfg.StateDir, st); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	c.st = st
+	c.mu.Unlock()
 
-	tunDev, cleanup, err := cfg.CreateTUN(netip.PrefixFrom(st.IP, st.Prefix.Bits()), cfg.MTU)
+	tunDev, cleanup, err := c.cfg.CreateTUN(netip.PrefixFrom(st.IP, st.Prefix.Bits()), c.cfg.MTU)
 	if err != nil {
 		return err
 	}
 	engine, err := dataplane.New(tunDev, st.PrivateKey, st.DiscoPriv, st.DiscoPub)
 	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
 		return err
 	}
-	defer engine.Close()
 	engine.SetMeshPrefix(st.Prefix)
+	c.setEngine(engine)
 	defer func() {
+		c.setEngine(nil)
+		engine.Close()
 		if cleanup != nil {
 			cleanup()
 		}
 	}()
 
-	cache := &netmapCache{}
-	sock := cfg.SocketPath
-	if sock == "" {
-		sock = filepath.Join(cfg.StateDir, "vpn.sock")
-	}
-	if err := serveLocalAPI(ctx, sock, cfg.Hostname, cache, engine, st.ServerURL); err != nil {
+	c.cfg.Logf("up: node %d, ip %s, wg port %d", st.NodeID, st.IP, engine.LocalPort())
+	return sessionLoop(ctx, c.cfg, st, c.tlsConf, c.pub, engine, c.cache)
+}
+
+func (c *controller) wantsUp() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.st.Down
+}
+
+func (c *controller) setEngine(e *dataplane.Engine) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.engine = e
+}
+
+func (c *controller) getEngine() *dataplane.Engine {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.engine
+}
+
+func (c *controller) state() state {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.st
+}
+
+// setDown persists the desired state and pokes supervise. Going down also
+// cancels the running tunnel.
+func (c *controller) setDown(down bool) error {
+	c.mu.Lock()
+	c.st.Down = down
+	st := c.st
+	stop := c.stopTunnel
+	c.mu.Unlock()
+	if err := saveState(c.cfg.StateDir, st); err != nil {
 		return err
 	}
+	if down && stop != nil {
+		stop()
+	}
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	return nil
+}
 
-	cfg.Logf("up: node %d, ip %s, wg port %d", st.NodeID, st.IP, engine.LocalPort())
-	return sessionLoop(ctx, cfg, st, tlsConf, pub, engine, cache)
+// waitEngine polls until the tunnel's engine presence matches want or the
+// timeout elapses; it reports whether the state was reached.
+func (c *controller) waitEngine(ctx context.Context, want bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if (c.getEngine() != nil) == want {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // sessionLoop keeps a coordination session alive, reapplying netmaps and

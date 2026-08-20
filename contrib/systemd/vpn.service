@@ -9,7 +9,7 @@ Type=simple
 # First run needs the enrollment key; /etc/vpnmesh/vpn.env provides
 # VPN_SERVER (always) and VPN_KEY (only until enrolled — see DEPLOY.md).
 EnvironmentFile=/etc/vpnmesh/vpn.env
-ExecStart=/usr/local/bin/vpn up --server ${VPN_SERVER} --key "${VPN_KEY}" --state-dir /var/lib/vpn
+ExecStart=/usr/local/bin/vpn run --server ${VPN_SERVER} --key "${VPN_KEY}" --state-dir /var/lib/vpn
 Restart=on-failure
 RestartSec=2
 

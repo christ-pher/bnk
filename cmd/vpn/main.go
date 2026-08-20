@@ -37,7 +37,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vpn <up|status|ping|netcheck> [flags]")
+		return fmt.Errorf("usage: vpn <up|down|status|ping|netcheck|run> [flags]")
 	}
 	switch args[0] {
 	case "status":
@@ -46,11 +46,15 @@ func run(args []string) error {
 		return pingCmd(args[1:])
 	case "netcheck":
 		return netcheckCmd(args[1:])
+	case "up":
+		return upCmd(args[1:])
+	case "down":
+		return downCmd(args[1:])
 	}
-	if args[0] != "up" {
-		return fmt.Errorf("usage: vpn up --server https://host:8443 [--key vpnkey:...] [flags]")
+	if args[0] != "run" {
+		return fmt.Errorf("usage: vpn run --server https://host:8443 [--key vpnkey:...] [flags]")
 	}
-	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	serverURL := fs.String("server", "", "control server URL, e.g. https://vpn.example:8443")
 	enrollKey := fs.String("key", "", "enrollment key (vpnkey:...), required on first run")
 	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
@@ -130,6 +134,50 @@ func localGet(sock, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// localPost sends a control verb to the daemon and decodes the reply.
+func localPost(sock, path string) error {
+	resp, err := localClient(sock).Post("http://vpn"+path, "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("vpn daemon not running — start it with: systemctl start vpn (%w)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	return nil
+}
+
+// upCmd tells the running daemon to (re)connect the tunnel.
+func upCmd(args []string) error {
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	sock := socketFlag(fs)
+	fs.Parse(args)
+	if err := localPost(*sock, "/up"); err != nil {
+		return err
+	}
+	var st vpnc.Status
+	if err := localGet(*sock, "/status", &st); err == nil && st.Running {
+		fmt.Printf("vpn is up: %s (%s)\n", st.Self.Name, st.Self.IP)
+	} else {
+		fmt.Println("vpn is up")
+	}
+	return nil
+}
+
+// downCmd tells the running daemon to tear the tunnel down (the daemon
+// stays alive; `vpn up` reconnects).
+func downCmd(args []string) error {
+	fs := flag.NewFlagSet("down", flag.ExitOnError)
+	sock := socketFlag(fs)
+	fs.Parse(args)
+	if err := localPost(*sock, "/down"); err != nil {
+		return err
+	}
+	fmt.Println("vpn is down (run `vpn up` to reconnect)")
+	return nil
+}
+
 func pingCmd(args []string) error {
 	fs := flag.NewFlagSet("ping", flag.ExitOnError)
 	sock := socketFlag(fs)
@@ -175,6 +223,10 @@ func status(args []string) error {
 	var st vpnc.Status
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		return err
+	}
+	if !st.Running {
+		fmt.Println("vpn is down (run `vpn up` to connect)")
+		return nil
 	}
 	cliutil.Table(os.Stdout, []string{"NODE", "IP", "ONLINE", "PATH", "LAST HANDSHAKE"}, statusRows(st, time.Now()))
 	return nil
