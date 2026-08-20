@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
+	"syscall"
 
 	"golang.org/x/sys/windows/svc/mgr"
 
@@ -49,7 +49,7 @@ func serviceInstall(args []string) error {
 	}
 	defer m.Disconnect()
 
-	binPath := commandLine(exe, serviceArgs(*server, *key, *stateDir))
+	svcArgs := serviceArgs(*server, *key, *stateDir)
 
 	// Re-running the installer must update the existing service rather
 	// than fail — that is also how a spent enrollment key gets dropped.
@@ -59,7 +59,9 @@ func serviceInstall(args []string) error {
 		if err != nil {
 			return err
 		}
-		cfg.BinaryPathName = binPath
+		// UpdateConfig, unlike CreateService, takes the whole command
+		// line through BinaryPathName.
+		cfg.BinaryPathName = commandLine(exe, svcArgs)
 		cfg.StartType = mgr.StartAutomatic
 		if err := s.UpdateConfig(cfg); err != nil {
 			return err
@@ -68,12 +70,15 @@ func serviceInstall(args []string) error {
 		return nil
 	}
 
+	// The arguments MUST be passed variadically: CreateService builds the
+	// registered command line from exe plus these, and ignores
+	// Config.BinaryPathName. Setting that field instead registers a bare
+	// exe with no arguments, which starts, prints usage, and exits 1.
 	s, err := m.CreateService(serviceName, exe, mgr.Config{
-		DisplayName:    "bnk mesh VPN",
-		Description:    "Connects this machine to the bnk mesh network.",
-		StartType:      mgr.StartAutomatic,
-		BinaryPathName: binPath,
-	})
+		DisplayName: "bnk mesh VPN",
+		Description: "Connects this machine to the bnk mesh network.",
+		StartType:   mgr.StartAutomatic,
+	}, svcArgs...)
 	if err != nil {
 		return err
 	}
@@ -100,10 +105,15 @@ func serviceUninstall() error {
 	return nil
 }
 
-// commandLine quotes the executable path so a service ImagePath with
-// spaces (C:\Program Files\bnk\bnk.exe) parses correctly.
+// commandLine renders a service ImagePath, escaping each element the
+// same way CreateService does internally so the create and update paths
+// register byte-identical command lines.
 func commandLine(exe string, args []string) string {
-	return `"` + exe + `" ` + strings.Join(args, " ")
+	s := syscall.EscapeArg(exe)
+	for _, a := range args {
+		s += " " + syscall.EscapeArg(a)
+	}
+	return s
 }
 
 // updateCmd: Windows releases ship as a zip and swapping a running .exe

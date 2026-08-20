@@ -123,8 +123,41 @@ try {
 
 Add-ToMachinePath $InstallDir
 
+# Show-ServiceDiagnostics reports what the service manager actually
+# holds — the registered command line is the thing most likely to be
+# wrong, and a bare "cannot start service" never mentions it.
+function Show-ServiceDiagnostics {
+    Write-Host ''
+    Write-Host 'bnk service diagnostics:' -ForegroundColor Yellow
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Host ("  state         : " + $(if ($svc) { $svc.Status } else { 'not installed' }))
+    $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($wmi) {
+        Write-Host ("  exit code     : " + $wmi.ExitCode)
+        Write-Host ("  command line  : " + $wmi.PathName)
+    }
+    Write-Host ("  wintun.dll    : " + $(if (Test-Path (Join-Path $InstallDir 'wintun.dll')) { 'present' } else { 'MISSING' }))
+    Write-Host ''
+    Write-Host 'Run it in the foreground to see the actual error:'
+    Write-Host "  & `"$Exe`" run --server $Server --state-dir `"$StateDir`""
+}
+
 & $Exe service install --server $Server --key $Key --state-dir $StateDir
-Start-Service -Name $ServiceName
+
+# The registered command line must carry the `run` subcommand: a service
+# registered as a bare exe starts, prints usage, and exits immediately.
+$registered = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue).PathName
+if ($registered -notmatch '\srun(\s|$)') {
+    Show-ServiceDiagnostics
+    throw "the bnk service was registered without its arguments ($registered) — this build cannot start; please report it."
+}
+
+try {
+    Start-Service -Name $ServiceName
+} catch {
+    Show-ServiceDiagnostics
+    throw
+}
 
 # The first install on a machine also installs the Wintun driver, which
 # can take considerably longer than a subsequent start, so this waits
@@ -146,21 +179,7 @@ foreach ($i in 1..90) {
 }
 
 if (-not $joined) {
-    # Surface why rather than a bare timeout: the service state and its
-    # last error are what actually distinguish the failure modes.
-    Write-Host ''
-    Write-Host 'bnk did not come up. Diagnostics:' -ForegroundColor Yellow
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    Write-Host ("  service state : " + $(if ($svc) { $svc.Status } else { 'not installed' }))
-    $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
-    if ($wmi) {
-        Write-Host ("  service exit  : " + $wmi.ExitCode)
-        Write-Host ("  command line  : " + $wmi.PathName)
-    }
-    Write-Host ("  wintun.dll    : " + $(if (Test-Path (Join-Path $InstallDir 'wintun.dll')) { 'present' } else { 'MISSING' }))
-    Write-Host ''
-    Write-Host 'Run it in the foreground to see the actual error:'
-    Write-Host "  & `"$Exe`" run --server $Server --state-dir `"$StateDir`""
+    Show-ServiceDiagnostics
     throw 'bnk did not come up after 90s (see diagnostics above).'
 }
 
