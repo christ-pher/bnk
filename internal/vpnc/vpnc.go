@@ -112,9 +112,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if sock == "" {
 		sock = filepath.Join(cfg.StateDir, "vpn.sock")
 	}
-	if err := serveLocalAPI(ctx, sock, c); err != nil {
+	ln, err := serveLocalAPI(sock, c)
+	if err != nil {
 		return err
 	}
+	defer ln.Close()
 	return c.supervise(ctx)
 }
 

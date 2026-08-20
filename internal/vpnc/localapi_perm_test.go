@@ -1,7 +1,6 @@
 package vpnc
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,13 +9,13 @@ import (
 // The local socket must be reachable without root: parent dir 0755, socket
 // itself 0666. Status/ping/netcheck are read-only diagnostics.
 func TestLocalAPISocketWorldAccessible(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	sock := filepath.Join(t.TempDir(), "run", "vpn.sock")
 	c := &controller{cfg: Config{Hostname: "self"}, cache: &netmapCache{}, kick: make(chan struct{}, 1)}
-	if err := serveLocalAPI(ctx, sock, c); err != nil {
+	ln, err := serveLocalAPI(sock, c)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer ln.Close()
 	fi, err := os.Stat(sock)
 	if err != nil {
 		t.Fatal(err)

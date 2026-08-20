@@ -62,6 +62,7 @@ type tnetHolder struct {
 	mu   sync.Mutex
 	tnet *netstack.Net
 	ip   netip.Addr
+	done chan struct{} // closed when the daemon's Run returns
 }
 
 func (h *tnetHolder) factory(prefix netip.Prefix, mtu int) (tun.Device, func() error, error) {
@@ -101,8 +102,9 @@ func (h *tnetHolder) get(t *testing.T) (*netstack.Net, netip.Addr) {
 
 func runClient(t *testing.T, ctx context.Context, tc *testControl, name, stateDir, enrollKey string) *tnetHolder {
 	t.Helper()
-	h := &tnetHolder{}
+	h := &tnetHolder{done: make(chan struct{})}
 	go func() {
+		defer close(h.done)
 		err := vpnc.Run(ctx, vpnc.Config{
 			ServerURL: tc.url,
 			EnrollKey: enrollKey,

@@ -89,6 +89,7 @@ func TestDownStatePersistsAcrossRestart(t *testing.T) {
 	}
 	waitRunning(t, hc, false)
 	cancel1()
+	<-h.done // the old daemon must release the socket before the restart
 
 	// Restart the daemon: it must come back with the tunnel still down.
 	// Fresh client: hc's pooled keep-alive conn still points at the old

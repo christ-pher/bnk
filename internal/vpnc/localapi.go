@@ -36,20 +36,22 @@ func (c *netmapCache) get() netmap.Netmap {
 
 // serveLocalAPI exposes daemon state to the CLI over a unix socket. The
 // socket is world-accessible (0666, dir 0755) so status and diagnostics
-// don't need root; private key material lives elsewhere. It shuts down
-// when ctx is canceled.
-func serveLocalAPI(ctx context.Context, sock string, c *controller) error {
+// don't need root; private key material lives elsewhere. The caller owns
+// the returned listener and must close it on shutdown — closing must
+// finish before Run returns, or a restarting daemon can have its fresh
+// socket file unlinked by the old instance's teardown.
+func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.Chmod(sock, 0o666); err != nil {
 		ln.Close()
-		return err
+		return nil, err
 	}
 
 	// withEngine gates handlers that need a live tunnel.
@@ -164,12 +166,8 @@ func serveLocalAPI(ctx context.Context, sock string, c *controller) error {
 		}
 		json.NewEncoder(w).Encode(out)
 	}))
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
 	go http.Serve(ln, mux)
-	return nil
+	return ln, nil
 }
 
 func buildStatus(nm netmap.Netmap, selfName string, paths []dataplane.PeerPath) Status {
