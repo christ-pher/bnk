@@ -11,7 +11,9 @@ import (
 func TestPingWaitsForPongAndReportsPathAndRTT(t *testing.T) {
 	h := newPMHarness(t)
 	h.setPeerAndProbe()
+	h.mu.Lock()
 	h.rawSent = nil
+	h.mu.Unlock()
 
 	type result struct {
 		res PingResult
@@ -25,24 +27,24 @@ func TestPingWaitsForPongAndReportsPathAndRTT(t *testing.T) {
 
 	// Wait for the ping to hit the wire, then answer it from cand1.
 	deadline := time.Now().Add(5 * time.Second)
-	for len(h.rawSent) == 0 {
+	for len(h.raw()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("Ping never sent anything")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	var answered bool
-	for i, rp := range h.rawSent {
+	for _, rp := range h.raw() {
 		if rp.to == cand1 {
-			txid := h.openAll(h.rawSent[i : i+1])[0].(disco.Ping).TxID
-			h.now = h.now.Add(30 * time.Millisecond)
+			txid := h.openAll([]rawPkt{rp})[0].(disco.Ping).TxID
+			h.advance(30 * time.Millisecond)
 			pong := disco.Seal(disco.Pong{TxID: txid, Observed: cand1}, h.pPriv, h.pPub, h.pub)
 			h.pm.HandleDisco(cand1, pong)
 			answered = true
 		}
 	}
 	if !answered {
-		t.Fatalf("no ping went to %v: %v", cand1, h.rawSent)
+		t.Fatalf("no ping went to %v: %v", cand1, h.raw())
 	}
 
 	select {

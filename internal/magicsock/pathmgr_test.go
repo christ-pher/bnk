@@ -2,16 +2,19 @@ package magicsock
 
 import (
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
 	"vpnmesh/internal/disco"
 )
 
-// pmHarness wires a PathManager to captured I/O and a fake clock.
+// pmHarness wires a PathManager to captured I/O and a fake clock. The
+// mutex matters only for tests that call PathManager from goroutines.
 type pmHarness struct {
 	t     *testing.T
 	pm    *PathManager
+	mu    sync.Mutex
 	now   time.Time
 	prv   [32]byte // our disco priv
 	pub   [32]byte
@@ -45,8 +48,14 @@ func newPMHarness(t *testing.T) *pmHarness {
 	h.pm = NewPathManager(PathManagerConfig{
 		DiscoPriv: h.prv,
 		DiscoPub:  h.pub,
-		Clock:     func() time.Time { return h.now },
+		Clock: func() time.Time {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.now
+		},
 		SendRaw: func(to netip.AddrPort, pkt []byte) error {
+			h.mu.Lock()
+			defer h.mu.Unlock()
 			h.rawSent = append(h.rawSent, rawPkt{to, append([]byte(nil), pkt...)})
 			return nil
 		},
@@ -54,15 +63,36 @@ func newPMHarness(t *testing.T) *pmHarness {
 			if peer != h.peer {
 				t.Errorf("fwd to wrong peer %v", peer)
 			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
 			h.fwdSent = append(h.fwdSent, append([]byte(nil), payload...))
 			return nil
 		},
 		SetAddr: func(peer NodeKey, addr netip.AddrPort) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
 			h.setAddrs = append(h.setAddrs, addr)
 		},
-		ClearAddr: func(peer NodeKey) { h.cleared++ },
+		ClearAddr: func(peer NodeKey) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			h.cleared++
+		},
 	})
 	return h
+}
+
+// raw returns a snapshot of SendRaw calls, safe from any goroutine.
+func (h *pmHarness) raw() []rawPkt {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]rawPkt(nil), h.rawSent...)
+}
+
+func (h *pmHarness) advance(d time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.now = h.now.Add(d)
 }
 
 func (h *pmHarness) openAll(pkts []rawPkt) []disco.Message {
