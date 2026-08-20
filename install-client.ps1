@@ -46,8 +46,30 @@ function Get-Arch {
     }
 }
 
+# Add-ToMachinePath puts the install dir on the system PATH so `bnk`
+# works from any shell, and on this session's PATH so it works right now
+# without reopening the terminal.
+function Add-ToMachinePath([string]$dir) {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $parts = @($machine -split ';' | Where-Object { $_ -ne '' })
+    if ($parts -notcontains $dir) {
+        [Environment]::SetEnvironmentVariable('Path', (($parts + $dir) -join ';'), 'Machine')
+        Write-Host "added $dir to the system PATH"
+    }
+    if (@($env:Path -split ';') -notcontains $dir) {
+        $env:Path = "$env:Path;$dir"
+    }
+}
+
+function Remove-FromMachinePath([string]$dir) {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $parts = @($machine -split ';' | Where-Object { $_ -ne '' -and $_ -ne $dir })
+    [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'Machine')
+}
+
 function Invoke-Uninstall {
     Write-Host 'uninstalling bnk...'
+    Remove-FromMachinePath $InstallDir
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
         if (Test-Path $Exe) {
@@ -99,12 +121,17 @@ try {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+Add-ToMachinePath $InstallDir
+
 & $Exe service install --server $Server --key $Key --state-dir $StateDir
 Start-Service -Name $ServiceName
 
-Write-Host 'waiting for the tunnel...'
+# The first install on a machine also installs the Wintun driver, which
+# can take considerably longer than a subsequent start, so this waits
+# well past what a warm start needs before giving up.
+Write-Host 'waiting for the tunnel (first run also installs the Wintun driver)...'
 $joined = $false
-foreach ($i in 1..30) {
+foreach ($i in 1..90) {
     $out = & $Exe status 2>$null
     if ($LASTEXITCODE -eq 0) {
         if ($out -match '^bnk is down') {
@@ -114,10 +141,27 @@ foreach ($i in 1..30) {
             break
         }
     }
+    if ($i % 10 -eq 0) { Write-Host "  still waiting ($i s)..." }
     Start-Sleep -Seconds 1
 }
+
 if (-not $joined) {
-    throw "bnk did not come up after 30s. Check: Get-EventLog -LogName Application -Source bnk, or run `"$Exe`" run --server $Server by hand."
+    # Surface why rather than a bare timeout: the service state and its
+    # last error are what actually distinguish the failure modes.
+    Write-Host ''
+    Write-Host 'bnk did not come up. Diagnostics:' -ForegroundColor Yellow
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    Write-Host ("  service state : " + $(if ($svc) { $svc.Status } else { 'not installed' }))
+    $wmi = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($wmi) {
+        Write-Host ("  service exit  : " + $wmi.ExitCode)
+        Write-Host ("  command line  : " + $wmi.PathName)
+    }
+    Write-Host ("  wintun.dll    : " + $(if (Test-Path (Join-Path $InstallDir 'wintun.dll')) { 'present' } else { 'MISSING' }))
+    Write-Host ''
+    Write-Host 'Run it in the foreground to see the actual error:'
+    Write-Host "  & `"$Exe`" run --server $Server --state-dir `"$StateDir`""
+    throw 'bnk did not come up after 90s (see diagnostics above).'
 }
 
 # The key is single-use and now spent; the identity lives in $StateDir.
@@ -131,4 +175,5 @@ Write-Host 'Done. Everyday commands (no elevation needed for status):'
 Write-Host '    bnk status | bnk ping NAME | bnk netcheck    diagnostics'
 Write-Host '    bnk down / bnk up (elevated)                 disconnect / reconnect'
 Write-Host ''
-Write-Host "Add $InstallDir to your PATH to run bnk from anywhere."
+Write-Host "bnk is on the system PATH. Open a NEW terminal to pick it up —"
+Write-Host 'already-open windows keep their old PATH until restarted.'
