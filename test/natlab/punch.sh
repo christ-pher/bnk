@@ -71,11 +71,26 @@ lan_leg() { # client_ns nat_ns subnet_prefix
     ip netns exec "$2" sysctl -qw net.ipv4.ip_forward=1
     local masq="masquerade"
     [[ "$MODE" == "symmetric" ]] && masq="masquerade fully-random"
+    # The stateful firewall is essential, not decoration: without it,
+    # unsolicited inbound packets confirm conntrack entries on the NAT's
+    # local stack, stealing the very tuples outbound mappings need
+    # (port-preservation fails) — which deadlocks hole punching. Real
+    # routers drop unsolicited traffic, so their mappings stay clean.
     ip netns exec "$2" nft -f - <<EOF
 table ip nat {
     chain postrouting {
         type nat hook postrouting priority srcnat;
         oifname "wan0" $masq
+    }
+}
+table ip filter {
+    chain input {
+        type filter hook input priority 0; policy accept;
+        iifname "wan0" ct state new,invalid drop
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        iifname "wan0" ct state new,invalid drop
     }
 }
 EOF

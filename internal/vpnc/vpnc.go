@@ -192,30 +192,63 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		if err := sess.SendEndpoints(eps); err != nil {
 			cfg.Logf("send endpoints: %v", err)
 		}
-		go func() {
-			if cfg.EndpointsOverride != nil {
-				return
-			}
-			observed, err := stunQuery(ctx, engine, st.ServerURL)
-			if err != nil {
-				if ctx.Err() == nil {
-					cfg.Logf("stun: %v (advertising local endpoints only)", err)
-				}
-				return
-			}
-			all := append([]netip.AddrPort{observed}, eps...)
-			engine.SetSelfEndpoints(all)
-			if err := sess.SendEndpoints(all); err != nil {
-				cfg.Logf("send endpoints: %v", err)
-			}
-		}()
+		// Keep the STUN-observed endpoint fresh for the session's lifetime:
+		// mappings drift, and peers punch at whatever we last advertised.
+		sctx, scancel := context.WithCancel(ctx)
+		if cfg.EndpointsOverride == nil {
+			go stunRefreshLoop(sctx, 30*time.Second,
+				func(qctx context.Context) (netip.AddrPort, error) {
+					return stunQuery(qctx, engine, st.ServerURL)
+				},
+				func(observed netip.AddrPort) {
+					all := append([]netip.AddrPort{observed}, eps...)
+					engine.SetSelfEndpoints(all)
+					if err := sess.SendEndpoints(all); err != nil {
+						cfg.Logf("send endpoints: %v", err)
+					}
+				},
+				cfg.Logf,
+			)
+		}
 
 		select {
 		case <-ctx.Done():
+			scancel()
 			sess.Close()
 			return ctx.Err()
 		case <-sess.Done():
+			scancel()
 			cfg.Logf("coordination session lost, reconnecting")
+		}
+	}
+}
+
+// stunRefreshLoop re-queries STUN until ctx ends, invoking onUpdate each
+// time the observed address changes (including the first success). NAT
+// mappings drift and can be stolen by inbound traffic; a one-shot query
+// leaves peers punching at a dead address.
+func stunRefreshLoop(ctx context.Context, interval time.Duration, query func(context.Context) (netip.AddrPort, error), onUpdate func(netip.AddrPort), logf func(string, ...any)) {
+	var last netip.AddrPort
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		observed, err := query(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logf("stun: %v (advertising local endpoints only)", err)
+		} else if observed != last {
+			if last.IsValid() {
+				logf("stun: mapping changed %v -> %v", last, observed)
+			}
+			last = observed
+			onUpdate(observed)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
