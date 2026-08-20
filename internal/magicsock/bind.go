@@ -42,6 +42,7 @@ var ErrNoPath = errors.New("magicsock: no known path to peer")
 type Bind struct {
 	mu     sync.Mutex
 	pc     *net.UDPConn
+	port   uint16
 	peers  map[NodeKey]netip.AddrPort // identity → current direct address
 	byAddr map[netip.AddrPort]NodeKey // reverse map for tagging receives
 }
@@ -66,8 +67,8 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		return nil, 0, err
 	}
 	b.pc = pc
-	actual := uint16(pc.LocalAddr().(*net.UDPAddr).Port)
-	return []conn.ReceiveFunc{b.receive}, actual, nil
+	b.port = uint16(pc.LocalAddr().(*net.UDPAddr).Port)
+	return []conn.ReceiveFunc{b.receive}, b.port, nil
 }
 
 // receive reads datagrams until one comes from a known peer, tagging it with
@@ -149,6 +150,16 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 func (b *Bind) BatchSize() int {
 	return 1
+}
+
+// LocalPort reports the UDP port the Bind is listening on, or 0 if closed.
+func (b *Bind) LocalPort() uint16 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pc == nil {
+		return 0
+	}
+	return b.port
 }
 
 // SetPeerAddr sets the current direct address for a peer. Phase 0: a static
