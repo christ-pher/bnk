@@ -2,6 +2,8 @@
 # install-server.sh — set up the bnk control server on this machine.
 #
 # Run as root on the VPS:   sudo ./install-server.sh
+# Uninstall (removes binary, unit, AND server state — cert + registry):
+#                           sudo ./install-server.sh -u
 #
 # Also runs straight from the repo with no checkout:
 #   curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-server.sh | sudo sh
@@ -17,6 +19,30 @@ BIN=/usr/local/bin/bnk-server
 STATE_DIR=/var/lib/bnk-server
 UNIT=/etc/systemd/system/bnk-server.service
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+UNINSTALL=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u | --uninstall) UNINSTALL=1; shift ;;
+        *) echo "usage: $0 [-u|--uninstall]" >&2; exit 1 ;;
+    esac
+done
+
+uninstall() {
+    echo "uninstalling bnk-server..."
+    systemctl stop bnk-server 2>/dev/null || true
+    systemctl disable bnk-server 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl daemon-reload
+    for path in "$BIN" "$STATE_DIR"; do
+        if [ -e "$path" ]; then
+            echo "removing $path"
+            rm -rf "$path"
+        fi
+    done
+    echo "bnk-server removed. State (TLS cert, node registry, keys) is gone:"
+    echo "a reinstall starts a fresh mesh and every client must re-enroll."
+}
 
 # download_binary <name>: fetch the latest release build for this arch.
 download_binary() {
@@ -36,6 +62,11 @@ download_binary() {
 }
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0" >&2; exit 1; }
+
+if [ "$UNINSTALL" = 1 ]; then
+    uninstall
+    exit 0
+fi
 
 if [ -x "$HERE/bnk-server" ]; then
     install -m 755 "$HERE/bnk-server" "$BIN"

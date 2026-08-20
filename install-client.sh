@@ -4,6 +4,8 @@
 # Run as root:  sudo ./install-client.sh --server https://VPS_IP:8443 --key bnkkey:...
 # (--key can be omitted if this machine enrolled before and still has
 #  /var/lib/bnk/client.json)
+# Uninstall (removes binary, unit, config, AND the node's identity):
+#               sudo ./install-client.sh -u
 #
 # Also runs straight from the repo with no checkout:
 #   curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server ... --key ...
@@ -38,16 +40,34 @@ download_binary() {
     chmod 755 "$BIN"
 }
 
-SERVER= KEY=
+SERVER= KEY= UNINSTALL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --server) SERVER=$2; shift 2 ;;
         --key)    KEY=$2; shift 2 ;;
-        *) echo "usage: $0 --server https://host:8443 [--key bnkkey:...]" >&2; exit 1 ;;
+        -u | --uninstall) UNINSTALL=1; shift ;;
+        *) echo "usage: $0 --server https://host:8443 [--key bnkkey:...] | $0 -u" >&2; exit 1 ;;
     esac
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0 ..." >&2; exit 1; }
+
+if [ "$UNINSTALL" = 1 ]; then
+    echo "uninstalling bnk..."
+    systemctl stop bnk 2>/dev/null || true
+    systemctl disable bnk 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl daemon-reload
+    for path in "$BIN" /var/lib/bnk "$CONF_DIR" /run/bnk; do
+        if [ -e "$path" ]; then
+            echo "removing $path"
+            rm -rf "$path"
+        fi
+    done
+    echo "bnk removed. The node identity is gone — rejoining needs a fresh key from the server."
+    exit 0
+fi
+
 [ -n "$SERVER" ] || [ -f "$ENV_FILE" ] || { echo "--server is required on first install" >&2; exit 1; }
 
 if [ -x "$HERE/bnk" ]; then

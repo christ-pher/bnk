@@ -99,6 +99,13 @@ bnk up                                      # reconnect
 bnk-server up / bnk-server down             # start/stop the control server (on the VPS)
 ```
 
+Uninstall completely (same script, `-u`; deletes state and identity too):
+
+```
+curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- -u   # client
+curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-server.sh | sudo sh -s -- -u  # server
+```
+
 ## Locking it down (optional, 5 min)
 
 No policy = every node reaches every node. To restrict, on the VPS:
