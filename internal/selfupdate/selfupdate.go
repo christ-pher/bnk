@@ -93,6 +93,12 @@ func Run(cfg Config) error {
 	return nil
 }
 
+// LatestTag resolves the tag GitHub's releases/latest redirect points
+// at. It is exported because the tray checks for updates without being
+// able to install one: replacing files under Program Files needs
+// privileges the tray deliberately does not have.
+func LatestTag(baseURL string) (string, error) { return latestTag(baseURL) }
+
 // latestTag resolves the tag GitHub's releases/latest redirect points at.
 func latestTag(baseURL string) (string, error) {
 	hc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {

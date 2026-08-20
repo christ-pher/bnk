@@ -152,3 +152,63 @@ jobs:
 
           Stop-Process -Id $cli.Id -Force -ErrorAction SilentlyContinue
           Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+
+  # Build the installer on every push: WiX authoring errors should not
+  # wait for a release tag to be discovered.
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Stage payload
+        shell: pwsh
+        run: |
+          go build -o packaging\windows\bnk.exe .\cmd\bnk
+          go build -ldflags "-H=windowsgui" -o packaging\windows\bnk-tray.exe .\cmd\bnk-tray
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath . -Force
+          Copy-Item wintun\bin\amd64\wintun.dll packaging\windows\wintun.dll
+          Copy-Item wintun\LICENSE.txt packaging\windows\WINTUN-LICENSE.txt
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          cd packaging\windows
+          wix build bnk.wxs -arch x64 -d Version=0.0.1 `
+            -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
+            -o bnk-test.msi
+          if (-not (Test-Path bnk-test.msi)) { throw 'no MSI produced' }
+          Write-Host "MSI built: $((Get-Item bnk-test.msi).Length) bytes"
+
+      - name: Install, verify, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cd packaging\windows
+          # Files-only install: no BNK_SERVER, so no service registration.
+          Start-Process msiexec -ArgumentList '/i','bnk-test.msi','/qn','/l*v','install.log' -Wait
+          $exe = "$env:ProgramFiles\bnk\bnk.exe"
+          if (-not (Test-Path $exe)) {
+            Get-Content install.log -Tail 40
+            throw "bnk.exe was not installed to $exe"
+          }
+          foreach ($f in @('bnk-tray.exe','wintun.dll','WINTUN-LICENSE.txt')) {
+            if (-not (Test-Path "$env:ProgramFiles\bnk\$f")) { throw "$f missing from the install" }
+          }
+          $arp = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+                 Where-Object { $_.DisplayName -eq 'bnk' }
+          if (-not $arp) { throw 'no Add/Remove Programs entry' }
+          Write-Host "ARP entry: $($arp.DisplayName) $($arp.DisplayVersion)"
+
+          Start-Process msiexec -ArgumentList '/x','bnk-test.msi','/qn','/l*v','uninstall.log' -Wait
+          if (Test-Path $exe) {
+            Get-Content uninstall.log -Tail 40
+            throw 'files survived uninstall'
+          }

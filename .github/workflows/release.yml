@@ -14,7 +14,55 @@ env:
   WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
 
 jobs:
+  # WiX runs on Windows, so the installer is built here and handed to the
+  # release job as an artifact.
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME
+          go build -trimpath -ldflags "-s -w -X main.version=$v" -o packaging\windows\bnk.exe .\cmd\bnk
+          go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$v" -o packaging\windows\bnk-tray.exe .\cmd\bnk-tray
+
+      - name: Fetch Wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri $env:WINTUN_URL -OutFile wintun.zip
+          $got = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:WINTUN_SHA256) { throw "wintun checksum $got, want $env:WINTUN_SHA256" }
+          Expand-Archive wintun.zip -DestinationPath . -Force
+          Copy-Item wintun\bin\amd64\wintun.dll packaging\windows\wintun.dll
+          Copy-Item wintun\LICENSE.txt packaging\windows\WINTUN-LICENSE.txt
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          # MSI ProductVersion must be numeric: v0.7.0 -> 0.7.0
+          $v = $env:GITHUB_REF_NAME -replace '^v', ''
+          cd packaging\windows
+          wix build bnk.wxs -arch x64 -d Version=$v `
+            -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
+            -o bnk-windows-amd64.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msi
+          path: packaging/windows/bnk-windows-amd64.msi
+
   release:
+    needs: msi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,12 +98,17 @@ jobs:
             mkdir -p "$stage"
             CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "$stage/bnk.exe" ./cmd/bnk
             # -H=windowsgui: the tray must not open a console window.
-            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -H=windowsgui" -o "$stage/bnk-tray.exe" ./cmd/bnk-tray
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$GITHUB_REF_NAME" -o "$stage/bnk-tray.exe" ./cmd/bnk-tray
             cp "wintun/bin/$arch/wintun.dll" "$stage/wintun.dll"
             cp wintun/LICENSE.txt "$stage/WINTUN-LICENSE.txt"
             (cd "$stage" && zip -q -r "../dist/bnk-windows-$arch.zip" .)
           done
           cp install-client.ps1 dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: msi
+          path: dist
 
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS

@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MSI for the bnk Windows client.
+
+  It installs files and puts them on PATH. Configuration — which server,
+  which enrollment key, which operator account — is not baked into the
+  package: it is applied by `bnk service install`, the same code path the
+  script installer uses, so there is one implementation of that logic
+  rather than two.
+
+  Pass BNK_SERVER (and usually BNK_KEY) to have the package register and
+  start the service itself:
+
+    msiexec /i bnk.msi /qn BNK_SERVER=https://host:8443 BNK_KEY=bnkkey:...
+
+  With no BNK_SERVER the install is files-only, which is the right
+  behaviour for an upgrade: the service is already configured, and the
+  UpgradeCode below means its settings survive.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="bnk"
+           Manufacturer="bnk"
+           Version="$(var.Version)"
+           UpgradeCode="6f1d9b02-3a4c-4f5e-9c11-2b7a5d4e8f30"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!-- Replace an older install in place instead of stacking entries
+         in Add or Remove Programs. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of bnk is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="bnkicon" SourceFile="connected.ico" />
+    <Property Id="ARPPRODUCTICON" Value="bnkicon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/christ-pher/bnk" />
+
+    <Property Id="BNK_SERVER" Secure="yes" />
+    <Property Id="BNK_KEY" Secure="yes" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="bnk" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="bnkExe" Guid="*">
+        <File Id="bnkExe" Source="bnk.exe" KeyPath="yes" />
+        <!-- One PATH entry for the whole package, so `bnk` works from
+             any shell without the script installer's manual edit. -->
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]"
+                     Permanent="no" Part="last" Action="set" System="yes" />
+      </Component>
+      <Component Id="bnkTrayExe" Guid="*">
+        <File Id="bnkTrayExe" Source="bnk-tray.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="wintunDll" Guid="*">
+        <File Id="wintunDll" Source="wintun.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="wintunLicense" Guid="*">
+        <File Id="wintunLicense" Source="WINTUN-LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="bnk" Level="1">
+      <ComponentGroupRef Id="Binaries" />
+    </Feature>
+
+    <!-- Registration runs deferred and elevated, after the files exist.
+         Uninstall reverses it before they are removed. -->
+    <CustomAction Id="SetRegisterCmd"
+                  Property="RegisterService"
+                  Value="&quot;[INSTALLFOLDER]bnk.exe&quot; service install --server &quot;[BNK_SERVER]&quot; --key &quot;[BNK_KEY]&quot; --operator &quot;[USERDOMAIN]\[LogonUser]&quot;" />
+    <CustomAction Id="RegisterService"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="check" Impersonate="no" />
+
+    <CustomAction Id="SetUnregisterCmd"
+                  Property="UnregisterService"
+                  Value="&quot;[INSTALLFOLDER]bnk.exe&quot; service uninstall" />
+    <CustomAction Id="UnregisterService"
+                  BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetRegisterCmd" After="InstallFiles" Condition="BNK_SERVER" />
+      <Custom Action="RegisterService" After="SetRegisterCmd" Condition="BNK_SERVER" />
+      <Custom Action="SetUnregisterCmd" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="UnregisterService" After="SetUnregisterCmd" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

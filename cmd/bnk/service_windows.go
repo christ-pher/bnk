@@ -6,8 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"syscall"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"github.com/christ-pher/bnk/internal/vpnc"
@@ -39,6 +42,12 @@ func serviceInstall(args []string) error {
 	if *server == "" {
 		return fmt.Errorf("--server is required")
 	}
+	// Accept either a SID or an account name: the MSI can only pass a
+	// name, since Windows Installer has no built-in SID property.
+	operatorSID, err := resolveOperator(*operator)
+	if err != nil {
+		return err
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -50,7 +59,7 @@ func serviceInstall(args []string) error {
 	}
 	defer m.Disconnect()
 
-	svcArgs := serviceArgs(*server, *key, *stateDir, *operator)
+	svcArgs := serviceArgs(*server, *key, *stateDir, operatorSID)
 
 	// Re-running the installer must update the existing service rather
 	// than fail — that is also how a spent enrollment key gets dropped.
@@ -67,6 +76,7 @@ func serviceInstall(args []string) error {
 		if err := s.UpdateConfig(cfg); err != nil {
 			return err
 		}
+		setTrayAutostart(operatorSID, exe)
 		fmt.Println("bnk service updated")
 		return nil
 	}
@@ -84,8 +94,41 @@ func serviceInstall(args []string) error {
 		return err
 	}
 	defer s.Close()
+	setTrayAutostart(operatorSID, exe)
 	fmt.Println("bnk service installed")
 	return nil
+}
+
+// resolveOperator turns an account name into a SID, and passes an
+// existing SID through untouched. An empty operator stays empty, which
+// means administrators only.
+func resolveOperator(operator string) (string, error) {
+	if operator == "" {
+		return "", nil
+	}
+	if sidPattern.MatchString(operator) {
+		return operator, nil
+	}
+	sid, _, _, err := windows.LookupSID("", operator)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve operator %q to an account: %w", operator, err)
+	}
+	return sid.String(), nil
+}
+
+// sidPattern mirrors the daemon's own check so a name that merely looks
+// like a SID is not silently treated as one.
+var sidPattern = regexp.MustCompile(`^S-1-\d+(-\d+)+$`)
+
+// setTrayAutostart is best-effort: a machine with no tray installed, or
+// an operator whose hive is not loaded, must not fail the install.
+func setTrayAutostart(operatorSID, exe string) {
+	if operatorSID == "" {
+		return
+	}
+	if err := enableTrayAutostart(operatorSID, filepath.Dir(exe)); err != nil {
+		fmt.Fprintf(os.Stderr, "note: could not set the tray to start at login: %v\n", err)
+	}
 }
 
 func serviceUninstall() error {
@@ -99,6 +142,13 @@ func serviceUninstall() error {
 		return fmt.Errorf("bnk service is not installed")
 	}
 	defer s.Close()
+	// Clear the tray's autostart entry for whichever operator the
+	// registered command line names, before the service record is gone.
+	if cfg, err := s.Config(); err == nil {
+		if sid := operatorFromCommandLine(cfg.BinaryPathName); sid != "" {
+			disableTrayAutostart(sid)
+		}
+	}
 	if err := s.Delete(); err != nil {
 		return err
 	}

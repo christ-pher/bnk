@@ -36,3 +36,18 @@ func TestServiceArgsKeepsOperatorWithoutKey(t *testing.T) {
 		t.Errorf("serviceArgs = %v, want %v", got, want)
 	}
 }
+
+func TestOperatorFromCommandLine(t *testing.T) {
+	sid := "S-1-5-21-1-2-3-1001"
+	cases := map[string]string{
+		`"C:\Program Files\bnk\bnk.exe" run --server https://v:8443 --state-dir "C:\ProgramData\bnk" --operator ` + sid: sid,
+		`"C:\Program Files\bnk\bnk.exe" run --server https://v:8443`:                                                    "",
+		`"C:\bnk.exe" run --operator "` + sid + `"`:                                                                     sid,
+		`"C:\bnk.exe" run --operator`:                                                                                   "",
+	}
+	for cmd, want := range cases {
+		if got := operatorFromCommandLine(cmd); got != want {
+			t.Errorf("operatorFromCommandLine(%q) = %q, want %q", cmd, got, want)
+		}
+	}
+}
