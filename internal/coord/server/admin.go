@@ -34,9 +34,13 @@ type AdminKey struct {
 
 // AdminHandler serves the local admin API (bound to a unix socket by bnk-server).
 // fingerprint is the server cert's fingerprint, embedded in minted
-// enrollment keys.
-func (s *Server) AdminHandler(fingerprint string) http.Handler {
+// enrollment keys; publicURL is the address clients should enroll
+// against, used by the CLI to print ready-to-paste install commands.
+func (s *Server) AdminHandler(fingerprint, publicURL string) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /info", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"public_url": publicURL})
+	})
 	mux.HandleFunc("GET /nodes", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		nodes := make([]AdminNode, 0, len(s.st.Nodes))

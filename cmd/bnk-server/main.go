@@ -106,6 +106,7 @@ func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	stateDir := stateDirFlag(fs)
 	listen := fs.String("listen", ":8443", "TLS listen address for clients")
+	publicURL := fs.String("public-url", "", "URL clients reach this server at (default: detected outbound IP + listen port)")
 	fs.Parse(args)
 
 	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
@@ -138,7 +139,11 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	go http.Serve(adminLn, srv.AdminHandler(fp))
+	pubURL := *publicURL
+	if pubURL == "" {
+		pubURL = detectPublicURL(*listen)
+	}
+	go http.Serve(adminLn, srv.AdminHandler(fp, pubURL))
 
 	fmt.Printf("bnk-server: listening on %s\n", *listen)
 	fmt.Printf("bnk-server: cert fingerprint %s\n", fp)
@@ -150,6 +155,27 @@ func serve(args []string) error {
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 	return hs.ListenAndServeTLS("", "")
+}
+
+// detectPublicURL guesses the URL clients can reach this server at: the
+// machine's outbound IP plus the listen port. No packets are sent — the
+// UDP dial only resolves a route. A server behind NAT should pass
+// --public-url instead.
+func detectPublicURL(listen string) string {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return ""
+	}
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	ua, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+	return "https://" + net.JoinHostPort(ua.IP.String(), port)
 }
 
 func loadOrCreateCert(dir string) (certPEM, keyPEM []byte, fp string, err error) {
@@ -203,7 +229,26 @@ func keyNew(args []string) error {
 		return err
 	}
 	fmt.Println(out.Key)
+	printInstallHint(*stateDir, out.Key)
 	return nil
+}
+
+// printInstallHint writes a ready-to-paste client install command to
+// stderr — stderr so `KEY=$(bnk-server key new)` still captures only the
+// key on stdout.
+func printInstallHint(stateDir, key string) {
+	serverURL := "https://YOUR_SERVER_IP:8443"
+	var info struct {
+		PublicURL string `json:"public_url"`
+	}
+	if resp, err := adminClient(stateDir).Get("http://bnk-server/info"); err == nil {
+		json.NewDecoder(resp.Body).Decode(&info)
+		resp.Body.Close()
+		if info.PublicURL != "" {
+			serverURL = info.PublicURL
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\n# paste on the new node to install and join (verify the IP is this server's public one):\ncurl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server %s --key %s\n", serverURL, key)
 }
 
 func aclSet(args []string) error {

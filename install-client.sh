@@ -5,16 +5,38 @@
 # (--key can be omitted if this machine enrolled before and still has
 #  /var/lib/bnk/client.json)
 #
-# Uses a prebuilt ./bnk next to this script if present, otherwise builds
-# it (needs Go). Installs to /usr/local/bin, config in /etc/bnk,
-# state in /var/lib/bnk, systemd unit bnk.service.
+# Also runs straight from the repo with no checkout:
+#   curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server ... --key ...
+#
+# Binary source, in order: a prebuilt ./bnk next to this script, a source
+# build (repo checkout + Go), else the latest GitHub release for this
+# architecture. Installs to /usr/local/bin, config in /etc/bnk, state in
+# /var/lib/bnk, systemd unit bnk.service.
 set -eu
 
+REPO=christ-pher/bnk
 BIN=/usr/local/bin/bnk
 CONF_DIR=/etc/bnk
 ENV_FILE=$CONF_DIR/bnk.env
 UNIT=/etc/systemd/system/bnk.service
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# download_binary <name>: fetch the latest release build for this arch.
+download_binary() {
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) arch=amd64 ;;
+        aarch64 | arm64) arch=arm64 ;;
+        *) echo "unsupported architecture $arch — build from source: go build ./cmd/$1" >&2; exit 1 ;;
+    esac
+    url="https://github.com/$REPO/releases/latest/download/$1-linux-$arch"
+    echo "downloading $url"
+    curl -fSL -o "$BIN" "$url" || {
+        echo "download failed — no release published yet? Build from source: go build ./cmd/$1" >&2
+        exit 1
+    }
+    chmod 755 "$BIN"
+}
 
 SERVER= KEY=
 while [ $# -gt 0 ]; do
@@ -34,9 +56,7 @@ elif command -v go >/dev/null 2>&1 && [ -f "$HERE/go.mod" ]; then
     echo "building bnk..."
     (cd "$HERE" && CGO_ENABLED=0 go build -o "$BIN" ./cmd/bnk)
 else
-    echo "no ./bnk binary next to this script and no Go toolchain to build one" >&2
-    echo "build elsewhere with: CGO_ENABLED=0 go build -o bnk ./cmd/bnk — then scp both files here" >&2
-    exit 1
+    download_binary bnk
 fi
 
 if [ -n "$SERVER" ]; then

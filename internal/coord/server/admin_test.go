@@ -18,7 +18,7 @@ func TestAdminNodesListsEnrollmentAndOnlineState(t *testing.T) {
 	e.enroll(t, "beta", key32(2))
 	dialSession(t, e, id.priv) // alpha online
 
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	// Session registration completes shortly after Dial returns (the
@@ -63,7 +63,7 @@ func TestAdminPolicyRoundTripAndCheck(t *testing.T) {
 	e := startServer(t)
 	e.enroll(t, "laptop", key32(1))
 	e.enroll(t, "nas", key32(2))
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	policy := `{"rules":[{"from":["laptop"],"to":["nas"],"allow":["tcp/22"]}]}`
@@ -119,7 +119,7 @@ func TestAdminPolicyRoundTripAndCheck(t *testing.T) {
 func TestAdminPolicyRejectsInvalid(t *testing.T) {
 	e := startServer(t)
 	e.enroll(t, "laptop", key32(1))
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	req, _ := http.NewRequest(http.MethodPut, admin.URL+"/policy",
@@ -136,7 +136,7 @@ func TestAdminPolicyRejectsInvalid(t *testing.T) {
 
 func TestAdminKeyLifecycle(t *testing.T) {
 	e := startServer(t)
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	// Default mint: one-time. With ?reusable=true: reusable.
@@ -181,7 +181,7 @@ func TestAdminKeyLifecycle(t *testing.T) {
 
 func TestAdminMintDefaultsToOneTime(t *testing.T) {
 	e := startServer(t)
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	resp, err := http.Post(admin.URL+"/enroll-keys", "application/json", nil)
@@ -197,7 +197,7 @@ func TestAdminMintDefaultsToOneTime(t *testing.T) {
 
 func TestAdminNewEnrollKeyReturnsFullPinnedKey(t *testing.T) {
 	e := startServer(t)
-	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", ""))
 	defer admin.Close()
 
 	resp, err := http.Post(admin.URL+"/enroll-keys", "application/json", nil)
@@ -213,5 +213,26 @@ func TestAdminNewEnrollKeyReturnsFullPinnedKey(t *testing.T) {
 	}
 	if !strings.HasPrefix(out.Key, "bnkkey:") || !strings.HasSuffix(out.Key, ":feedface") {
 		t.Errorf("key = %q, want bnkkey:<secret>:feedface", out.Key)
+	}
+}
+
+func TestAdminInfoReportsPublicURL(t *testing.T) {
+	e := startServer(t)
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface", "https://203.0.113.7:8443"))
+	defer admin.Close()
+
+	resp, err := http.Get(admin.URL + "/info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var info struct {
+		PublicURL string `json:"public_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatal(err)
+	}
+	if info.PublicURL != "https://203.0.113.7:8443" {
+		t.Errorf("public_url = %q, want the configured URL", info.PublicURL)
 	}
 }

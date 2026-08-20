@@ -33,15 +33,19 @@ plus clients via the install scripts, ~10 minutes.
 Server (any Linux box with a public IP):
 
 ```
-sudo ./install-server.sh     # installs bnk-server + systemd unit, prints next steps
-sudo bnk-server key new            # prints bnkkey:<secret>:<fingerprint>, one per client
+curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-server.sh | sudo sh
+bnk-server key new           # one key per client; prints a paste-ready install command
 ```
 
-Each client (Linux):
+Each client (Linux) — paste what `key new` printed:
 
 ```
-sudo ./install-client.sh --server https://YOUR_SERVER:8443 --key bnkkey:...
+curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server https://YOUR_SERVER:8443 --key bnkkey:...
 ```
+
+Binaries come from [GitHub Releases](https://github.com/christ-pher/bnk/releases)
+(linux amd64/arm64, built by CI on every version tag); the installers
+also accept a locally built binary placed next to them.
 
 The enrollment key is single-use; the node's identity persists in
 `/var/lib/bnk`. Day to day: `bnk status` (no sudo needed) shows every

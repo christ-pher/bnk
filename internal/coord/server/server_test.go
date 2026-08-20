@@ -81,7 +81,7 @@ func ident(t *testing.T) identity {
 // adminNodes fetches the admin view of all nodes.
 func adminNodes(t *testing.T, e *env) []server.AdminNode {
 	t.Helper()
-	admin := httptest.NewServer(e.srv.AdminHandler("fp"))
+	admin := httptest.NewServer(e.srv.AdminHandler("fp", ""))
 	defer admin.Close()
 	resp, err := http.Get(admin.URL + "/nodes")
 	if err != nil {

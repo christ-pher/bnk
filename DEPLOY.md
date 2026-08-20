@@ -1,6 +1,7 @@
 # Deploy: VPS control plane + Linux clients
 
-Total time: ~10 minutes (3 build, 3 VPS, 2 per client, 2 verify).
+Total time: ~5 minutes (2 VPS, 1 per client, 2 verify). No build step —
+binaries come from GitHub Releases.
 
 What you end up with: every machine gets a stable `100.64.x.x` address and
 can reach the others over encrypted WireGuard, directly when possible,
@@ -27,25 +28,19 @@ Everything lands in predefined places — no paths to choose:
 
 - [ ] A VPS with a public IP (any small Linux box works)
 - [ ] Root on the VPS and on each client machine
-- [ ] Go 1.22+ on ONE machine to build (binaries are static; build once, copy anywhere)
 
-Build both binaries now (~2 min):
+No build step: the installers pull prebuilt binaries (linux amd64/arm64)
+from GitHub Releases. Working from a source checkout instead? Put a
+locally built binary next to the script and it uses that.
 
-```
-git clone https://github.com/christ-pher/bnk.git && cd bnk
-CGO_ENABLED=0 go build -o bnk-server ./cmd/bnk-server
-CGO_ENABLED=0 go build -o bnk ./cmd/bnk
-```
+## Part 1 — VPS (2 min)
 
-## Part 1 — VPS (3 min)
-
-1. Copy the binary and installer, then run it:
+1. Install the control server (one line, as root on the VPS):
    ```
-   scp bnk-server install-server.sh root@YOUR_VPS:
-   ssh root@YOUR_VPS './install-server.sh'
+   curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-server.sh | sudo sh
    ```
-   It installs the binary and the systemd unit, starts the service, and
-   prints the cert fingerprint.
+   It downloads the binary, installs the systemd unit, starts the
+   service, and prints the cert fingerprint.
 2. Open ONE port, both protocols (this is the only firewall change anywhere):
    ```
    ufw allow 8443/tcp && ufw allow 8443/udp     # or your provider's firewall panel
@@ -54,21 +49,26 @@ CGO_ENABLED=0 go build -o bnk ./cmd/bnk
 3. Mint one enrollment key PER CLIENT (keys are single-use and die in 24h —
    that's the join security):
    ```
-   ssh root@YOUR_VPS 'bnk-server key new'
+   bnk-server key new
    ```
-   Copy the whole `bnkkey:...` line somewhere. Run it again for the second
-   client. Done with the VPS.
+   Below the key it prints a ready-to-paste install command with the
+   server URL and key already filled in. Run it again for each client.
+   Done with the VPS.
 
-## Part 2 — each client (2 min per machine)
+   (If the VPS is behind NAT or the detected IP looks wrong, set
+   `--public-url https://REAL_IP:8443` on `bnk-server serve` in the unit.)
+
+## Part 2 — each client (1 min per machine)
+
+Paste the command `key new` printed, as root on the new machine:
 
 ```
-scp bnk install-client.sh root@CLIENT:
-ssh root@CLIENT './install-client.sh --server https://YOUR_VPS_IP:8443 --key bnkkey:PASTE_HERE'
+curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server https://YOUR_VPS_IP:8443 --key bnkkey:PASTE_HERE
 ```
 
-The installer starts the service, waits for the tunnel, prints
-`bnk status`, and blanks the spent key from `/etc/bnk/bnk.env`
-automatically. Repeat with the OTHER key on the second client.
+The installer downloads the binary, starts the service, waits for the
+tunnel, prints `bnk status`, and blanks the spent key from
+`/etc/bnk/bnk.env` automatically. Repeat per client with its own key.
 
 ## Part 3 — verify (2 min, run on client A, no sudo needed)
 
