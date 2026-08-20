@@ -82,6 +82,46 @@ func (e *Engine) watchdog() {
 	}
 }
 
+// PeerPath describes the current packet path for one configured peer.
+type PeerPath struct {
+	Key           magicsock.NodeKey
+	Direct        bool
+	LastHandshake time.Time
+}
+
+// PeerPaths reports each configured peer's path and last handshake time.
+func (e *Engine) PeerPaths() []PeerPath {
+	raw, err := e.dev.IpcGet()
+	if err != nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []PeerPath
+	var idx = -1
+	for _, line := range strings.Split(raw, "\n") {
+		if v, ok := strings.CutPrefix(line, "public_key="); ok {
+			b, err := hex.DecodeString(v)
+			if err != nil || len(b) != 32 {
+				idx = -1
+				continue
+			}
+			var key magicsock.NodeKey
+			copy(key[:], b)
+			_, direct := e.applied[key]
+			out = append(out, PeerPath{Key: key, Direct: direct})
+			idx = len(out) - 1
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "last_handshake_time_sec="); ok && idx >= 0 && v != "0" {
+			var sec int64
+			fmt.Sscanf(v, "%d", &sec)
+			out[idx].LastHandshake = time.Unix(sec, 0)
+		}
+	}
+	return out
+}
+
 // handshakedPeers reports which peers have ever completed a handshake.
 func (e *Engine) handshakedPeers() map[magicsock.NodeKey]bool {
 	out := make(map[magicsock.NodeKey]bool)

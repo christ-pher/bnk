@@ -114,13 +114,18 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
+	cache := &netmapCache{}
+	if err := serveLocalAPI(ctx, cfg.StateDir, cache, engine); err != nil {
+		return err
+	}
+
 	cfg.Logf("up: node %d, ip %s, wg port %d", st.NodeID, st.IP, engine.LocalPort())
-	return sessionLoop(ctx, cfg, st, tlsConf, pub, engine)
+	return sessionLoop(ctx, cfg, st, tlsConf, pub, engine, cache)
 }
 
 // sessionLoop keeps a coordination session alive, reapplying netmaps and
 // reporting endpoints, with jittered backoff between attempts.
-func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config, pub netmap.Key, engine *dataplane.Engine) error {
+func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config, pub netmap.Key, engine *dataplane.Engine, cache *netmapCache) error {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -128,6 +133,7 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		}
 		sess, err := client.Dial(ctx, st.ServerURL, tlsConf, pub, client.Handlers{
 			OnNetmap: func(nm netmap.Netmap) {
+				cache.set(nm)
 				if err := engine.ApplyNetmap(nm); err != nil {
 					cfg.Logf("apply netmap: %v", err)
 				}

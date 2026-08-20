@@ -4,13 +4,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"text/tabwriter"
+	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
 
@@ -26,7 +32,13 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) == 0 || args[0] != "up" {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: vpn <up|status> [flags]")
+	}
+	if args[0] == "status" {
+		return status(args[1:])
+	}
+	if args[0] != "up" {
 		return fmt.Errorf("usage: vpn up --server https://host:8443 [--key vpnkey:...] [flags]")
 	}
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
@@ -75,6 +87,41 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 		}
 		return dev, dev.Close, nil
 	}
+}
+
+func status(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	fs.Parse(args)
+
+	sock := filepath.Join(*stateDir, "vpn.sock")
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		},
+	}}
+	resp, err := hc.Get("http://vpn/status")
+	if err != nil {
+		return fmt.Errorf("is vpn up running? %w", err)
+	}
+	defer resp.Body.Close()
+	var st vpnc.Status
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return err
+	}
+
+	fmt.Printf("self: node %d, %s\n", st.Self.ID, st.Self.IP)
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "PEER\tIP\tONLINE\tPATH\tLAST HANDSHAKE")
+	for _, p := range st.Peers {
+		hs := "never"
+		if !p.LastHandshake.IsZero() {
+			hs = time.Since(p.LastHandshake).Round(time.Second).String() + " ago"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\n", p.Name, p.IP, p.Online, p.Path, hs)
+	}
+	return tw.Flush()
 }
 
 func defaultHostname() string {
