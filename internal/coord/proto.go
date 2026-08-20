@@ -55,6 +55,22 @@ func ReadFrame(r io.Reader) (FrameType, []byte, error) {
 	return FrameType(hdr[0]), payload, nil
 }
 
+// EnrollRequest/EnrollResponse are exchanged over plain HTTPS POST /enroll,
+// outside the framed session, so enrollment stays curl-debuggable.
+type EnrollRequest struct {
+	EnrollKey string     `json:"enroll_key"`
+	Hostname  string     `json:"hostname"`
+	OS        string     `json:"os"`
+	NodeKey   netmap.Key `json:"node_key"`
+	DiscoKey  netmap.Key `json:"disco_key"`
+}
+
+type EnrollResponse struct {
+	NodeID netmap.NodeID `json:"node_id"`
+	IP     netip.Addr    `json:"ip"`
+	Prefix netip.Prefix  `json:"prefix"`
+}
+
 // Message type tags for the control envelope.
 const (
 	MsgHello     = "hello"
