@@ -221,6 +221,21 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 		}
 		switch typ {
 		case coord.FrameKeepalive:
+		case coord.FrameRelayData:
+			dst, pkt, err := coord.DecodeRelay(payload)
+			if err != nil {
+				return
+			}
+			s.mu.Lock()
+			target, online := s.sessions[dst]
+			s.mu.Unlock()
+			if !online {
+				continue // peer offline: drop silently, sender's WG will retry
+			}
+			// Restamp with the true source so identity can't be spoofed.
+			if err := target.send(coord.FrameRelayData, coord.EncodeRelay(sess.id, pkt)); err != nil {
+				target.conn.Close()
+			}
 		case coord.FrameControl:
 			msg, err := coord.DecodeControl(payload)
 			if err != nil {

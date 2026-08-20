@@ -51,7 +51,8 @@ func Enroll(ctx context.Context, baseURL string, hc *http.Client, req coord.Enro
 }
 
 type Handlers struct {
-	OnNetmap func(netmap.Netmap)
+	OnNetmap    func(netmap.Netmap)
+	OnRelayData func(src netmap.NodeID, pkt []byte)
 }
 
 type Session struct {
@@ -129,6 +130,14 @@ func (s *Session) readLoop(r *bufio.Reader, h Handlers) {
 		}
 		switch typ {
 		case coord.FrameKeepalive:
+		case coord.FrameRelayData:
+			src, pkt, err := coord.DecodeRelay(payload)
+			if err != nil {
+				return
+			}
+			if h.OnRelayData != nil {
+				h.OnRelayData(src, pkt)
+			}
 		case coord.FrameControl:
 			msg, err := coord.DecodeControl(payload)
 			if err != nil {
@@ -148,6 +157,11 @@ func (s *Session) send(typ coord.FrameType, payload []byte) error {
 		return err
 	}
 	return s.bw.Flush()
+}
+
+// SendRelay forwards one encrypted WireGuard packet to dst via the server.
+func (s *Session) SendRelay(dst netmap.NodeID, pkt []byte) error {
+	return s.send(coord.FrameRelayData, coord.EncodeRelay(dst, pkt))
 }
 
 // SendEndpoints reports this node's current candidate endpoints.
