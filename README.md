@@ -4,11 +4,15 @@ A deliberately simple, open-source mesh VPN built on WireGuard, in Go.
 One CLI control server, one client binary, no web UI, no accounts.
 
 **Status: early but functional on Linux.** Working today: control plane
-(enroll, IP assignment, netmap push), direct connections, encrypted relay
-through the server when peers can't reach each other, and port/protocol
-ACLs enforced by a userspace packet filter. Planned next: NAT traversal
-(STUN + hole punching) so relayed pairs upgrade to direct. macOS/Windows
-clients compile but lack interface configuration for now.
+(enroll, IP assignment, netmap push), encrypted relay through the server,
+port/protocol ACLs enforced by a userspace packet filter, and NAT
+traversal — clients behind NATs start on the relay, then hole-punch
+(STUN + authenticated disco probes) and upgrade to a direct path, falling
+back to relay if the punch fails. macOS/Windows clients compile but lack
+interface configuration for now.
+
+Diagnostics: `vpn status` (per-peer path: direct/relay), `vpn ping <peer>`
+(disco-level RTT), `vpn netcheck` (local + STUN-observed endpoints).
 
 ## How it works
 
@@ -53,6 +57,8 @@ listed flows (plus replies to connections a node initiates) pass.
 ```
 go test -race ./...          # unit + in-process integration (no root)
 sudo test/e2e/smoke.sh       # real binaries + TUNs in network namespaces
+sudo test/natlab/punch.sh    # hole punch through two masquerading NATs
+sudo test/natlab/punch.sh symmetric  # hostile NATs: relay fallback
 ```
 
 The integration tests run entire meshes in-process using netstack TUNs —
