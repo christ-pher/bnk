@@ -132,6 +132,9 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 					cfg.Logf("apply netmap: %v", err)
 				}
 			},
+			OnRelayData: func(src netmap.NodeID, pkt []byte) {
+				engine.DeliverRelay(uint32(src), pkt)
+			},
 		})
 		if err != nil {
 			cfg.Logf("coordination dial: %v (retrying in %v)", err, backoff)
@@ -146,6 +149,9 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 			continue
 		}
 		backoff = time.Second
+		engine.SetRelaySender(func(dst uint32, pkt []byte) error {
+			return sess.SendRelay(netmap.NodeID(dst), pkt)
+		})
 
 		if err := sess.SendEndpoints(candidateEndpoints(engine.LocalPort())); err != nil {
 			cfg.Logf("send endpoints: %v", err)

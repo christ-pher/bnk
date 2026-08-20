@@ -259,6 +259,17 @@ func (b *Bind) SetPeerAddr(key NodeKey, addr netip.AddrPort) {
 	b.byAddr[normalize(addr)] = key
 }
 
+// ClearPeerAddr removes a peer's direct address so sends fall back to the
+// relay (used when a direct path never proves itself).
+func (b *Bind) ClearPeerAddr(key NodeKey) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if old, ok := b.peers[key]; ok {
+		delete(b.byAddr, normalize(old))
+		delete(b.peers, key)
+	}
+}
+
 // ParseEndpoint accepts a base64 node key, not an ip:port: WireGuard
 // addresses peers by identity and the Bind owns the identity→address mapping.
 func (b *Bind) ParseEndpoint(s string) (conn.Endpoint, error) {

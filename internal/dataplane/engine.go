@@ -40,6 +40,18 @@ func (e *Engine) LocalPort() uint16 {
 	return e.bind.LocalPort()
 }
 
+// SetRelaySender wires the coordination session's relay transport into the
+// packet path.
+func (e *Engine) SetRelaySender(send func(dst uint32, pkt []byte) error) {
+	e.bind.SetRelaySender(send)
+}
+
+// DeliverRelay feeds a relayed WireGuard packet from the coordination
+// session into the packet path.
+func (e *Engine) DeliverRelay(src uint32, pkt []byte) {
+	e.bind.DeliverRelay(src, pkt)
+}
+
 // ApplyNetmap reconfigures the device and path table to match nm. Peers
 // absent from nm are removed (replace_peers); each peer's identity is its
 // node key, and its freshest known endpoint feeds the Bind's path table.
@@ -53,6 +65,7 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 		fmt.Fprintf(&cfg, "public_key=%s\n", hex.EncodeToString(p.NodeKey[:]))
 		fmt.Fprintf(&cfg, "endpoint=%s\n", p.NodeKey)
 		fmt.Fprintf(&cfg, "allowed_ip=%s/32\n", p.IP)
+		e.bind.SetPeerRelay(magicsock.NodeKey(p.NodeKey), uint32(p.ID))
 		if len(p.Endpoints) > 0 {
 			e.bind.SetPeerAddr(magicsock.NodeKey(p.NodeKey), p.Endpoints[0])
 		}
