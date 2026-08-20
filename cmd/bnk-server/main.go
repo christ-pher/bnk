@@ -32,6 +32,9 @@ import (
 // local builds report "dev".
 var version = "dev"
 
+// rawBase is where the install scripts are served from.
+const rawBase = "https://raw.githubusercontent.com/christ-pher/bnk/main"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "bnk-server:", err)
@@ -318,13 +321,24 @@ func printInstallHint(stateDir, key string) {
 		}
 	}
 	// Both platforms are printed because the server cannot know what the
-	// joining machine runs.
-	fmt.Fprintf(os.Stderr, "\n# paste on the new node to install and join (verify the IP is this server's public one)\n"+
-		"# Linux:\n"+
-		"curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server %s --key %s\n"+
-		"# Windows (elevated PowerShell):\n"+
-		"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1))) -Server %s -Key %s\n",
-		serverURL, key, serverURL, key)
+	// joining machine runs. Everything here goes to stderr so stdout
+	// stays a bare key for scripts.
+	const rule = "────────────────────────────────────────────────────────────"
+	w := os.Stderr
+	fmt.Fprintf(w, "\n%s\n", rule)
+	fmt.Fprintf(w, "  Join a node — paste ONE of these on that machine.\n")
+	fmt.Fprintf(w, "  Server: %s   (check this is reachable from the node)\n", serverURL)
+	fmt.Fprintf(w, "%s\n\n", rule)
+	// Each command stays on one line: a wrapped line survives a
+	// triple-click copy, a backslash continuation does not.
+	fmt.Fprintf(w, "  LINUX  (as root)\n\n")
+	fmt.Fprintf(w, "    curl -fsSL %s/install-client.sh | sudo sh -s -- --server %s --key %s\n\n",
+		rawBase, serverURL, key)
+	fmt.Fprintf(w, "  WINDOWS  (elevated PowerShell)\n\n")
+	fmt.Fprintf(w, "    & ([scriptblock]::Create((irm %s/install-client.ps1))) -Server %s -Key %s\n\n",
+		rawBase, serverURL, key)
+	fmt.Fprintf(w, "  The key is single-use and expires — mint another with `bnk-server key new`.\n")
+	fmt.Fprintf(w, "%s\n", rule)
 }
 
 func aclSet(args []string) error {
