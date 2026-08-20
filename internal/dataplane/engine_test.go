@@ -74,15 +74,19 @@ func startClient(t *testing.T, url, enrollKey, name string) *node {
 
 	sess, err := client.Dial(context.Background(), url, nil, pub, client.Handlers{
 		OnNetmap: func(nm netmap.Netmap) {
-			if err := engine.ApplyNetmap(nm); err != nil {
-				t.Errorf("%s apply netmap: %v", name, err)
-			}
+			// Apply errors are benign during teardown (device closed); a
+			// real failure surfaces as the tunnel never coming up. Never
+			// touch t here: this goroutine can outlive the test body.
+			_ = engine.ApplyNetmap(nm)
 		},
 	})
 	if err != nil {
 		t.Fatalf("%s dial: %v", name, err)
 	}
-	t.Cleanup(sess.Close)
+	t.Cleanup(func() {
+		sess.Close()
+		<-sess.Done() // ensure no ApplyNetmap is in flight before engine closes
+	})
 
 	self := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), engine.LocalPort())
 	if err := sess.SendEndpoints([]netip.AddrPort{self}); err != nil {

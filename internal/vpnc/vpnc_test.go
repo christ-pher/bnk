@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"log"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -101,7 +102,8 @@ func runClient(t *testing.T, ctx context.Context, tc *testControl, name, stateDi
 			StateDir:  stateDir,
 			Hostname:  name,
 			CreateTUN: h.factory,
-			Logf:      t.Logf,
+			// log.Printf, not t.Logf: this goroutine can outlive the test.
+			Logf: log.Printf,
 		})
 		if err != nil && ctx.Err() == nil {
 			t.Errorf("%s Run: %v", name, err)
