@@ -8,12 +8,16 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"vpnmesh/internal/acl"
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/ipam"
 	"vpnmesh/internal/netmap"
@@ -251,12 +255,101 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 	}
 }
 
+// SetPolicy validates, persists, and broadcasts a new ACL policy; nil
+// clears it (allow-all).
+func (s *Server) SetPolicy(p *acl.Policy) error {
+	s.mu.Lock()
+	if p != nil {
+		if _, err := acl.Compile(*p, s.aclNodesLocked()); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+	s.st.Policy = p
+	err := s.fs.Save(s.st)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.broadcastNetmaps()
+	return nil
+}
+
+// CheckPolicy is a dry-run evaluator: would traffic from node src to node
+// dst matching target ("tcp/22", "icmp") be allowed under the current
+// policy? Return-flow admission is not modeled — this answers "could src
+// initiate to dst".
+func (s *Server) CheckPolicy(src, dst, target string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var srcNode *store.Node
+	for i, n := range s.st.Nodes {
+		if n.Name == src {
+			srcNode = &s.st.Nodes[i]
+		}
+	}
+	if srcNode == nil {
+		return false, fmt.Errorf("unknown source node %q", src)
+	}
+	proto, portSpec, _ := strings.Cut(target, "/")
+	var port uint64
+	if proto != "icmp" {
+		var err error
+		port, err = strconv.ParseUint(portSpec, 10, 16)
+		if err != nil {
+			return false, fmt.Errorf("bad target %q (want tcp/22, udp/53, or icmp)", target)
+		}
+	}
+	compiled, enabled := s.compileFilterLocked()
+	if !enabled {
+		return true, nil
+	}
+	for _, r := range compiled[dst] {
+		if r.Match(srcNode.IP, proto, uint16(port)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Policy returns the current ACL policy (nil = allow all).
+func (s *Server) Policy() *acl.Policy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.st.Policy
+}
+
+func (s *Server) aclNodesLocked() []acl.NodeInfo {
+	nodes := make([]acl.NodeInfo, 0, len(s.st.Nodes))
+	for _, n := range s.st.Nodes {
+		nodes = append(nodes, acl.NodeInfo{Name: n.Name, IP: n.IP, Tags: n.Tags})
+	}
+	return nodes
+}
+
+// compileFilterLocked compiles the current policy; s.mu must be held. A nil
+// map with enabled=false means no policy (allow all). Compile errors after
+// a node change fail closed: enforcement stays on with empty rules.
+func (s *Server) compileFilterLocked() (map[string][]acl.CompiledRule, bool) {
+	if s.st.Policy == nil {
+		return nil, false
+	}
+	compiled, err := acl.Compile(*s.st.Policy, s.aclNodesLocked())
+	if err != nil {
+		return map[string][]acl.CompiledRule{}, true
+	}
+	return compiled, true
+}
+
 // netmapForLocked computes the netmap for one node; s.mu must be held.
 func (s *Server) netmapForLocked(node store.Node) netmap.Netmap {
 	nm := netmap.Netmap{
 		SelfID: node.ID,
 		SelfIP: netip.PrefixFrom(node.IP, 32),
 	}
+	compiled, enabled := s.compileFilterLocked()
+	nm.FilterEnabled = enabled
+	nm.Filter = compiled[node.Name]
 	for _, n := range s.st.Nodes {
 		if n.ID == node.ID {
 			continue

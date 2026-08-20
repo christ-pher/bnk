@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"vpnmesh/internal/acl"
 	"vpnmesh/internal/netmap"
 )
 
@@ -19,6 +20,7 @@ type State struct {
 	Prefix     netip.Prefix `json:"prefix"`
 	Nodes      []Node       `json:"nodes"`
 	EnrollKeys []EnrollKey  `json:"enroll_keys"`
+	Policy     *acl.Policy  `json:"policy,omitempty"`
 }
 
 type Node struct {

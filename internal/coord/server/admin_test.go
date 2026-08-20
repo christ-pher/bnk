@@ -46,6 +46,81 @@ func TestAdminNodesListsEnrollmentAndOnlineState(t *testing.T) {
 	}
 }
 
+func TestAdminPolicyRoundTripAndCheck(t *testing.T) {
+	e := startServer(t)
+	e.enroll(t, "laptop", key32(1))
+	e.enroll(t, "nas", key32(2))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	defer admin.Close()
+
+	policy := `{"rules":[{"from":["laptop"],"to":["nas"],"allow":["tcp/22"]}]}`
+	req, _ := http.NewRequest(http.MethodPut, admin.URL+"/policy", strings.NewReader(policy))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /policy = %s", resp.Status)
+	}
+
+	resp, err = http.Get(admin.URL + "/policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Rules []struct {
+			To []string `json:"to"`
+		} `json:"rules"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rules) != 1 || got.Rules[0].To[0] != "nas" {
+		t.Errorf("GET /policy = %+v", got)
+	}
+
+	for query, want := range map[string]bool{
+		"src=laptop&dst=nas&target=tcp/22": true,
+		"src=laptop&dst=nas&target=tcp/23": false,
+		"src=nas&dst=laptop&target=tcp/22": false,
+	} {
+		resp, err := http.Get(admin.URL + "/check?" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var verdict struct {
+			Allowed bool `json:"allowed"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&verdict); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if verdict.Allowed != want {
+			t.Errorf("check %s = %v, want %v", query, verdict.Allowed, want)
+		}
+	}
+}
+
+func TestAdminPolicyRejectsInvalid(t *testing.T) {
+	e := startServer(t)
+	e.enroll(t, "laptop", key32(1))
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	defer admin.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, admin.URL+"/policy",
+		strings.NewReader(`{"rules":[{"from":["ghost"],"to":["laptop"],"allow":["tcp/22"]}]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Error("invalid policy accepted over admin API")
+	}
+}
+
 func TestAdminNewEnrollKeyReturnsFullPinnedKey(t *testing.T) {
 	e := startServer(t)
 	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))

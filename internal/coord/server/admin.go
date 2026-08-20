@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/netip"
 
+	"vpnmesh/internal/acl"
 	"vpnmesh/internal/netmap"
 	"vpnmesh/internal/pin"
 )
@@ -35,6 +36,35 @@ func (s *Server) AdminHandler(fingerprint string) http.Handler {
 		}
 		s.mu.Unlock()
 		json.NewEncoder(w).Encode(nodes)
+	})
+	mux.HandleFunc("PUT /policy", func(w http.ResponseWriter, r *http.Request) {
+		var p acl.Policy
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.SetPolicy(&p); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /policy", func(w http.ResponseWriter, r *http.Request) {
+		p := s.Policy()
+		if p == nil {
+			http.Error(w, "no policy set (allow all)", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(p)
+	})
+	mux.HandleFunc("GET /check", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		allowed, err := s.CheckPolicy(q.Get("src"), q.Get("dst"), q.Get("target"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"allowed": allowed})
 	})
 	mux.HandleFunc("POST /enroll-keys", func(w http.ResponseWriter, r *http.Request) {
 		secret, err := s.NewEnrollKey()

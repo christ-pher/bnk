@@ -1,0 +1,10 @@
+{
+  "groups": {
+    "trusted": ["laptop", "desktop"],
+    "servers": ["nas"]
+  },
+  "rules": [
+    { "from": ["group:trusted"], "to": ["group:servers"], "allow": ["tcp/22", "tcp/443", "icmp"] },
+    { "from": ["*"], "to": ["*"], "allow": ["icmp"] }
+  ]
+}

@@ -13,6 +13,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"vpnmesh/internal/filter"
 	"vpnmesh/internal/magicsock"
 	"vpnmesh/internal/netmap"
 )
@@ -25,15 +26,19 @@ type Engine struct {
 	mu          sync.Mutex
 	bind        *magicsock.Bind
 	dev         *device.Device
+	filter      *filter.Filter
 	applied     map[magicsock.NodeKey]netip.AddrPort // direct addr currently set
 	directSince map[magicsock.NodeKey]time.Time      // unproven direct paths
 	done        chan struct{}
 }
 
 // New brings up a WireGuard device on tunDev with a fresh magicsock Bind.
+// The ACL filter sits between the device and the TUN; it starts in
+// allow-all mode until a netmap carries a policy.
 func New(tunDev tun.Device, privateKey [32]byte) (*Engine, error) {
+	f := filter.New()
 	bind := magicsock.NewBind()
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelError, "wg: "))
+	dev := device.NewDevice(filter.WrapTUN(tunDev, f), bind, device.NewLogger(device.LogLevelError, "wg: "))
 	if err := dev.IpcSet(fmt.Sprintf("private_key=%s\n", hex.EncodeToString(privateKey[:]))); err != nil {
 		dev.Close()
 		return nil, err
@@ -45,6 +50,7 @@ func New(tunDev tun.Device, privateKey [32]byte) (*Engine, error) {
 	e := &Engine{
 		bind:        bind,
 		dev:         dev,
+		filter:      f,
 		applied:     make(map[magicsock.NodeKey]netip.AddrPort),
 		directSince: make(map[magicsock.NodeKey]time.Time),
 		done:        make(chan struct{}),
@@ -169,6 +175,12 @@ func (e *Engine) DeliverRelay(src uint32, pkt []byte) {
 func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if nm.FilterEnabled {
+		e.filter.SetRules(nm.Filter)
+	} else {
+		e.filter.SetAllowAll()
+	}
 
 	var cfg strings.Builder
 	cfg.WriteString("replace_peers=true\n")

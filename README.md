@@ -3,10 +3,12 @@
 A deliberately simple, open-source mesh VPN built on WireGuard, in Go.
 One CLI control server, one client binary, no web UI, no accounts.
 
-**Status: early. Phase 1 (control plane) works on Linux.** Peers connect
-directly when reachable; NAT traversal (hole punching) and relay fallback
-are planned — see `docs/` plan. macOS/Windows clients compile but lack
-interface configuration for now.
+**Status: early but functional on Linux.** Working today: control plane
+(enroll, IP assignment, netmap push), direct connections, encrypted relay
+through the server when peers can't reach each other, and port/protocol
+ACLs enforced by a userspace packet filter. Planned next: NAT traversal
+(STUN + hole punching) so relayed pairs upgrade to direct. macOS/Windows
+clients compile but lack interface configuration for now.
 
 ## How it works
 
@@ -33,7 +35,18 @@ vpn up --server https://YOUR_SERVER:8443 --key vpnkey:...
 ```
 
 The enrollment key is only needed the first time; after that `vpn up
---server ...` resumes from saved state. `vpnd node ls` shows the mesh.
+--server ...` resumes from saved state. `vpnd node ls` shows the mesh and
+`vpn status` shows each peer's path (direct or relay) and handshake age.
+
+Access control (see `policy.example.json`):
+
+```
+vpnd acl set policy.json
+vpnd acl check laptop nas tcp/22   # dry-run: allowed or denied?
+```
+
+No policy means allow-all; an explicit policy is default-deny — only the
+listed flows (plus replies to connections a node initiates) pass.
 
 ## Development
 

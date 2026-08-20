@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+
+	"vpnmesh/internal/acl"
 )
 
 type NodeID uint32
@@ -43,6 +45,11 @@ type Netmap struct {
 	SelfID NodeID       `json:"self_id"`
 	SelfIP netip.Prefix `json:"self_ip"`
 	Peers  []Peer       `json:"peers"`
+
+	// FilterEnabled distinguishes "no policy, allow all" (false) from an
+	// active policy — where an empty Filter means deny all inbound.
+	FilterEnabled bool               `json:"filter_enabled,omitempty"`
+	Filter        []acl.CompiledRule `json:"filter,omitempty"`
 }
 
 type Peer struct {

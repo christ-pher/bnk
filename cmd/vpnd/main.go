@@ -4,13 +4,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"text/tabwriter"
@@ -44,6 +47,20 @@ func run(args []string) error {
 			return fmt.Errorf("usage: vpnd node ls")
 		}
 		return nodeLs(args[2:])
+	case "acl":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: vpnd acl <set|get|check> ...")
+		}
+		switch args[1] {
+		case "set":
+			return aclSet(args[2:])
+		case "get":
+			return aclGet(args[2:])
+		case "check":
+			return aclCheck(args[2:])
+		default:
+			return fmt.Errorf("usage: vpnd acl <set|get|check> ...")
+		}
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -144,6 +161,79 @@ func keyNew(args []string) error {
 		return err
 	}
 	fmt.Println(out.Key)
+	return nil
+}
+
+func aclSet(args []string) error {
+	fs := flag.NewFlagSet("acl set", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: vpnd acl set <policy.json>")
+	}
+	policy, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://vpnd/policy", bytes.NewReader(policy))
+	if err != nil {
+		return err
+	}
+	resp, err := adminClient(*stateDir).Do(req)
+	if err != nil {
+		return fmt.Errorf("is vpnd running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("policy rejected: %s", bytes.TrimSpace(msg))
+	}
+	fmt.Println("policy applied")
+	return nil
+}
+
+func aclGet(args []string) error {
+	fs := flag.NewFlagSet("acl get", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	resp, err := adminClient(*stateDir).Get("http://vpnd/policy")
+	if err != nil {
+		return fmt.Errorf("is vpnd running? %w", err)
+	}
+	defer resp.Body.Close()
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
+}
+
+func aclCheck(args []string) error {
+	fs := flag.NewFlagSet("acl check", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() != 3 {
+		return fmt.Errorf("usage: vpnd acl check <src-node> <dst-node> <tcp/22|udp/53|icmp>")
+	}
+	u := fmt.Sprintf("http://vpnd/check?src=%s&dst=%s&target=%s",
+		url.QueryEscape(fs.Arg(0)), url.QueryEscape(fs.Arg(1)), url.QueryEscape(fs.Arg(2)))
+	resp, err := adminClient(*stateDir).Get(u)
+	if err != nil {
+		return fmt.Errorf("is vpnd running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	var verdict struct {
+		Allowed bool `json:"allowed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&verdict); err != nil {
+		return err
+	}
+	if verdict.Allowed {
+		fmt.Println("allowed")
+	} else {
+		fmt.Println("denied")
+	}
 	return nil
 }
 
