@@ -123,6 +123,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer engine.Close()
+	engine.SetMeshPrefix(st.Prefix)
 	defer func() {
 		if cleanup != nil {
 			cleanup()
@@ -183,7 +184,7 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		// Advertise local endpoints immediately; the STUN-discovered public
 		// endpoint follows asynchronously so a missing responder never
 		// stalls the session.
-		eps := candidateEndpoints(engine.LocalPort())
+		eps := filterEndpoints(candidateEndpoints(engine.LocalPort()), st.Prefix)
 		if cfg.EndpointsOverride != nil {
 			eps = cfg.EndpointsOverride
 		}
@@ -237,6 +238,22 @@ func stunQuery(ctx context.Context, engine *dataplane.Engine, serverURL string) 
 	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return engine.QuerySTUN(qctx, netip.AddrPortFrom(server.Unmap(), uint16(ua.Port)))
+}
+
+// filterEndpoints drops endpoints inside the mesh prefix: advertising a
+// tunnel address makes peers probe through the tunnel itself, proving a
+// looping path that then swallows all traffic.
+func filterEndpoints(eps []netip.AddrPort, mesh netip.Prefix) []netip.AddrPort {
+	if !mesh.IsValid() {
+		return eps
+	}
+	out := eps[:0]
+	for _, ep := range eps {
+		if !mesh.Contains(ep.Addr()) {
+			out = append(out, ep)
+		}
+	}
+	return out
 }
 
 // candidateEndpoints pairs every up-interface IPv4 address with the

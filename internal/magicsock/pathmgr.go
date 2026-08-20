@@ -54,6 +54,7 @@ type PathManager struct {
 	cfg PathManagerConfig
 
 	mu         sync.Mutex
+	meshPrefix netip.Prefix
 	peers      map[NodeKey]*peerState
 	byDiscoKey map[[32]byte]NodeKey
 	pings      map[[12]byte]sentPing
@@ -69,6 +70,21 @@ func NewPathManager(cfg PathManagerConfig) *PathManager {
 		pings:      make(map[[12]byte]sentPing),
 		waiters:    make(map[[12]byte]chan PingResult),
 	}
+}
+
+// SetMeshPrefix declares the tunnel network. Any candidate inside it is
+// refused: probing a tunnel address routes through the tunnel itself and
+// proves a looping path that then swallows all traffic.
+func (pm *PathManager) SetMeshPrefix(p netip.Prefix) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.meshPrefix = p
+}
+
+// badCandidateLocked reports whether addr must never be probed; pm.mu
+// must be held.
+func (pm *PathManager) badCandidateLocked(addr netip.AddrPort) bool {
+	return pm.meshPrefix.IsValid() && pm.meshPrefix.Contains(addr.Addr())
 }
 
 func (pm *PathManager) SetSelfEndpoints(eps []netip.AddrPort) {
@@ -89,6 +105,9 @@ func (pm *PathManager) SetPeer(key NodeKey, discoKey [32]byte, cands []netip.Add
 	}
 	pm.byDiscoKey[discoKey] = key
 	for _, c := range cands {
+		if pm.badCandidateLocked(c) {
+			continue
+		}
 		ps.candidates[c] = true
 		if pm.cfg.AddAddrHint != nil {
 			pm.cfg.AddAddrHint(key, c)
@@ -170,12 +189,17 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 	switch m := msg.(type) {
 	case disco.Ping:
 		// A ping proves the peer can reach us at this path; answer with
-		// their observed address and remember theirs as a candidate.
+		// their observed address and remember theirs as a candidate —
+		// unless it arrived through the tunnel itself.
 		pm.mu.Lock()
-		ps.candidates[src] = true
-		pm.mu.Unlock()
-		if pm.cfg.AddAddrHint != nil {
-			pm.cfg.AddAddrHint(key, src)
+		if !pm.badCandidateLocked(src) {
+			ps.candidates[src] = true
+			pm.mu.Unlock()
+			if pm.cfg.AddAddrHint != nil {
+				pm.cfg.AddAddrHint(key, src)
+			}
+		} else {
+			pm.mu.Unlock()
 		}
 		pong := disco.Seal(disco.Pong{TxID: m.TxID, Observed: src}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, ps.discoKey)
 		pm.cfg.SendRaw(src, pong)
@@ -232,14 +256,19 @@ func (pm *PathManager) HandleDiscoFwd(payload []byte) {
 // once — the simultaneous transmit that opens NAT mappings on both sides.
 func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 	pm.mu.Lock()
+	kept := eps[:0]
 	for _, ep := range eps {
+		if pm.badCandidateLocked(ep) {
+			continue
+		}
 		ps.candidates[ep] = true
+		kept = append(kept, ep)
 	}
 	cands := candidateList(ps)
 	discoKey := ps.discoKey
 	pm.mu.Unlock()
 	if pm.cfg.AddAddrHint != nil {
-		for _, ep := range eps {
+		for _, ep := range kept {
 			pm.cfg.AddAddrHint(key, ep)
 		}
 	}

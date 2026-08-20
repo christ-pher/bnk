@@ -137,6 +137,12 @@ func (e *Engine) HandleDiscoFwd(payload []byte) {
 	e.pm.HandleDiscoFwd(payload)
 }
 
+// SetMeshPrefix declares the tunnel network so the path manager never
+// probes in-tunnel addresses (which would prove a self-looping path).
+func (e *Engine) SetMeshPrefix(p netip.Prefix) {
+	e.pm.SetMeshPrefix(p)
+}
+
 // SetSelfEndpoints tells the path manager which addresses to advertise in
 // call-me-maybe messages.
 func (e *Engine) SetSelfEndpoints(eps []netip.AddrPort) {

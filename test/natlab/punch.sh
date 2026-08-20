@@ -156,19 +156,28 @@ ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
 ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
 
 echo "== netcheck (alpha side): path-manager state and relay counters"
-ip netns exec punch-a "$WORK/vpn" netcheck --state-dir "$WORK/a" || true
+NETCHECK=$(ip netns exec punch-a "$WORK/vpn" netcheck --state-dir "$WORK/a" 2>&1 || true)
+echo "$NETCHECK"
+BEST=$(echo "$NETCHECK" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(iter(d.get("peers",{}).values()),{}).get("best",""))' 2>/dev/null || true)
 
 if [[ "$MODE" == "symmetric" ]]; then
     if [[ "$DIRECT" == "yes" ]]; then
-        echo "== NOTE: path went DIRECT under symmetric NATs — unexpected;"
-        echo "==       check 'best' in netcheck above to see which address punched"
+        echo "punch: FAIL - direct path ($BEST) under symmetric NATs is impossible; a bogus candidate was proven" >&2
+        diagnostics
+        exit 1
     fi
-    echo "== symmetric mode: relay is the expected outcome; tunnel works = PASS"
+    echo "== PASS: symmetric NATs correctly fell back to relay, tunnel works"
     exit 0
 fi
 if [[ "$DIRECT" == "yes" ]]; then
-    echo "== PASS: hole punch succeeded, path is direct through both NATs"
-    exit 0
+    # The proven address must be a real underlay (simulated-internet) one.
+    if [[ "$BEST" == 10.99.* ]]; then
+        echo "== PASS: hole punch succeeded, direct via real underlay address $BEST"
+        exit 0
+    fi
+    echo "punch: FAIL - 'direct' via $BEST, which is not an underlay address (loop or LAN)" >&2
+    diagnostics
+    exit 1
 fi
 echo "punch: FAIL - never upgraded to a direct path (still relayed)" >&2
 diagnostics
