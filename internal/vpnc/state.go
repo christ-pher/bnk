@@ -17,6 +17,8 @@ import (
 // state is the client's persistent identity and enrollment result.
 type state struct {
 	PrivateKey  netmap.Key    `json:"private_key"`
+	DiscoPriv   netmap.Key    `json:"disco_priv,omitempty"`
+	DiscoPub    netmap.Key    `json:"disco_pub,omitempty"`
 	ServerURL   string        `json:"server_url"`
 	Fingerprint string        `json:"fingerprint,omitempty"`
 	NodeID      netmap.NodeID `json:"node_id,omitempty"`

@@ -21,6 +21,7 @@ import (
 	"vpnmesh/internal/coord/server"
 	"vpnmesh/internal/pin"
 	"vpnmesh/internal/store"
+	"vpnmesh/internal/stunner"
 )
 
 func main() {
@@ -92,6 +93,13 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// STUN responder on the same port number, UDP: one port to open.
+	stunPC, err := net.ListenPacket("udp", *listen)
+	if err != nil {
+		return err
+	}
+	go stunner.Serve(context.Background(), stunPC)
 
 	sockPath := filepath.Join(*stateDir, "admin.sock")
 	os.Remove(sockPath)

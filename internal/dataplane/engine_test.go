@@ -67,7 +67,7 @@ func startClient(t *testing.T, url, enrollKey, name string) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := dataplane.New(tunDev, priv)
+	engine, err := dataplane.New(tunDev, priv, [32]byte{}, [32]byte{})
 	if err != nil {
 		t.Fatalf("%s engine: %v", name, err)
 	}

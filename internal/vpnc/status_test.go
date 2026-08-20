@@ -45,11 +45,10 @@ func TestStatusReportsPeersAndPath(t *testing.T) {
 			if !st.Self.IP.IsValid() {
 				t.Error("status has no self IP")
 			}
-			if len(st.Peers) == 1 && st.Peers[0].Name == "beta" {
+			// The direct path is proven asynchronously by disco, so keep
+			// polling until the peer shows up as direct.
+			if len(st.Peers) == 1 && st.Peers[0].Name == "beta" && st.Peers[0].Path == "direct" {
 				p := st.Peers[0]
-				if p.Path != "direct" {
-					t.Errorf("path = %q, want direct (loopback endpoints in-process)", p.Path)
-				}
 				if !p.IP.IsValid() {
 					t.Error("peer has no IP")
 				}

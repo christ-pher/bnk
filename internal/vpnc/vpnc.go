@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/coord/client"
 	"vpnmesh/internal/dataplane"
+	"vpnmesh/internal/disco"
 	"vpnmesh/internal/netmap"
 	"vpnmesh/internal/pin"
 )
@@ -52,6 +54,13 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 		st = state{PrivateKey: priv, ServerURL: cfg.ServerURL}
+	}
+	if st.DiscoPub == (netmap.Key{}) {
+		dPriv, dPub, err := disco.NewKeypair()
+		if err != nil {
+			return err
+		}
+		st.DiscoPriv, st.DiscoPub = dPriv, dPub
 	}
 	if cfg.ServerURL != "" {
 		st.ServerURL = cfg.ServerURL
@@ -89,6 +98,7 @@ func Run(ctx context.Context, cfg Config) error {
 			Hostname:  cfg.Hostname,
 			OS:        osName(),
 			NodeKey:   pub,
+			DiscoKey:  st.DiscoPub,
 		})
 		if err != nil {
 			return err
@@ -103,7 +113,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	engine, err := dataplane.New(tunDev, st.PrivateKey)
+	engine, err := dataplane.New(tunDev, st.PrivateKey, st.DiscoPriv, st.DiscoPub)
 	if err != nil {
 		return err
 	}
@@ -141,6 +151,9 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 			OnRelayData: func(src netmap.NodeID, pkt []byte) {
 				engine.DeliverRelay(uint32(src), pkt)
 			},
+			OnDiscoFwd: func(src netmap.NodeID, payload []byte) {
+				engine.HandleDiscoFwd(payload)
+			},
 		})
 		if err != nil {
 			cfg.Logf("coordination dial: %v (retrying in %v)", err, backoff)
@@ -158,10 +171,32 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		engine.SetRelaySender(func(dst uint32, pkt []byte) error {
 			return sess.SendRelay(netmap.NodeID(dst), pkt)
 		})
+		engine.SetDiscoFwdSender(func(dst uint32, payload []byte) error {
+			return sess.SendDiscoFwd(netmap.NodeID(dst), payload)
+		})
 
-		if err := sess.SendEndpoints(candidateEndpoints(engine.LocalPort())); err != nil {
+		// Advertise local endpoints immediately; the STUN-discovered public
+		// endpoint follows asynchronously so a missing responder never
+		// stalls the session.
+		eps := candidateEndpoints(engine.LocalPort())
+		engine.SetSelfEndpoints(eps)
+		if err := sess.SendEndpoints(eps); err != nil {
 			cfg.Logf("send endpoints: %v", err)
 		}
+		go func() {
+			observed, err := stunQuery(ctx, engine, st.ServerURL)
+			if err != nil {
+				if ctx.Err() == nil {
+					cfg.Logf("stun: %v (advertising local endpoints only)", err)
+				}
+				return
+			}
+			all := append([]netip.AddrPort{observed}, eps...)
+			engine.SetSelfEndpoints(all)
+			if err := sess.SendEndpoints(all); err != nil {
+				cfg.Logf("send endpoints: %v", err)
+			}
+		}()
 
 		select {
 		case <-ctx.Done():
@@ -171,6 +206,26 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 			cfg.Logf("coordination session lost, reconnecting")
 		}
 	}
+}
+
+// stunQuery asks the control server's STUN responder (UDP, same port as
+// the TLS listener) for our reflexive address.
+func stunQuery(ctx context.Context, engine *dataplane.Engine, serverURL string) (netip.AddrPort, error) {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	ua, err := net.ResolveUDPAddr("udp4", u.Host)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	server, ok := netip.AddrFromSlice(ua.IP)
+	if !ok {
+		return netip.AddrPort{}, fmt.Errorf("stun: cannot parse resolved addr %v", ua)
+	}
+	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return engine.QuerySTUN(qctx, netip.AddrPortFrom(server.Unmap(), uint16(ua.Port)))
 }
 
 // candidateEndpoints pairs every up-interface IPv4 address with the

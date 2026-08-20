@@ -3,6 +3,7 @@
 package dataplane
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"vpnmesh/internal/filter"
 	"vpnmesh/internal/magicsock"
 	"vpnmesh/internal/netmap"
+	"vpnmesh/internal/stunner"
 )
 
 // fallbackGrace is how long a never-handshaked peer may hold a direct
@@ -27,15 +29,22 @@ type Engine struct {
 	bind        *magicsock.Bind
 	dev         *device.Device
 	filter      *filter.Filter
-	applied     map[magicsock.NodeKey]netip.AddrPort // direct addr currently set
-	directSince map[magicsock.NodeKey]time.Time      // unproven direct paths
+	pm          *magicsock.PathManager
+	stun        *stunner.Client
+	applied     map[magicsock.NodeKey]netip.AddrPort // blind direct addrs (legacy, no-disco peers)
+	directSince map[magicsock.NodeKey]time.Time      // unproven blind paths
+	pmDirect    map[magicsock.NodeKey]netip.AddrPort // disco-proven paths
+	keyToID     map[magicsock.NodeKey]uint32
+	fwdSend     func(dst uint32, payload []byte) error
 	done        chan struct{}
 }
 
 // New brings up a WireGuard device on tunDev with a fresh magicsock Bind.
 // The ACL filter sits between the device and the TUN; it starts in
-// allow-all mode until a netmap carries a policy.
-func New(tunDev tun.Device, privateKey [32]byte) (*Engine, error) {
+// allow-all mode until a netmap carries a policy. The disco keypair feeds
+// the path manager; peers that publish a disco key get proven paths (probe
+// → punch → pong), others fall back to blind endpoints plus the watchdog.
+func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, error) {
 	f := filter.New()
 	bind := magicsock.NewBind()
 	dev := device.NewDevice(filter.WrapTUN(tunDev, f), bind, device.NewLogger(device.LogLevelError, "wg: "))
@@ -53,10 +62,68 @@ func New(tunDev tun.Device, privateKey [32]byte) (*Engine, error) {
 		filter:      f,
 		applied:     make(map[magicsock.NodeKey]netip.AddrPort),
 		directSince: make(map[magicsock.NodeKey]time.Time),
+		pmDirect:    make(map[magicsock.NodeKey]netip.AddrPort),
+		keyToID:     make(map[magicsock.NodeKey]uint32),
 		done:        make(chan struct{}),
 	}
+	e.pm = magicsock.NewPathManager(magicsock.PathManagerConfig{
+		DiscoPriv: discoPriv,
+		DiscoPub:  discoPub,
+		Clock:     time.Now,
+		SendRaw:   bind.SendRaw,
+		SendFwd: func(peer magicsock.NodeKey, payload []byte) error {
+			e.mu.Lock()
+			id, ok := e.keyToID[peer]
+			send := e.fwdSend
+			e.mu.Unlock()
+			if !ok || send == nil {
+				return nil
+			}
+			return send(id, payload)
+		},
+		SetAddr: func(peer magicsock.NodeKey, addr netip.AddrPort) {
+			bind.SetPeerAddr(peer, addr)
+			e.mu.Lock()
+			e.pmDirect[peer] = addr
+			e.mu.Unlock()
+		},
+		ClearAddr: func(peer magicsock.NodeKey) {
+			bind.ClearPeerAddr(peer)
+			e.mu.Lock()
+			delete(e.pmDirect, peer)
+			e.mu.Unlock()
+		},
+	})
+	bind.SetDiscoHandler(e.pm.HandleDisco)
+	e.stun = stunner.NewClient(bind)
 	go e.watchdog()
 	return e, nil
+}
+
+// QuerySTUN asks server for this node's reflexive address as seen from
+// the WireGuard socket.
+func (e *Engine) QuerySTUN(ctx context.Context, server netip.AddrPort) (netip.AddrPort, error) {
+	return e.stun.Query(ctx, server)
+}
+
+// SetDiscoFwdSender wires the coordination session's disco_fwd transport
+// into the path manager.
+func (e *Engine) SetDiscoFwdSender(send func(dst uint32, payload []byte) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fwdSend = send
+}
+
+// HandleDiscoFwd feeds a server-forwarded disco payload to the path
+// manager.
+func (e *Engine) HandleDiscoFwd(payload []byte) {
+	e.pm.HandleDiscoFwd(payload)
+}
+
+// SetSelfEndpoints tells the path manager which addresses to advertise in
+// call-me-maybe messages.
+func (e *Engine) SetSelfEndpoints(eps []netip.AddrPort) {
+	e.pm.SetSelfEndpoints(eps)
 }
 
 // watchdog demotes direct paths that never produce a handshake, so a peer
@@ -71,6 +138,7 @@ func (e *Engine) watchdog() {
 			return
 		case <-ticker.C:
 		}
+		e.pm.Tick()
 		shaken := e.handshakedPeers()
 		e.mu.Lock()
 		for key, since := range e.directSince {
@@ -114,8 +182,9 @@ func (e *Engine) PeerPaths() []PeerPath {
 			}
 			var key magicsock.NodeKey
 			copy(key[:], b)
-			_, direct := e.applied[key]
-			out = append(out, PeerPath{Key: key, Direct: direct})
+			_, blind := e.applied[key]
+			_, proven := e.pmDirect[key]
+			out = append(out, PeerPath{Key: key, Direct: blind || proven})
 			idx = len(out) - 1
 			continue
 		}
@@ -192,6 +261,13 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 		fmt.Fprintf(&cfg, "endpoint=%s\n", p.NodeKey)
 		fmt.Fprintf(&cfg, "allowed_ip=%s/32\n", p.IP)
 		e.bind.SetPeerRelay(key, uint32(p.ID))
+		e.keyToID[key] = uint32(p.ID)
+		if p.DiscoKey != (netmap.Key{}) {
+			// Disco-capable peer: the path manager proves paths; netmap
+			// endpoints are just candidates, never blindly trusted.
+			e.pm.SetPeer(key, p.DiscoKey, p.Endpoints)
+			continue
+		}
 		if len(p.Endpoints) > 0 && e.applied[key] != p.Endpoints[0] {
 			e.bind.SetPeerAddr(key, p.Endpoints[0])
 			e.applied[key] = p.Endpoints[0]
@@ -203,6 +279,14 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 			e.bind.ClearPeerAddr(key)
 			delete(e.applied, key)
 			delete(e.directSince, key)
+		}
+	}
+	for key := range e.keyToID {
+		if !inMap[key] {
+			e.pm.RemovePeer(key)
+			e.bind.ClearPeerAddr(key)
+			delete(e.pmDirect, key)
+			delete(e.keyToID, key)
 		}
 	}
 	return e.dev.IpcSet(cfg.String())
