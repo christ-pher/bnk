@@ -9,7 +9,7 @@ import (
 // The local socket must be reachable without root: parent dir 0755, socket
 // itself 0666. Status/ping/netcheck are read-only diagnostics.
 func TestLocalAPISocketWorldAccessible(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "run", "vpn.sock")
+	sock := filepath.Join(t.TempDir(), "run", "bnk.sock")
 	c := &controller{cfg: Config{Hostname: "self"}, cache: &netmapCache{}, kick: make(chan struct{}, 1)}
 	ln, err := serveLocalAPI(sock, c)
 	if err != nil {
@@ -35,7 +35,7 @@ func TestLocalAPISocketWorldAccessible(t *testing.T) {
 // A second daemon must refuse to replace a socket another daemon is
 // actively serving, instead of silently hijacking its CLI.
 func TestSecondDaemonCannotHijackLiveSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "vpn.sock")
+	sock := filepath.Join(t.TempDir(), "bnk.sock")
 	c := &controller{cfg: Config{Hostname: "self"}, cache: &netmapCache{}, kick: make(chan struct{}, 1)}
 	ln, err := serveLocalAPI(sock, c)
 	if err != nil {

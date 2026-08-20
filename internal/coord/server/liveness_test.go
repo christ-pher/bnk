@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func TestServerDropsSilentSessionButKeepsKeepalivedOne(t *testing.T) {

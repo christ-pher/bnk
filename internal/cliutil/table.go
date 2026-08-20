@@ -1,4 +1,4 @@
-// Package cliutil holds output helpers shared by the vpn and vpnd CLIs.
+// Package cliutil holds output helpers shared by the bnk and bnk-server CLIs.
 package cliutil
 
 import (

@@ -13,11 +13,11 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/store"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/store"
 )
 
 type env struct {

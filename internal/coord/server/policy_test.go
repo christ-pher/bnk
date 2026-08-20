@@ -3,8 +3,8 @@ package server_test
 import (
 	"testing"
 
-	"vpnmesh/internal/acl"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/acl"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func TestSetPolicyPushesCompiledRulesToTargets(t *testing.T) {

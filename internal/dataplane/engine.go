@@ -14,10 +14,10 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
-	"vpnmesh/internal/filter"
-	"vpnmesh/internal/magicsock"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/stunner"
+	"github.com/christ-pher/bnk/internal/filter"
+	"github.com/christ-pher/bnk/internal/magicsock"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/stunner"
 )
 
 // fallbackGrace is how long a never-handshaked peer may hold a direct

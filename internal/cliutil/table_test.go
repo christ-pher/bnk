@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"vpnmesh/internal/cliutil"
+	"github.com/christ-pher/bnk/internal/cliutil"
 )
 
 func TestTableDashesUnderHeaders(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 
-	"vpnmesh/internal/magicsock"
-	"vpnmesh/internal/stunner"
+	"github.com/christ-pher/bnk/internal/magicsock"
+	"github.com/christ-pher/bnk/internal/stunner"
 )
 
 // pumpAll drives the Bind's ReceiveFuncs so its demux runs, discarding

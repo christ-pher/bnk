@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/netip"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 type FrameType byte

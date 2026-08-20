@@ -1,19 +1,19 @@
 #!/bin/sh
 # install-client.sh — join this Linux machine to the mesh.
 #
-# Run as root:  sudo ./install-client.sh --server https://VPS_IP:8443 --key vpnkey:...
+# Run as root:  sudo ./install-client.sh --server https://VPS_IP:8443 --key bnkkey:...
 # (--key can be omitted if this machine enrolled before and still has
-#  /var/lib/vpn/client.json)
+#  /var/lib/bnk/client.json)
 #
-# Uses a prebuilt ./vpn next to this script if present, otherwise builds
-# it (needs Go). Installs to /usr/local/bin, config in /etc/vpnmesh,
-# state in /var/lib/vpn, systemd unit vpn.service.
+# Uses a prebuilt ./bnk next to this script if present, otherwise builds
+# it (needs Go). Installs to /usr/local/bin, config in /etc/bnk,
+# state in /var/lib/bnk, systemd unit bnk.service.
 set -eu
 
-BIN=/usr/local/bin/vpn
-CONF_DIR=/etc/vpnmesh
-ENV_FILE=$CONF_DIR/vpn.env
-UNIT=/etc/systemd/system/vpn.service
+BIN=/usr/local/bin/bnk
+CONF_DIR=/etc/bnk
+ENV_FILE=$CONF_DIR/bnk.env
+UNIT=/etc/systemd/system/bnk.service
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SERVER= KEY=
@@ -21,57 +21,57 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --server) SERVER=$2; shift 2 ;;
         --key)    KEY=$2; shift 2 ;;
-        *) echo "usage: $0 --server https://host:8443 [--key vpnkey:...]" >&2; exit 1 ;;
+        *) echo "usage: $0 --server https://host:8443 [--key bnkkey:...]" >&2; exit 1 ;;
     esac
 done
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo $0 ..." >&2; exit 1; }
 [ -n "$SERVER" ] || [ -f "$ENV_FILE" ] || { echo "--server is required on first install" >&2; exit 1; }
 
-if [ -x "$HERE/vpn" ]; then
-    install -m 755 "$HERE/vpn" "$BIN"
+if [ -x "$HERE/bnk" ]; then
+    install -m 755 "$HERE/bnk" "$BIN"
 elif command -v go >/dev/null 2>&1 && [ -f "$HERE/go.mod" ]; then
-    echo "building vpn..."
-    (cd "$HERE" && CGO_ENABLED=0 go build -o "$BIN" ./cmd/vpn)
+    echo "building bnk..."
+    (cd "$HERE" && CGO_ENABLED=0 go build -o "$BIN" ./cmd/bnk)
 else
-    echo "no ./vpn binary next to this script and no Go toolchain to build one" >&2
-    echo "build elsewhere with: CGO_ENABLED=0 go build -o vpn ./cmd/vpn — then scp both files here" >&2
+    echo "no ./bnk binary next to this script and no Go toolchain to build one" >&2
+    echo "build elsewhere with: CGO_ENABLED=0 go build -o bnk ./cmd/bnk — then scp both files here" >&2
     exit 1
 fi
 
 if [ -n "$SERVER" ]; then
     mkdir -p "$CONF_DIR"
     cat > "$ENV_FILE" <<EOF
-VPN_SERVER=$SERVER
-VPN_KEY=$KEY
+BNK_SERVER=$SERVER
+BNK_KEY=$KEY
 EOF
     chmod 600 "$ENV_FILE"
 elif [ -n "$KEY" ]; then
     # Re-enrollment with the stored server: refresh just the key.
     [ -f "$ENV_FILE" ] || { echo "no $ENV_FILE yet — pass --server too" >&2; exit 1; }
-    sed -i "s|^VPN_KEY=.*|VPN_KEY=$KEY|" "$ENV_FILE"
+    sed -i "s|^BNK_KEY=.*|BNK_KEY=$KEY|" "$ENV_FILE"
 fi
 
 cat > "$UNIT" <<'EOF'
 [Unit]
-Description=vpnmesh client
-Documentation=https://github.com/chris/vpnmesh (DEPLOY.md)
+Description=bnk client
+Documentation=https://github.com/christ-pher/bnk (DEPLOY.md)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# /etc/vpnmesh/vpn.env provides VPN_SERVER (always) and VPN_KEY (only
+# /etc/bnk/bnk.env provides BNK_SERVER (always) and BNK_KEY (only
 # until enrolled — the installer blanks it after the first start).
-EnvironmentFile=/etc/vpnmesh/vpn.env
-ExecStart=/usr/local/bin/vpn run --server ${VPN_SERVER} --key "${VPN_KEY}" --state-dir /var/lib/vpn
+EnvironmentFile=/etc/bnk/bnk.env
+ExecStart=/usr/local/bin/bnk run --server ${BNK_SERVER} --key "${BNK_KEY}" --state-dir /var/lib/bnk
 Restart=on-failure
 RestartSec=2
 
 # Needs root: creates the TUN device and configures routes.
-StateDirectory=vpn
-# Local API socket lives here so `vpn status` works without sudo.
-RuntimeDirectory=vpnmesh
+StateDirectory=bnk
+# Local API socket lives here so `bnk status` works without sudo.
+RuntimeDirectory=bnk
 RuntimeDirectoryMode=0755
 
 [Install]
@@ -79,35 +79,35 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable vpn
+systemctl enable bnk
 # restart, not `enable --now`: a re-run (upgrade, re-enroll) must replace
 # an already-running daemon with the new binary and config.
-systemctl restart vpn
+systemctl restart bnk
 
 echo "waiting for the tunnel..."
 i=0
 while :; do
-    out=$(vpn status 2>/dev/null) || out=""
+    out=$(bnk status 2>/dev/null) || out=""
     case "$out" in
         "") ;; # daemon not answering yet
-        "vpn is down"*) vpn up >/dev/null 2>&1 || true ;; # persisted `vpn down` from a past install
+        "bnk is down"*) bnk up >/dev/null 2>&1 || true ;; # persisted `bnk down` from a past install
         *) break ;;
     esac
     i=$((i + 1))
     if [ "$i" -gt 30 ]; then
-        echo "vpn service did not come up after 30s; check: journalctl -u vpn -n 20" >&2
+        echo "bnk service did not come up after 30s; check: journalctl -u bnk -n 20" >&2
         exit 1
     fi
     sleep 1
 done
 
 # The key is single-use and now spent; the node's identity lives in
-# /var/lib/vpn. Blank it so the unit never resubmits a dead key.
-sed -i 's/^VPN_KEY=.*/VPN_KEY=/' "$ENV_FILE"
+# /var/lib/bnk. Blank it so the unit never resubmits a dead key.
+sed -i 's/^BNK_KEY=.*/BNK_KEY=/' "$ENV_FILE"
 
 echo
-vpn status
+bnk status
 echo
 echo "Done. Everyday commands (no sudo needed for status):"
-echo "    vpn status | vpn ping NAME | vpn netcheck    diagnostics"
-echo "    vpn down / vpn up                            disconnect / reconnect"
+echo "    bnk status | bnk ping NAME | bnk netcheck    diagnostics"
+echo "    bnk down / bnk up                            disconnect / reconnect"

@@ -1,4 +1,4 @@
-# vpnmesh
+# bnk
 
 A deliberately simple, open-source mesh VPN built on WireGuard, in Go.
 One CLI control server, one client binary, no web UI, no accounts.
@@ -13,14 +13,14 @@ port-randomizing NATs). Both outcomes are exercised against real
 netfilter NATs in `test/natlab/`. macOS/Windows clients compile but lack
 interface configuration for now.
 
-Diagnostics: `vpn status` (per-peer path: direct/relay), `vpn ping <peer>`
-(disco-level RTT), `vpn netcheck` (local + STUN-observed endpoints).
+Diagnostics: `bnk status` (per-peer path: direct/relay), `bnk ping <peer>`
+(disco-level RTT), `bnk netcheck` (local + STUN-observed endpoints).
 
 ## How it works
 
-- `vpnd` runs on a publicly reachable server: enrolls nodes, assigns IPs
+- `bnk-server` runs on a publicly reachable server: enrolls nodes, assigns IPs
   from `100.64.0.0/10`, and pushes peer maps over one TLS connection.
-- `vpn` runs on each machine: brings up a userspace WireGuard interface
+- `bnk` runs on each machine: brings up a userspace WireGuard interface
   (wireguard-go) and keeps it configured from the server's pushes.
 - Trust is a pinned certificate fingerprint embedded in the enrollment
   key — no CA, no domain required.
@@ -33,27 +33,27 @@ plus clients via the install scripts, ~10 minutes.
 Server (any Linux box with a public IP):
 
 ```
-sudo ./install-server.sh     # installs vpnd + systemd unit, prints next steps
-sudo vpnd key new            # prints vpnkey:<secret>:<fingerprint>, one per client
+sudo ./install-server.sh     # installs bnk-server + systemd unit, prints next steps
+sudo bnk-server key new            # prints bnkkey:<secret>:<fingerprint>, one per client
 ```
 
 Each client (Linux):
 
 ```
-sudo ./install-client.sh --server https://YOUR_SERVER:8443 --key vpnkey:...
+sudo ./install-client.sh --server https://YOUR_SERVER:8443 --key bnkkey:...
 ```
 
 The enrollment key is single-use; the node's identity persists in
-`/var/lib/vpn`. Day to day: `vpn status` (no sudo needed) shows every
-node's path (direct or relay) and handshake age, `vpn down` / `vpn up`
-disconnect and reconnect, `vpnd node ls` on the server shows the mesh,
-and `vpnd down` / `vpnd up` stop and start the control server.
+`/var/lib/bnk`. Day to day: `bnk status` (no sudo needed) shows every
+node's path (direct or relay) and handshake age, `bnk down` / `bnk up`
+disconnect and reconnect, `bnk-server node ls` on the server shows the mesh,
+and `bnk-server down` / `bnk-server up` stop and start the control server.
 
 Access control (see `policy.example.json`):
 
 ```
-vpnd acl set policy.json
-vpnd acl check laptop nas tcp/22   # dry-run: allowed or denied?
+bnk-server acl set policy.json
+bnk-server acl check laptop nas tcp/22   # dry-run: allowed or denied?
 ```
 
 No policy means allow-all; an explicit policy is default-deny — only the

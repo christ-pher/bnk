@@ -16,7 +16,7 @@ import (
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 // NodeKey is a peer's WireGuard public key, the stable identity every path

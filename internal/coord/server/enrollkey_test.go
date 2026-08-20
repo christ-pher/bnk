@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func enrollWith(t *testing.T, e *env, secret, name string, key netmap.Key) error {

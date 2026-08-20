@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 // The path manager must refuse candidates inside the mesh prefix, from

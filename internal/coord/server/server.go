@@ -19,11 +19,11 @@ import (
 
 	"golang.org/x/crypto/nacl/box"
 
-	"vpnmesh/internal/acl"
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/ipam"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/store"
+	"github.com/christ-pher/bnk/internal/acl"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/ipam"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/store"
 )
 
 var defaultPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -266,7 +266,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: vpn-coord/1\r\nConnection: Upgrade\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: bnk-coord/1\r\nConnection: Upgrade\r\n\r\n")); err != nil {
 		conn.Close()
 		return
 	}

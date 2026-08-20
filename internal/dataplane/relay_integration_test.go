@@ -14,12 +14,12 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/dataplane"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/store"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/dataplane"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/store"
 )
 
 // startRelayOnlyClient is startClient with one difference: it never

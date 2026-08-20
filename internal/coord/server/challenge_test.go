@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 // rawHello connects to /c, upgrades, and sends a hello claiming pub —
@@ -29,7 +29,7 @@ func rawHello(t *testing.T, e *env, pub netmap.Key) net.Conn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	fmt.Fprintf(conn, "GET /c HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: vpn-coord/1\r\n\r\n", u.Host)
+	fmt.Fprintf(conn, "GET /c HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: bnk-coord/1\r\n\r\n", u.Host)
 	br := bufio.NewReader(conn)
 	// Skip HTTP 101 headers.
 	for {

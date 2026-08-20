@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"vpnmesh/internal/acl"
+	"github.com/christ-pher/bnk/internal/acl"
 )
 
 type NodeID uint32

@@ -6,7 +6,7 @@
 # namespace, so nothing touches the host's network config.
 #
 #   [a]-----\
-#            [lab bridge 10.99.0.0/24]----[srv: vpnd]
+#            [lab bridge 10.99.0.0/24]----[srv: bnk-server]
 #   [b]-----/
 #
 # Asserts: both clients enroll, and a pings b over tunnel IPs.
@@ -19,58 +19,58 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-WORK=/tmp/vpnmesh-e2e
-NS=(vpnlab-srv vpnlab-a vpnlab-b)
+WORK=/tmp/bnk-e2e
+NS=(bnklab-srv bnklab-a bnklab-b)
 
 # Pre-clean leftovers from any earlier aborted run.
-pkill -f "$WORK/vpnd serve" 2>/dev/null || true
-pkill -f "$WORK/vpn run" 2>/dev/null || true
+pkill -f "$WORK/bnk-server serve" 2>/dev/null || true
+pkill -f "$WORK/bnk run" 2>/dev/null || true
 for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
-ip link del vpnlab-br 2>/dev/null || true
+ip link del bnklab-br 2>/dev/null || true
 rm -rf "$WORK"
 mkdir -p "$WORK"/{srv,a,b}
 echo "== building binaries"
-go build -o "$WORK/vpnd" ./cmd/vpnd
-go build -o "$WORK/vpn" ./cmd/vpn
+go build -o "$WORK/bnk-server" ./cmd/bnk-server
+go build -o "$WORK/bnk" ./cmd/bnk
 
 cleanup() {
     set +e
-    pkill -f "$WORK/vpnd serve" 2>/dev/null
-    pkill -f "$WORK/vpn run" 2>/dev/null
+    pkill -f "$WORK/bnk-server serve" 2>/dev/null
+    pkill -f "$WORK/bnk run" 2>/dev/null
     for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null; done
-    ip link del vpnlab-br 2>/dev/null
+    ip link del bnklab-br 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 echo "== building topology"
-ip link add vpnlab-br type bridge
-ip addr add 10.99.0.254/24 dev vpnlab-br
-ip link set vpnlab-br up
+ip link add bnklab-br type bridge
+ip addr add 10.99.0.254/24 dev bnklab-br
+ip link set bnklab-br up
 
 i=1
 for ns in "${NS[@]}"; do
     ip netns add "$ns"
     ip link add "veth-$ns" type veth peer name eth0 netns "$ns"
-    ip link set "veth-$ns" master vpnlab-br up
+    ip link set "veth-$ns" master bnklab-br up
     ip netns exec "$ns" ip addr add "10.99.0.$i/24" dev eth0
     ip netns exec "$ns" ip link set eth0 up
     ip netns exec "$ns" ip link set lo up
     i=$((i+1))
 done
 
-echo "== starting vpnd"
-ip netns exec vpnlab-srv "$WORK/vpnd" serve --state-dir "$WORK/srv" --listen :8443 &
+echo "== starting bnk-server"
+ip netns exec bnklab-srv "$WORK/bnk-server" serve --state-dir "$WORK/srv" --listen :8443 &
 sleep 1
 
-KEY=$(ip netns exec vpnlab-srv "$WORK/vpnd" key new --reusable --ttl 1h --state-dir "$WORK/srv")
+KEY=$(ip netns exec bnklab-srv "$WORK/bnk-server" key new --reusable --ttl 1h --state-dir "$WORK/srv")
 echo "== enrollment key: $KEY"
 
 echo "== starting clients"
-ip netns exec vpnlab-a "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/a" --socket "$WORK/a/vpn.sock" --name alpha &
-ip netns exec vpnlab-b "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/b" --socket "$WORK/b/vpn.sock" --name beta &
+ip netns exec bnklab-a "$WORK/bnk" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/a" --socket "$WORK/a/bnk.sock" --name alpha &
+ip netns exec bnklab-b "$WORK/bnk" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/b" --socket "$WORK/b/bnk.sock" --name beta &
 
 echo "== waiting for tunnel"
 for i in $(seq 1 30); do
@@ -83,9 +83,9 @@ done
 echo "== alpha=$A_IP beta=$B_IP"
 
 for i in $(seq 1 30); do
-    if ip netns exec vpnlab-a ping -c1 -W1 "$B_IP" >/dev/null 2>&1; then
+    if ip netns exec bnklab-a ping -c1 -W1 "$B_IP" >/dev/null 2>&1; then
         echo "== PASS: alpha pinged beta over the tunnel"
-        ip netns exec vpnlab-srv "$WORK/vpnd" node ls --state-dir "$WORK/srv"
+        ip netns exec bnklab-srv "$WORK/bnk-server" node ls --state-dir "$WORK/srv"
         exit 0
     fi
     sleep 1

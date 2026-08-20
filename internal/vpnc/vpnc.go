@@ -1,5 +1,5 @@
 // Package vpnc is the client daemon: state, enrollment, the session/
-// reconnect loop, and dataplane assembly. The vpn binary is a thin shell
+// reconnect loop, and dataplane assembly. The bnk binary is a thin shell
 // around Run; tests inject a netstack TUN factory.
 package vpnc
 
@@ -18,27 +18,27 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/dataplane"
-	"vpnmesh/internal/disco"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/pin"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/dataplane"
+	"github.com/christ-pher/bnk/internal/disco"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/pin"
 )
 
 // DefaultSocket is the one place the daemon and the CLI agree on where
 // the local API lives when no --socket is given.
-const DefaultSocket = "/run/vpnmesh/vpn.sock"
+const DefaultSocket = "/run/bnk/bnk.sock"
 
 type Config struct {
 	ServerURL  string
-	EnrollKey  string // vpnkey:<secret>:<fingerprint>; required on first run
+	EnrollKey  string // bnkkey:<secret>:<fingerprint>; required on first run
 	StateDir   string
 	SocketPath string // local API socket; default DefaultSocket
 	Hostname   string
 	MTU        int // default 1280
-	CreateTUN func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
-	Logf      func(format string, args ...any)
+	CreateTUN  func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
+	Logf       func(format string, args ...any)
 
 	// EndpointsOverride replaces interface/STUN endpoint discovery with a
 	// fixed set. Test hook for simulating hostile NATs; leave nil in
@@ -47,7 +47,7 @@ type Config struct {
 }
 
 // Run starts the daemon: it serves the local API immediately and keeps
-// the tunnel matching the persisted desired state (`vpn up`/`vpn down`)
+// the tunnel matching the persisted desired state (`bnk up`/`bnk down`)
 // until ctx is canceled.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.MTU == 0 {
@@ -148,7 +148,7 @@ func (c *controller) supervise(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Check Down and publish stopTunnel under one lock: a `vpn down`
+		// Check Down and publish stopTunnel under one lock: a `bnk down`
 		// arriving in between either flips Down before the check or finds
 		// stopTunnel set and cancels the tunnel — never neither.
 		c.mu.Lock()
@@ -206,7 +206,7 @@ func (c *controller) runTunnel(ctx context.Context) error {
 		st.NodeID, st.IP, st.Prefix = resp.NodeID, resp.IP, resp.Prefix
 	}
 	// Merge only the enrollment fields: writing the whole snapshot back
-	// would clobber a Down flag persisted concurrently by `vpn down`.
+	// would clobber a Down flag persisted concurrently by `bnk down`.
 	c.mu.Lock()
 	c.st.NodeID, c.st.IP, c.st.Prefix = st.NodeID, st.IP, st.Prefix
 	snapshot := c.st

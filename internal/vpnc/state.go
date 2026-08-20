@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 // state is the client's persistent identity and enrollment result.
@@ -24,7 +24,7 @@ type state struct {
 	NodeID      netmap.NodeID `json:"node_id,omitempty"`
 	IP          netip.Addr    `json:"ip,omitempty"`
 	Prefix      netip.Prefix  `json:"prefix,omitempty"`
-	// Down means the user ran `vpn down`: the daemon stays alive serving
+	// Down means the user ran `bnk down`: the daemon stays alive serving
 	// the local API but keeps the tunnel torn down, across restarts. The
 	// zero value is "up" so pre-existing state files keep connecting.
 	Down bool `json:"down,omitempty"`

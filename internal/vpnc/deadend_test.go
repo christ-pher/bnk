@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"vpnmesh/internal/vpnc"
+	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 func runDeadEndClient(t *testing.T, ctx context.Context, tc *testControl, name string, deadEp netip.AddrPort) *tnetHolder {
@@ -24,7 +24,7 @@ func runDeadEndClient(t *testing.T, ctx context.Context, tc *testControl, name s
 			ServerURL:         tc.url,
 			EnrollKey:         tc.enrollKey,
 			StateDir:          stateDir,
-			SocketPath:        filepath.Join(stateDir, "vpn.sock"),
+			SocketPath:        filepath.Join(stateDir, "bnk.sock"),
 			Hostname:          name,
 			CreateTUN:         h.factory,
 			Logf:              log.Printf,

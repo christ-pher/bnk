@@ -82,8 +82,8 @@ func TestClientTLSConfigRejectsWrongFingerprint(t *testing.T) {
 func TestEnrollKeyFormatRoundTrip(t *testing.T) {
 	fp := strings.Repeat("cd", 32)
 	full := FormatEnrollKey("deadbeef", fp)
-	if !strings.HasPrefix(full, "vpnkey:") {
-		t.Errorf("formatted key = %q, want vpnkey: prefix", full)
+	if !strings.HasPrefix(full, "bnkkey:") {
+		t.Errorf("formatted key = %q, want bnkkey: prefix", full)
 	}
 	secret, gotFP, err := ParseEnrollKey(full)
 	if err != nil {
@@ -95,7 +95,7 @@ func TestEnrollKeyFormatRoundTrip(t *testing.T) {
 }
 
 func TestParseEnrollKeyRejectsGarbage(t *testing.T) {
-	for _, s := range []string{"", "vpnkey:", "nope", "vpnkey:onlysecret"} {
+	for _, s := range []string{"", "bnkkey:", "nope", "bnkkey:onlysecret"} {
 		if _, _, err := ParseEnrollKey(s); err == nil {
 			t.Errorf("ParseEnrollKey(%q) succeeded, want error", s)
 		}

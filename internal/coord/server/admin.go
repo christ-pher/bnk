@@ -6,9 +6,9 @@ import (
 	"net/netip"
 	"time"
 
-	"vpnmesh/internal/acl"
-	"vpnmesh/internal/netmap"
-	"vpnmesh/internal/pin"
+	"github.com/christ-pher/bnk/internal/acl"
+	"github.com/christ-pher/bnk/internal/netmap"
+	"github.com/christ-pher/bnk/internal/pin"
 )
 
 // AdminNode is the CLI-facing view of a node.
@@ -32,7 +32,7 @@ type AdminKey struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// AdminHandler serves the local admin API (bound to a unix socket by vpnd).
+// AdminHandler serves the local admin API (bound to a unix socket by bnk-server).
 // fingerprint is the server cert's fingerprint, embedded in minted
 // enrollment keys.
 func (s *Server) AdminHandler(fingerprint string) http.Handler {

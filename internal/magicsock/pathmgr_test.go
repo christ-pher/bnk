@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 // pmHarness wires a PathManager to captured I/O and a fake clock. The

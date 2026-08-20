@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 // Relay frame payload: [4B big-endian NodeID][WireGuard packet]. The ID is

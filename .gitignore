@@ -1,4 +1,4 @@
-/vpn
-/vpnd
+/bnk
+/bnk-server
 *.exe
 /dist/

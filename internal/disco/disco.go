@@ -17,7 +17,7 @@ import (
 )
 
 // Magic prefixes every disco packet so the demux can classify traffic.
-const Magic = "vpn\x00disco\x00"
+const Magic = "bnk\x00disco\x00"
 
 // Wire layout: Magic (8) + sender pub (32) + nonce (24) + box(payload).
 const headerLen = len(Magic) + 32 + 24

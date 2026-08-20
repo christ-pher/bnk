@@ -14,7 +14,7 @@ import (
 
 	"github.com/pion/stun/v3"
 
-	"vpnmesh/internal/magicsock"
+	"github.com/christ-pher/bnk/internal/magicsock"
 )
 
 // Serve answers STUN binding requests on pc until ctx is canceled.

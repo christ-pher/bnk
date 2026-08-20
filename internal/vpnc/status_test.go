@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/vpnc"
+	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 func statusClient(stateDir string) *http.Client {
-	sock := filepath.Join(stateDir, "vpn.sock")
+	sock := filepath.Join(stateDir, "bnk.sock")
 	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -35,7 +35,7 @@ func TestPingEndpointReportsRTT(t *testing.T) {
 	hc := statusClient(stateA)
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		resp, err := hc.Get("http://vpn/ping?peer=beta")
+		resp, err := hc.Get("http://bnk/ping?peer=beta")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var out struct {
 				Addr  string  `json:"addr"`
@@ -74,7 +74,7 @@ func TestStatusReportsPeersAndPath(t *testing.T) {
 	hc := statusClient(stateA)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		resp, err := hc.Get("http://vpn/status")
+		resp, err := hc.Get("http://bnk/status")
 		if err == nil {
 			defer resp.Body.Close()
 			var st vpnc.Status

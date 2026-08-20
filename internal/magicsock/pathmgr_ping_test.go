@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 func TestPingWaitsForPongAndReportsPathAndRTT(t *testing.T) {

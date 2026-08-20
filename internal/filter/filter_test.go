@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/acl"
+	"github.com/christ-pher/bnk/internal/acl"
 )
 
 // ipv4 builds a minimal IPv4 packet with the given payload attached.

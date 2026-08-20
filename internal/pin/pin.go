@@ -30,7 +30,7 @@ func GenerateCert() (certPEM, keyPEM []byte, err error) {
 	}
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "vpnmesh control server"},
+		Subject:      pkix.Name{CommonName: "bnk control server"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().AddDate(10, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -79,13 +79,13 @@ func ClientTLSConfig(fingerprint string) *tls.Config {
 }
 
 func FormatEnrollKey(secret, fingerprint string) string {
-	return fmt.Sprintf("vpnkey:%s:%s", secret, fingerprint)
+	return fmt.Sprintf("bnkkey:%s:%s", secret, fingerprint)
 }
 
 func ParseEnrollKey(s string) (secret, fingerprint string, err error) {
 	parts := strings.Split(s, ":")
-	if len(parts) != 3 || parts[0] != "vpnkey" || parts[1] == "" || parts[2] == "" {
-		return "", "", fmt.Errorf("pin: enrollment key must look like vpnkey:<secret>:<fingerprint>")
+	if len(parts) != 3 || parts[0] != "bnkkey" || parts[1] == "" || parts[2] == "" {
+		return "", "", fmt.Errorf("pin: enrollment key must look like bnkkey:<secret>:<fingerprint>")
 	}
 	return parts[1], parts[2], nil
 }

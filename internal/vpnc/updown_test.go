@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/vpnc"
+	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 func postLocal(t *testing.T, hc *http.Client, path string) int {
 	t.Helper()
-	resp, err := hc.Post("http://vpn"+path, "application/json", nil)
+	resp, err := hc.Post("http://bnk"+path, "application/json", nil)
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}
@@ -25,7 +25,7 @@ func waitRunning(t *testing.T, hc *http.Client, want bool) vpnc.Status {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		resp, err := hc.Get("http://vpn/status")
+		resp, err := hc.Get("http://bnk/status")
 		if err == nil {
 			var st vpnc.Status
 			jerr := json.NewDecoder(resp.Body).Decode(&st)
@@ -58,7 +58,7 @@ func TestDownAndUpOverLocalAPI(t *testing.T) {
 	waitRunning(t, hc, false)
 
 	// Diagnostics refuse while down instead of hanging.
-	resp, err := hc.Get("http://vpn/ping?peer=beta")
+	resp, err := hc.Get("http://bnk/ping?peer=beta")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestDownStatePersistsAcrossRestart(t *testing.T) {
 	// listener's teardown races the new daemon's socket takeover.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		resp, err := hc.Post("http://vpn/up", "application/json", nil)
+		resp, err := hc.Post("http://bnk/up", "application/json", nil)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {

@@ -20,8 +20,8 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 // Enroll registers this node with the control server over plain HTTP(S).
@@ -112,7 +112,7 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodePriv net
 	}
 
 	br := bufio.NewReader(conn)
-	req := fmt.Sprintf("GET /c HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: vpn-coord/1\r\n\r\n", u.Host)
+	req := fmt.Sprintf("GET /c HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: bnk-coord/1\r\n\r\n", u.Host)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		conn.Close()
 		return nil, err

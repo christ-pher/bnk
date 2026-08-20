@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord/client"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord/client"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 type relayed struct {

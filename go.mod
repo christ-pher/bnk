@@ -1,4 +1,4 @@
-module vpnmesh
+module github.com/christ-pher/bnk
 
 go 1.25.0
 

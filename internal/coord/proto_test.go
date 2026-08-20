@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func testKey() netmap.Key {

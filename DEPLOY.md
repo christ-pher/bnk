@@ -16,12 +16,12 @@ Everything lands in predefined places — no paths to choose:
 
 | What | Where |
 |---|---|
-| Binaries | `/usr/local/bin/{vpnd,vpn}` |
-| Server state (cert, registry, admin socket) | `/var/lib/vpnd` |
-| Client config | `/etc/vpnmesh/vpn.env` |
-| Client identity/state | `/var/lib/vpn` |
-| Client local API socket (no sudo needed) | `/run/vpnmesh/vpn.sock` |
-| systemd units | `vpnd.service`, `vpn.service` |
+| Binaries | `/usr/local/bin/{bnk-server,bnk}` |
+| Server state (cert, registry, admin socket) | `/var/lib/bnk-server` |
+| Client config | `/etc/bnk/bnk.env` |
+| Client identity/state | `/var/lib/bnk` |
+| Client local API socket (no sudo needed) | `/run/bnk/bnk.sock` |
+| systemd units | `bnk-server.service`, `bnk.service` |
 
 ## Before you start
 
@@ -32,16 +32,16 @@ Everything lands in predefined places — no paths to choose:
 Build both binaries now (~2 min):
 
 ```
-git clone <your-repo> vpnmesh && cd vpnmesh
-CGO_ENABLED=0 go build -o vpnd ./cmd/vpnd
-CGO_ENABLED=0 go build -o vpn ./cmd/vpn
+git clone https://github.com/christ-pher/bnk.git && cd bnk
+CGO_ENABLED=0 go build -o bnk-server ./cmd/bnk-server
+CGO_ENABLED=0 go build -o bnk ./cmd/bnk
 ```
 
 ## Part 1 — VPS (3 min)
 
 1. Copy the binary and installer, then run it:
    ```
-   scp vpnd install-server.sh root@YOUR_VPS:
+   scp bnk-server install-server.sh root@YOUR_VPS:
    ssh root@YOUR_VPS './install-server.sh'
    ```
    It installs the binary and the systemd unit, starts the service, and
@@ -54,20 +54,20 @@ CGO_ENABLED=0 go build -o vpn ./cmd/vpn
 3. Mint one enrollment key PER CLIENT (keys are single-use and die in 24h —
    that's the join security):
    ```
-   ssh root@YOUR_VPS 'vpnd key new'
+   ssh root@YOUR_VPS 'bnk-server key new'
    ```
-   Copy the whole `vpnkey:...` line somewhere. Run it again for the second
+   Copy the whole `bnkkey:...` line somewhere. Run it again for the second
    client. Done with the VPS.
 
 ## Part 2 — each client (2 min per machine)
 
 ```
-scp vpn install-client.sh root@CLIENT:
-ssh root@CLIENT './install-client.sh --server https://YOUR_VPS_IP:8443 --key vpnkey:PASTE_HERE'
+scp bnk install-client.sh root@CLIENT:
+ssh root@CLIENT './install-client.sh --server https://YOUR_VPS_IP:8443 --key bnkkey:PASTE_HERE'
 ```
 
 The installer starts the service, waits for the tunnel, prints
-`vpn status`, and blanks the spent key from `/etc/vpnmesh/vpn.env`
+`bnk status`, and blanks the spent key from `/etc/bnk/bnk.env`
 automatically. Repeat with the OTHER key on the second client.
 
 ## Part 3 — verify (2 min, run on client A, no sudo needed)
@@ -75,17 +75,17 @@ automatically. Repeat with the OTHER key on the second client.
 Work down this list; each line proves one layer:
 
 ```
-vpn status               # all nodes listed (yours marked *), ONLINE true
+bnk status               # all nodes listed (yours marked *), ONLINE true
 ping 100.64.0.2          # traffic flows (relay or direct)
-vpn ping NODENAME        # direct path + RTT, if punchable
-vpn netcheck             # relay counters, path state, probe log
+bnk ping NODENAME        # direct path + RTT, if punchable
+bnk netcheck             # relay counters, path state, probe log
 ```
 
 How to read it:
 - `PATH direct` = machines talk directly; the VPS only coordinates.
 - `PATH relay` + working ping = fine too; traffic relays through the VPS.
   Two cloud VPSes usually go direct. A machine behind a hostile NAT may not.
-- `vpn ping` timing out while `ping` works = relay-only peer. Expected
+- `bnk ping` timing out while `ping` works = relay-only peer. Expected
   behind port-randomizing NATs; the error text says so.
 
 Real throughput test: `iperf3 -s` on B, `iperf3 -c 100.64.0.2` on A.
@@ -93,10 +93,10 @@ Real throughput test: `iperf3 -s` on B, `iperf3 -c 100.64.0.2` on A.
 ## Everyday commands
 
 ```
-vpn status | vpn ping NAME | vpn netcheck   # diagnostics, no sudo
-vpn down                                    # disconnect (daemon stays; survives reboot)
-vpn up                                      # reconnect
-vpnd up / vpnd down                         # start/stop the control server (on the VPS)
+bnk status | bnk ping NAME | bnk netcheck   # diagnostics, no sudo
+bnk down                                    # disconnect (daemon stays; survives reboot)
+bnk up                                      # reconnect
+bnk-server up / bnk-server down             # start/stop the control server (on the VPS)
 ```
 
 ## Locking it down (optional, 5 min)
@@ -107,8 +107,8 @@ No policy = every node reaches every node. To restrict, on the VPS:
    groups of node names, then from/to/allow rules like `tcp/22`).
 2. Apply and dry-run-check it:
    ```
-   vpnd acl set policy.json
-   vpnd acl check nodeA nodeB tcp/22
+   bnk-server acl set policy.json
+   bnk-server acl check nodeA nodeB tcp/22
    ```
 Rules take effect on all clients within seconds. Replies to connections a
 node initiates are always allowed; everything else not listed is dropped.
@@ -116,10 +116,10 @@ node initiates are always allowed; everything else not listed is dropped.
 ## Key management (VPS, as root)
 
 ```
-vpnd key ls                        # what exists, what's spent
-vpnd key new --reusable --ttl 1h   # multi-node key, if you must
-vpnd key revoke PREFIX             # kill a key by its ls prefix
-vpnd node ls                       # who's enrolled + online
+bnk-server key ls                        # what exists, what's spent
+bnk-server key new --reusable --ttl 1h   # multi-node key, if you must
+bnk-server key revoke PREFIX             # kill a key by its ls prefix
+bnk-server node ls                       # who's enrolled + online
 ```
 
 ## When something doesn't work
@@ -127,11 +127,11 @@ vpnd node ls                       # who's enrolled + online
 | Symptom | Cause → fix |
 |---|---|
 | `enroll: 403` | Key spent, expired, or mistyped → mint a new one on the VPS |
-| client log: `certificate does not match pinned fingerprint` | vpnd state dir was rebuilt (new cert) → re-enroll client with a fresh key |
-| `vpn status` says down but you didn't run `vpn down` | Service stopped → `systemctl start vpn`; the down/up state persists on purpose |
-| peer `ONLINE false` | Its vpn service is down, or its network path to the VPS is → check `journalctl -u vpn` there |
-| ping works, then dies for ~15s, then works | Paths renegotiating; check `vpn netcheck`'s `disco_events` and send me the output |
-| nothing works | `journalctl -u vpnd` on the VPS; is 8443/tcp+udp actually open? `curl -k https://VPS:8443/enroll` should answer (405/400, not timeout) |
+| client log: `certificate does not match pinned fingerprint` | bnk-server state dir was rebuilt (new cert) → re-enroll client with a fresh key |
+| `bnk status` says down but you didn't run `bnk down` | Service stopped → `systemctl start bnk`; the down/up state persists on purpose |
+| peer `ONLINE false` | Its bnk service is down, or its network path to the VPS is → check `journalctl -u bnk` there |
+| ping works, then dies for ~15s, then works | Paths renegotiating; check `bnk netcheck`'s `disco_events` and send me the output |
+| nothing works | `journalctl -u bnk-server` on the VPS; is 8443/tcp+udp actually open? `curl -k https://VPS:8443/enroll` should answer (405/400, not timeout) |
 
 Next after it works: add your laptop the same way — that's the machine
 where the NAT traversal actually earns its keep.

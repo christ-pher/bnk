@@ -16,10 +16,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/pin"
-	"vpnmesh/internal/store"
-	"vpnmesh/internal/vpnc"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/pin"
+	"github.com/christ-pher/bnk/internal/store"
+	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 type testControl struct {
@@ -109,7 +109,7 @@ func runClient(t *testing.T, ctx context.Context, tc *testControl, name, stateDi
 			ServerURL:  tc.url,
 			EnrollKey:  enrollKey,
 			StateDir:   stateDir,
-			SocketPath: filepath.Join(stateDir, "vpn.sock"),
+			SocketPath: filepath.Join(stateDir, "bnk.sock"),
 			Hostname:   name,
 			CreateTUN:  h.factory,
 			// log.Printf, not t.Logf: this goroutine can outlive the test.

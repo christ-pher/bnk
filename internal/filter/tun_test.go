@@ -6,7 +6,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
-	"vpnmesh/internal/acl"
+	"github.com/christ-pher/bnk/internal/acl"
 )
 
 // fakeTUN records writes and serves queued reads.

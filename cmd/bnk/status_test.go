@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/vpnc"
+	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 func TestStatusRowsMergesSelfSortedByID(t *testing.T) {

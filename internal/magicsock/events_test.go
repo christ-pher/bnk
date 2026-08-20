@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 func TestEventLogRecordsDiscoTraffic(t *testing.T) {

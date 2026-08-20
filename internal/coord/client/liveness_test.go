@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/coord"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func TestSessionDiesWhenServerGoesSilent(t *testing.T) {
@@ -28,7 +28,7 @@ func TestSessionDiesWhenServerGoesSilent(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: vpn-coord/1\r\nConnection: Upgrade\r\n\r\n"))
+		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: bnk-coord/1\r\nConnection: Upgrade\r\n\r\n"))
 		coord.ReadFrame(bufrw.Reader) // hello
 		// Speak just enough protocol to get past Dial: send a challenge
 		// (the answer is read and ignored), then go silent forever.

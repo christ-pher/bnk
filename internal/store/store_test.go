@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 func TestLoadMissingFileReturnsEmptyState(t *testing.T) {

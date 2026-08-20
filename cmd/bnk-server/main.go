@@ -1,6 +1,6 @@
-// vpnd is the control server: it enrolls nodes, assigns IPs, pushes
+// bnk-server is the control server: it enrolls nodes, assigns IPs, pushes
 // netmaps, and (soon) relays traffic. Admin subcommands talk to a running
-// vpnd over a unix socket in the state directory.
+// bnk-server over a unix socket in the state directory.
 package main
 
 import (
@@ -19,23 +19,23 @@ import (
 	"path/filepath"
 	"time"
 
-	"vpnmesh/internal/cliutil"
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/pin"
-	"vpnmesh/internal/store"
-	"vpnmesh/internal/stunner"
+	"github.com/christ-pher/bnk/internal/cliutil"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/pin"
+	"github.com/christ-pher/bnk/internal/store"
+	"github.com/christ-pher/bnk/internal/stunner"
 )
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "vpnd:", err)
+		fmt.Fprintln(os.Stderr, "bnk-server:", err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vpnd <up|down|serve|key|node|acl> [flags]")
+		return fmt.Errorf("usage: bnk-server <up|down|serve|key|node|acl> [flags]")
 	}
 	switch args[0] {
 	case "serve":
@@ -46,7 +46,7 @@ func run(args []string) error {
 		return systemctl("stop")
 	case "key":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: vpnd key <new|ls|revoke> ...")
+			return fmt.Errorf("usage: bnk-server key <new|ls|revoke> ...")
 		}
 		switch args[1] {
 		case "new":
@@ -56,16 +56,16 @@ func run(args []string) error {
 		case "revoke":
 			return keyRevoke(args[2:])
 		default:
-			return fmt.Errorf("usage: vpnd key <new|ls|revoke> ...")
+			return fmt.Errorf("usage: bnk-server key <new|ls|revoke> ...")
 		}
 	case "node":
 		if len(args) < 2 || args[1] != "ls" {
-			return fmt.Errorf("usage: vpnd node ls")
+			return fmt.Errorf("usage: bnk-server node ls")
 		}
 		return nodeLs(args[2:])
 	case "acl":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: vpnd acl <set|get|check> ...")
+			return fmt.Errorf("usage: bnk-server acl <set|get|check> ...")
 		}
 		switch args[1] {
 		case "set":
@@ -75,7 +75,7 @@ func run(args []string) error {
 		case "check":
 			return aclCheck(args[2:])
 		default:
-			return fmt.Errorf("usage: vpnd acl <set|get|check> ...")
+			return fmt.Errorf("usage: bnk-server acl <set|get|check> ...")
 		}
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -83,21 +83,21 @@ func run(args []string) error {
 }
 
 func stateDirFlag(fs *flag.FlagSet) *string {
-	return fs.String("state-dir", "/var/lib/vpnd", "directory for state, cert, and admin socket")
+	return fs.String("state-dir", "/var/lib/bnk-server", "directory for state, cert, and admin socket")
 }
 
-// systemctl starts or stops the vpnd service: `vpnd up` / `vpnd down`
+// systemctl starts or stops the bnk-server service: `bnk-server up` / `bnk-server down`
 // control the control server without remembering systemd incantations.
 func systemctl(verb string) error {
-	cmd := exec.Command("systemctl", verb, "vpnd")
+	cmd := exec.Command("systemctl", verb, "bnk-server")
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("systemctl %s vpnd: %w (is the vpnd service installed? see install-server.sh)", verb, err)
+		return fmt.Errorf("systemctl %s bnk-server: %w (is the bnk-server service installed? see install-server.sh)", verb, err)
 	}
 	if verb == "start" {
-		fmt.Println("vpnd is up")
+		fmt.Println("bnk-server is up")
 	} else {
-		fmt.Println("vpnd is down (run `vpnd up` to start it again)")
+		fmt.Println("bnk-server is down (run `bnk-server up` to start it again)")
 	}
 	return nil
 }
@@ -140,9 +140,9 @@ func serve(args []string) error {
 	}
 	go http.Serve(adminLn, srv.AdminHandler(fp))
 
-	fmt.Printf("vpnd: listening on %s\n", *listen)
-	fmt.Printf("vpnd: cert fingerprint %s\n", fp)
-	fmt.Printf("vpnd: mint enrollment keys with: vpnd key new --state-dir %s\n", *stateDir)
+	fmt.Printf("bnk-server: listening on %s\n", *listen)
+	fmt.Printf("bnk-server: cert fingerprint %s\n", fp)
+	fmt.Printf("bnk-server: mint enrollment keys with: bnk-server key new --state-dir %s\n", *stateDir)
 
 	hs := &http.Server{
 		Addr:      *listen,
@@ -190,10 +190,10 @@ func keyNew(args []string) error {
 	ttl := fs.Duration("ttl", 24*time.Hour, "how long the key stays valid")
 	fs.Parse(args)
 
-	u := fmt.Sprintf("http://vpnd/enroll-keys?ttl=%s&reusable=%v", url.QueryEscape(ttl.String()), *reusable)
+	u := fmt.Sprintf("http://bnk-server/enroll-keys?ttl=%s&reusable=%v", url.QueryEscape(ttl.String()), *reusable)
 	resp, err := adminClient(*stateDir).Post(u, "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	var out struct {
@@ -211,19 +211,19 @@ func aclSet(args []string) error {
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: vpnd acl set <policy.json>")
+		return fmt.Errorf("usage: bnk-server acl set <policy.json>")
 	}
 	policy, err := os.ReadFile(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPut, "http://vpnd/policy", bytes.NewReader(policy))
+	req, err := http.NewRequest(http.MethodPut, "http://bnk-server/policy", bytes.NewReader(policy))
 	if err != nil {
 		return err
 	}
 	resp, err := adminClient(*stateDir).Do(req)
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -238,9 +238,9 @@ func aclGet(args []string) error {
 	fs := flag.NewFlagSet("acl get", flag.ExitOnError)
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
-	resp, err := adminClient(*stateDir).Get("http://vpnd/policy")
+	resp, err := adminClient(*stateDir).Get("http://bnk-server/policy")
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	_, err = io.Copy(os.Stdout, resp.Body)
@@ -252,13 +252,13 @@ func aclCheck(args []string) error {
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
 	if fs.NArg() != 3 {
-		return fmt.Errorf("usage: vpnd acl check <src-node> <dst-node> <tcp/22|udp/53|icmp>")
+		return fmt.Errorf("usage: bnk-server acl check <src-node> <dst-node> <tcp/22|udp/53|icmp>")
 	}
-	u := fmt.Sprintf("http://vpnd/check?src=%s&dst=%s&target=%s",
+	u := fmt.Sprintf("http://bnk-server/check?src=%s&dst=%s&target=%s",
 		url.QueryEscape(fs.Arg(0)), url.QueryEscape(fs.Arg(1)), url.QueryEscape(fs.Arg(2)))
 	resp, err := adminClient(*stateDir).Get(u)
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -284,9 +284,9 @@ func keyLs(args []string) error {
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
 
-	resp, err := adminClient(*stateDir).Get("http://vpnd/enroll-keys")
+	resp, err := adminClient(*stateDir).Get("http://bnk-server/enroll-keys")
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	var keys []server.AdminKey
@@ -313,11 +313,11 @@ func keyRevoke(args []string) error {
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: vpnd key revoke <prefix>")
+		return fmt.Errorf("usage: bnk-server key revoke <prefix>")
 	}
-	resp, err := adminClient(*stateDir).Post("http://vpnd/enroll-keys/revoke?prefix="+url.QueryEscape(fs.Arg(0)), "application/json", nil)
+	resp, err := adminClient(*stateDir).Post("http://bnk-server/enroll-keys/revoke?prefix="+url.QueryEscape(fs.Arg(0)), "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -333,9 +333,9 @@ func nodeLs(args []string) error {
 	stateDir := stateDirFlag(fs)
 	fs.Parse(args)
 
-	resp, err := adminClient(*stateDir).Get("http://vpnd/nodes")
+	resp, err := adminClient(*stateDir).Get("http://bnk-server/nodes")
 	if err != nil {
-		return fmt.Errorf("is vpnd running? %w", err)
+		return fmt.Errorf("is bnk-server running? %w", err)
 	}
 	defer resp.Body.Close()
 	var nodes []server.AdminNode

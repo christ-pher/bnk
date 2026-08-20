@@ -4,12 +4,12 @@ import (
 	"net/netip"
 	"time"
 
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
-// Status is served on the local unix socket for the vpn CLI.
+// Status is served on the local unix socket for the bnk CLI.
 type Status struct {
-	// Running reports whether the tunnel is up. False after `vpn down`:
+	// Running reports whether the tunnel is up. False after `bnk down`:
 	// the daemon still answers, but there is no interface or session.
 	Running bool         `json:"running"`
 	Self    SelfStatus   `json:"self"`

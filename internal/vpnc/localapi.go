@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"vpnmesh/internal/dataplane"
-	"vpnmesh/internal/magicsock"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/dataplane"
+	"github.com/christ-pher/bnk/internal/magicsock"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 // netmapCache holds the latest pushed netmap for status reporting.
@@ -80,7 +80,7 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		return func(w http.ResponseWriter, r *http.Request) {
 			engine := c.getEngine()
 			if engine == nil {
-				http.Error(w, "vpn is down (run `vpn up` to connect)", http.StatusServiceUnavailable)
+				http.Error(w, "bnk is down (run `bnk up` to connect)", http.StatusServiceUnavailable)
 				return
 			}
 			h(w, r, engine)
@@ -105,7 +105,7 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 			return
 		}
 		if !c.waitEngine(r.Context(), true, 15*time.Second) {
-			http.Error(w, "still connecting; check daemon logs (journalctl -u vpn)", http.StatusGatewayTimeout)
+			http.Error(w, "still connecting; check daemon logs (journalctl -u bnk)", http.StatusGatewayTimeout)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"running": true})

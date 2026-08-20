@@ -10,7 +10,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 func TestBatchSizeIsIdeal(t *testing.T) {

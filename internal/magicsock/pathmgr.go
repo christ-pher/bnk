@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"vpnmesh/internal/disco"
+	"github.com/christ-pher/bnk/internal/disco"
 )
 
 const (
@@ -393,7 +393,7 @@ type PingResult struct {
 }
 
 // Ping probes the peer's candidate paths and returns the first proven one
-// with its round-trip time. Used by the vpn ping diagnostic.
+// with its round-trip time. Used by the bnk ping diagnostic.
 func (pm *PathManager) Ping(key NodeKey, timeout time.Duration) (PingResult, error) {
 	pm.mu.Lock()
 	ps, ok := pm.peers[key]

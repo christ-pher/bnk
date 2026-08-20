@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/coord/server"
 )
 
 func TestAdminNodesListsEnrollmentAndOnlineState(t *testing.T) {
@@ -211,7 +211,7 @@ func TestAdminNewEnrollKeyReturnsFullPinnedKey(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out.Key, "vpnkey:") || !strings.HasSuffix(out.Key, ":feedface") {
-		t.Errorf("key = %q, want vpnkey:<secret>:feedface", out.Key)
+	if !strings.HasPrefix(out.Key, "bnkkey:") || !strings.HasSuffix(out.Key, ":feedface") {
+		t.Errorf("key = %q, want bnkkey:<secret>:feedface", out.Key)
 	}
 }

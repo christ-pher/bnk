@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"vpnmesh/internal/coord/server"
-	"vpnmesh/internal/store"
+	"github.com/christ-pher/bnk/internal/coord/server"
+	"github.com/christ-pher/bnk/internal/store"
 )
 
 func TestBogusDirectEndpointFallsBackToRelay(t *testing.T) {

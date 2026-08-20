@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"vpnmesh/internal/acl"
-	"vpnmesh/internal/netmap"
+	"github.com/christ-pher/bnk/internal/acl"
+	"github.com/christ-pher/bnk/internal/netmap"
 )
 
 type State struct {
