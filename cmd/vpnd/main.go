@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"vpnmesh/internal/cliutil"
 	"vpnmesh/internal/coord/server"
 	"vpnmesh/internal/pin"
 	"vpnmesh/internal/store"
@@ -321,10 +322,10 @@ func nodeLs(args []string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
 		return err
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tNAME\tIP\tOS\tONLINE")
+	rows := make([][]string, 0, len(nodes))
 	for _, n := range nodes {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%v\n", n.ID, n.Name, n.IP, n.OS, n.Online)
+		rows = append(rows, []string{fmt.Sprint(n.ID), n.Name, n.IP.String(), n.OS, fmt.Sprintf("%v", n.Online)})
 	}
-	return tw.Flush()
+	cliutil.Table(os.Stdout, []string{"ID", "NAME", "IP", "OS", "ONLINE"}, rows)
+	return nil
 }

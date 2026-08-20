@@ -14,8 +14,9 @@ type Status struct {
 }
 
 type SelfStatus struct {
-	ID netmap.NodeID `json:"id"`
-	IP netip.Addr    `json:"ip"`
+	ID   netmap.NodeID `json:"id"`
+	Name string        `json:"name"`
+	IP   netip.Addr    `json:"ip"`
 }
 
 type PeerStatus struct {

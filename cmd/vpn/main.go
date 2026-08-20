@@ -17,12 +17,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
 
+	"vpnmesh/internal/cliutil"
+	"vpnmesh/internal/netmap"
 	"vpnmesh/internal/router"
 	"vpnmesh/internal/vpnc"
 )
@@ -166,18 +168,31 @@ func status(args []string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		return err
 	}
+	cliutil.Table(os.Stdout, []string{"NODE", "IP", "ONLINE", "PATH", "LAST HANDSHAKE"}, statusRows(st, time.Now()))
+	return nil
+}
 
-	fmt.Printf("self: node %d, %s\n", st.Self.ID, st.Self.IP)
-	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PEER\tIP\tONLINE\tPATH\tLAST HANDSHAKE")
+// statusRows merges self into the peer list (marked with *), ordered by
+// node ID so the table is stable across runs.
+func statusRows(st vpnc.Status, now time.Time) [][]string {
+	type idRow struct {
+		id  netmap.NodeID
+		row []string
+	}
+	all := []idRow{{st.Self.ID, []string{st.Self.Name + "*", st.Self.IP.String(), "true", "-", "-"}}}
 	for _, p := range st.Peers {
 		hs := "never"
 		if !p.LastHandshake.IsZero() {
-			hs = time.Since(p.LastHandshake).Round(time.Second).String() + " ago"
+			hs = now.Sub(p.LastHandshake).Round(time.Second).String() + " ago"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\n", p.Name, p.IP, p.Online, p.Path, hs)
+		all = append(all, idRow{p.ID, []string{p.Name, p.IP.String(), fmt.Sprintf("%v", p.Online), p.Path, hs}})
 	}
-	return tw.Flush()
+	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+	rows := make([][]string, len(all))
+	for i, r := range all {
+		rows[i] = r.row
+	}
+	return rows
 }
 
 func defaultHostname() string {
