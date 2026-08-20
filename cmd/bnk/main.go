@@ -26,8 +26,13 @@ import (
 	"github.com/christ-pher/bnk/internal/cliutil"
 	"github.com/christ-pher/bnk/internal/netmap"
 	"github.com/christ-pher/bnk/internal/router"
+	"github.com/christ-pher/bnk/internal/selfupdate"
 	"github.com/christ-pher/bnk/internal/vpnc"
 )
+
+// version is stamped by the release workflow (-X main.version=vX.Y.Z);
+// local builds report "dev".
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -38,7 +43,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|run> [flags]")
+		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|update|version|run> [flags]")
 	}
 	switch args[0] {
 	case "status":
@@ -51,6 +56,19 @@ func run(args []string) error {
 		return upCmd(args[1:])
 	case "down":
 		return downCmd(args[1:])
+	case "version":
+		fmt.Println(version)
+		return nil
+	case "update":
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("update replaces /usr/local/bin/bnk — run as root (sudo bnk update)")
+		}
+		return selfupdate.Run(selfupdate.Config{
+			BaseURL: "https://github.com/christ-pher/bnk",
+			Asset:   "bnk",
+			Version: version,
+			Service: "bnk",
+		})
 	}
 	if args[0] != "run" {
 		return fmt.Errorf("usage: bnk run --server https://host:8443 [--key bnkkey:...] [flags]")

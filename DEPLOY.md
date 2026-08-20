@@ -96,8 +96,16 @@ Real throughput test: `iperf3 -s` on B, `iperf3 -c 100.64.0.2` on A.
 bnk status | bnk ping NAME | bnk netcheck   # diagnostics, no sudo
 bnk down                                    # disconnect (daemon stays; survives reboot)
 bnk up                                      # reconnect
-bnk-server up / bnk-server down             # start/stop the control server (on the VPS)
+sudo bnk update                             # upgrade to the latest release in place (state kept)
+bnk-server status                           # is the control server up? + node summary (VPS)
+bnk-server up / bnk-server down             # start/stop the control server (VPS)
+sudo bnk-server update                      # upgrade the control server in place (state kept)
 ```
+
+`update` downloads the latest release for this machine's architecture,
+verifies it against the release checksums, swaps the binary, and restarts
+the service. Nothing else is touched — identities, keys, and config stay.
+`bnk version` / `bnk-server version` show what's currently installed.
 
 Uninstall completely (same script, `-u`; deletes state and identity too):
 

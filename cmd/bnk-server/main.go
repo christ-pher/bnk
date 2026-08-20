@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,9 +23,14 @@ import (
 	"github.com/christ-pher/bnk/internal/cliutil"
 	"github.com/christ-pher/bnk/internal/coord/server"
 	"github.com/christ-pher/bnk/internal/pin"
+	"github.com/christ-pher/bnk/internal/selfupdate"
 	"github.com/christ-pher/bnk/internal/store"
 	"github.com/christ-pher/bnk/internal/stunner"
 )
+
+// version is stamped by the release workflow (-X main.version=vX.Y.Z);
+// local builds report "dev".
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -35,7 +41,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk-server <up|down|serve|key|node|acl> [flags]")
+		return fmt.Errorf("usage: bnk-server <up|down|status|serve|key|node|acl|update|version> [flags]")
 	}
 	switch args[0] {
 	case "serve":
@@ -44,6 +50,21 @@ func run(args []string) error {
 		return systemctl("start")
 	case "down":
 		return systemctl("stop")
+	case "status":
+		return statusCmd(args[1:])
+	case "version":
+		fmt.Println(version)
+		return nil
+	case "update":
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("update replaces /usr/local/bin/bnk-server — run as root (sudo bnk-server update)")
+		}
+		return selfupdate.Run(selfupdate.Config{
+			BaseURL: "https://github.com/christ-pher/bnk",
+			Asset:   "bnk-server",
+			Version: version,
+			Service: "bnk-server",
+		})
 	case "key":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: bnk-server key <new|ls|revoke> ...")
@@ -84,6 +105,54 @@ func run(args []string) error {
 
 func stateDirFlag(fs *flag.FlagSet) *string {
 	return fs.String("state-dir", "/var/lib/bnk-server", "directory for state, cert, and admin socket")
+}
+
+// statusCmd reports whether the control server is running, via its admin
+// socket, with a node summary when it is.
+func statusCmd(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+
+	hc := adminClient(*stateDir)
+	resp, err := hc.Get("http://bnk-server/info")
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return fmt.Errorf("the admin socket needs root: sudo bnk-server status")
+		}
+		fmt.Println("bnk-server is down (run `bnk-server up` to start it)")
+		return nil
+	}
+	var info struct {
+		PublicURL string `json:"public_url"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&info)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+
+	line := "bnk-server is up"
+	if info.PublicURL != "" {
+		line += ": " + info.PublicURL
+	}
+	nresp, err := hc.Get("http://bnk-server/nodes")
+	if err == nil {
+		var nodes []server.AdminNode
+		derr := json.NewDecoder(nresp.Body).Decode(&nodes)
+		nresp.Body.Close()
+		if derr == nil {
+			online := 0
+			for _, n := range nodes {
+				if n.Online {
+					online++
+				}
+			}
+			line += fmt.Sprintf(" — %d nodes (%d online)", len(nodes), online)
+		}
+	}
+	fmt.Println(line)
+	return nil
 }
 
 // systemctl starts or stops the bnk-server service: `bnk-server up` / `bnk-server down`

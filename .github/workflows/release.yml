@@ -23,8 +23,8 @@ jobs:
         run: |
           mkdir -p dist
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "dist/bnk-linux-$arch" ./cmd/bnk
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "dist/bnk-server-linux-$arch" ./cmd/bnk-server
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/bnk-linux-$arch" ./cmd/bnk
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/bnk-server-linux-$arch" ./cmd/bnk-server
           done
           cp install-client.sh install-server.sh dist/
           (cd dist && sha256sum * > SHA256SUMS)
