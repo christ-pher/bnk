@@ -317,7 +317,14 @@ func printInstallHint(stateDir, key string) {
 			serverURL = info.PublicURL
 		}
 	}
-	fmt.Fprintf(os.Stderr, "\n# paste on the new node to install and join (verify the IP is this server's public one):\ncurl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server %s --key %s\n", serverURL, key)
+	// Both platforms are printed because the server cannot know what the
+	// joining machine runs.
+	fmt.Fprintf(os.Stderr, "\n# paste on the new node to install and join (verify the IP is this server's public one)\n"+
+		"# Linux:\n"+
+		"curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server %s --key %s\n"+
+		"# Windows (elevated PowerShell):\n"+
+		"& ([scriptblock]::Create((irm https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1))) -Server %s -Key %s\n",
+		serverURL, key, serverURL, key)
 }
 
 func aclSet(args []string) error {

@@ -7,6 +7,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pinned so a changed upstream artifact fails the build instead of
+  # silently shipping something we never verified.
+  WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
+  WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -27,7 +33,30 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "dist/bnk-server-linux-$arch" ./cmd/bnk-server
           done
           cp install-client.sh install-server.sh dist/
-          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Fetch Wintun
+        run: |
+          curl -fsSL -o wintun.zip "$WINTUN_URL"
+          echo "$WINTUN_SHA256  wintun.zip" | sha256sum -c -
+          unzip -q wintun.zip
+
+      # Wintun's prebuilt-binary license permits redistribution only when
+      # the DLL ships alongside software using it through its public API,
+      # so each zip carries the DLL as a sibling file plus its LICENSE.
+      - name: Build + package (windows amd64 + arm64)
+        run: |
+          for arch in amd64 arm64; do
+            stage="stage-$arch"
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "$stage/bnk.exe" ./cmd/bnk
+            cp "wintun/bin/$arch/wintun.dll" "$stage/wintun.dll"
+            cp wintun/LICENSE.txt "$stage/WINTUN-LICENSE.txt"
+            (cd "$stage" && zip -q -r "../dist/bnk-windows-$arch.zip" .)
+          done
+          cp install-client.ps1 dist/
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
 
       - name: Release
         env:

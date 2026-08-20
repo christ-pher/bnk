@@ -10,8 +10,8 @@ filter, and NAT traversal — clients behind NATs start on the relay, then
 hole-punch (STUN + authenticated disco probes) and upgrade to a direct
 path, falling back to relay when the punch is impossible (e.g. two
 port-randomizing NATs). Both outcomes are exercised against real
-netfilter NATs in `test/natlab/`. macOS/Windows clients compile but lack
-interface configuration for now.
+netfilter NATs in `test/natlab/`. Linux and Windows clients are
+supported; macOS is deferred.
 
 Diagnostics: `bnk status` (per-peer path: direct/relay), `bnk ping <peer>`
 (disco-level RTT), `bnk netcheck` (local + STUN-observed endpoints).
@@ -37,15 +37,22 @@ curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-server
 bnk-server key new           # one key per client; prints a paste-ready install command
 ```
 
-Each client (Linux) — paste what `key new` printed:
+Each client — paste what `key new` printed for that platform:
 
 ```
+# Linux (root)
 curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server https://YOUR_SERVER:8443 --key bnkkey:...
 ```
 
-Binaries come from [GitHub Releases](https://github.com/christ-pher/bnk/releases)
-(linux amd64/arm64, built by CI on every version tag); the installers
-also accept a locally built binary placed next to them.
+```powershell
+# Windows (elevated PowerShell)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1))) -Server https://YOUR_SERVER:8443 -Key bnkkey:...
+```
+
+Binaries come from [GitHub Releases](https://github.com/christ-pher/bnk/releases),
+built by CI on every version tag: linux amd64/arm64, and windows
+amd64/arm64 zipped with Wintun's driver DLL alongside. The Linux
+installer also accepts a locally built binary placed next to it.
 
 The enrollment key is single-use; the node's identity persists in
 `/var/lib/bnk`. Day to day: `bnk status` (no sudo needed) shows every

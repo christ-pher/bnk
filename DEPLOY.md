@@ -60,15 +60,31 @@ locally built binary next to the script and it uses that.
 
 ## Part 2 — each client (1 min per machine)
 
-Paste the command `key new` printed, as root on the new machine:
+Paste the command `key new` printed — it prints one for each platform.
+
+**Linux**, as root:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server https://YOUR_VPS_IP:8443 --key bnkkey:PASTE_HERE
 ```
 
-The installer downloads the binary, starts the service, waits for the
-tunnel, prints `bnk status`, and blanks the spent key from
-`/etc/bnk/bnk.env` automatically. Repeat per client with its own key.
+**Windows**, from an elevated PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1))) -Server https://YOUR_VPS_IP:8443 -Key bnkkey:PASTE_HERE
+```
+
+Either installer downloads the binary, registers and starts the service,
+waits for the tunnel, prints `bnk status`, and scrubs the spent key
+automatically. Repeat per client with its own key.
+
+Windows notes: the client installs to `C:\Program Files\bnk` (add it to
+your PATH to run `bnk` from anywhere) with state in `%ProgramData%\bnk`.
+`bnk status` works unelevated; `bnk up` / `bnk down` need an elevated
+prompt. `bnk.exe` is unsigned, so SmartScreen may warn on first run.
+Re-running the installer is how you update a Windows client — `bnk
+update` is Linux-only for now. Throughput trails Linux because Wintun
+has no batched I/O upstream.
 
 ## Part 3 — verify (2 min, run on client A, no sudo needed)
 
