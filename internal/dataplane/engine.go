@@ -101,6 +101,11 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 	return e, nil
 }
 
+// PeerDebug exposes the path manager's diagnostic snapshot for a peer.
+func (e *Engine) PeerDebug(key magicsock.NodeKey) (magicsock.PeerDebug, bool) {
+	return e.pm.PeerDebug(key)
+}
+
 // RelayStats reports WireGuard packets sent/received via the relay.
 func (e *Engine) RelayStats() (tx, rx uint64) {
 	return e.bind.RelayStats()

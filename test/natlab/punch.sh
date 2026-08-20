@@ -20,13 +20,19 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 WORK=/tmp/vpnmesh-natlab
+NS=(punch-srv punch-nata punch-natb punch-a punch-b)
+
+# Pre-clean leftovers from any earlier aborted run, so reruns always work.
+pkill -f "$WORK/vpnd serve" 2>/dev/null || true
+pkill -f "$WORK/vpn up" 2>/dev/null || true
+for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
+ip link del punch-br 2>/dev/null || true
 rm -rf "$WORK"
 mkdir -p "$WORK"/{srv,a,b}
 echo "== building binaries"
 go build -o "$WORK/vpnd" ./cmd/vpnd
 go build -o "$WORK/vpn" ./cmd/vpn
 
-NS=(punch-srv punch-nata punch-natb punch-a punch-b)
 cleanup() {
     set +e
     pkill -f "$WORK/vpnd serve" 2>/dev/null
@@ -149,7 +155,14 @@ ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
 ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
 ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
 
+echo "== netcheck (alpha side): path-manager state and relay counters"
+ip netns exec punch-a "$WORK/vpn" netcheck --state-dir "$WORK/a" || true
+
 if [[ "$MODE" == "symmetric" ]]; then
+    if [[ "$DIRECT" == "yes" ]]; then
+        echo "== NOTE: path went DIRECT under symmetric NATs — unexpected;"
+        echo "==       check 'best' in netcheck above to see which address punched"
+    fi
     echo "== symmetric mode: relay is the expected outcome; tunnel works = PASS"
     exit 0
 fi

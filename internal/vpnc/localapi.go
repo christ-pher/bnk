@@ -3,6 +3,7 @@ package vpnc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -61,6 +62,12 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 		}
 		res, err := engine.PingPeer(key, 5*time.Second)
 		if err != nil {
+			// Append the path snapshot: it distinguishes "network dead"
+			// (stale pong) from "pongs flow but Ping is broken" (fresh).
+			if d, ok := engine.PeerDebug(key); ok {
+				err = fmt.Errorf("%w [best=%v lastPong=%v ago lastPing=%v ago candidates=%v]",
+					err, d.Best, d.LastPongAge.Round(time.Millisecond), d.LastPingAge.Round(time.Millisecond), d.Candidates)
+			}
 			http.Error(w, err.Error(), http.StatusGatewayTimeout)
 			return
 		}
@@ -71,10 +78,22 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 	})
 	mux.HandleFunc("GET /netcheck", func(w http.ResponseWriter, r *http.Request) {
 		tx, rx := engine.RelayStats()
+		peers := map[string]any{}
+		for _, p := range cache.get().Peers {
+			if d, ok := engine.PeerDebug(magicsock.NodeKey(p.NodeKey)); ok {
+				peers[p.Name] = map[string]any{
+					"best":          d.Best.String(),
+					"last_pong_ago": d.LastPongAge.Round(time.Millisecond).String(),
+					"last_ping_ago": d.LastPingAge.Round(time.Millisecond).String(),
+					"candidates":    d.Candidates,
+				}
+			}
+		}
 		out := map[string]any{
 			"local_endpoints": candidateEndpoints(engine.LocalPort()),
 			"relay_tx":        tx,
 			"relay_rx":        rx,
+			"peers":           peers,
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()

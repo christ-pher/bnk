@@ -20,12 +20,19 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 WORK=/tmp/vpnmesh-e2e
+NS=(vpnlab-srv vpnlab-a vpnlab-b)
+
+# Pre-clean leftovers from any earlier aborted run.
+pkill -f "$WORK/vpnd serve" 2>/dev/null || true
+pkill -f "$WORK/vpn up" 2>/dev/null || true
+for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
+ip link del vpnlab-br 2>/dev/null || true
+rm -rf "$WORK"
 mkdir -p "$WORK"/{srv,a,b}
 echo "== building binaries"
 go build -o "$WORK/vpnd" ./cmd/vpnd
 go build -o "$WORK/vpn" ./cmd/vpn
 
-NS=(vpnlab-srv vpnlab-a vpnlab-b)
 cleanup() {
     set +e
     pkill -f "$WORK/vpnd serve" 2>/dev/null

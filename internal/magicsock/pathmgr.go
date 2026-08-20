@@ -246,6 +246,32 @@ func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 	pm.pingAll(key, discoKey, cands)
 }
 
+// PeerDebug is a diagnostic snapshot of one peer's path state.
+type PeerDebug struct {
+	Best        netip.AddrPort
+	LastPongAge time.Duration // since the last proof of life (0 if never)
+	LastPingAge time.Duration
+	Candidates  []netip.AddrPort
+}
+
+func (pm *PathManager) PeerDebug(key NodeKey) (PeerDebug, bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	ps, ok := pm.peers[key]
+	if !ok {
+		return PeerDebug{}, false
+	}
+	now := pm.cfg.Clock()
+	d := PeerDebug{Best: ps.best, Candidates: candidateList(ps)}
+	if !ps.lastPong.IsZero() {
+		d.LastPongAge = now.Sub(ps.lastPong)
+	}
+	if !ps.lastPing.IsZero() {
+		d.LastPingAge = now.Sub(ps.lastPing)
+	}
+	return d, true
+}
+
 // PingResult reports a successful disco ping round trip.
 type PingResult struct {
 	Addr netip.AddrPort
