@@ -53,6 +53,7 @@ func Enroll(ctx context.Context, baseURL string, hc *http.Client, req coord.Enro
 type Handlers struct {
 	OnNetmap    func(netmap.Netmap)
 	OnRelayData func(src netmap.NodeID, pkt []byte)
+	OnDiscoFwd  func(src netmap.NodeID, payload []byte)
 }
 
 type Session struct {
@@ -143,8 +144,11 @@ func (s *Session) readLoop(r *bufio.Reader, h Handlers) {
 			if err != nil {
 				return
 			}
-			if msg.T == coord.MsgNetmap && msg.Netmap != nil && h.OnNetmap != nil {
+			switch {
+			case msg.T == coord.MsgNetmap && msg.Netmap != nil && h.OnNetmap != nil:
 				h.OnNetmap(*msg.Netmap)
+			case msg.T == coord.MsgDiscoFwd && msg.DiscoFwd != nil && h.OnDiscoFwd != nil:
+				h.OnDiscoFwd(msg.DiscoFwd.Src, msg.DiscoFwd.Payload)
 			}
 		}
 	}
@@ -157,6 +161,16 @@ func (s *Session) send(typ coord.FrameType, payload []byte) error {
 		return err
 	}
 	return s.bw.Flush()
+}
+
+// SendDiscoFwd asks the server to hand a sealed disco payload to dst —
+// the bootstrap channel for hole punching when no direct path exists yet.
+func (s *Session) SendDiscoFwd(dst netmap.NodeID, payload []byte) error {
+	raw, err := coord.EncodeControl(coord.Envelope{T: coord.MsgDiscoFwd, DiscoFwd: &coord.DiscoFwd{Dst: dst, Payload: payload}})
+	if err != nil {
+		return err
+	}
+	return s.send(coord.FrameControl, raw)
 }
 
 // SendRelay forwards one encrypted WireGuard packet to dst via the server.

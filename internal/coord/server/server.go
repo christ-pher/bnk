@@ -245,11 +245,32 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 			if err != nil {
 				return
 			}
-			if msg.T == coord.MsgEndpoints {
+			switch msg.T {
+			case coord.MsgEndpoints:
 				s.mu.Lock()
 				s.endpoints[sess.id] = msg.Endpoints
 				s.mu.Unlock()
 				s.broadcastNetmaps()
+			case coord.MsgDiscoFwd:
+				if msg.DiscoFwd == nil {
+					continue
+				}
+				s.mu.Lock()
+				target, online := s.sessions[msg.DiscoFwd.Dst]
+				s.mu.Unlock()
+				if !online {
+					continue
+				}
+				// Restamp with the true source; the sender's Src is ignored.
+				out, err := coord.EncodeControl(coord.Envelope{T: coord.MsgDiscoFwd, DiscoFwd: &coord.DiscoFwd{
+					Src: sess.id, Payload: msg.DiscoFwd.Payload,
+				}})
+				if err != nil {
+					continue
+				}
+				if err := target.send(coord.FrameControl, out); err != nil {
+					target.conn.Close()
+				}
 			}
 		}
 	}
