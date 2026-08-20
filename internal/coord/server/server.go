@@ -26,8 +26,17 @@ import (
 
 var defaultPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
+// Liveness tuning: the server sends keepalives every KeepaliveInterval
+// and drops sessions silent for ReadTimeout. Package-level for tests.
+var (
+	KeepaliveInterval = 25 * time.Second
+	ReadTimeout       = 75 * time.Second
+)
+
 type Server struct {
-	fs *store.FileStore
+	fs          *store.FileStore
+	readTimeout time.Duration // captured from ReadTimeout at New
+	keepalive   time.Duration // captured from KeepaliveInterval at New
 
 	mu        sync.Mutex
 	st        store.State
@@ -41,6 +50,24 @@ type session struct {
 	conn net.Conn
 	wmu  sync.Mutex
 	bw   *bufio.Writer
+	done chan struct{}
+}
+
+// keepaliveLoop proves liveness to the client (whose read deadline would
+// otherwise fire on a quiet mesh).
+func (s *session) keepaliveLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			if err := s.send(coord.FrameKeepalive, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *session) send(typ coord.FrameType, payload []byte) error {
@@ -61,10 +88,12 @@ func New(fs *store.FileStore) (*Server, error) {
 		st.Prefix = defaultPrefix
 	}
 	return &Server{
-		fs:        fs,
-		st:        st,
-		sessions:  make(map[netmap.NodeID]*session),
-		endpoints: make(map[netmap.NodeID][]netip.AddrPort),
+		fs:          fs,
+		readTimeout: ReadTimeout,
+		keepalive:   KeepaliveInterval,
+		st:          st,
+		sessions:    make(map[netmap.NodeID]*session),
+		endpoints:   make(map[netmap.NodeID][]netip.AddrPort),
 	}, nil
 }
 
@@ -196,7 +225,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	sess := &session{id: node.ID, conn: conn, bw: bufrw.Writer}
+	sess := &session{id: node.ID, conn: conn, bw: bufrw.Writer, done: make(chan struct{})}
 	if old, exists := s.sessions[node.ID]; exists {
 		old.conn.Close()
 	}
@@ -204,11 +233,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	s.broadcastNetmaps()
+	go sess.keepaliveLoop(s.keepalive)
 	s.readLoop(sess, bufrw.Reader)
 }
 
 func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 	defer func() {
+		close(sess.done)
 		s.mu.Lock()
 		if s.sessions[sess.id] == sess {
 			delete(s.sessions, sess.id)
@@ -219,6 +250,9 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 		s.broadcastNetmaps()
 	}()
 	for {
+		// Clients keepalive more often than ReadTimeout; total silence
+		// means the machine or its network path is gone.
+		sess.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 		typ, payload, err := coord.ReadFrame(r)
 		if err != nil {
 			return

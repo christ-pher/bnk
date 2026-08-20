@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sync"
+	"time"
 
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/netmap"
@@ -50,6 +51,14 @@ func Enroll(ctx context.Context, baseURL string, hc *http.Client, req coord.Enro
 	return out, nil
 }
 
+// Liveness tuning: a session sends keepalive frames every
+// KeepaliveInterval and treats ReadTimeout of silence as a dead
+// connection. Package-level so tests can shrink them.
+var (
+	KeepaliveInterval = 25 * time.Second
+	ReadTimeout       = 75 * time.Second
+)
+
 type Handlers struct {
 	OnNetmap    func(netmap.Netmap)
 	OnRelayData func(src netmap.NodeID, pkt []byte)
@@ -57,10 +66,12 @@ type Handlers struct {
 }
 
 type Session struct {
-	conn net.Conn
-	wmu  sync.Mutex
-	bw   *bufio.Writer
-	done chan struct{}
+	conn        net.Conn
+	wmu         sync.Mutex
+	bw          *bufio.Writer
+	done        chan struct{}
+	keepalive   time.Duration // captured from KeepaliveInterval at Dial
+	readTimeout time.Duration // captured from ReadTimeout at Dial
 }
 
 // Done is closed when the session's read loop exits for any reason.
@@ -106,7 +117,8 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netm
 		return nil, fmt.Errorf("coord dial: server returned %s, want 101", resp.Status)
 	}
 
-	s := &Session{conn: conn, bw: bufio.NewWriter(conn), done: make(chan struct{})}
+	s := &Session{conn: conn, bw: bufio.NewWriter(conn), done: make(chan struct{}),
+		keepalive: KeepaliveInterval, readTimeout: ReadTimeout}
 	hello, err := coord.EncodeControl(coord.Envelope{T: coord.MsgHello, Hello: &coord.Hello{NodeKey: nodeKey}})
 	if err != nil {
 		conn.Close()
@@ -118,13 +130,34 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netm
 	}
 
 	go s.readLoop(br, h)
+	go s.keepaliveLoop()
 	return s, nil
+}
+
+// keepaliveLoop proves liveness to the server and keeps middleboxes'
+// state fresh until the session dies.
+func (s *Session) keepaliveLoop() {
+	ticker := time.NewTicker(s.keepalive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			if err := s.send(coord.FrameKeepalive, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *Session) readLoop(r *bufio.Reader, h Handlers) {
 	defer close(s.done)
 	defer s.conn.Close()
 	for {
+		// A connection silent past ReadTimeout is dead (the server
+		// keepalives more often than this); fail it so reconnect can run.
+		s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 		typ, payload, err := coord.ReadFrame(r)
 		if err != nil {
 			return
