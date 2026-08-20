@@ -237,7 +237,7 @@ func (c *controller) runTunnel(ctx context.Context) error {
 	}()
 
 	c.cfg.Logf("up: node %d, ip %s, wg port %d", st.NodeID, st.IP, engine.LocalPort())
-	return sessionLoop(ctx, c.cfg, st, c.tlsConf, c.pub, engine, c.cache)
+	return sessionLoop(ctx, c, st, engine)
 }
 
 func (c *controller) setEngine(e *dataplane.Engine) {
@@ -256,6 +256,41 @@ func (c *controller) state() state {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.st
+}
+
+// reAddress adopts a new mesh address pushed by the server. The address
+// is baked into the TUN device at creation, so the tunnel is torn down
+// and rebuilt rather than edited in place; supervise brings it straight
+// back up. A no-op when the address is unchanged, which is the usual
+// case on every netmap push.
+func (c *controller) reAddress(self netip.Prefix) error {
+	if !self.IsValid() || !self.Addr().IsValid() {
+		return nil
+	}
+	mesh := self.Masked()
+	c.mu.Lock()
+	if c.st.IP == self.Addr() && c.st.Prefix == mesh {
+		c.mu.Unlock()
+		return nil
+	}
+	old := c.st.IP
+	c.st.IP, c.st.Prefix = self.Addr(), mesh
+	snapshot := c.st
+	stop := c.stopTunnel
+	c.mu.Unlock()
+
+	if err := saveState(c.cfg.StateDir, snapshot); err != nil {
+		return err
+	}
+	c.cfg.Logf("mesh network changed: re-addressing %v -> %v (%v)", old, self.Addr(), mesh)
+	if stop != nil {
+		stop()
+	}
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 // setDown persists the desired state and pokes supervise. Going down also
@@ -296,7 +331,8 @@ func (c *controller) waitEngine(ctx context.Context, want bool, timeout time.Dur
 
 // sessionLoop keeps a coordination session alive, reapplying netmaps and
 // reporting endpoints, with jittered backoff between attempts.
-func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config, pub netmap.Key, engine *dataplane.Engine, cache *netmapCache) error {
+func sessionLoop(ctx context.Context, c *controller, st state, engine *dataplane.Engine) error {
+	cfg, tlsConf, cache := c.cfg, c.tlsConf, c.cache
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -307,6 +343,11 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 				cache.set(nm)
 				if err := engine.ApplyNetmap(nm); err != nil {
 					cfg.Logf("apply netmap: %v", err)
+				}
+				// The server can move the whole mesh to a different
+				// network; the netmap's SelfIP is how that reaches us.
+				if err := c.reAddress(nm.SelfIP); err != nil {
+					cfg.Logf("re-address: %v", err)
 				}
 			},
 			OnRelayData: func(src netmap.NodeID, pkt []byte) {

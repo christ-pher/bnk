@@ -515,7 +515,10 @@ func (s *Server) compileFilterLocked() (map[string][]acl.CompiledRule, bool) {
 func (s *Server) netmapForLocked(node store.Node) netmap.Netmap {
 	nm := netmap.Netmap{
 		SelfID: node.ID,
-		SelfIP: netip.PrefixFrom(node.IP, 32),
+		// The mesh prefix, not a /32: this is what tells a client which
+		// network it belongs to, so it can re-address its interface when
+		// the network changes.
+		SelfIP: netip.PrefixFrom(node.IP, s.st.Prefix.Bits()),
 	}
 	compiled, enabled := s.compileFilterLocked()
 	nm.FilterEnabled = enabled

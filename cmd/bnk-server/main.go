@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -44,7 +45,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk-server <up|down|status|serve|key|node|acl|update|version> [flags]")
+		return fmt.Errorf("usage: bnk-server <up|down|status|serve|key|node|net|acl|update|version> [flags]")
 	}
 	switch args[0] {
 	case "serve":
@@ -55,6 +56,18 @@ func run(args []string) error {
 		return systemctl("stop")
 	case "status":
 		return statusCmd(args[1:])
+	case "net":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: bnk-server net <get|set> [cidr]")
+		}
+		switch args[1] {
+		case "get":
+			return netGet(args[2:])
+		case "set":
+			return netSet(args[2:])
+		default:
+			return fmt.Errorf("usage: bnk-server net <get|set> [cidr]")
+		}
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -110,6 +123,77 @@ func stateDirFlag(fs *flag.FlagSet) *string {
 	return fs.String("state-dir", "/var/lib/bnk-server", "directory for state, cert, and admin socket")
 }
 
+func netGet(args []string) error {
+	fs := flag.NewFlagSet("net get", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	resp, err := adminClient(*stateDir).Get("http://bnk-server/network")
+	if err != nil {
+		return fmt.Errorf("is bnk-server running? %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Network string `json:"network"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	fmt.Println(out.Network)
+	return nil
+}
+
+// netSet moves the whole mesh to a different network. Every node is
+// re-addressed and reconnects on its own; the operation interrupts
+// traffic, so it confirms first unless --yes is given.
+func netSet(args []string) error {
+	fs := flag.NewFlagSet("net set", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: bnk-server net set <cidr>   e.g. bnk-server net set 100.67.0.0/16")
+	}
+	target := fs.Arg(0)
+	if _, err := netip.ParsePrefix(target); err != nil {
+		return fmt.Errorf("bad network %q: %w", target, err)
+	}
+
+	if !*yes {
+		fmt.Printf("Move the mesh to %s?\n", target)
+		fmt.Println("Every node is re-addressed and its tunnel restarts; traffic drops briefly.")
+		fmt.Print("Type yes to continue: ")
+		var answer string
+		fmt.Scanln(&answer)
+		if answer != "yes" {
+			fmt.Println("cancelled")
+			return nil
+		}
+	}
+
+	body, err := json.Marshal(map[string]string{"network": target})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://bnk-server/network", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := adminClient(*stateDir).Do(req)
+	if err != nil {
+		return fmt.Errorf("is bnk-server running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	fmt.Printf("mesh network is now %s\n", target)
+	fmt.Println("Connected nodes re-address themselves; offline nodes do it when they reconnect.")
+	fmt.Println("Check with: bnk-server node ls")
+	return nil
+}
+
 // statusCmd reports whether the control server is running, via its admin
 // socket, with a node summary when it is.
 func statusCmd(args []string) error {
@@ -128,6 +212,7 @@ func statusCmd(args []string) error {
 	}
 	var info struct {
 		PublicURL string `json:"public_url"`
+		Network   string `json:"network"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&info)
 	resp.Body.Close()
@@ -138,6 +223,9 @@ func statusCmd(args []string) error {
 	line := "bnk-server is up"
 	if info.PublicURL != "" {
 		line += ": " + info.PublicURL
+	}
+	if info.Network != "" {
+		line += "  network " + info.Network
 	}
 	nresp, err := hc.Get("http://bnk-server/nodes")
 	if err == nil {
@@ -312,6 +400,7 @@ func printInstallHint(stateDir, key string) {
 	serverURL := "https://YOUR_SERVER_IP:8443"
 	var info struct {
 		PublicURL string `json:"public_url"`
+		Network   string `json:"network"`
 	}
 	if resp, err := adminClient(stateDir).Get("http://bnk-server/info"); err == nil {
 		json.NewDecoder(resp.Body).Decode(&info)

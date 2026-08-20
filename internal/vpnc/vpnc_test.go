@@ -25,6 +25,7 @@ import (
 type testControl struct {
 	url       string
 	enrollKey string
+	srv       *server.Server
 }
 
 // startControl runs a TLS control server with a generated pinned cert.
@@ -54,7 +55,7 @@ func startControl(t *testing.T) *testControl {
 	ts.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	ts.StartTLS()
 	t.Cleanup(ts.Close)
-	return &testControl{url: ts.URL, enrollKey: pin.FormatEnrollKey(secret, fp)}
+	return &testControl{url: ts.URL, enrollKey: pin.FormatEnrollKey(secret, fp), srv: srv}
 }
 
 // tnetOf captures the netstack.Net created for a client.

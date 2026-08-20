@@ -144,6 +144,25 @@ No policy = every node reaches every node. To restrict, on the VPS:
 Rules take effect on all clients within seconds. Replies to connections a
 node initiates are always allowed; everything else not listed is dropped.
 
+## Changing the mesh network (VPS, as root)
+
+The mesh uses `100.64.0.0/10` by default. To move it somewhere else:
+
+```
+bnk-server net get                      # what it is now
+bnk-server net set 100.67.0.0/16        # confirms first; --yes to skip
+```
+
+Every node is re-addressed, keeping its host number where it fits
+(`100.64.0.3` becomes `100.67.0.3`). Connected clients pick the change up
+from the next netmap, rebuild their tunnel, and rejoin on their own;
+nodes that are offline do it when they reconnect. **Traffic drops for a
+few seconds** while tunnels restart, and anything pinned to an old
+address (scripts, `/etc/hosts`, firewall rules) needs updating.
+
+A network must be IPv4, `/30` or larger, and big enough for every
+enrolled node — otherwise the change is refused and nothing changes.
+
 ## Key management (VPS, as root)
 
 ```

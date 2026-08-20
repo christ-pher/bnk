@@ -39,7 +39,32 @@ type AdminKey struct {
 func (s *Server) AdminHandler(fingerprint, publicURL string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /info", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"public_url": publicURL})
+		json.NewEncoder(w).Encode(map[string]string{
+			"public_url": publicURL,
+			"network":    s.Network().String(),
+		})
+	})
+	mux.HandleFunc("GET /network", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"network": s.Network().String()})
+	})
+	mux.HandleFunc("PUT /network", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Network string `json:"network"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		p, err := netip.ParsePrefix(req.Network)
+		if err != nil {
+			http.Error(w, "bad network: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.SetNetwork(p); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"network": s.Network().String()})
 	})
 	mux.HandleFunc("GET /nodes", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
