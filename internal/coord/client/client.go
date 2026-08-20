@@ -58,6 +58,12 @@ type Session struct {
 	conn net.Conn
 	wmu  sync.Mutex
 	bw   *bufio.Writer
+	done chan struct{}
+}
+
+// Done is closed when the session's read loop exits for any reason.
+func (s *Session) Done() <-chan struct{} {
+	return s.done
 }
 
 // Dial connects to the server's /c endpoint, upgrades to the framed
@@ -98,7 +104,7 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netm
 		return nil, fmt.Errorf("coord dial: server returned %s, want 101", resp.Status)
 	}
 
-	s := &Session{conn: conn, bw: bufio.NewWriter(conn)}
+	s := &Session{conn: conn, bw: bufio.NewWriter(conn), done: make(chan struct{})}
 	hello, err := coord.EncodeControl(coord.Envelope{T: coord.MsgHello, Hello: &coord.Hello{NodeKey: nodeKey}})
 	if err != nil {
 		conn.Close()
@@ -114,6 +120,7 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netm
 }
 
 func (s *Session) readLoop(r *bufio.Reader, h Handlers) {
+	defer close(s.done)
 	defer s.conn.Close()
 	for {
 		typ, payload, err := coord.ReadFrame(r)
