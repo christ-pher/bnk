@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"golang.zx2c4.com/wireguard/conn"
 
@@ -59,6 +60,8 @@ type Bind struct {
 	closeCh   chan struct{}
 	onDisco   func(src netip.AddrPort, pkt []byte)
 	onSTUN    func(pkt []byte)
+	relayTx   atomic.Uint64
+	relayRx   atomic.Uint64
 }
 
 var _ conn.Bind = (*Bind)(nil)
@@ -230,6 +233,7 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			if err := relaySend(relayID, buf); err != nil {
 				return err
 			}
+			b.relayTx.Add(1)
 		}
 		return nil
 	default:
@@ -305,8 +309,16 @@ func (b *Bind) DeliverRelay(src uint32, pkt []byte) {
 	}
 	select {
 	case b.relayCh <- relayPacket{key: key, pkt: pkt}:
+		b.relayRx.Add(1)
 	default:
 	}
+}
+
+// RelayStats reports how many WireGuard packets have gone out via and
+// come in from the relay — the first question when debugging "why is
+// there no tunnel".
+func (b *Bind) RelayStats() (tx, rx uint64) {
+	return b.relayTx.Load(), b.relayRx.Load()
 }
 
 // SetPeerAddr sets the current direct address for a peer. Phase 0: a static

@@ -138,7 +138,9 @@ func echoOverTunnel(t *testing.T, a, b *tnetHolder) {
 		}
 	}()
 
-	deadline := time.Now().Add(20 * time.Second)
+	// Generous: the full -race suite runs packages in parallel and can
+	// starve handshake timers.
+	deadline := time.Now().Add(45 * time.Second)
 	for {
 		dctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		c, err := anet.DialContextTCPAddrPort(dctx, netip.AddrPortFrom(bip, 4242))

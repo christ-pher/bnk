@@ -77,16 +77,44 @@ EOF
 lan_leg punch-a punch-nata 192.168.10
 lan_leg punch-b punch-natb 192.168.20
 
+diagnostics() {
+    echo "===================== DIAGNOSTICS ====================="
+    echo "--- vpnd node ls"
+    ip netns exec punch-srv "$WORK/vpnd" node ls --state-dir "$WORK/srv" 2>&1 || true
+    for c in a b; do
+        echo "--- vpn status ($c)"
+        ip netns exec "punch-$c" "$WORK/vpn" status --state-dir "$WORK/$c" 2>&1 || true
+        echo "--- vpn netcheck ($c)"
+        ip netns exec "punch-$c" "$WORK/vpn" netcheck --state-dir "$WORK/$c" 2>&1 || true
+    done
+    for n in nata natb; do
+        echo "--- nft ruleset ($n)"
+        ip netns exec "punch-$n" nft list ruleset 2>&1 || true
+        echo "--- conntrack ($n)"
+        ip netns exec "punch-$n" conntrack -L 2>/dev/null | head -30 || \
+            ip netns exec "punch-$n" cat /proc/net/nf_conntrack 2>/dev/null | head -30 || \
+            echo "(conntrack unavailable)"
+    done
+    echo "--- server sockets"
+    ip netns exec punch-srv ss -tunap 2>&1 | head -20 || true
+    for f in "$WORK"/srv.log "$WORK"/a.log "$WORK"/b.log; do
+        echo "--- $(basename "$f") (last 40 lines)"
+        tail -40 "$f" 2>/dev/null || true
+    done
+    echo "======================================================="
+}
+
 echo "== starting vpnd"
-ip netns exec punch-srv "$WORK/vpnd" serve --state-dir "$WORK/srv" --listen :8443 &
+ip netns exec punch-srv "$WORK/vpnd" serve --state-dir "$WORK/srv" --listen :8443 \
+    >"$WORK/srv.log" 2>&1 &
 sleep 1
 KEY=$(ip netns exec punch-srv "$WORK/vpnd" key new --state-dir "$WORK/srv")
 
 echo "== starting clients (each behind its own NAT)"
 ip netns exec punch-a "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/a" --name alpha &
+    --state-dir "$WORK/a" --name alpha >"$WORK/a.log" 2>&1 &
 ip netns exec punch-b "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/b" --name beta &
+    --state-dir "$WORK/b" --name beta >"$WORK/b.log" 2>&1 &
 
 echo "== waiting for tunnel (relay path first)"
 B_IP=""
@@ -96,7 +124,11 @@ for i in $(seq 1 30); do
     B_IP=""
     sleep 1
 done
-[[ -n "$B_IP" ]] || { echo "punch: FAIL - tunnel never came up at all" >&2; exit 1; }
+if [[ -z "$B_IP" ]]; then
+    echo "punch: FAIL - tunnel never came up at all" >&2
+    diagnostics
+    exit 1
+fi
 echo "== tunnel is up (alpha pinged beta at $B_IP)"
 
 echo "== waiting for direct path"
@@ -109,8 +141,13 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
+# The peer name as seen from client a depends on enrollment order.
+PEER=$(ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" 2>/dev/null | awk 'NR>2 {print $1; exit}')
+echo "== vpn ping ${PEER:-?} (twice, with status before/after)"
 ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
-ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" beta || true
+ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
+ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
+ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
 
 if [[ "$MODE" == "symmetric" ]]; then
     echo "== symmetric mode: relay is the expected outcome; tunnel works = PASS"
@@ -121,4 +158,5 @@ if [[ "$DIRECT" == "yes" ]]; then
     exit 0
 fi
 echo "punch: FAIL - never upgraded to a direct path (still relayed)" >&2
+diagnostics
 exit 1

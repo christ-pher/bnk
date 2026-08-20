@@ -38,7 +38,7 @@ func TestPingEndpointReportsRTT(t *testing.T) {
 		resp, err := hc.Get("http://vpn/ping?peer=beta")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var out struct {
-				Addr string  `json:"addr"`
+				Addr  string  `json:"addr"`
 				RTTms float64 `json:"rtt_ms"`
 			}
 			err := json.NewDecoder(resp.Body).Decode(&out)

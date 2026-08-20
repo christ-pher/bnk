@@ -43,6 +43,15 @@ func TestSendPrefersRelayWhenNoDirectPath(t *testing.T) {
 	default:
 		t.Fatal("nothing went through the relay sender")
 	}
+
+	if tx, _ := bindA.RelayStats(); tx != 1 {
+		t.Errorf("relay tx = %d, want 1", tx)
+	}
+	bindA.SetPeerRelay(keyA, 1)
+	bindA.DeliverRelay(1, []byte("inbound"))
+	if _, rx := bindA.RelayStats(); rx != 1 {
+		t.Errorf("relay rx = %d, want 1", rx)
+	}
 }
 
 func TestDirectPathStillWinsOverRelay(t *testing.T) {

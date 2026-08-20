@@ -33,6 +33,11 @@ type Config struct {
 	MTU       int // default 1280
 	CreateTUN func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
 	Logf      func(format string, args ...any)
+
+	// EndpointsOverride replaces interface/STUN endpoint discovery with a
+	// fixed set. Test hook for simulating hostile NATs; leave nil in
+	// production.
+	EndpointsOverride []netip.AddrPort
 }
 
 // Run brings the node up and blocks until ctx is canceled.
@@ -179,11 +184,17 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		// endpoint follows asynchronously so a missing responder never
 		// stalls the session.
 		eps := candidateEndpoints(engine.LocalPort())
+		if cfg.EndpointsOverride != nil {
+			eps = cfg.EndpointsOverride
+		}
 		engine.SetSelfEndpoints(eps)
 		if err := sess.SendEndpoints(eps); err != nil {
 			cfg.Logf("send endpoints: %v", err)
 		}
 		go func() {
+			if cfg.EndpointsOverride != nil {
+				return
+			}
 			observed, err := stunQuery(ctx, engine, st.ServerURL)
 			if err != nil {
 				if ctx.Err() == nil {

@@ -100,6 +100,11 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 	return e, nil
 }
 
+// RelayStats reports WireGuard packets sent/received via the relay.
+func (e *Engine) RelayStats() (tx, rx uint64) {
+	return e.bind.RelayStats()
+}
+
 // PingPeer runs a disco ping round trip to the peer, proving (or timing
 // out on) a direct path.
 func (e *Engine) PingPeer(key magicsock.NodeKey, timeout time.Duration) (magicsock.PingResult, error) {

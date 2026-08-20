@@ -70,7 +70,12 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 		})
 	})
 	mux.HandleFunc("GET /netcheck", func(w http.ResponseWriter, r *http.Request) {
-		out := map[string]any{"local_endpoints": candidateEndpoints(engine.LocalPort())}
+		tx, rx := engine.RelayStats()
+		out := map[string]any{
+			"local_endpoints": candidateEndpoints(engine.LocalPort()),
+			"relay_tx":        tx,
+			"relay_rx":        rx,
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		if observed, err := stunQuery(ctx, engine, serverURL); err == nil {
