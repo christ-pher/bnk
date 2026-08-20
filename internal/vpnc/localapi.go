@@ -34,13 +34,21 @@ func (c *netmapCache) get() netmap.Netmap {
 	return c.nm
 }
 
-// serveLocalAPI exposes daemon state to the CLI over a unix socket in the
-// state directory. It shuts down when ctx is canceled.
-func serveLocalAPI(ctx context.Context, stateDir, selfName string, cache *netmapCache, engine *dataplane.Engine, serverURL string) error {
-	sock := filepath.Join(stateDir, "vpn.sock")
+// serveLocalAPI exposes daemon state to the CLI over a unix socket. The
+// socket is world-accessible (0666, dir 0755) so status and diagnostics
+// don't need root; private key material lives elsewhere. It shuts down
+// when ctx is canceled.
+func serveLocalAPI(ctx context.Context, sock, selfName string, cache *netmapCache, engine *dataplane.Engine, serverURL string) error {
+	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+		return err
+	}
 	os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
+		return err
+	}
+	if err := os.Chmod(sock, 0o666); err != nil {
+		ln.Close()
 		return err
 	}
 	mux := http.NewServeMux()

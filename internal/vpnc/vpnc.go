@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,11 +27,12 @@ import (
 )
 
 type Config struct {
-	ServerURL string
-	EnrollKey string // vpnkey:<secret>:<fingerprint>; required on first run
-	StateDir  string
-	Hostname  string
-	MTU       int // default 1280
+	ServerURL  string
+	EnrollKey  string // vpnkey:<secret>:<fingerprint>; required on first run
+	StateDir   string
+	SocketPath string // local API socket; default <StateDir>/vpn.sock
+	Hostname   string
+	MTU        int // default 1280
 	CreateTUN func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
 	Logf      func(format string, args ...any)
 
@@ -131,7 +133,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	cache := &netmapCache{}
-	if err := serveLocalAPI(ctx, cfg.StateDir, cfg.Hostname, cache, engine, st.ServerURL); err != nil {
+	sock := cfg.SocketPath
+	if sock == "" {
+		sock = filepath.Join(cfg.StateDir, "vpn.sock")
+	}
+	if err := serveLocalAPI(ctx, sock, cfg.Hostname, cache, engine, st.ServerURL); err != nil {
 		return err
 	}
 

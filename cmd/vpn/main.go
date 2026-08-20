@@ -16,7 +16,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"syscall"
 	"time"
@@ -55,6 +54,7 @@ func run(args []string) error {
 	serverURL := fs.String("server", "", "control server URL, e.g. https://vpn.example:8443")
 	enrollKey := fs.String("key", "", "enrollment key (vpnkey:...), required on first run")
 	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	sock := socketFlag(fs)
 	name := fs.String("name", defaultHostname(), "node name shown to the mesh")
 	ifName := fs.String("ifname", "vpn0", "tunnel interface name")
 	fs.Parse(args[1:])
@@ -67,12 +67,13 @@ func run(args []string) error {
 	defer stop()
 
 	err := vpnc.Run(ctx, vpnc.Config{
-		ServerURL: *serverURL,
-		EnrollKey: *enrollKey,
-		StateDir:  *stateDir,
-		Hostname:  *name,
-		CreateTUN: realTUN(*ifName),
-		Logf:      log.Printf,
+		ServerURL:  *serverURL,
+		EnrollKey:  *enrollKey,
+		StateDir:   *stateDir,
+		SocketPath: *sock,
+		Hostname:   *name,
+		CreateTUN:  realTUN(*ifName),
+		Logf:       log.Printf,
 	})
 	if ctx.Err() != nil {
 		return nil // clean shutdown on signal
@@ -99,8 +100,15 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 	}
 }
 
-func localClient(stateDir string) *http.Client {
-	sock := filepath.Join(stateDir, "vpn.sock")
+// defaultSocket is where the daemon serves the local API. It lives under
+// /run (not the 0700 state dir) so status works without root.
+const defaultSocket = "/run/vpnmesh/vpn.sock"
+
+func socketFlag(fs *flag.FlagSet) *string {
+	return fs.String("socket", defaultSocket, "path to the daemon's local API socket")
+}
+
+func localClient(sock string) *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -109,8 +117,8 @@ func localClient(stateDir string) *http.Client {
 	}}
 }
 
-func localGet(stateDir, path string, out any) error {
-	resp, err := localClient(stateDir).Get("http://vpn" + path)
+func localGet(sock, path string, out any) error {
+	resp, err := localClient(sock).Get("http://vpn" + path)
 	if err != nil {
 		return fmt.Errorf("is vpn up running? %w", err)
 	}
@@ -124,7 +132,7 @@ func localGet(stateDir, path string, out any) error {
 
 func pingCmd(args []string) error {
 	fs := flag.NewFlagSet("ping", flag.ExitOnError)
-	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	sock := socketFlag(fs)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("usage: vpn ping <peer-name>")
@@ -133,7 +141,7 @@ func pingCmd(args []string) error {
 		Addr  string  `json:"addr"`
 		RTTms float64 `json:"rtt_ms"`
 	}
-	if err := localGet(*stateDir, "/ping?peer="+url.QueryEscape(fs.Arg(0)), &out); err != nil {
+	if err := localGet(*sock, "/ping?peer="+url.QueryEscape(fs.Arg(0)), &out); err != nil {
 		return err
 	}
 	fmt.Printf("pong from %s via %s: %.2fms (direct path proven)\n", fs.Arg(0), out.Addr, out.RTTms)
@@ -142,10 +150,10 @@ func pingCmd(args []string) error {
 
 func netcheckCmd(args []string) error {
 	fs := flag.NewFlagSet("netcheck", flag.ExitOnError)
-	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	sock := socketFlag(fs)
 	fs.Parse(args)
 	var out map[string]any
-	if err := localGet(*stateDir, "/netcheck", &out); err != nil {
+	if err := localGet(*sock, "/netcheck", &out); err != nil {
 		return err
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -155,10 +163,10 @@ func netcheckCmd(args []string) error {
 
 func status(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	sock := socketFlag(fs)
 	fs.Parse(args)
 
-	hc := localClient(*stateDir)
+	hc := localClient(*sock)
 	resp, err := hc.Get("http://vpn/status")
 	if err != nil {
 		return fmt.Errorf("is vpn up running? %w", err)
