@@ -2,6 +2,7 @@ package magicsock
 
 import (
 	"crypto/rand"
+	"fmt"
 	"net/netip"
 	"sync"
 	"time"
@@ -53,6 +54,7 @@ type PathManager struct {
 	peers      map[NodeKey]*peerState
 	byDiscoKey map[[32]byte]NodeKey
 	pings      map[[12]byte]sentPing
+	waiters    map[[12]byte]chan PingResult // Ping() calls awaiting pongs
 	selfEps    []netip.AddrPort
 }
 
@@ -62,6 +64,7 @@ func NewPathManager(cfg PathManagerConfig) *PathManager {
 		peers:      make(map[NodeKey]*peerState),
 		byDiscoKey: make(map[[32]byte]NodeKey),
 		pings:      make(map[[12]byte]sentPing),
+		waiters:    make(map[[12]byte]chan PingResult),
 	}
 }
 
@@ -177,9 +180,17 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 			pm.mu.Unlock()
 			return
 		}
-		ps.lastPong = pm.cfg.Clock()
+		now := pm.cfg.Clock()
+		ps.lastPong = now
 		promote := ps.best != sp.to
 		ps.best = sp.to
+		if w, waiting := pm.waiters[m.TxID]; waiting {
+			select {
+			case w <- PingResult{Addr: sp.to, RTT: now.Sub(sp.at)}:
+			default:
+			}
+			delete(pm.waiters, m.TxID)
+		}
 		pm.mu.Unlock()
 		if promote {
 			pm.cfg.SetAddr(key, sp.to)
@@ -219,6 +230,60 @@ func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 	discoKey := ps.discoKey
 	pm.mu.Unlock()
 	pm.pingAll(key, discoKey, cands)
+}
+
+// PingResult reports a successful disco ping round trip.
+type PingResult struct {
+	Addr netip.AddrPort
+	RTT  time.Duration
+}
+
+// Ping probes the peer's candidate paths and returns the first proven one
+// with its round-trip time. Used by the vpn ping diagnostic.
+func (pm *PathManager) Ping(key NodeKey, timeout time.Duration) (PingResult, error) {
+	pm.mu.Lock()
+	ps, ok := pm.peers[key]
+	if !ok {
+		pm.mu.Unlock()
+		return PingResult{}, fmt.Errorf("magicsock: unknown peer %s", key)
+	}
+	targets := candidateList(ps)
+	if ps.best.IsValid() {
+		targets = append([]netip.AddrPort{ps.best}, targets...)
+	}
+	discoKey := ps.discoKey
+	pm.mu.Unlock()
+	if len(targets) == 0 {
+		return PingResult{}, fmt.Errorf("magicsock: no candidate paths for %s", key)
+	}
+
+	ch := make(chan PingResult, 1)
+	now := pm.cfg.Clock()
+	var txids [][12]byte
+	for _, addr := range targets {
+		var txid [12]byte
+		rand.Read(txid[:])
+		pm.mu.Lock()
+		pm.pings[txid] = sentPing{peer: key, to: addr, at: now}
+		pm.waiters[txid] = ch
+		pm.mu.Unlock()
+		txids = append(txids, txid)
+		pm.cfg.SendRaw(addr, disco.Seal(disco.Ping{TxID: txid}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, discoKey))
+	}
+	defer func() {
+		pm.mu.Lock()
+		for _, txid := range txids {
+			delete(pm.waiters, txid)
+		}
+		pm.mu.Unlock()
+	}()
+
+	select {
+	case res := <-ch:
+		return res, nil
+	case <-time.After(timeout):
+		return PingResult{}, fmt.Errorf("magicsock: ping to %s timed out after %v", key, timeout)
+	}
 }
 
 // Tick advances timers: keepalives on proven paths, demotion after
