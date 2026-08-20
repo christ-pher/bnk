@@ -37,6 +37,14 @@ func TestBuildWhenConnected(t *testing.T) {
 	if !strings.Contains(v.Title, "100.64.0.4") {
 		t.Errorf("title %q should name the address", v.Title)
 	}
+	// The menu is only as wide as its widest item, so the status line
+	// stays short and the hostname lives in the tooltip.
+	if len(v.Title) > 30 {
+		t.Errorf("title %q is %d chars; it drives the menu width", v.Title, len(v.Title))
+	}
+	if !strings.Contains(v.Tooltip, "desktop") {
+		t.Errorf("tooltip %q should carry the node name", v.Tooltip)
+	}
 	if v.SelfIP != "100.64.0.4" {
 		t.Errorf("SelfIP = %q", v.SelfIP)
 	}
@@ -81,8 +89,8 @@ func TestBuildWhenDown(t *testing.T) {
 // An unreachable daemon must say so rather than looking disconnected.
 func TestBuildWhenDaemonUnreachable(t *testing.T) {
 	v := trayui.Build(vpnc.Status{}, errors.New("dial: no such file"))
-	if !strings.Contains(v.Title, "unreachable") {
-		t.Errorf("title = %q, want it to mention the daemon being unreachable", v.Title)
+	if !strings.Contains(v.Title, "not running") {
+		t.Errorf("title = %q, want it to say the daemon is not running", v.Title)
 	}
 }
 

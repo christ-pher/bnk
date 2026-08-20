@@ -136,7 +136,7 @@ func (m *menu) refresh() {
 	m.lastView = v
 
 	m.status.SetTitle(v.Title)
-	systray.SetTooltip(v.Title)
+	systray.SetTooltip(v.Tooltip)
 	m.action.SetTitle(v.Action)
 	if v.Connected {
 		systray.SetIcon(iconConnected)
