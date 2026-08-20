@@ -277,6 +277,26 @@ func (b *Bind) SendRaw(addr netip.AddrPort, pkt []byte) error {
 	return err
 }
 
+// AddAddrHint registers an additional source address that should be
+// attributed to peer key on receive. The peer may send from any of its
+// candidate addresses, not just the one we send to.
+func (b *Bind) AddAddrHint(key NodeKey, addr netip.AddrPort) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.byAddr[normalize(addr)] = key
+}
+
+// RemovePeerHints forgets every source-address attribution for key.
+func (b *Bind) RemovePeerHints(key NodeKey) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for addr, k := range b.byAddr {
+		if k == key {
+			delete(b.byAddr, addr)
+		}
+	}
+}
+
 // SetRelaySender injects the transport used to reach peers with no direct
 // path (frames via the coordination session, in production).
 func (b *Bind) SetRelaySender(send func(dst uint32, pkt []byte) error) {
@@ -321,27 +341,24 @@ func (b *Bind) RelayStats() (tx, rx uint64) {
 	return b.relayTx.Load(), b.relayRx.Load()
 }
 
-// SetPeerAddr sets the current direct address for a peer. Phase 0: a static
-// passthrough table; later phases hand this to the path manager.
+// SetPeerAddr sets the peer's current send address. Old reverse-map
+// entries are kept: the peer may legitimately still send from any of its
+// candidate addresses (see AddAddrHint), and forgetting them silently
+// drops its WireGuard traffic.
 func (b *Bind) SetPeerAddr(key NodeKey, addr netip.AddrPort) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if old, ok := b.peers[key]; ok {
-		delete(b.byAddr, normalize(old))
-	}
 	b.peers[key] = addr
 	b.byAddr[normalize(addr)] = key
 }
 
-// ClearPeerAddr removes a peer's direct address so sends fall back to the
-// relay (used when a direct path never proves itself).
+// ClearPeerAddr removes a peer's direct send address so sends fall back
+// to the relay. Receive attribution (byAddr) is kept: stray packets from
+// the dead path are harmless, dropped ones are not.
 func (b *Bind) ClearPeerAddr(key NodeKey) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if old, ok := b.peers[key]; ok {
-		delete(b.byAddr, normalize(old))
-		delete(b.peers, key)
-	}
+	delete(b.peers, key)
 }
 
 // ParseEndpoint accepts a base64 node key, not an ip:port: WireGuard

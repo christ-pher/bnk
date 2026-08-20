@@ -93,6 +93,7 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 			delete(e.pmDirect, peer)
 			e.mu.Unlock()
 		},
+		AddAddrHint: bind.AddAddrHint,
 	})
 	bind.SetDiscoHandler(e.pm.HandleDisco)
 	e.stun = stunner.NewClient(bind)
@@ -296,6 +297,7 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 		if !inMap[key] {
 			e.pm.RemovePeer(key)
 			e.bind.ClearPeerAddr(key)
+			e.bind.RemovePeerHints(key)
 			delete(e.pmDirect, key)
 			delete(e.keyToID, key)
 		}

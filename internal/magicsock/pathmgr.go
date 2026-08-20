@@ -27,6 +27,9 @@ type PathManagerConfig struct {
 	SendFwd   func(peer NodeKey, payload []byte) error  // disco_fwd via coord
 	SetAddr   func(peer NodeKey, addr netip.AddrPort)   // proven path → Bind
 	ClearAddr func(peer NodeKey)                        // demotion → Bind
+	// AddAddrHint registers a candidate as a valid inbound source for the
+	// peer; the peer may send from any candidate, not just the proven one.
+	AddAddrHint func(peer NodeKey, addr netip.AddrPort)
 }
 
 type sentPing struct {
@@ -87,6 +90,9 @@ func (pm *PathManager) SetPeer(key NodeKey, discoKey [32]byte, cands []netip.Add
 	pm.byDiscoKey[discoKey] = key
 	for _, c := range cands {
 		ps.candidates[c] = true
+		if pm.cfg.AddAddrHint != nil {
+			pm.cfg.AddAddrHint(key, c)
+		}
 	}
 }
 
@@ -168,6 +174,9 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 		pm.mu.Lock()
 		ps.candidates[src] = true
 		pm.mu.Unlock()
+		if pm.cfg.AddAddrHint != nil {
+			pm.cfg.AddAddrHint(key, src)
+		}
 		pong := disco.Seal(disco.Pong{TxID: m.TxID, Observed: src}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, ps.discoKey)
 		pm.cfg.SendRaw(src, pong)
 	case disco.Pong:
@@ -229,6 +238,11 @@ func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 	cands := candidateList(ps)
 	discoKey := ps.discoKey
 	pm.mu.Unlock()
+	if pm.cfg.AddAddrHint != nil {
+		for _, ep := range eps {
+			pm.cfg.AddAddrHint(key, ep)
+		}
+	}
 	pm.pingAll(key, discoKey, cands)
 }
 
