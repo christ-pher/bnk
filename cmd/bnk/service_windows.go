@@ -34,6 +34,7 @@ func serviceInstall(args []string) error {
 	server := fs.String("server", "", "control server URL, e.g. https://host:8443")
 	key := fs.String("key", "", "enrollment key (bnkkey:...); omit once enrolled")
 	stateDir := fs.String("state-dir", vpnc.DefaultStateDir, "directory for client state")
+	operator := fs.String("operator", "", "SID of an account allowed to toggle the tunnel without elevating")
 	fs.Parse(args)
 	if *server == "" {
 		return fmt.Errorf("--server is required")
@@ -49,7 +50,7 @@ func serviceInstall(args []string) error {
 	}
 	defer m.Disconnect()
 
-	svcArgs := serviceArgs(*server, *key, *stateDir)
+	svcArgs := serviceArgs(*server, *key, *stateDir, *operator)
 
 	// Re-running the installer must update the existing service rather
 	// than fail — that is also how a spent enrollment key gets dropped.

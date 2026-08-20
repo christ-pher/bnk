@@ -16,6 +16,9 @@ supported; macOS is deferred.
 Diagnostics: `bnk status` (per-peer path: direct/relay), `bnk ping <peer>`
 (disco-level RTT), `bnk netcheck` (local + STUN-observed endpoints).
 
+On Windows a tray icon toggles the tunnel without an elevated prompt and
+lists the mesh under Peers.
+
 ## How it works
 
 - `bnk-server` runs on a publicly reachable server: enrolls nodes, assigns IPs

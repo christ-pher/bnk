@@ -19,6 +19,9 @@
 param(
     [string]$Server,
     [string]$Key,
+    # Account allowed to toggle the VPN from the tray without elevating.
+    # Defaults to the user running the installer.
+    [string]$Operator,
     [switch]$Uninstall
 )
 
@@ -29,6 +32,8 @@ $ServiceName = 'bnk'
 $InstallDir  = Join-Path $env:ProgramFiles 'bnk'
 $StateDir    = Join-Path $env:ProgramData 'bnk'
 $Exe         = Join-Path $InstallDir 'bnk.exe'
+$TrayExe     = Join-Path $InstallDir 'bnk-tray.exe'
+$RunKey      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -36,6 +41,22 @@ function Assert-Admin {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Run this from an elevated PowerShell (Run as Administrator).'
     }
+}
+
+# Get-OperatorSid resolves the account that may control the tunnel from
+# the tray. Elevation does not change which account you are, so the
+# current identity is the right default.
+function Get-OperatorSid {
+    if ($Operator) {
+        if ($Operator -match '^S-1-\d+(-\d+)+$') { return $Operator }
+        return (New-Object Security.Principal.NTAccount($Operator)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    }
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Stop-Tray {
+    Get-Process -Name 'bnk-tray' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 function Get-Arch {
@@ -78,6 +99,8 @@ function Invoke-Uninstall {
             Write-Host '  (could not reach the server; remove it there with: bnk-server node rm <name>)'
         }
     }
+    Stop-Tray
+    Remove-ItemProperty -Path $RunKey -Name 'bnk-tray' -ErrorAction SilentlyContinue
     Remove-FromMachinePath $InstallDir
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
@@ -122,8 +145,10 @@ try {
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     }
+    Stop-Tray
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item (Join-Path $tmp 'bnk.exe') $Exe -Force
+    Copy-Item (Join-Path $tmp 'bnk-tray.exe') $TrayExe -Force
     Copy-Item (Join-Path $tmp 'wintun.dll') (Join-Path $InstallDir 'wintun.dll') -Force
     Copy-Item (Join-Path $tmp 'WINTUN-LICENSE.txt') (Join-Path $InstallDir 'WINTUN-LICENSE.txt') -Force
 } finally {
@@ -151,7 +176,9 @@ function Show-ServiceDiagnostics {
     Write-Host "  & `"$Exe`" run --server $Server --state-dir `"$StateDir`""
 }
 
-& $Exe service install --server $Server --key $Key --state-dir $StateDir
+$operatorSid = Get-OperatorSid
+Write-Host "tray operator: $operatorSid"
+& $Exe service install --server $Server --key $Key --state-dir $StateDir --operator $operatorSid
 
 # The registered command line must carry the `run` subcommand: a service
 # registered as a bare exe starts, prints usage, and exits immediately.
@@ -194,7 +221,12 @@ if (-not $joined) {
 
 # The key is single-use and now spent; the identity lives in $StateDir.
 # Re-register without it so the service never resubmits a dead key.
-& $Exe service install --server $Server --state-dir $StateDir | Out-Null
+& $Exe service install --server $Server --state-dir $StateDir --operator $operatorSid | Out-Null
+
+# Start the tray now and at every login. HKCU is the operator's hive:
+# elevation does not change which user you are.
+Set-ItemProperty -Path $RunKey -Name 'bnk-tray' -Value "`"$TrayExe`"" -Force
+Start-Process -FilePath $TrayExe
 
 Write-Host ''
 & $Exe status
@@ -202,6 +234,9 @@ Write-Host ''
 Write-Host 'Done. Everyday commands (no elevation needed for status):'
 Write-Host '    bnk status | bnk ping NAME | bnk netcheck    diagnostics'
 Write-Host '    bnk down / bnk up (elevated)                 disconnect / reconnect'
+Write-Host ''
+Write-Host 'The tray icon is running now and starts with Windows: toggle the'
+Write-Host 'VPN there without an elevated prompt, and see peers under Peers.'
 Write-Host ''
 Write-Host "bnk is on the system PATH. Open a NEW terminal to pick it up —"
 Write-Host 'already-open windows keep their old PATH until restarted.'

@@ -15,13 +15,6 @@ import (
 // Administrators and SYSTEM may open. A non-elevated caller cannot open
 // the control pipe at all — UAC leaves the Administrators SID deny-only
 // in an unelevated token.
-const (
-	// SYSTEM and Administrators get full access; Everyone (WD) may read
-	// and write, which is all a request/response client needs.
-	sddlDiagnostics = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
-	sddlControl     = "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
-)
-
 // ControlPipe returns the control pipe name paired with a diagnostics
 // pipe name, so the daemon and CLI derive it the same way.
 func ControlPipe(diagnostics string) string {
@@ -36,7 +29,12 @@ func serveLocalAPI(sock string, c *controller) (io.Closer, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctlLn, err := winio.ListenPipe(ControlPipe(sock), &winio.PipeConfig{SecurityDescriptor: sddlControl})
+	ctlSDDL, err := controlSDDL(c.cfg.OperatorSID)
+	if err != nil {
+		diagLn.Close()
+		return nil, err
+	}
+	ctlLn, err := winio.ListenPipe(ControlPipe(sock), &winio.PipeConfig{SecurityDescriptor: ctlSDDL})
 	if err != nil {
 		diagLn.Close()
 		return nil, err

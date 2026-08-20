@@ -49,6 +49,8 @@ jobs:
             stage="stage-$arch"
             mkdir -p "$stage"
             CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "$stage/bnk.exe" ./cmd/bnk
+            # -H=windowsgui: the tray must not open a console window.
+            CGO_ENABLED=0 GOOS=windows GOARCH=$arch go build -trimpath -ldflags "-s -w -H=windowsgui" -o "$stage/bnk-tray.exe" ./cmd/bnk-tray
             cp "wintun/bin/$arch/wintun.dll" "$stage/wintun.dll"
             cp wintun/LICENSE.txt "$stage/WINTUN-LICENSE.txt"
             (cd "$stage" && zip -q -r "../dist/bnk-windows-$arch.zip" .)

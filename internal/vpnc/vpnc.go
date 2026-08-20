@@ -36,10 +36,14 @@ type Config struct {
 	EnrollKey  string // bnkkey:<secret>:<fingerprint>; required on first run
 	StateDir   string
 	SocketPath string // local API socket; default DefaultSocket
-	Hostname   string
-	MTU        int // default 1280
-	CreateTUN  func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
-	Logf       func(format string, args ...any)
+	// OperatorSID, on Windows, is an account granted control of the
+	// tunnel (up/down) without elevating — what the tray app runs as.
+	// Empty means administrators only.
+	OperatorSID string
+	Hostname    string
+	MTU         int // default 1280
+	CreateTUN   func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
+	Logf        func(format string, args ...any)
 
 	// EndpointsOverride replaces interface/STUN endpoint discovery with a
 	// fixed set. Test hook for simulating hostile NATs; leave nil in

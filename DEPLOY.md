@@ -78,10 +78,16 @@ Either installer downloads the binary, registers and starts the service,
 waits for the tunnel, prints `bnk status`, and scrubs the spent key
 automatically. Repeat per client with its own key.
 
-Windows notes: the client installs to `C:\Program Files\bnk` (add it to
-your PATH to run `bnk` from anywhere) with state in `%ProgramData%\bnk`.
-`bnk status` works unelevated; `bnk up` / `bnk down` need an elevated
-prompt. `bnk.exe` is unsigned, so SmartScreen may warn on first run.
+Windows notes: the client installs to `C:\Program Files\bnk` (added to
+your PATH automatically) with state in `%ProgramData%\bnk`. A **tray
+icon** starts with Windows: toggle the VPN there with no elevated
+prompt, and see every peer under its Peers submenu. `bnk status` works
+unelevated from a shell too; `bnk up` / `bnk down` from a *shell* still
+need an elevated prompt, because only the operator account's tray path
+is granted control.
+
+The operator is whoever ran the installer. Install for a different
+account with `-Operator DOMAIN\user` (or a SID). `bnk.exe` is unsigned, so SmartScreen may warn on first run.
 Re-running the installer is how you update a Windows client — `bnk
 update` is Linux-only for now. Throughput trails Linux because Wintun
 has no batched I/O upstream.

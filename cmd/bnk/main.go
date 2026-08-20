@@ -3,15 +3,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -22,6 +18,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/christ-pher/bnk/internal/cliutil"
+	"github.com/christ-pher/bnk/internal/localclient"
 	"github.com/christ-pher/bnk/internal/netmap"
 	"github.com/christ-pher/bnk/internal/router"
 	"github.com/christ-pher/bnk/internal/vpnc"
@@ -78,6 +75,7 @@ func run(args []string) error {
 	sock := socketFlag(fs)
 	name := fs.String("name", defaultHostname(), "node name shown to the mesh")
 	ifName := fs.String("ifname", "bnk0", "tunnel interface name")
+	operator := fs.String("operator", "", "Windows only: SID of an account allowed to toggle the tunnel without elevating")
 	fs.Parse(args[1:])
 
 	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
@@ -85,13 +83,14 @@ func run(args []string) error {
 	}
 
 	return runDaemon(vpnc.Config{
-		ServerURL:  *serverURL,
-		EnrollKey:  *enrollKey,
-		StateDir:   *stateDir,
-		SocketPath: *sock,
-		Hostname:   *name,
-		CreateTUN:  realTUN(*ifName),
-		Logf:       log.Printf,
+		ServerURL:   *serverURL,
+		EnrollKey:   *enrollKey,
+		StateDir:    *stateDir,
+		SocketPath:  *sock,
+		OperatorSID: *operator,
+		Hostname:    *name,
+		CreateTUN:   realTUN(*ifName),
+		Logf:        log.Printf,
 	})
 }
 
@@ -132,43 +131,6 @@ func socketFlag(fs *flag.FlagSet) *string {
 	return fs.String("socket", vpnc.DefaultSocket, "path to the daemon's local API socket")
 }
 
-func localClient(sock string) *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialLocal(ctx, sock)
-		},
-	}}
-}
-
-func localGet(sock, path string, out any) error {
-	resp, err := localClient(sock).Get("http://bnk" + path)
-	if err != nil {
-		return fmt.Errorf("is bnk up running? %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("%s", bytes.TrimSpace(msg))
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-// localPost sends a control verb to the daemon and decodes the reply.
-// Control verbs travel on their own endpoint (a separate, admin-only
-// pipe on Windows; the same socket on Linux).
-func localPost(sock, path string) error {
-	resp, err := localClient(controlEndpoint(sock)).Post("http://bnk"+path, "application/json", nil)
-	if err != nil {
-		return fmt.Errorf("%s (%w)", daemonDownHint, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("%s", bytes.TrimSpace(msg))
-	}
-	return nil
-}
-
 // upCmd tells the running daemon to (re)connect the tunnel.
 func upCmd(args []string) error {
 	// Machines deployed before the daemon split had units running
@@ -182,11 +144,11 @@ func upCmd(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	sock := socketFlag(fs)
 	fs.Parse(args)
-	if err := localPost(*sock, "/up"); err != nil {
+	if err := localclient.Up(*sock); err != nil {
 		return err
 	}
 	var st vpnc.Status
-	if err := localGet(*sock, "/status", &st); err == nil && st.Running {
+	if err := localclient.Get(*sock, "/status", &st); err == nil && st.Running {
 		fmt.Printf("bnk is up: %s (%s)\n", st.Self.Name, st.Self.IP)
 	} else {
 		fmt.Println("bnk is up")
@@ -200,7 +162,7 @@ func downCmd(args []string) error {
 	fs := flag.NewFlagSet("down", flag.ExitOnError)
 	sock := socketFlag(fs)
 	fs.Parse(args)
-	if err := localPost(*sock, "/down"); err != nil {
+	if err := localclient.Down(*sock); err != nil {
 		return err
 	}
 	fmt.Println("bnk is down (run `bnk up` to reconnect)")
@@ -218,7 +180,7 @@ func pingCmd(args []string) error {
 		Addr  string  `json:"addr"`
 		RTTms float64 `json:"rtt_ms"`
 	}
-	if err := localGet(*sock, "/ping?peer="+url.QueryEscape(fs.Arg(0)), &out); err != nil {
+	if err := localclient.Get(*sock, "/ping?peer="+url.QueryEscape(fs.Arg(0)), &out); err != nil {
 		return err
 	}
 	fmt.Printf("pong from %s via %s: %.2fms (direct path proven)\n", fs.Arg(0), out.Addr, out.RTTms)
@@ -230,7 +192,7 @@ func netcheckCmd(args []string) error {
 	sock := socketFlag(fs)
 	fs.Parse(args)
 	var out map[string]any
-	if err := localGet(*sock, "/netcheck", &out); err != nil {
+	if err := localclient.Get(*sock, "/netcheck", &out); err != nil {
 		return err
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -244,7 +206,7 @@ func status(args []string) error {
 	fs.Parse(args)
 
 	var st vpnc.Status
-	if err := localGet(*sock, "/status", &st); err != nil {
+	if err := localclient.Get(*sock, "/status", &st); err != nil {
 		return err
 	}
 	if !st.Running {
