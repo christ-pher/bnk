@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/nacl/box"
+
 	"vpnmesh/internal/acl"
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/ipam"
@@ -274,11 +276,20 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	node, ok := s.nodeByKey(msg.Hello.NodeKey)
+	s.mu.Unlock()
 	if !ok {
-		s.mu.Unlock()
 		conn.Close()
 		return
 	}
+
+	// Knowing an enrolled public key is not identity: challenge the client
+	// to prove it holds the matching private key.
+	if !proveNodeKey(conn, bufrw, node.NodeKey, s.readTimeout) {
+		conn.Close()
+		return
+	}
+
+	s.mu.Lock()
 	sess := &session{id: node.ID, conn: conn, bw: bufrw.Writer, done: make(chan struct{})}
 	if old, exists := s.sessions[node.ID]; exists {
 		old.conn.Close()
@@ -289,6 +300,47 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	s.broadcastNetmaps()
 	go sess.keepaliveLoop(s.keepalive)
 	s.readLoop(sess, bufrw.Reader)
+}
+
+// proveNodeKey runs the challenge-response: the client must seal our
+// random value to a fresh ephemeral key using the node's private key.
+func proveNodeKey(conn net.Conn, bufrw *bufio.ReadWriter, nodePub netmap.Key, timeout time.Duration) bool {
+	ephPub, ephPriv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return false
+	}
+	var nonce [24]byte
+	value := make([]byte, 32)
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return false
+	}
+	if _, err := rand.Read(value); err != nil {
+		return false
+	}
+	ch, err := coord.EncodeControl(coord.Envelope{T: coord.MsgChallenge, Challenge: &coord.Challenge{
+		EphPub: netmap.Key(*ephPub), Nonce: nonce[:], Value: value,
+	}})
+	if err != nil {
+		return false
+	}
+	if err := coord.WriteFrame(bufrw.Writer, coord.FrameControl, ch); err != nil {
+		return false
+	}
+	if err := bufrw.Flush(); err != nil {
+		return false
+	}
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	typ, payload, err := coord.ReadFrame(bufrw.Reader)
+	if err != nil || typ != coord.FrameControl {
+		return false
+	}
+	msg, err := coord.DecodeControl(payload)
+	if err != nil || msg.T != coord.MsgAuth || msg.Auth == nil {
+		return false
+	}
+	pub := [32]byte(nodePub)
+	opened, ok := box.Open(nil, msg.Auth.Sealed, &nonce, &pub, ephPriv)
+	return ok && subtle.ConstantTimeCompare(opened, value) == 1
 }
 
 func (s *Server) readLoop(sess *session, r *bufio.Reader) {

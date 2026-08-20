@@ -14,11 +14,11 @@ type fwd struct {
 	payload []byte
 }
 
-func dialWithDisco(t *testing.T, e *env, nodeKey netmap.Key) (*client.Session, chan fwd, chan netmap.Netmap) {
+func dialWithDisco(t *testing.T, e *env, priv netmap.Key) (*client.Session, chan fwd, chan netmap.Netmap) {
 	t.Helper()
 	ch := make(chan fwd, 16)
 	nms := make(chan netmap.Netmap, 16)
-	sess, err := client.Dial(t.Context(), e.ts.URL, nil, nodeKey, client.Handlers{
+	sess, err := client.Dial(t.Context(), e.ts.URL, nil, priv, client.Handlers{
 		OnNetmap: func(nm netmap.Netmap) { nms <- nm },
 		OnDiscoFwd: func(src netmap.NodeID, payload []byte) {
 			ch <- fwd{src, append([]byte(nil), payload...)}
@@ -33,11 +33,12 @@ func dialWithDisco(t *testing.T, e *env, nodeKey netmap.Key) (*client.Session, c
 
 func TestDiscoFwdForwardedWithSourceStamped(t *testing.T) {
 	e := startServer(t)
-	a := e.enroll(t, "alpha", key32(1))
-	b := e.enroll(t, "beta", key32(2))
+	idA, idB := ident32(t, 1), ident32(t, 2)
+	a := e.enroll(t, "alpha", idA.pub)
+	b := e.enroll(t, "beta", idB.pub)
 
-	sessA, _, nmsA := dialWithDisco(t, e, key32(1))
-	_, gotB, _ := dialWithDisco(t, e, key32(2))
+	sessA, _, nmsA := dialWithDisco(t, e, idA.priv)
+	_, gotB, _ := dialWithDisco(t, e, idB.priv)
 
 	waitNetmap(t, nmsA, func(nm netmap.Netmap) bool {
 		return len(nm.Peers) == 1 && nm.Peers[0].Online

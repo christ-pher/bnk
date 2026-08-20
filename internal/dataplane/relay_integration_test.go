@@ -43,7 +43,7 @@ func startRelayOnlyClient(t *testing.T, url, enrollKey, name string) *node {
 	}
 	t.Cleanup(engine.Close)
 
-	sess, err := client.Dial(context.Background(), url, nil, pub, client.Handlers{
+	sess, err := client.Dial(context.Background(), url, nil, netmap.Key(priv), client.Handlers{
 		OnNetmap: func(nm netmap.Netmap) { _ = engine.ApplyNetmap(nm) },
 		OnRelayData: func(src netmap.NodeID, pkt []byte) {
 			engine.DeliverRelay(uint32(src), pkt)

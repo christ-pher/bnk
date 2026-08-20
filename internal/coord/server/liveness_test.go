@@ -19,15 +19,16 @@ func TestServerDropsSilentSessionButKeepsKeepalivedOne(t *testing.T) {
 	defer func() { server.ReadTimeout, client.KeepaliveInterval = oldRT, oldKA }()
 
 	e := startServer(t)
-	e.enroll(t, "quiet", key32(1))
-	e.enroll(t, "silent", key32(2))
+	idQ, idS := ident32(t, 1), ident32(t, 2)
+	e.enroll(t, "quiet", idQ.pub)
+	e.enroll(t, "silent", idS.pub)
 
 	// "quiet" keepalives normally; "silent" never sends after hello.
 	client.KeepaliveInterval = 100 * time.Millisecond
-	quiet, _ := dialSession(t, e, key32(1))
+	quiet, _ := dialSession(t, e, idQ.priv)
 	defer quiet.Close()
 	client.KeepaliveInterval = time.Hour
-	silent, _ := dialSession(t, e, key32(2))
+	silent, _ := dialSession(t, e, idS.priv)
 	defer silent.Close()
 
 	// The silent session must be dropped by the server's read deadline...

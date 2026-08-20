@@ -2,11 +2,16 @@ package server_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/curve25519"
 
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/coord/client"
@@ -36,6 +41,58 @@ func startServer(t *testing.T) *env {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return &env{srv: srv, ts: ts, statePath: statePath, enrollKey: key}
+}
+
+// identity is a real curve25519 keypair: sessions must prove the private
+// key, so tests need genuine pairs.
+type identity struct {
+	priv, pub netmap.Key
+}
+
+func identFromPriv(t *testing.T, priv [32]byte) identity {
+	t.Helper()
+	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id identity
+	id.priv = netmap.Key(priv)
+	copy(id.pub[:], pub)
+	return id
+}
+
+// ident32 derives a deterministic keypair from a seed byte, mirroring the
+// old key32 pattern so enroll/dial pairs stay readable.
+func ident32(t *testing.T, b byte) identity {
+	t.Helper()
+	// Seed goes in byte 1: clamping wipes the low bits of byte 0.
+	return identFromPriv(t, [32]byte{8, b, 0x13})
+}
+
+func ident(t *testing.T) identity {
+	t.Helper()
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		t.Fatal(err)
+	}
+	return identFromPriv(t, priv)
+}
+
+// adminNodes fetches the admin view of all nodes.
+func adminNodes(t *testing.T, e *env) []server.AdminNode {
+	t.Helper()
+	admin := httptest.NewServer(e.srv.AdminHandler("fp"))
+	defer admin.Close()
+	resp, err := http.Get(admin.URL + "/nodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var nodes []server.AdminNode
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	return nodes
 }
 
 func key32(b byte) netmap.Key {
@@ -104,10 +161,10 @@ func TestEnrollSameNodeKeyIsIdempotent(t *testing.T) {
 
 // dialSession connects a client session and returns it plus a channel of
 // received netmaps.
-func dialSession(t *testing.T, e *env, nodeKey netmap.Key) (*client.Session, chan netmap.Netmap) {
+func dialSession(t *testing.T, e *env, priv netmap.Key) (*client.Session, chan netmap.Netmap) {
 	t.Helper()
 	nms := make(chan netmap.Netmap, 16)
-	sess, err := client.Dial(context.Background(), e.ts.URL, nil, nodeKey, client.Handlers{
+	sess, err := client.Dial(context.Background(), e.ts.URL, nil, priv, client.Handlers{
 		OnNetmap: func(nm netmap.Netmap) { nms <- nm },
 	})
 	if err != nil {
@@ -134,27 +191,29 @@ func waitNetmap(t *testing.T, ch chan netmap.Netmap, ok func(netmap.Netmap) bool
 
 func TestSessionReceivesNetmapListingPeers(t *testing.T) {
 	e := startServer(t)
-	a := e.enroll(t, "alpha", key32(1))
-	b := e.enroll(t, "beta", key32(2))
+	idA, idB := ident32(t, 1), ident32(t, 2)
+	a := e.enroll(t, "alpha", idA.pub)
+	b := e.enroll(t, "beta", idB.pub)
 
-	_, nms := dialSession(t, e, key32(1))
+	_, nms := dialSession(t, e, idA.priv)
 	nm := waitNetmap(t, nms, func(nm netmap.Netmap) bool { return len(nm.Peers) == 1 })
 	if nm.SelfID != a.NodeID || nm.SelfIP.Addr() != a.IP {
 		t.Errorf("self = %d %v, want %d %v", nm.SelfID, nm.SelfIP, a.NodeID, a.IP)
 	}
 	p := nm.Peers[0]
-	if p.ID != b.NodeID || p.IP != b.IP || p.NodeKey != key32(2) || p.Name != "beta" {
+	if p.ID != b.NodeID || p.IP != b.IP || p.NodeKey != ident32(t, 2).pub || p.Name != "beta" {
 		t.Errorf("peer = %+v, want beta id=%d ip=%v", p, b.NodeID, b.IP)
 	}
 }
 
 func TestEndpointUpdatesReachOtherSessions(t *testing.T) {
 	e := startServer(t)
-	e.enroll(t, "alpha", key32(1))
-	e.enroll(t, "beta", key32(2))
+	idA, idB := ident32(t, 1), ident32(t, 2)
+	e.enroll(t, "alpha", idA.pub)
+	e.enroll(t, "beta", idB.pub)
 
-	sessA, nmsA := dialSession(t, e, key32(1))
-	_, nmsB := dialSession(t, e, key32(2))
+	sessA, nmsA := dialSession(t, e, idA.priv)
+	_, nmsB := dialSession(t, e, idB.priv)
 
 	ep := netip.MustParseAddrPort("203.0.113.5:41641")
 	if err := sessA.SendEndpoints([]netip.AddrPort{ep}); err != nil {

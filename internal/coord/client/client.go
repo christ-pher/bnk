@@ -17,6 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/nacl/box"
+
 	"vpnmesh/internal/coord"
 	"vpnmesh/internal/netmap"
 )
@@ -80,9 +83,16 @@ func (s *Session) Done() <-chan struct{} {
 }
 
 // Dial connects to the server's /c endpoint, upgrades to the framed
-// protocol, sends hello, and starts the read loop. tlsConf nil means plain
-// TCP (tests); production passes a fingerprint-pinning config.
-func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netmap.Key, h Handlers) (*Session, error) {
+// protocol, sends hello, proves possession of the node private key, and
+// starts the read loop. tlsConf nil means plain TCP (tests); production
+// passes a fingerprint-pinning config.
+func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodePriv netmap.Key, h Handlers) (*Session, error) {
+	pubBytes, err := curve25519.X25519(nodePriv[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	var nodeKey netmap.Key
+	copy(nodeKey[:], pubBytes)
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -128,10 +138,41 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodeKey netm
 		conn.Close()
 		return nil, err
 	}
+	if err := s.answerChallenge(br, nodePriv); err != nil {
+		conn.Close()
+		return nil, err
+	}
 
 	go s.readLoop(br, h)
 	go s.keepaliveLoop()
 	return s, nil
+}
+
+// answerChallenge reads the server's challenge and returns the sealed
+// proof that we hold the node private key.
+func (s *Session) answerChallenge(r *bufio.Reader, nodePriv netmap.Key) error {
+	s.conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	typ, payload, err := coord.ReadFrame(r)
+	if err != nil {
+		return fmt.Errorf("coord: reading challenge: %w", err)
+	}
+	msg, err := coord.DecodeControl(payload)
+	if err != nil || typ != coord.FrameControl || msg.T != coord.MsgChallenge || msg.Challenge == nil {
+		return fmt.Errorf("coord: expected a challenge, got frame type %d", typ)
+	}
+	if len(msg.Challenge.Nonce) != 24 {
+		return fmt.Errorf("coord: bad challenge nonce")
+	}
+	var nonce [24]byte
+	copy(nonce[:], msg.Challenge.Nonce)
+	eph := [32]byte(msg.Challenge.EphPub)
+	priv := [32]byte(nodePriv)
+	sealed := box.Seal(nil, msg.Challenge.Value, &nonce, &eph, &priv)
+	auth, err := coord.EncodeControl(coord.Envelope{T: coord.MsgAuth, Auth: &coord.Auth{Sealed: sealed}})
+	if err != nil {
+		return err
+	}
+	return s.send(coord.FrameControl, auth)
 }
 
 // keepaliveLoop proves liveness to the server and keeps middleboxes'

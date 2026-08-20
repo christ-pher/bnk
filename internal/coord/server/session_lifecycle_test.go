@@ -7,9 +7,10 @@ import (
 
 func TestNewSessionReplacesOldAndOldDoneFires(t *testing.T) {
 	e := startServer(t)
-	e.enroll(t, "alpha", key32(1))
-	first, _ := dialSession(t, e, key32(1))
-	dialSession(t, e, key32(1))
+	id := ident32(t, 1)
+	e.enroll(t, "alpha", id.pub)
+	first, _ := dialSession(t, e, id.priv)
+	dialSession(t, e, id.priv)
 
 	select {
 	case <-first.Done():

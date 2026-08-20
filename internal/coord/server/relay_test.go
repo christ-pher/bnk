@@ -14,11 +14,11 @@ type relayed struct {
 	pkt []byte
 }
 
-func dialWithRelay(t *testing.T, e *env, nodeKey netmap.Key) (*client.Session, chan relayed, chan netmap.Netmap) {
+func dialWithRelay(t *testing.T, e *env, priv netmap.Key) (*client.Session, chan relayed, chan netmap.Netmap) {
 	t.Helper()
 	ch := make(chan relayed, 16)
 	nms := make(chan netmap.Netmap, 16)
-	sess, err := client.Dial(t.Context(), e.ts.URL, nil, nodeKey, client.Handlers{
+	sess, err := client.Dial(t.Context(), e.ts.URL, nil, priv, client.Handlers{
 		OnNetmap: func(nm netmap.Netmap) { nms <- nm },
 		OnRelayData: func(src netmap.NodeID, pkt []byte) {
 			ch <- relayed{src, append([]byte(nil), pkt...)}
@@ -33,11 +33,12 @@ func dialWithRelay(t *testing.T, e *env, nodeKey netmap.Key) (*client.Session, c
 
 func TestRelayForwardsWithSourceStampedByServer(t *testing.T) {
 	e := startServer(t)
-	a := e.enroll(t, "alpha", key32(1))
-	b := e.enroll(t, "beta", key32(2))
+	idA, idB := ident32(t, 1), ident32(t, 2)
+	a := e.enroll(t, "alpha", idA.pub)
+	b := e.enroll(t, "beta", idB.pub)
 
-	sessA, _, nmsA := dialWithRelay(t, e, key32(1))
-	_, gotB, _ := dialWithRelay(t, e, key32(2))
+	sessA, _, nmsA := dialWithRelay(t, e, idA.priv)
+	_, gotB, _ := dialWithRelay(t, e, idB.priv)
 
 	// Wait until the server sees beta online, else the frame is dropped.
 	waitNetmap(t, nmsA, func(nm netmap.Netmap) bool {
@@ -63,10 +64,11 @@ func TestRelayForwardsWithSourceStampedByServer(t *testing.T) {
 
 func TestRelayToOfflinePeerIsDroppedWithoutKillingSession(t *testing.T) {
 	e := startServer(t)
-	e.enroll(t, "alpha", key32(1))
+	idA := ident32(t, 1)
+	e.enroll(t, "alpha", idA.pub)
 	b := e.enroll(t, "beta", key32(2))
 
-	sessA, _, _ := dialWithRelay(t, e, key32(1))
+	sessA, _, _ := dialWithRelay(t, e, idA.priv)
 	if err := sessA.SendRelay(b.NodeID, []byte("into the void")); err != nil {
 		t.Fatal(err)
 	}

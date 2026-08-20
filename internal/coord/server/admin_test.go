@@ -6,37 +6,50 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"vpnmesh/internal/coord/server"
 )
 
 func TestAdminNodesListsEnrollmentAndOnlineState(t *testing.T) {
 	e := startServer(t)
-	e.enroll(t, "alpha", key32(1))
+	id := ident32(t, 1)
+	e.enroll(t, "alpha", id.pub)
 	e.enroll(t, "beta", key32(2))
-	dialSession(t, e, key32(1)) // alpha online
+	dialSession(t, e, id.priv) // alpha online
 
 	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
 	defer admin.Close()
 
-	resp, err := http.Get(admin.URL + "/nodes")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var nodes []server.AdminNode
-	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
-		t.Fatal(err)
-	}
-	if len(nodes) != 2 {
-		t.Fatalf("got %d nodes, want 2", len(nodes))
-	}
-	byName := map[string]server.AdminNode{}
-	for _, n := range nodes {
-		byName[n.Name] = n
-	}
-	if !byName["alpha"].Online {
-		t.Error("alpha should be online (session connected)")
+	// Session registration completes shortly after Dial returns (the
+	// server verifies the key proof first), so poll for alpha online.
+	var byName map[string]server.AdminNode
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get(admin.URL + "/nodes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nodes []server.AdminNode
+		err = json.NewDecoder(resp.Body).Decode(&nodes)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(nodes) != 2 {
+			t.Fatalf("got %d nodes, want 2", len(nodes))
+		}
+		byName = map[string]server.AdminNode{}
+		for _, n := range nodes {
+			byName[n.Name] = n
+		}
+		if byName["alpha"].Online {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("alpha never came online (session connected)")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if byName["beta"].Online {
 		t.Error("beta should be offline")

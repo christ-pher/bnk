@@ -147,7 +147,7 @@ func sessionLoop(ctx context.Context, cfg Config, st state, tlsConf *tls.Config,
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		sess, err := client.Dial(ctx, st.ServerURL, tlsConf, pub, client.Handlers{
+		sess, err := client.Dial(ctx, st.ServerURL, tlsConf, st.PrivateKey, client.Handlers{
 			OnNetmap: func(nm netmap.Netmap) {
 				cache.set(nm)
 				if err := engine.ApplyNetmap(nm); err != nil {

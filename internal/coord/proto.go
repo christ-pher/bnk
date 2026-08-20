@@ -74,6 +74,8 @@ type EnrollResponse struct {
 // Message type tags for the control envelope.
 const (
 	MsgHello     = "hello"
+	MsgChallenge = "challenge"
+	MsgAuth      = "auth"
 	MsgNetmap    = "netmap"
 	MsgEndpoints = "endpoints"
 	MsgDiscoFwd  = "disco_fwd"
@@ -84,6 +86,8 @@ const (
 type Envelope struct {
 	T         string           `json:"t"`
 	Hello     *Hello           `json:"hello,omitempty"`
+	Challenge *Challenge       `json:"challenge,omitempty"`
+	Auth      *Auth            `json:"auth,omitempty"`
 	Netmap    *netmap.Netmap   `json:"netmap,omitempty"`
 	Endpoints []netip.AddrPort `json:"endpoints,omitempty"`
 	DiscoFwd  *DiscoFwd        `json:"disco_fwd,omitempty"`
@@ -91,6 +95,18 @@ type Envelope struct {
 
 type Hello struct {
 	NodeKey netmap.Key `json:"node_key"`
+}
+
+// Challenge asks the connecting client to prove possession of the node
+// private key: seal Value with nacl/box to EphPub using that key.
+type Challenge struct {
+	EphPub netmap.Key `json:"eph_pub"`
+	Nonce  []byte     `json:"nonce"`
+	Value  []byte     `json:"value"`
+}
+
+type Auth struct {
+	Sealed []byte `json:"sealed"`
 }
 
 type DiscoFwd struct {

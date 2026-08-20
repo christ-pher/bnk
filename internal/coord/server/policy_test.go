@@ -9,11 +9,12 @@ import (
 
 func TestSetPolicyPushesCompiledRulesToTargets(t *testing.T) {
 	e := startServer(t)
-	e.enroll(t, "laptop", key32(1))
-	b := e.enroll(t, "nas", key32(2))
+	idL, idN := ident32(t, 1), ident32(t, 2)
+	e.enroll(t, "laptop", idL.pub)
+	b := e.enroll(t, "nas", idN.pub)
 
-	_, nmsLaptop := dialSession(t, e, key32(1))
-	_, nmsNas := dialSession(t, e, key32(2))
+	_, nmsLaptop := dialSession(t, e, idL.priv)
+	_, nmsNas := dialSession(t, e, idN.priv)
 
 	err := e.srv.SetPolicy(&acl.Policy{
 		Groups: map[string][]string{"trusted": {"laptop"}},

@@ -76,7 +76,7 @@ func TestRelayOverTLSWithDeadEndpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(engine.Close)
-		sess, err := client.Dial(context.Background(), ts.URL, tlsConf, pub, client.Handlers{
+		sess, err := client.Dial(context.Background(), ts.URL, tlsConf, netmap.Key(priv), client.Handlers{
 			OnNetmap: func(nm netmap.Netmap) { _ = engine.ApplyNetmap(nm) },
 			OnRelayData: func(src netmap.NodeID, pkt []byte) {
 				engine.DeliverRelay(uint32(src), pkt)

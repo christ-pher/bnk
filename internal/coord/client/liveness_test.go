@@ -29,7 +29,15 @@ func TestSessionDiesWhenServerGoesSilent(t *testing.T) {
 			return
 		}
 		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: vpn-coord/1\r\nConnection: Upgrade\r\n\r\n"))
-		coord.ReadFrame(bufrw.Reader)
+		coord.ReadFrame(bufrw.Reader) // hello
+		// Speak just enough protocol to get past Dial: send a challenge
+		// (the answer is read and ignored), then go silent forever.
+		ch, _ := coord.EncodeControl(coord.Envelope{T: coord.MsgChallenge, Challenge: &coord.Challenge{
+			Nonce: make([]byte, 24), Value: make([]byte, 32),
+		}})
+		coord.WriteFrame(bufrw.Writer, coord.FrameControl, ch)
+		bufrw.Flush()
+		coord.ReadFrame(bufrw.Reader) // auth
 		// Keep the TCP connection open but never send another byte, and
 		// keep draining so client keepalives don't block.
 		go func() {
