@@ -93,7 +93,53 @@ func startClient(t *testing.T, url, enrollKey, name string) *node {
 	if err := sess.SendEndpoints([]netip.AddrPort{self}); err != nil {
 		t.Fatal(err)
 	}
-	return &node{engine: engine, net: tnet, ip: resp.IP}
+	return &node{engine: engine, net: tnet, ip: resp.IP, sess: sess}
+}
+
+// echoTCPOverTunnel retries a TCP echo from a to b until the tunnel works.
+func echoTCPOverTunnel(t *testing.T, a, b *node) {
+	t.Helper()
+	ln, err := b.net.ListenTCPAddrPort(netip.AddrPortFrom(b.ip, 9999))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				buf := make([]byte, 64)
+				if n, err := c.Read(buf); err == nil {
+					c.Write(buf[:n])
+				}
+			}()
+		}
+	}()
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		c, err := a.net.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(b.ip, 9999))
+		cancel()
+		if err == nil {
+			defer c.Close()
+			c.Write([]byte("via control plane"))
+			c.SetReadDeadline(time.Now().Add(10 * time.Second))
+			buf := make([]byte, 64)
+			n, err := c.Read(buf)
+			if err != nil || string(buf[:n]) != "via control plane" {
+				t.Fatalf("echo = %q, %v", buf[:n], err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tunnel never came up: %v", err)
+		}
+	}
 }
 
 func TestControlPlaneEstablishesTunnel(t *testing.T) {
@@ -110,53 +156,5 @@ func TestControlPlaneEstablishesTunnel(t *testing.T) {
 
 	a := startClient(t, ts.URL, enrollKey, "alpha")
 	b := startClient(t, ts.URL, enrollKey, "beta")
-
-	ln, err := b.net.ListenTCPAddrPort(netip.AddrPortFrom(b.ip, 9999))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				buf := make([]byte, 64)
-				n, err := c.Read(buf)
-				if err == nil {
-					c.Write(buf[:n])
-				}
-			}()
-		}
-	}()
-
-	// Netmaps propagate asynchronously; retry the dial until the tunnel is up.
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		c, err := a.net.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(b.ip, 9999))
-		cancel()
-		if err == nil {
-			defer c.Close()
-			if _, err := c.Write([]byte("via control plane")); err != nil {
-				t.Fatal(err)
-			}
-			c.SetReadDeadline(time.Now().Add(10 * time.Second))
-			buf := make([]byte, 64)
-			n, err := c.Read(buf)
-			if err != nil {
-				t.Fatalf("read echo: %v", err)
-			}
-			if got := string(buf[:n]); got != "via control plane" {
-				t.Errorf("echo = %q", got)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("tunnel never came up: %v", err)
-		}
-	}
+	echoTCPOverTunnel(t, a, b)
 }

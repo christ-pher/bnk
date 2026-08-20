@@ -35,6 +35,7 @@ type Engine struct {
 	directSince map[magicsock.NodeKey]time.Time      // unproven blind paths
 	pmDirect    map[magicsock.NodeKey]netip.AddrPort // disco-proven paths
 	keyToID     map[magicsock.NodeKey]uint32
+	configured  map[magicsock.NodeKey]netip.Addr // peers currently in the WG device
 	fwdSend     func(dst uint32, payload []byte) error
 	done        chan struct{}
 }
@@ -64,6 +65,7 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 		directSince: make(map[magicsock.NodeKey]time.Time),
 		pmDirect:    make(map[magicsock.NodeKey]netip.AddrPort),
 		keyToID:     make(map[magicsock.NodeKey]uint32),
+		configured:  make(map[magicsock.NodeKey]netip.Addr),
 		done:        make(chan struct{}),
 	}
 	e.pm = magicsock.NewPathManager(magicsock.PathManagerConfig{
@@ -266,9 +268,10 @@ func (e *Engine) DeliverRelay(src uint32, pkt []byte) {
 	e.bind.DeliverRelay(src, pkt)
 }
 
-// ApplyNetmap reconfigures the device and path table to match nm. Peers
-// absent from nm are removed (replace_peers); each peer's identity is its
-// node key, and its freshest known endpoint feeds the Bind's path table.
+// ApplyNetmap reconfigures the device and path table to match nm. The
+// device config is diffed, not replaced: netmap pushes are routine
+// (endpoint refresh, nodes joining) and must not disturb the handshake
+// state of established sessions.
 func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -280,14 +283,22 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 	}
 
 	var cfg strings.Builder
-	cfg.WriteString("replace_peers=true\n")
 	inMap := make(map[magicsock.NodeKey]bool, len(nm.Peers))
 	for _, p := range nm.Peers {
 		key := magicsock.NodeKey(p.NodeKey)
 		inMap[key] = true
-		fmt.Fprintf(&cfg, "public_key=%s\n", hex.EncodeToString(p.NodeKey[:]))
-		fmt.Fprintf(&cfg, "endpoint=%s\n", p.NodeKey)
-		fmt.Fprintf(&cfg, "allowed_ip=%s/32\n", p.IP)
+		switch ip, known := e.configured[key]; {
+		case !known:
+			fmt.Fprintf(&cfg, "public_key=%s\n", hex.EncodeToString(p.NodeKey[:]))
+			fmt.Fprintf(&cfg, "endpoint=%s\n", p.NodeKey)
+			fmt.Fprintf(&cfg, "allowed_ip=%s/32\n", p.IP)
+			e.configured[key] = p.IP
+		case ip != p.IP:
+			fmt.Fprintf(&cfg, "public_key=%s\n", hex.EncodeToString(p.NodeKey[:]))
+			cfg.WriteString("replace_allowed_ips=true\n")
+			fmt.Fprintf(&cfg, "allowed_ip=%s/32\n", p.IP)
+			e.configured[key] = p.IP
+		}
 		e.bind.SetPeerRelay(key, uint32(p.ID))
 		e.keyToID[key] = uint32(p.ID)
 		if p.DiscoKey != (netmap.Key{}) {
@@ -317,6 +328,15 @@ func (e *Engine) ApplyNetmap(nm netmap.Netmap) error {
 			delete(e.pmDirect, key)
 			delete(e.keyToID, key)
 		}
+	}
+	for key := range e.configured {
+		if !inMap[key] {
+			fmt.Fprintf(&cfg, "public_key=%s\nremove=true\n", hex.EncodeToString(key[:]))
+			delete(e.configured, key)
+		}
+	}
+	if cfg.Len() == 0 {
+		return nil // nothing changed at the WG layer; don't touch the device
 	}
 	return e.dev.IpcSet(cfg.String())
 }
