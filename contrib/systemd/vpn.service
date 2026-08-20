@@ -1,0 +1,20 @@
+[Unit]
+Description=vpnmesh client
+Documentation=https://github.com/chris/vpnmesh (DEPLOY.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# First run needs the enrollment key; /etc/vpnmesh/vpn.env provides
+# VPN_SERVER (always) and VPN_KEY (only until enrolled — see DEPLOY.md).
+EnvironmentFile=/etc/vpnmesh/vpn.env
+ExecStart=/usr/local/bin/vpn up --server ${VPN_SERVER} --key "${VPN_KEY}" --state-dir /var/lib/vpn
+Restart=on-failure
+RestartSec=2
+
+# Needs root: creates the TUN device and configures routes.
+StateDirectory=vpn
+
+[Install]
+WantedBy=multi-user.target

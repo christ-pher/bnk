@@ -25,6 +25,9 @@ Diagnostics: `vpn status` (per-peer path: direct/relay), `vpn ping <peer>`
 - Trust is a pinned certificate fingerprint embedded in the enrollment
   key — no CA, no domain required.
 
+**Deploying for real?** Follow [DEPLOY.md](DEPLOY.md) — VPS control plane
+plus clients, step by step, ~25 minutes.
+
 ## Quickstart
 
 Server (any Linux box with a public IP):

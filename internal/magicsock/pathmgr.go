@@ -15,6 +15,7 @@ const (
 	demoteAfter    = 15 * time.Second // silence on a proven path → relay
 	reprobeEvery   = 15 * time.Second // retry discovery while on relay
 	pingExpiry     = 10 * time.Second // forget unanswered pings
+	learnedTTL     = 5 * time.Minute  // learned (non-netmap) candidates expire
 )
 
 // PathManagerConfig injects all I/O and time, keeping the state machine
@@ -38,9 +39,16 @@ type sentPing struct {
 	at   time.Time
 }
 
+// candMeta records where a candidate came from: the netmap is
+// authoritative (pruned on every SetPeer), learned candidates expire.
+type candMeta struct {
+	fromNetmap bool
+	learnedAt  time.Time
+}
+
 type peerState struct {
 	discoKey   [32]byte
-	candidates map[netip.AddrPort]bool
+	candidates map[netip.AddrPort]candMeta
 	best       netip.AddrPort // zero = relay
 	lastPong   time.Time
 	lastPing   time.Time
@@ -135,17 +143,33 @@ func (pm *PathManager) SetPeer(key NodeKey, discoKey [32]byte, cands []netip.Add
 	defer pm.mu.Unlock()
 	ps, ok := pm.peers[key]
 	if !ok || ps.discoKey != discoKey {
-		ps = &peerState{discoKey: discoKey, candidates: make(map[netip.AddrPort]bool)}
+		ps = &peerState{discoKey: discoKey, candidates: make(map[netip.AddrPort]candMeta)}
 		pm.peers[key] = ps
 	}
 	pm.byDiscoKey[discoKey] = key
+	inList := make(map[netip.AddrPort]bool, len(cands))
 	for _, c := range cands {
 		if pm.badCandidateLocked(c) {
 			continue
 		}
-		ps.candidates[c] = true
+		inList[c] = true
+		m := ps.candidates[c]
+		m.fromNetmap = true
+		ps.candidates[c] = m
 		if pm.cfg.AddAddrHint != nil {
 			pm.cfg.AddAddrHint(key, c)
+		}
+	}
+	// The netmap is authoritative: drop netmap-sourced candidates it no
+	// longer lists (drifted STUN mappings, removed endpoints).
+	for c, m := range ps.candidates {
+		if m.fromNetmap && !inList[c] {
+			if m.learnedAt.IsZero() {
+				delete(ps.candidates, c)
+			} else {
+				m.fromNetmap = false
+				ps.candidates[c] = m
+			}
 		}
 	}
 }
@@ -238,7 +262,9 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 		// unless it arrived through the tunnel itself.
 		pm.mu.Lock()
 		if !pm.badCandidateLocked(src) {
-			ps.candidates[src] = true
+			m := ps.candidates[src]
+			m.learnedAt = pm.cfg.Clock()
+			ps.candidates[src] = m
 			pm.mu.Unlock()
 			if pm.cfg.AddAddrHint != nil {
 				pm.cfg.AddAddrHint(key, src)
@@ -311,11 +337,14 @@ func (pm *PathManager) HandleDiscoFwd(payload []byte) {
 func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 	pm.mu.Lock()
 	kept := eps[:0]
+	now := pm.cfg.Clock()
 	for _, ep := range eps {
 		if pm.badCandidateLocked(ep) {
 			continue
 		}
-		ps.candidates[ep] = true
+		m := ps.candidates[ep]
+		m.learnedAt = now
+		ps.candidates[ep] = m
 		kept = append(kept, ep)
 	}
 	cands := candidateList(ps)
@@ -424,6 +453,13 @@ func (pm *PathManager) Tick() {
 	for txid, sp := range pm.pings {
 		if now.Sub(sp.at) > pingExpiry {
 			delete(pm.pings, txid)
+		}
+	}
+	for _, ps := range pm.peers {
+		for c, m := range ps.candidates {
+			if !m.fromNetmap && now.Sub(m.learnedAt) > learnedTTL {
+				delete(ps.candidates, c)
+			}
 		}
 	}
 	type action struct {

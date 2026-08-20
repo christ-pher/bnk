@@ -65,8 +65,12 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 			// Append the path snapshot: it distinguishes "network dead"
 			// (stale pong) from "pongs flow but Ping is broken" (fresh).
 			if d, ok := engine.PeerDebug(key); ok {
-				err = fmt.Errorf("%w [best=%v lastPong=%v ago lastPing=%v ago candidates=%v]",
-					err, d.Best, d.LastPongAge.Round(time.Millisecond), d.LastPingAge.Round(time.Millisecond), d.Candidates)
+				if !d.HasPong {
+					err = fmt.Errorf("no direct path to this peer has ever been proven — it is likely reachable only via the relay (normal behind port-randomizing NATs). Underlying: %w [candidates=%v]", err, d.Candidates)
+				} else {
+					err = fmt.Errorf("%w [best=%v lastPong=%v ago lastPing=%v ago candidates=%v]",
+						err, d.Best, d.LastPongAge.Round(time.Millisecond), d.LastPingAge.Round(time.Millisecond), d.Candidates)
+				}
 			}
 			http.Error(w, err.Error(), http.StatusGatewayTimeout)
 			return
