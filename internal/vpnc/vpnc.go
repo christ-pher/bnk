@@ -125,7 +125,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	cache := &netmapCache{}
-	if err := serveLocalAPI(ctx, cfg.StateDir, cache, engine); err != nil {
+	if err := serveLocalAPI(ctx, cfg.StateDir, cache, engine, st.ServerURL); err != nil {
 		return err
 	}
 

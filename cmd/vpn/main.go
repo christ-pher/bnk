@@ -3,14 +3,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,10 +36,15 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vpn <up|status> [flags]")
+		return fmt.Errorf("usage: vpn <up|status|ping|netcheck> [flags]")
 	}
-	if args[0] == "status" {
+	switch args[0] {
+	case "status":
 		return status(args[1:])
+	case "ping":
+		return pingCmd(args[1:])
+	case "netcheck":
+		return netcheckCmd(args[1:])
 	}
 	if args[0] != "up" {
 		return fmt.Errorf("usage: vpn up --server https://host:8443 [--key vpnkey:...] [flags]")
@@ -89,18 +97,66 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 	}
 }
 
-func status(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
-	fs.Parse(args)
-
-	sock := filepath.Join(*stateDir, "vpn.sock")
-	hc := &http.Client{Transport: &http.Transport{
+func localClient(stateDir string) *http.Client {
+	sock := filepath.Join(stateDir, "vpn.sock")
+	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", sock)
 		},
 	}}
+}
+
+func localGet(stateDir, path string, out any) error {
+	resp, err := localClient(stateDir).Get("http://vpn" + path)
+	if err != nil {
+		return fmt.Errorf("is vpn up running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func pingCmd(args []string) error {
+	fs := flag.NewFlagSet("ping", flag.ExitOnError)
+	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: vpn ping <peer-name>")
+	}
+	var out struct {
+		Addr  string  `json:"addr"`
+		RTTms float64 `json:"rtt_ms"`
+	}
+	if err := localGet(*stateDir, "/ping?peer="+url.QueryEscape(fs.Arg(0)), &out); err != nil {
+		return err
+	}
+	fmt.Printf("pong from %s via %s: %.2fms (direct path proven)\n", fs.Arg(0), out.Addr, out.RTTms)
+	return nil
+}
+
+func netcheckCmd(args []string) error {
+	fs := flag.NewFlagSet("netcheck", flag.ExitOnError)
+	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	fs.Parse(args)
+	var out map[string]any
+	if err := localGet(*stateDir, "/netcheck", &out); err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+func status(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	stateDir := fs.String("state-dir", "/var/lib/vpn", "directory for client state")
+	fs.Parse(args)
+
+	hc := localClient(*stateDir)
 	resp, err := hc.Get("http://vpn/status")
 	if err != nil {
 		return fmt.Errorf("is vpn up running? %w", err)

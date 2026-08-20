@@ -22,6 +22,45 @@ func statusClient(stateDir string) *http.Client {
 	}}
 }
 
+func TestPingEndpointReportsRTT(t *testing.T) {
+	tc := startControl(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stateA := t.TempDir()
+	a := runClient(t, ctx, tc, "alpha", stateA, tc.enrollKey)
+	b := runClient(t, ctx, tc, "beta", t.TempDir(), tc.enrollKey)
+	echoOverTunnel(t, a, b)
+
+	hc := statusClient(stateA)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		resp, err := hc.Get("http://vpn/ping?peer=beta")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var out struct {
+				Addr string  `json:"addr"`
+				RTTms float64 `json:"rtt_ms"`
+			}
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Addr == "" || out.RTTms < 0 {
+				t.Errorf("ping result = %+v", out)
+			}
+			return
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ping endpoint never succeeded (last err %v)", err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func TestStatusReportsPeersAndPath(t *testing.T) {
 	tc := startControl(t)
 	ctx, cancel := context.WithCancel(context.Background())

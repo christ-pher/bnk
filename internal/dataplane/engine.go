@@ -100,6 +100,12 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 	return e, nil
 }
 
+// PingPeer runs a disco ping round trip to the peer, proving (or timing
+// out on) a direct path.
+func (e *Engine) PingPeer(key magicsock.NodeKey, timeout time.Duration) (magicsock.PingResult, error) {
+	return e.pm.Ping(key, timeout)
+}
+
 // QuerySTUN asks server for this node's reflexive address as seen from
 // the WireGuard socket.
 func (e *Engine) QuerySTUN(ctx context.Context, server netip.AddrPort) (netip.AddrPort, error) {
