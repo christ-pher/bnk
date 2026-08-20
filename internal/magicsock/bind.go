@@ -39,20 +39,33 @@ var ErrNoPath = errors.New("magicsock: no known path to peer")
 
 // Bind is a conn.Bind that multiplexes WireGuard, disco, and STUN traffic
 // over a single UDP socket.
+type relayPacket struct {
+	key NodeKey
+	pkt []byte
+}
+
 type Bind struct {
-	mu     sync.Mutex
-	pc     *net.UDPConn
-	port   uint16
-	peers  map[NodeKey]netip.AddrPort // identity → current direct address
-	byAddr map[netip.AddrPort]NodeKey // reverse map for tagging receives
+	mu        sync.Mutex
+	pc        *net.UDPConn
+	port      uint16
+	peers     map[NodeKey]netip.AddrPort // identity → current direct address
+	byAddr    map[netip.AddrPort]NodeKey // reverse map for tagging receives
+	relaySend func(dst uint32, pkt []byte) error
+	relayIDs  map[NodeKey]uint32
+	byRelayID map[uint32]NodeKey
+	relayCh   chan relayPacket
+	closeCh   chan struct{}
 }
 
 var _ conn.Bind = (*Bind)(nil)
 
 func NewBind() *Bind {
 	return &Bind{
-		peers:  make(map[NodeKey]netip.AddrPort),
-		byAddr: make(map[netip.AddrPort]NodeKey),
+		peers:     make(map[NodeKey]netip.AddrPort),
+		byAddr:    make(map[netip.AddrPort]NodeKey),
+		relayIDs:  make(map[NodeKey]uint32),
+		byRelayID: make(map[uint32]NodeKey),
+		relayCh:   make(chan relayPacket, 64),
 	}
 }
 
@@ -68,7 +81,28 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	}
 	b.pc = pc
 	b.port = uint16(pc.LocalAddr().(*net.UDPAddr).Port)
-	return []conn.ReceiveFunc{b.receive}, b.port, nil
+	b.closeCh = make(chan struct{})
+	return []conn.ReceiveFunc{b.receive, b.receiveRelay}, b.port, nil
+}
+
+// receiveRelay surfaces packets handed in by DeliverRelay as the Bind's
+// second receive path (the same way Tailscale plumbs DERP receives).
+func (b *Bind) receiveRelay(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	b.mu.Lock()
+	closeCh := b.closeCh
+	b.mu.Unlock()
+	if closeCh == nil {
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-closeCh:
+		return 0, net.ErrClosed
+	case rp := <-b.relayCh:
+		n := copy(packets[0], rp.pkt)
+		sizes[0] = n
+		eps[0] = &endpoint{key: rp.key}
+		return 1, nil
+	}
 }
 
 // receive reads datagrams until one comes from a known peer, tagging it with
@@ -116,6 +150,8 @@ func (b *Bind) Close() error {
 	if b.pc == nil {
 		return nil
 	}
+	close(b.closeCh)
+	b.closeCh = nil
 	err := b.pc.Close()
 	b.pc = nil
 	return err
@@ -125,6 +161,8 @@ func (b *Bind) SetMark(mark uint32) error {
 	return nil
 }
 
+// Send routes to the peer's direct address when one is known, else falls
+// back to the relay. WireGuard never sees which path was taken.
 func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	e, ok := ep.(*endpoint)
 	if !ok {
@@ -132,20 +170,31 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	}
 	b.mu.Lock()
 	pc := b.pc
-	addr, known := b.peers[e.key]
+	addr, direct := b.peers[e.key]
+	relayID, hasRelay := b.relayIDs[e.key]
+	relaySend := b.relaySend
 	b.mu.Unlock()
 	if pc == nil {
 		return net.ErrClosed
 	}
-	if !known {
+	switch {
+	case direct:
+		for _, buf := range bufs {
+			if _, err := pc.WriteToUDPAddrPort(buf, addr); err != nil {
+				return err
+			}
+		}
+		return nil
+	case hasRelay && relaySend != nil:
+		for _, buf := range bufs {
+			if err := relaySend(relayID, buf); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
 		return fmt.Errorf("%w: %s", ErrNoPath, e.key)
 	}
-	for _, buf := range bufs {
-		if _, err := pc.WriteToUDPAddrPort(buf, addr); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (b *Bind) BatchSize() int {
@@ -160,6 +209,42 @@ func (b *Bind) LocalPort() uint16 {
 		return 0
 	}
 	return b.port
+}
+
+// SetRelaySender injects the transport used to reach peers with no direct
+// path (frames via the coordination session, in production).
+func (b *Bind) SetRelaySender(send func(dst uint32, pkt []byte) error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.relaySend = send
+}
+
+// SetPeerRelay registers a peer's relay ID, enabling the relay fallback
+// path for it and mapping inbound relay packets back to its identity.
+func (b *Bind) SetPeerRelay(key NodeKey, id uint32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if old, ok := b.relayIDs[key]; ok {
+		delete(b.byRelayID, old)
+	}
+	b.relayIDs[key] = id
+	b.byRelayID[id] = key
+}
+
+// DeliverRelay hands the Bind one WireGuard packet that arrived via the
+// relay from the peer registered under src. Packets from unregistered IDs
+// are dropped; if the queue is full the packet is dropped (UDP semantics).
+func (b *Bind) DeliverRelay(src uint32, pkt []byte) {
+	b.mu.Lock()
+	key, ok := b.byRelayID[src]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case b.relayCh <- relayPacket{key: key, pkt: pkt}:
+	default:
+	}
 }
 
 // SetPeerAddr sets the current direct address for a peer. Phase 0: a static

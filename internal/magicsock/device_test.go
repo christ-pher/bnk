@@ -63,11 +63,10 @@ func startNode(t *testing.T, tunIP netip.Addr) *testNode {
 	return &testNode{priv: priv, pub: pub, bind: bind, dev: dev, net: tnet, tunIP: tunIP}
 }
 
-// addPeer points n at peer: identity endpoint in the device config, direct
-// address in the Bind's path table.
-func addPeer(t *testing.T, n, peer *testNode) {
+// configurePeer adds peer to n's device config with an identity endpoint;
+// it does NOT touch the Bind's path table.
+func configurePeer(t *testing.T, n, peer *testNode) {
 	t.Helper()
-	n.bind.SetPeerAddr(NodeKey(peer.pub), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), peer.bind.LocalPort()))
 	cfg := fmt.Sprintf("public_key=%s\nendpoint=%s\nallowed_ip=%s/32\n",
 		hex.EncodeToString(peer.pub[:]), NodeKey(peer.pub), peer.tunIP)
 	if err := n.dev.IpcSet(cfg); err != nil {
@@ -75,12 +74,25 @@ func addPeer(t *testing.T, n, peer *testNode) {
 	}
 }
 
+// addPeer points n at peer: identity endpoint in the device config, direct
+// address in the Bind's path table.
+func addPeer(t *testing.T, n, peer *testNode) {
+	t.Helper()
+	n.bind.SetPeerAddr(NodeKey(peer.pub), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), peer.bind.LocalPort()))
+	configurePeer(t, n, peer)
+}
+
 func TestTwoDevicesExchangeTCPOverTunnel(t *testing.T) {
 	a := startNode(t, netip.MustParseAddr("100.64.0.1"))
 	b := startNode(t, netip.MustParseAddr("100.64.0.2"))
 	addPeer(t, a, b)
 	addPeer(t, b, a)
+	echoTCP(t, a, b)
+}
 
+// echoTCP asserts a TCP round-trip from a to b over the tunnel.
+func echoTCP(t *testing.T, a, b *testNode) {
+	t.Helper()
 	ln, err := b.net.ListenTCPAddrPort(netip.AddrPortFrom(b.tunIP, 7777))
 	if err != nil {
 		t.Fatal(err)
