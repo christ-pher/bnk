@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"golang.zx2c4.com/wireguard/conn"
+
+	"vpnmesh/internal/disco"
 )
 
 // NodeKey is a peer's WireGuard public key, the stable identity every path
@@ -55,6 +57,7 @@ type Bind struct {
 	byRelayID map[uint32]NodeKey
 	relayCh   chan relayPacket
 	closeCh   chan struct{}
+	onDisco   func(src netip.AddrPort, pkt []byte)
 }
 
 var _ conn.Bind = (*Bind)(nil)
@@ -120,6 +123,17 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 		n, src, err := pc.ReadFromUDPAddrPort(packets[0])
 		if err != nil {
 			return 0, err
+		}
+		// Disco traffic peels off before any peer check: hole-punch probes
+		// arrive from source addresses no table knows yet.
+		if disco.IsDisco(packets[0][:n]) {
+			b.mu.Lock()
+			h := b.onDisco
+			b.mu.Unlock()
+			if h != nil {
+				h(normalize(src), append([]byte(nil), packets[0][:n]...))
+			}
+			continue
 		}
 		key, ok := b.lookupAddr(src)
 		if !ok {
@@ -209,6 +223,27 @@ func (b *Bind) LocalPort() uint16 {
 		return 0
 	}
 	return b.port
+}
+
+// SetDiscoHandler registers the callback for inbound disco packets. The
+// callback runs on the receive goroutine and must not block.
+func (b *Bind) SetDiscoHandler(h func(src netip.AddrPort, pkt []byte)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onDisco = h
+}
+
+// SendDisco transmits a raw disco packet to addr, independent of any peer
+// path state — this is how candidate paths are probed before they exist.
+func (b *Bind) SendDisco(addr netip.AddrPort, pkt []byte) error {
+	b.mu.Lock()
+	pc := b.pc
+	b.mu.Unlock()
+	if pc == nil {
+		return net.ErrClosed
+	}
+	_, err := pc.WriteToUDPAddrPort(pkt, addr)
+	return err
 }
 
 // SetRelaySender injects the transport used to reach peers with no direct
