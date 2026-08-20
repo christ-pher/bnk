@@ -45,7 +45,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|update|version|run|service> [flags]")
+		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|leave|update|version|run|service> [flags]")
 	}
 	switch args[0] {
 	case "status":
@@ -65,6 +65,8 @@ func run(args []string) error {
 		return updateCmd()
 	case "service":
 		return serviceCmd(args[1:])
+	case "leave":
+		return leaveCmd(args[1:])
 	}
 	if args[0] != "run" {
 		return fmt.Errorf("usage: bnk run --server https://host:8443 [--key bnkkey:...] [flags]")
@@ -110,6 +112,20 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 		}
 		return dev, dev.Close, nil
 	}
+}
+
+// leaveCmd deregisters this node from the control server. The installers
+// call it during uninstall so a removed machine does not linger in the
+// server's node list.
+func leaveCmd(args []string) error {
+	fs := flag.NewFlagSet("leave", flag.ExitOnError)
+	stateDir := fs.String("state-dir", vpnc.DefaultStateDir, "directory for client state")
+	fs.Parse(args)
+	if err := vpnc.Leave(context.Background(), *stateDir); err != nil {
+		return fmt.Errorf("could not deregister (remove it on the server with `bnk-server node rm`): %w", err)
+	}
+	fmt.Println("left the mesh — the server no longer lists this node")
+	return nil
 }
 
 func socketFlag(fs *flag.FlagSet) *string {

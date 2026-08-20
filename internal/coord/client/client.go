@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -148,6 +149,11 @@ func Dial(ctx context.Context, baseURL string, tlsConf *tls.Config, nodePriv net
 	return s, nil
 }
 
+// ErrRejected means the server refused the session outright — typically
+// because this node is no longer enrolled. Retrying will not help; the
+// node has to re-enroll.
+var ErrRejected = errors.New("coord: server rejected this node")
+
 // answerChallenge reads the server's challenge and returns the sealed
 // proof that we hold the node private key.
 func (s *Session) answerChallenge(r *bufio.Reader, nodePriv netmap.Key) error {
@@ -157,6 +163,9 @@ func (s *Session) answerChallenge(r *bufio.Reader, nodePriv netmap.Key) error {
 		return fmt.Errorf("coord: reading challenge: %w", err)
 	}
 	msg, err := coord.DecodeControl(payload)
+	if err == nil && typ == coord.FrameControl && msg.T == coord.MsgReject && msg.Reject != nil {
+		return fmt.Errorf("%w: %s", ErrRejected, msg.Reject.Reason)
+	}
 	if err != nil || typ != coord.FrameControl || msg.T != coord.MsgChallenge || msg.Challenge == nil {
 		return fmt.Errorf("coord: expected a challenge, got frame type %d", typ)
 	}
@@ -255,6 +264,17 @@ func (s *Session) SendRelay(dst netmap.NodeID, pkt []byte) error {
 // SendEndpoints reports this node's current candidate endpoints.
 func (s *Session) SendEndpoints(eps []netip.AddrPort) error {
 	payload, err := coord.EncodeControl(coord.Envelope{T: coord.MsgEndpoints, Endpoints: eps})
+	if err != nil {
+		return err
+	}
+	return s.send(coord.FrameControl, payload)
+}
+
+// Leave asks the server to remove this node from the mesh permanently.
+// The session is authenticated, so no further proof is needed. After a
+// successful call the node must re-enroll with a fresh key to rejoin.
+func (s *Session) Leave() error {
+	payload, err := coord.EncodeControl(coord.Envelope{T: coord.MsgLeave})
 	if err != nil {
 		return err
 	}

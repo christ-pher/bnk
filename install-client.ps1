@@ -69,6 +69,15 @@ function Remove-FromMachinePath([string]$dir) {
 
 function Invoke-Uninstall {
     Write-Host 'uninstalling bnk...'
+    # Deregister first, while the identity and network still exist. Best
+    # effort: if the server is unreachable, uninstall proceeds anyway and
+    # the entry is cleared with `bnk-server node rm`.
+    if (Test-Path $Exe) {
+        & $Exe leave 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  (could not reach the server; remove it there with: bnk-server node rm <name>)'
+        }
+    }
     Remove-FromMachinePath $InstallDir
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue

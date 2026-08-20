@@ -96,10 +96,17 @@ func run(args []string) error {
 			return fmt.Errorf("usage: bnk-server key <new|ls|revoke> ...")
 		}
 	case "node":
-		if len(args) < 2 || args[1] != "ls" {
-			return fmt.Errorf("usage: bnk-server node ls")
+		if len(args) < 2 {
+			return fmt.Errorf("usage: bnk-server node <ls|rm> ...")
 		}
-		return nodeLs(args[2:])
+		switch args[1] {
+		case "ls":
+			return nodeLs(args[2:])
+		case "rm":
+			return nodeRm(args[2:])
+		default:
+			return fmt.Errorf("usage: bnk-server node <ls|rm> ...")
+		}
 	case "acl":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: bnk-server acl <set|get|check> ...")
@@ -191,6 +198,35 @@ func netSet(args []string) error {
 	fmt.Printf("mesh network is now %s\n", target)
 	fmt.Println("Connected nodes re-address themselves; offline nodes do it when they reconnect.")
 	fmt.Println("Check with: bnk-server node ls")
+	return nil
+}
+
+// nodeRm forgets a node: its address returns to the pool and peers stop
+// seeing it. A node still running on that machine cannot rejoin without
+// a fresh enrollment key.
+func nodeRm(args []string) error {
+	fs := flag.NewFlagSet("node rm", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: bnk-server node rm <name>")
+	}
+	name := fs.Arg(0)
+	req, err := http.NewRequest(http.MethodDelete, "http://bnk-server/nodes?name="+url.QueryEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := adminClient(*stateDir).Do(req)
+	if err != nil {
+		return fmt.Errorf("is bnk-server running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	fmt.Printf("removed %s — its address is back in the pool\n", name)
+	fmt.Println("If that machine still runs bnk, it needs a new key to rejoin.")
 	return nil
 }
 

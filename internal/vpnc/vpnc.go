@@ -6,6 +6,7 @@ package vpnc
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -358,6 +359,12 @@ func sessionLoop(ctx context.Context, c *controller, st state, engine *dataplane
 			},
 		})
 		if err != nil {
+			if errors.Is(err, client.ErrRejected) {
+				// Retrying cannot fix this: the server has no record of
+				// this node, so it needs a fresh enrollment key.
+				cfg.Logf("REMOVED FROM MESH: %v", err)
+				cfg.Logf("run the client installer again with a new key from `bnk-server key new` to rejoin")
+			}
 			cfg.Logf("coordination dial: %v (retrying in %v)", err, backoff)
 			select {
 			case <-ctx.Done():

@@ -144,6 +144,25 @@ No policy = every node reaches every node. To restrict, on the VPS:
 Rules take effect on all clients within seconds. Replies to connections a
 node initiates are always allowed; everything else not listed is dropped.
 
+## Removing a node
+
+Uninstalling a client deregisters it automatically — the installer runs
+`bnk leave` before it removes anything, so the node disappears from
+`bnk-server node ls` on its own.
+
+That needs the server to be reachable at uninstall time. When it isn't —
+or when the machine died, was reimaged, or you just want to evict it —
+remove it from the VPS:
+
+```
+bnk-server node ls            # find the name
+bnk-server node rm laptop     # forget it; its address returns to the pool
+```
+
+A machine still running bnk after removal cannot rejoin on its own: the
+server no longer has its key, so its log says it was removed from the
+mesh and it needs a fresh key from `bnk-server key new`.
+
 ## Changing the mesh network (VPS, as root)
 
 The mesh uses `100.64.0.0/10` by default. To move it somewhere else:

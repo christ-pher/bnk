@@ -60,6 +60,12 @@ done
 
 if [ "$UNINSTALL" = 1 ]; then
     echo "uninstalling bnk..."
+    # Deregister first, while the identity and network still exist. Best
+    # effort: if the server is unreachable, uninstall proceeds anyway and
+    # the entry is cleared with `bnk-server node rm`.
+    if [ -x "$BIN" ]; then
+        "$BIN" leave 2>/dev/null || echo "  (could not reach the server; remove it there with: bnk-server node rm <name>)"
+    fi
     systemctl stop bnk 2>/dev/null || true
     systemctl disable bnk 2>/dev/null || true
     rm -f "$UNIT"

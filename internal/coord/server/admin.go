@@ -78,6 +78,18 @@ func (s *Server) AdminHandler(fingerprint, publicURL string) http.Handler {
 		s.mu.Unlock()
 		json.NewEncoder(w).Encode(nodes)
 	})
+	mux.HandleFunc("DELETE /nodes", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		if err := s.RemoveNode(name); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.HandleFunc("PUT /policy", func(w http.ResponseWriter, r *http.Request) {
 		var p acl.Policy
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {

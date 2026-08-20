@@ -287,6 +287,15 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	node, ok := s.nodeByKey(msg.Hello.NodeKey)
 	s.mu.Unlock()
 	if !ok {
+		// Most often this node was removed from the mesh. Say so, so the
+		// client can print something actionable rather than reconnecting
+		// forever against a server that will never accept it.
+		if payload, err := coord.EncodeControl(coord.Envelope{
+			T:      coord.MsgReject,
+			Reject: &coord.Reject{Reason: "this node is not enrolled (it may have been removed) — re-enroll with a new key"},
+		}); err == nil {
+			coord.WriteFrame(conn, coord.FrameControl, payload)
+		}
 		conn.Close()
 		return
 	}
@@ -395,6 +404,13 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 				return
 			}
 			switch msg.T {
+			case coord.MsgLeave:
+				// Authenticated by the session handshake: this node
+				// proved its private key to get here.
+				if err := s.removeNodeByID(sess.id); err != nil {
+					return
+				}
+				return
 			case coord.MsgEndpoints:
 				s.mu.Lock()
 				s.endpoints[sess.id] = msg.Endpoints

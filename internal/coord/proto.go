@@ -79,6 +79,13 @@ const (
 	MsgNetmap    = "netmap"
 	MsgEndpoints = "endpoints"
 	MsgDiscoFwd  = "disco_fwd"
+	// MsgLeave asks the server to forget this node entirely. It is only
+	// honored on an authenticated session, so possession of the node key
+	// is already proven.
+	MsgLeave = "leave"
+	// MsgReject tells a client why the server will not open a session,
+	// so it can report something actionable instead of retrying blindly.
+	MsgReject = "reject"
 )
 
 // Envelope is the tagged union carried by control frames; T selects which
@@ -91,6 +98,12 @@ type Envelope struct {
 	Netmap    *netmap.Netmap   `json:"netmap,omitempty"`
 	Endpoints []netip.AddrPort `json:"endpoints,omitempty"`
 	DiscoFwd  *DiscoFwd        `json:"disco_fwd,omitempty"`
+	Reject    *Reject          `json:"reject,omitempty"`
+}
+
+// Reject explains a refused session.
+type Reject struct {
+	Reason string `json:"reason"`
 }
 
 type Hello struct {
