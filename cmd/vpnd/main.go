@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"text/tabwriter"
+	"time"
 
 	"vpnmesh/internal/coord/server"
 	"vpnmesh/internal/pin"
@@ -39,10 +40,19 @@ func run(args []string) error {
 	case "serve":
 		return serve(args[1:])
 	case "key":
-		if len(args) < 2 || args[1] != "new" {
-			return fmt.Errorf("usage: vpnd key new")
+		if len(args) < 2 {
+			return fmt.Errorf("usage: vpnd key <new|ls|revoke> ...")
 		}
-		return keyNew(args[2:])
+		switch args[1] {
+		case "new":
+			return keyNew(args[2:])
+		case "ls":
+			return keyLs(args[2:])
+		case "revoke":
+			return keyRevoke(args[2:])
+		default:
+			return fmt.Errorf("usage: vpnd key <new|ls|revoke> ...")
+		}
 	case "node":
 		if len(args) < 2 || args[1] != "ls" {
 			return fmt.Errorf("usage: vpnd node ls")
@@ -155,9 +165,12 @@ func adminClient(stateDir string) *http.Client {
 func keyNew(args []string) error {
 	fs := flag.NewFlagSet("key new", flag.ExitOnError)
 	stateDir := stateDirFlag(fs)
+	reusable := fs.Bool("reusable", false, "allow the key to enroll multiple nodes")
+	ttl := fs.Duration("ttl", 24*time.Hour, "how long the key stays valid")
 	fs.Parse(args)
 
-	resp, err := adminClient(*stateDir).Post("http://vpnd/enroll-keys", "application/json", nil)
+	u := fmt.Sprintf("http://vpnd/enroll-keys?ttl=%s&reusable=%v", url.QueryEscape(ttl.String()), *reusable)
+	resp, err := adminClient(*stateDir).Post(u, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("is vpnd running? %w", err)
 	}
@@ -242,6 +255,55 @@ func aclCheck(args []string) error {
 	} else {
 		fmt.Println("denied")
 	}
+	return nil
+}
+
+func keyLs(args []string) error {
+	fs := flag.NewFlagSet("key ls", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+
+	resp, err := adminClient(*stateDir).Get("http://vpnd/enroll-keys")
+	if err != nil {
+		return fmt.Errorf("is vpnd running? %w", err)
+	}
+	defer resp.Body.Close()
+	var keys []server.AdminKey
+	if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "PREFIX\tREUSABLE\tUSED\tREVOKED\tEXPIRES")
+	for _, k := range keys {
+		exp := "never"
+		if !k.ExpiresAt.IsZero() {
+			exp = k.ExpiresAt.Local().Format("2006-01-02 15:04")
+			if time.Now().After(k.ExpiresAt) {
+				exp += " (expired)"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%v\t%v\t%v\t%s\n", k.Prefix, k.Reusable, k.Used, k.Revoked, exp)
+	}
+	return tw.Flush()
+}
+
+func keyRevoke(args []string) error {
+	fs := flag.NewFlagSet("key revoke", flag.ExitOnError)
+	stateDir := stateDirFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: vpnd key revoke <prefix>")
+	}
+	resp, err := adminClient(*stateDir).Post("http://vpnd/enroll-keys/revoke?prefix="+url.QueryEscape(fs.Arg(0)), "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("is vpnd running? %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s", bytes.TrimSpace(msg))
+	}
+	fmt.Println("revoked")
 	return nil
 }
 

@@ -63,7 +63,7 @@ echo "== starting vpnd"
 ip netns exec vpnlab-srv "$WORK/vpnd" serve --state-dir "$WORK/srv" --listen :8443 &
 sleep 1
 
-KEY=$(ip netns exec vpnlab-srv "$WORK/vpnd" key new --state-dir "$WORK/srv")
+KEY=$(ip netns exec vpnlab-srv "$WORK/vpnd" key new --reusable --ttl 1h --state-dir "$WORK/srv")
 echo "== enrollment key: $KEY"
 
 echo "== starting clients"

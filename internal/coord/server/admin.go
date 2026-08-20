@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"vpnmesh/internal/acl"
 	"vpnmesh/internal/netmap"
@@ -18,6 +19,17 @@ type AdminNode struct {
 	IP     netip.Addr    `json:"ip"`
 	Online bool          `json:"online"`
 	Tags   []string      `json:"tags,omitempty"`
+}
+
+// AdminKey is the CLI-facing view of an enrollment key: the secret itself
+// is only revealed at mint time.
+type AdminKey struct {
+	Prefix    string    `json:"prefix"`
+	Reusable  bool      `json:"reusable"`
+	Used      bool      `json:"used"`
+	Revoked   bool      `json:"revoked"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // AdminHandler serves the local admin API (bound to a unix socket by vpnd).
@@ -67,12 +79,39 @@ func (s *Server) AdminHandler(fingerprint string) http.Handler {
 		json.NewEncoder(w).Encode(map[string]bool{"allowed": allowed})
 	})
 	mux.HandleFunc("POST /enroll-keys", func(w http.ResponseWriter, r *http.Request) {
-		secret, err := s.NewEnrollKey()
+		ttl := 24 * time.Hour
+		if v := r.URL.Query().Get("ttl"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				http.Error(w, "bad ttl: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			ttl = d
+		}
+		reusable := r.URL.Query().Get("reusable") == "true"
+		secret, err := s.MintEnrollKey(ttl, reusable)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"key": pin.FormatEnrollKey(secret, fingerprint)})
+	})
+	mux.HandleFunc("GET /enroll-keys", func(w http.ResponseWriter, r *http.Request) {
+		var out []AdminKey
+		for _, k := range s.EnrollKeys() {
+			out = append(out, AdminKey{
+				Prefix: k.Secret[:8], Reusable: k.Reusable, Used: k.Used,
+				Revoked: k.Revoked, CreatedAt: k.CreatedAt, ExpiresAt: k.ExpiresAt,
+			})
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("POST /enroll-keys/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.RevokeEnrollKey(r.URL.Query().Get("prefix")); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 	return mux
 }

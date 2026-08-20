@@ -134,6 +134,67 @@ func TestAdminPolicyRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestAdminKeyLifecycle(t *testing.T) {
+	e := startServer(t)
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	defer admin.Close()
+
+	// Default mint: one-time. With ?reusable=true: reusable.
+	resp, err := http.Post(admin.URL+"/enroll-keys?reusable=true&ttl=1h", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// startServer minted a baseline key; ours is the newest entry.
+	resp, err = http.Get(admin.URL + "/enroll-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []server.AdminKey
+	if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	mine := keys[len(keys)-1]
+	if !mine.Reusable || mine.Revoked {
+		t.Fatalf("minted key = %+v, want reusable unrevoked", mine)
+	}
+
+	resp, err = http.Post(admin.URL+"/enroll-keys/revoke?prefix="+mine.Prefix, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke = %s", resp.Status)
+	}
+
+	resp, _ = http.Get(admin.URL + "/enroll-keys")
+	keys = nil
+	json.NewDecoder(resp.Body).Decode(&keys)
+	resp.Body.Close()
+	if got := keys[len(keys)-1]; !got.Revoked {
+		t.Fatalf("after revoke: %+v", got)
+	}
+}
+
+func TestAdminMintDefaultsToOneTime(t *testing.T) {
+	e := startServer(t)
+	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))
+	defer admin.Close()
+
+	resp, err := http.Post(admin.URL+"/enroll-keys", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	keys := e.srv.EnrollKeys()
+	if got := keys[len(keys)-1]; got.Reusable {
+		t.Fatalf("default-minted key = %+v, want one-time", got)
+	}
+}
+
 func TestAdminNewEnrollKeyReturnsFullPinnedKey(t *testing.T) {
 	e := startServer(t)
 	admin := httptest.NewServer(e.srv.AdminHandler("feedface"))

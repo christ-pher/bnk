@@ -198,6 +198,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.st.EnrollKeys[keyIdx].Used = true
+	keyConsumed := !s.st.EnrollKeys[keyIdx].Reusable
 
 	node, ok := s.nodeByKey(req.NodeKey)
 	if !ok {
@@ -225,6 +226,14 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: time.Now().UTC(),
 		}
 		s.st.Nodes = append(s.st.Nodes, node)
+		if err := s.fs.Save(s.st); err != nil {
+			s.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if ok && keyConsumed {
+		// The new-node path saved already; persist consumption here too.
 		if err := s.fs.Save(s.st); err != nil {
 			s.mu.Unlock()
 			http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -129,7 +129,7 @@ echo "== starting vpnd"
 ip netns exec punch-srv "$WORK/vpnd" serve --state-dir "$WORK/srv" --listen :8443 \
     >"$WORK/srv.log" 2>&1 &
 sleep 1
-KEY=$(ip netns exec punch-srv "$WORK/vpnd" key new --state-dir "$WORK/srv")
+KEY=$(ip netns exec punch-srv "$WORK/vpnd" key new --reusable --ttl 1h --state-dir "$WORK/srv")
 
 echo "== starting clients (each behind its own NAT)"
 ip netns exec punch-a "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
