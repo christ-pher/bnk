@@ -101,6 +101,11 @@ func New(tunDev tun.Device, privateKey, discoPriv, discoPub [32]byte) (*Engine, 
 	return e, nil
 }
 
+// DiscoEvents returns the path manager's packet-level debug transcript.
+func (e *Engine) DiscoEvents() []string {
+	return e.pm.Events()
+}
+
 // PeerDebug exposes the path manager's diagnostic snapshot for a peer.
 func (e *Engine) PeerDebug(key magicsock.NodeKey) (magicsock.PeerDebug, bool) {
 	return e.pm.PeerDebug(key)

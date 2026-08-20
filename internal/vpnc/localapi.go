@@ -81,9 +81,13 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 		peers := map[string]any{}
 		for _, p := range cache.get().Peers {
 			if d, ok := engine.PeerDebug(magicsock.NodeKey(p.NodeKey)); ok {
+				lastPong := "never"
+				if d.HasPong {
+					lastPong = d.LastPongAge.Round(time.Millisecond).String()
+				}
 				peers[p.Name] = map[string]any{
 					"best":          d.Best.String(),
-					"last_pong_ago": d.LastPongAge.Round(time.Millisecond).String(),
+					"last_pong_ago": lastPong,
 					"last_ping_ago": d.LastPingAge.Round(time.Millisecond).String(),
 					"candidates":    d.Candidates,
 				}
@@ -94,6 +98,7 @@ func serveLocalAPI(ctx context.Context, stateDir string, cache *netmapCache, eng
 			"relay_tx":        tx,
 			"relay_rx":        rx,
 			"peers":           peers,
+			"disco_events":    engine.DiscoEvents(),
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()

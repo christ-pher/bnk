@@ -60,6 +60,41 @@ type PathManager struct {
 	pings      map[[12]byte]sentPing
 	waiters    map[[12]byte]chan PingResult // Ping() calls awaiting pongs
 	selfEps    []netip.AddrPort
+
+	evMu   sync.Mutex
+	events []event
+}
+
+// event is one entry in the disco debug log.
+type event struct {
+	at  time.Time
+	msg string
+}
+
+const maxEvents = 256
+
+// logEvent appends to the debug ring. Never call with pm.mu held rules
+// don't apply — it uses its own lock.
+func (pm *PathManager) logEvent(format string, args ...any) {
+	pm.evMu.Lock()
+	defer pm.evMu.Unlock()
+	pm.events = append(pm.events, event{at: pm.cfg.Clock(), msg: fmt.Sprintf(format, args...)})
+	if len(pm.events) > maxEvents {
+		pm.events = pm.events[len(pm.events)-maxEvents:]
+	}
+}
+
+// Events renders the disco debug log, oldest first, with ages relative to
+// now — the packet-level transcript for debugging traversal.
+func (pm *PathManager) Events() []string {
+	now := pm.cfg.Clock()
+	pm.evMu.Lock()
+	defer pm.evMu.Unlock()
+	out := make([]string, len(pm.events))
+	for i, e := range pm.events {
+		out[i] = fmt.Sprintf("%8s ago  %s", now.Sub(e.at).Round(10*time.Millisecond), e.msg)
+	}
+	return out
 }
 
 func NewPathManager(cfg PathManagerConfig) *PathManager {
@@ -141,7 +176,11 @@ func (pm *PathManager) TriggerProbe(key NodeKey) {
 
 	if len(selfEps) > 0 {
 		cmm := disco.Seal(disco.CallMeMaybe{Endpoints: selfEps}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, discoKey)
-		pm.cfg.SendFwd(key, cmm)
+		if err := pm.cfg.SendFwd(key, cmm); err != nil {
+			pm.logEvent("cmm-tx %v ERR %v", selfEps, err)
+		} else {
+			pm.logEvent("cmm-tx %v", selfEps)
+		}
 	}
 	pm.pingAll(key, discoKey, cands)
 }
@@ -168,7 +207,11 @@ func (pm *PathManager) pingAll(key NodeKey, discoKey [32]byte, addrs []netip.Add
 		}
 		pm.mu.Unlock()
 		pkt := disco.Seal(disco.Ping{TxID: txid}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, discoKey)
-		pm.cfg.SendRaw(addr, pkt)
+		if err := pm.cfg.SendRaw(addr, pkt); err != nil {
+			pm.logEvent("ping-tx %s ERR %v", addr, err)
+		} else {
+			pm.logEvent("ping-tx %s", addr)
+		}
 	}
 }
 
@@ -183,11 +226,13 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 	ps := pm.peers[key]
 	pm.mu.Unlock()
 	if !known || ps == nil {
+		pm.logEvent("drop %s: unknown disco sender", src)
 		return // decryption is not authentication: sender must be a known peer
 	}
 
 	switch m := msg.(type) {
 	case disco.Ping:
+		pm.logEvent("ping-rx %s", src)
 		// A ping proves the peer can reach us at this path; answer with
 		// their observed address and remember theirs as a candidate —
 		// unless it arrived through the tunnel itself.
@@ -202,7 +247,11 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 			pm.mu.Unlock()
 		}
 		pong := disco.Seal(disco.Pong{TxID: m.TxID, Observed: src}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, ps.discoKey)
-		pm.cfg.SendRaw(src, pong)
+		if err := pm.cfg.SendRaw(src, pong); err != nil {
+			pm.logEvent("pong-tx %s ERR %v", src, err)
+		} else {
+			pm.logEvent("pong-tx %s", src)
+		}
 	case disco.Pong:
 		pm.mu.Lock()
 		sp, outstanding := pm.pings[m.TxID]
@@ -211,6 +260,7 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 		}
 		if !outstanding || sp.peer != key {
 			pm.mu.Unlock()
+			pm.logEvent("pong-rx %s UNMATCHED (outstanding=%v)", src, outstanding)
 			return
 		}
 		now := pm.cfg.Clock()
@@ -225,10 +275,13 @@ func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
 			delete(pm.waiters, m.TxID)
 		}
 		pm.mu.Unlock()
+		pm.logEvent("pong-rx %s (path %s proven)", src, sp.to)
 		if promote {
+			pm.logEvent("promote %s", sp.to)
 			pm.cfg.SetAddr(key, sp.to)
 		}
 	case disco.CallMeMaybe:
+		pm.logEvent("cmm-rx-udp %s %v", src, m.Endpoints)
 		pm.punch(key, ps, m.Endpoints)
 	}
 }
@@ -248,6 +301,7 @@ func (pm *PathManager) HandleDiscoFwd(payload []byte) {
 		return
 	}
 	if cmm, ok := msg.(disco.CallMeMaybe); ok {
+		pm.logEvent("cmm-rx %v", cmm.Endpoints)
 		pm.punch(key, ps, cmm.Endpoints)
 	}
 }
@@ -278,7 +332,8 @@ func (pm *PathManager) punch(key NodeKey, ps *peerState, eps []netip.AddrPort) {
 // PeerDebug is a diagnostic snapshot of one peer's path state.
 type PeerDebug struct {
 	Best        netip.AddrPort
-	LastPongAge time.Duration // since the last proof of life (0 if never)
+	HasPong     bool          // false: no pong has EVER arrived
+	LastPongAge time.Duration // since the last proof of life
 	LastPingAge time.Duration
 	Candidates  []netip.AddrPort
 }
@@ -293,6 +348,7 @@ func (pm *PathManager) PeerDebug(key NodeKey) (PeerDebug, bool) {
 	now := pm.cfg.Clock()
 	d := PeerDebug{Best: ps.best, Candidates: candidateList(ps)}
 	if !ps.lastPong.IsZero() {
+		d.HasPong = true
 		d.LastPongAge = now.Sub(ps.lastPong)
 	}
 	if !ps.lastPing.IsZero() {
@@ -337,7 +393,11 @@ func (pm *PathManager) Ping(key NodeKey, timeout time.Duration) (PingResult, err
 		pm.waiters[txid] = ch
 		pm.mu.Unlock()
 		txids = append(txids, txid)
-		pm.cfg.SendRaw(addr, disco.Seal(disco.Ping{TxID: txid}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, discoKey))
+		if err := pm.cfg.SendRaw(addr, disco.Seal(disco.Ping{TxID: txid}, pm.cfg.DiscoPriv, pm.cfg.DiscoPub, discoKey)); err != nil {
+			pm.logEvent("ping-tx %s (diag) ERR %v", addr, err)
+		} else {
+			pm.logEvent("ping-tx %s (diag)", addr)
+		}
 	}
 	defer func() {
 		pm.mu.Lock()
@@ -397,6 +457,7 @@ func (pm *PathManager) Tick() {
 
 	for _, a := range acts {
 		if a.demote {
+			pm.logEvent("demote (silence)")
 			pm.cfg.ClearAddr(a.key)
 		}
 		if a.ping.IsValid() {

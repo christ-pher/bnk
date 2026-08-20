@@ -158,6 +158,8 @@ ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
 echo "== netcheck (alpha side): path-manager state and relay counters"
 NETCHECK=$(ip netns exec punch-a "$WORK/vpn" netcheck --state-dir "$WORK/a" 2>&1 || true)
 echo "$NETCHECK"
+echo "== netcheck (beta side)"
+ip netns exec punch-b "$WORK/vpn" netcheck --state-dir "$WORK/b" 2>&1 || true
 BEST=$(echo "$NETCHECK" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(iter(d.get("peers",{}).values()),{}).get("best",""))' 2>/dev/null || true)
 
 if [[ "$MODE" == "symmetric" ]]; then
