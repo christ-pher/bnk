@@ -1,0 +1,154 @@
+name: windows
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+# Runtime checks for the Windows client. Cross-compiling proves it
+# builds; this proves it does the right thing when Windows runs it. The
+# service-registration assertion exists because a bug that registered
+# the service without its arguments shipped once: it compiled, vetted,
+# and cross-built cleanly, and only failed when the SCM started it.
+jobs:
+  service:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          go build -o bnk.exe ./cmd/bnk
+          go build -ldflags "-H=windowsgui" -o bnk-tray.exe ./cmd/bnk-tray
+          go build -o bnk-server.exe ./cmd/bnk-server
+
+      - name: Service registers with its arguments
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Join-Path $env:RUNNER_TEMP 'bnkstate'
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+          .\bnk.exe service install --server https://example.invalid:8443 --state-dir $state --operator $sid
+          $svc = Get-CimInstance Win32_Service -Filter "Name='bnk'"
+          if (-not $svc) { throw 'service was not registered at all' }
+          Write-Host "registered: $($svc.PathName)"
+
+          # The bug this guards: Config.BinaryPathName is ignored by
+          # CreateService, so the arguments have to be passed variadically.
+          if ($svc.PathName -notmatch '\srun(\s|$)') {
+            throw "service registered without its run subcommand: $($svc.PathName)"
+          }
+          foreach ($needle in @('--server', 'https://example.invalid:8443', '--state-dir', '--operator', $sid)) {
+            if ($svc.PathName -notlike "*$needle*") {
+              throw "registered command line is missing ${needle}: $($svc.PathName)"
+            }
+          }
+          if ($svc.StartMode -ne 'Auto') { throw "start mode is $($svc.StartMode), want Auto" }
+
+      - name: Re-installing updates the registration and drops a spent key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $state = Join-Path $env:RUNNER_TEMP 'bnkstate'
+          .\bnk.exe service install --server https://example.invalid:8443 --state-dir $state --key 'bnkkey:secret:fp'
+          $withKey = (Get-CimInstance Win32_Service -Filter "Name='bnk'").PathName
+          if ($withKey -notlike '*--key*') { throw "key missing after install with a key: $withKey" }
+
+          # The installer re-registers without the key once enrolled; a
+          # spent key must not survive into the service arguments.
+          .\bnk.exe service install --server https://example.invalid:8443 --state-dir $state
+          $withoutKey = (Get-CimInstance Win32_Service -Filter "Name='bnk'").PathName
+          if ($withoutKey -like '*--key*') { throw "spent key survived re-registration: $withoutKey" }
+
+      - name: Uninstall removes the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\bnk.exe service uninstall
+          if (Get-CimInstance Win32_Service -Filter "Name='bnk'") {
+            throw 'service still registered after uninstall'
+          }
+
+  # A real mesh, entirely on the runner: the control server and a client
+  # on one machine. This exercises Wintun adapter creation, enrollment,
+  # and the named-pipe split that no amount of cross-compiling can check.
+  loopback:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          go build -o bnk.exe ./cmd/bnk
+          go build -o bnk-server.exe ./cmd/bnk-server
+
+      - name: Fetch Wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $want = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $got = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) { throw "wintun checksum $got, want $want" }
+          Expand-Archive wintun.zip -DestinationPath . -Force
+          Copy-Item wintun\bin\amd64\wintun.dll .\wintun.dll
+
+      - name: Client joins a local mesh over a real tunnel
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $srvState = Join-Path $env:RUNNER_TEMP 'srv'
+          $cliState = Join-Path $env:RUNNER_TEMP 'cli'
+
+          $srv = Start-Process -FilePath .\bnk-server.exe `
+            -ArgumentList 'serve','--state-dir',$srvState,'--listen',':8443' `
+            -PassThru -RedirectStandardOutput srv.log -RedirectStandardError srv.err
+          Start-Sleep -Seconds 3
+
+          $key = (.\bnk-server.exe key new --state-dir $srvState 2>$null)
+          if (-not $key) { throw 'no enrollment key minted' }
+          Write-Host "key: $($key.Substring(0,20))..."
+
+          $pipe = '\\.\pipe\bnk-ci'
+          $cli = Start-Process -FilePath .\bnk.exe `
+            -ArgumentList 'run','--server','https://127.0.0.1:8443','--key',$key,
+                          '--state-dir',$cliState,'--socket',$pipe,'--ifname','bnkci0' `
+            -PassThru -RedirectStandardOutput cli.log -RedirectStandardError cli.err
+
+          # Wintun installs its driver on first use, so allow real time.
+          $joined = $false
+          foreach ($i in 1..60) {
+            $out = .\bnk.exe status --socket $pipe 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out -notmatch '^bnk is down') { $joined = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $joined) {
+            Write-Host '--- client log ---'; Get-Content cli.log,cli.err -ErrorAction SilentlyContinue
+            Write-Host '--- server log ---'; Get-Content srv.log,srv.err -ErrorAction SilentlyContinue
+            throw 'client never came up'
+          }
+
+          Write-Host '--- bnk status ---'
+          .\bnk.exe status --socket $pipe
+
+          # The adapter must actually exist: enrollment alone would pass
+          # the check above even if Wintun had failed.
+          $adapter = Get-NetAdapter -Name 'bnkci0' -ErrorAction SilentlyContinue
+          if (-not $adapter) { throw 'the bnkci0 Wintun adapter was never created' }
+          Write-Host "adapter: $($adapter.Name) $($adapter.Status)"
+
+          $ip = (Get-NetIPAddress -InterfaceAlias 'bnkci0' -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+          if (-not $ip) { throw 'the adapter has no IPv4 address' }
+          Write-Host "adapter address: $ip"
+          if ($ip -notlike '100.*') { throw "adapter address $ip is outside the mesh range" }
+
+          Stop-Process -Id $cli.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
