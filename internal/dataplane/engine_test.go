@@ -29,6 +29,7 @@ type node struct {
 	engine *dataplane.Engine
 	net    *netstack.Net
 	ip     netip.Addr
+	sess   *client.Session
 }
 
 func newKeypair(t *testing.T) (priv [32]byte, pub netmap.Key) {

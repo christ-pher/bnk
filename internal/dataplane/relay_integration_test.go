@@ -59,7 +59,7 @@ func startRelayOnlyClient(t *testing.T, url, enrollKey, name string) *node {
 	engine.SetRelaySender(func(dst uint32, pkt []byte) error {
 		return sess.SendRelay(netmap.NodeID(dst), pkt)
 	})
-	return &node{engine: engine, net: tnet, ip: resp.IP}
+	return &node{engine: engine, net: tnet, ip: resp.IP, sess: sess}
 }
 
 func TestTunnelComesUpViaRelayWhenPeersShareNoEndpoints(t *testing.T) {
