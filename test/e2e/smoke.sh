@@ -24,7 +24,7 @@ NS=(vpnlab-srv vpnlab-a vpnlab-b)
 
 # Pre-clean leftovers from any earlier aborted run.
 pkill -f "$WORK/vpnd serve" 2>/dev/null || true
-pkill -f "$WORK/vpn up" 2>/dev/null || true
+pkill -f "$WORK/vpn run" 2>/dev/null || true
 for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
 ip link del vpnlab-br 2>/dev/null || true
 rm -rf "$WORK"
@@ -36,7 +36,7 @@ go build -o "$WORK/vpn" ./cmd/vpn
 cleanup() {
     set +e
     pkill -f "$WORK/vpnd serve" 2>/dev/null
-    pkill -f "$WORK/vpn up" 2>/dev/null
+    pkill -f "$WORK/vpn run" 2>/dev/null
     for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null; done
     ip link del vpnlab-br 2>/dev/null
     rm -rf "$WORK"
@@ -67,10 +67,10 @@ KEY=$(ip netns exec vpnlab-srv "$WORK/vpnd" key new --reusable --ttl 1h --state-
 echo "== enrollment key: $KEY"
 
 echo "== starting clients"
-ip netns exec vpnlab-a "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/a" --name alpha &
-ip netns exec vpnlab-b "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/b" --name beta &
+ip netns exec vpnlab-a "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/a" --socket "$WORK/a/vpn.sock" --name alpha &
+ip netns exec vpnlab-b "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/b" --socket "$WORK/b/vpn.sock" --name beta &
 
 echo "== waiting for tunnel"
 for i in $(seq 1 30); do

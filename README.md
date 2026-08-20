@@ -26,26 +26,28 @@ Diagnostics: `vpn status` (per-peer path: direct/relay), `vpn ping <peer>`
   key — no CA, no domain required.
 
 **Deploying for real?** Follow [DEPLOY.md](DEPLOY.md) — VPS control plane
-plus clients, step by step, ~25 minutes.
+plus clients via the install scripts, ~10 minutes.
 
 ## Quickstart
 
 Server (any Linux box with a public IP):
 
 ```
-vpnd serve --state-dir /var/lib/vpnd --listen :8443
-vpnd key new --state-dir /var/lib/vpnd   # prints vpnkey:<secret>:<fingerprint>
+sudo ./install-server.sh     # installs vpnd + systemd unit, prints next steps
+sudo vpnd key new            # prints vpnkey:<secret>:<fingerprint>, one per client
 ```
 
-Each client (Linux, as root):
+Each client (Linux):
 
 ```
-vpn up --server https://YOUR_SERVER:8443 --key vpnkey:...
+sudo ./install-client.sh --server https://YOUR_SERVER:8443 --key vpnkey:...
 ```
 
-The enrollment key is only needed the first time; after that `vpn up
---server ...` resumes from saved state. `vpnd node ls` shows the mesh and
-`vpn status` shows each peer's path (direct or relay) and handshake age.
+The enrollment key is single-use; the node's identity persists in
+`/var/lib/vpn`. Day to day: `vpn status` (no sudo needed) shows every
+node's path (direct or relay) and handshake age, `vpn down` / `vpn up`
+disconnect and reconnect, `vpnd node ls` on the server shows the mesh,
+and `vpnd down` / `vpnd up` stop and start the control server.
 
 Access control (see `policy.example.json`):
 

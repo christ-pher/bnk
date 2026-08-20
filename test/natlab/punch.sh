@@ -24,7 +24,7 @@ NS=(punch-srv punch-nata punch-natb punch-a punch-b)
 
 # Pre-clean leftovers from any earlier aborted run, so reruns always work.
 pkill -f "$WORK/vpnd serve" 2>/dev/null || true
-pkill -f "$WORK/vpn up" 2>/dev/null || true
+pkill -f "$WORK/vpn run" 2>/dev/null || true
 for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null || true; done
 ip link del punch-br 2>/dev/null || true
 rm -rf "$WORK"
@@ -36,7 +36,7 @@ go build -o "$WORK/vpn" ./cmd/vpn
 cleanup() {
     set +e
     pkill -f "$WORK/vpnd serve" 2>/dev/null
-    pkill -f "$WORK/vpn up" 2>/dev/null
+    pkill -f "$WORK/vpn run" 2>/dev/null
     for ns in "${NS[@]}"; do ip netns del "$ns" 2>/dev/null; done
     ip link del punch-br 2>/dev/null
     rm -rf "$WORK"
@@ -132,10 +132,10 @@ sleep 1
 KEY=$(ip netns exec punch-srv "$WORK/vpnd" key new --reusable --ttl 1h --state-dir "$WORK/srv")
 
 echo "== starting clients (each behind its own NAT)"
-ip netns exec punch-a "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/a" --name alpha >"$WORK/a.log" 2>&1 &
-ip netns exec punch-b "$WORK/vpn" up --server https://10.99.0.1:8443 --key "$KEY" \
-    --state-dir "$WORK/b" --name beta >"$WORK/b.log" 2>&1 &
+ip netns exec punch-a "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/a" --socket "$WORK/a/vpn.sock" --name alpha >"$WORK/a.log" 2>&1 &
+ip netns exec punch-b "$WORK/vpn" run --server https://10.99.0.1:8443 --key "$KEY" \
+    --state-dir "$WORK/b" --socket "$WORK/b/vpn.sock" --name beta >"$WORK/b.log" 2>&1 &
 
 echo "== waiting for tunnel (relay path first)"
 B_IP=""
@@ -155,7 +155,7 @@ echo "== tunnel is up (alpha pinged beta at $B_IP)"
 echo "== waiting for direct path"
 DIRECT=no
 for i in $(seq 1 60); do
-    if ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" 2>/dev/null | grep -q direct; then
+    if ip netns exec punch-a "$WORK/vpn" status --socket "$WORK/a/vpn.sock" 2>/dev/null | grep -q direct; then
         DIRECT=yes
         break
     fi
@@ -163,18 +163,18 @@ for i in $(seq 1 60); do
 done
 
 # The peer name as seen from client a depends on enrollment order.
-PEER=$(ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" 2>/dev/null | awk 'NR>2 {print $1; exit}')
+PEER=$(ip netns exec punch-a "$WORK/vpn" status --socket "$WORK/a/vpn.sock" 2>/dev/null | awk 'NR>2 && $1 !~ /\*$/ {print $1; exit}')
 echo "== vpn ping ${PEER:-?} (twice, with status before/after)"
-ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
-ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
-ip netns exec punch-a "$WORK/vpn" ping --state-dir "$WORK/a" "$PEER" || true
-ip netns exec punch-a "$WORK/vpn" status --state-dir "$WORK/a" || true
+ip netns exec punch-a "$WORK/vpn" status --socket "$WORK/a/vpn.sock" || true
+ip netns exec punch-a "$WORK/vpn" ping --socket "$WORK/a/vpn.sock" "$PEER" || true
+ip netns exec punch-a "$WORK/vpn" ping --socket "$WORK/a/vpn.sock" "$PEER" || true
+ip netns exec punch-a "$WORK/vpn" status --socket "$WORK/a/vpn.sock" || true
 
 echo "== netcheck (alpha side): path-manager state and relay counters"
-NETCHECK=$(ip netns exec punch-a "$WORK/vpn" netcheck --state-dir "$WORK/a" 2>&1 || true)
+NETCHECK=$(ip netns exec punch-a "$WORK/vpn" netcheck --socket "$WORK/a/vpn.sock" 2>&1 || true)
 echo "$NETCHECK"
 echo "== netcheck (beta side)"
-ip netns exec punch-b "$WORK/vpn" netcheck --state-dir "$WORK/b" 2>&1 || true
+ip netns exec punch-b "$WORK/vpn" netcheck --socket "$WORK/b/vpn.sock" 2>&1 || true
 BEST=$(echo "$NETCHECK" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(iter(d.get("peers",{}).values()),{}).get("best",""))' 2>/dev/null || true)
 
 if [[ "$MODE" == "symmetric" ]]; then
