@@ -26,9 +26,9 @@ import (
 	"github.com/christ-pher/bnk/internal/pin"
 )
 
-// DefaultSocket is the one place the daemon and the CLI agree on where
-// the local API lives when no --socket is given.
-const DefaultSocket = "/run/bnk/bnk.sock"
+// DefaultSocket and DefaultStateDir are per-OS (paths_linux.go,
+// paths_windows.go): the daemon and the CLI agree on them so neither
+// hardcodes a platform path.
 
 type Config struct {
 	ServerURL  string

@@ -8,11 +8,15 @@ import (
 	"net/netip"
 	"os/exec"
 	"strconv"
+
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 // Up assigns prefix (the node's IP with the mesh prefix length, so the
-// kernel derives the mesh route) and brings the interface up.
-func Up(ifName string, prefix netip.Prefix, mtu int) error {
+// kernel derives the mesh route) and brings the interface up. dev is
+// unused here — Linux addresses the interface by name — but Windows
+// needs it for the adapter LUID.
+func Up(dev tun.Device, ifName string, prefix netip.Prefix, mtu int) error {
 	cmds := [][]string{
 		{"ip", "addr", "add", prefix.String(), "dev", ifName},
 		{"ip", "link", "set", ifName, "up", "mtu", strconv.Itoa(mtu)},

@@ -15,10 +15,8 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -26,13 +24,17 @@ import (
 	"github.com/christ-pher/bnk/internal/cliutil"
 	"github.com/christ-pher/bnk/internal/netmap"
 	"github.com/christ-pher/bnk/internal/router"
-	"github.com/christ-pher/bnk/internal/selfupdate"
 	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
 // version is stamped by the release workflow (-X main.version=vX.Y.Z);
 // local builds report "dev".
 var version = "dev"
+
+const (
+	repoURL         = "https://github.com/christ-pher/bnk"
+	rawInstallerURL = "https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1"
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -43,7 +45,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|update|version|run> [flags]")
+		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|update|version|run|service> [flags]")
 	}
 	switch args[0] {
 	case "status":
@@ -60,15 +62,9 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	case "update":
-		if os.Geteuid() != 0 {
-			return fmt.Errorf("update replaces /usr/local/bin/bnk — run as root (sudo bnk update)")
-		}
-		return selfupdate.Run(selfupdate.Config{
-			BaseURL: "https://github.com/christ-pher/bnk",
-			Asset:   "bnk",
-			Version: version,
-			Service: "bnk",
-		})
+		return updateCmd()
+	case "service":
+		return serviceCmd(args[1:])
 	}
 	if args[0] != "run" {
 		return fmt.Errorf("usage: bnk run --server https://host:8443 [--key bnkkey:...] [flags]")
@@ -76,7 +72,7 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	serverURL := fs.String("server", "", "control server URL, e.g. https://bnk.example:8443")
 	enrollKey := fs.String("key", "", "enrollment key (bnkkey:...), required on first run")
-	stateDir := fs.String("state-dir", "/var/lib/bnk", "directory for client state")
+	stateDir := fs.String("state-dir", vpnc.DefaultStateDir, "directory for client state")
 	sock := socketFlag(fs)
 	name := fs.String("name", defaultHostname(), "node name shown to the mesh")
 	ifName := fs.String("ifname", "bnk0", "tunnel interface name")
@@ -86,10 +82,7 @@ func run(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	err := vpnc.Run(ctx, vpnc.Config{
+	return runDaemon(vpnc.Config{
 		ServerURL:  *serverURL,
 		EnrollKey:  *enrollKey,
 		StateDir:   *stateDir,
@@ -98,10 +91,6 @@ func run(args []string) error {
 		CreateTUN:  realTUN(*ifName),
 		Logf:       log.Printf,
 	})
-	if ctx.Err() != nil {
-		return nil // clean shutdown on signal
-	}
-	return err
 }
 
 // realTUN creates a kernel TUN device and applies OS addressing/routes.
@@ -109,13 +98,13 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 	return func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error) {
 		dev, err := tun.CreateTUN(ifName, mtu)
 		if err != nil {
-			return nil, nil, fmt.Errorf("create tun (root required?): %w", err)
+			return nil, nil, fmt.Errorf("create tun (%w)", adminHint(err))
 		}
 		name, err := dev.Name()
 		if err != nil {
 			name = ifName
 		}
-		if err := router.Up(name, prefix, mtu); err != nil {
+		if err := router.Up(dev, name, prefix, mtu); err != nil {
 			dev.Close()
 			return nil, nil, err
 		}
@@ -130,8 +119,7 @@ func socketFlag(fs *flag.FlagSet) *string {
 func localClient(sock string) *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", sock)
+			return dialLocal(ctx, sock)
 		},
 	}}
 }
@@ -150,10 +138,12 @@ func localGet(sock, path string, out any) error {
 }
 
 // localPost sends a control verb to the daemon and decodes the reply.
+// Control verbs travel on their own endpoint (a separate, admin-only
+// pipe on Windows; the same socket on Linux).
 func localPost(sock, path string) error {
-	resp, err := localClient(sock).Post("http://bnk"+path, "application/json", nil)
+	resp, err := localClient(controlEndpoint(sock)).Post("http://bnk"+path, "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("bnk daemon not running — start it with: systemctl start bnk (%w)", err)
+		return fmt.Errorf("%s (%w)", daemonDownHint, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

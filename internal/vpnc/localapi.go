@@ -4,10 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -34,47 +31,15 @@ func (c *netmapCache) get() netmap.Netmap {
 	return c.nm
 }
 
-// serveLocalAPI exposes daemon state to the CLI over a unix socket. The
-// socket is world-accessible (0666, dir 0755) so status and diagnostics
-// don't need root; private key material lives elsewhere. The caller owns
-// the returned listener and must close it on shutdown — closing must
-// finish before Run returns, or a restarting daemon can have its fresh
-// socket file unlinked by the old instance's teardown.
-func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-		return nil, err
-	}
-	// A connectable socket means another daemon is serving it; removing
-	// it would silently hijack that daemon's CLI. A stale file (daemon
-	// gone, nothing accepting) refuses the dial and is safe to replace.
-	if probe, err := net.DialTimeout("unix", sock, time.Second); err == nil {
-		probe.Close()
-		return nil, fmt.Errorf("another daemon is already serving %s", sock)
-	}
-	os.Remove(sock)
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(sock, 0o666); err != nil {
-		ln.Close()
-		return nil, err
-	}
+// The local API is split along privilege lines so each OS can enforce
+// the same policy with its own mechanism: diagnostics are readable by
+// any local user, control verbs are not. Linux mounts both sets on one
+// unix socket and gates control with SO_PEERCRED; Windows mounts them on
+// two named pipes whose ACLs do the gating.
 
-	// requireOwner gates control verbs: the socket is world-accessible
-	// so diagnostics work without root, but up/down must come from root
-	// or the uid the daemon runs as (SO_PEERCRED).
-	requireOwner := func(h http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			uid, ok := uidFromContext(r.Context())
-			if !ok || (uid != 0 && uid != os.Getuid()) {
-				http.Error(w, "permission denied: up/down need root (try sudo)", http.StatusForbidden)
-				return
-			}
-			h(w, r)
-		}
-	}
-
+// registerDiagnostics adds the read-only routes: they expose no secrets
+// and are safe for any local user.
+func registerDiagnostics(mux *http.ServeMux, c *controller) {
 	// withEngine gates handlers that need a live tunnel.
 	withEngine := func(h func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +52,6 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		}
 	}
 
-	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		engine := c.getEngine()
 		if engine == nil {
@@ -99,28 +63,6 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		out.Running = true
 		json.NewEncoder(w).Encode(out)
 	})
-	mux.HandleFunc("POST /up", requireOwner(func(w http.ResponseWriter, r *http.Request) {
-		if err := c.setDown(false); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if !c.waitEngine(r.Context(), true, 15*time.Second) {
-			http.Error(w, "still connecting; check daemon logs (journalctl -u bnk)", http.StatusGatewayTimeout)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"running": true})
-	}))
-	mux.HandleFunc("POST /down", requireOwner(func(w http.ResponseWriter, r *http.Request) {
-		if err := c.setDown(true); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if !c.waitEngine(r.Context(), false, 15*time.Second) {
-			http.Error(w, "tunnel did not shut down in time", http.StatusGatewayTimeout)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"running": false})
-	}))
 	mux.HandleFunc("GET /ping", withEngine(func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine) {
 		name := r.URL.Query().Get("peer")
 		var key magicsock.NodeKey
@@ -187,26 +129,37 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		}
 		json.NewEncoder(w).Encode(out)
 	}))
-	srv := &http.Server{
-		Handler: mux,
-		// Stamp each connection with the peer's uid so control verbs can
-		// distinguish root/daemon-owner from other local users.
-		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
-			if uid, ok := peerUID(conn); ok {
-				ctx = context.WithValue(ctx, peerUIDKey{}, uid)
-			}
-			return ctx
-		},
-	}
-	go srv.Serve(ln)
-	return ln, nil
 }
 
-type peerUIDKey struct{}
-
-func uidFromContext(ctx context.Context) (int, bool) {
-	uid, ok := ctx.Value(peerUIDKey{}).(int)
-	return uid, ok
+// registerControl adds the routes that change the tunnel's desired
+// state. gate wraps each handler with the platform's authorization check
+// (nil means the transport itself already restricted access).
+func registerControl(mux *http.ServeMux, c *controller, gate func(http.HandlerFunc) http.HandlerFunc) {
+	if gate == nil {
+		gate = func(h http.HandlerFunc) http.HandlerFunc { return h }
+	}
+	mux.HandleFunc("POST /up", gate(func(w http.ResponseWriter, r *http.Request) {
+		if err := c.setDown(false); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !c.waitEngine(r.Context(), true, 15*time.Second) {
+			http.Error(w, "still connecting; check the daemon logs", http.StatusGatewayTimeout)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"running": true})
+	}))
+	mux.HandleFunc("POST /down", gate(func(w http.ResponseWriter, r *http.Request) {
+		if err := c.setDown(true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !c.waitEngine(r.Context(), false, 15*time.Second) {
+			http.Error(w, "tunnel did not shut down in time", http.StatusGatewayTimeout)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"running": false})
+	}))
 }
 
 func buildStatus(nm netmap.Netmap, selfName string, paths []dataplane.PeerPath) Status {
