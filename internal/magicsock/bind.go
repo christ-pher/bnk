@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -137,6 +138,13 @@ func (b *Bind) receiveRelay(packets [][]byte, sizes []int, eps []conn.Endpoint) 
 	}
 }
 
+// batchIO reports whether recvmmsg/sendmmsg batching is safe to use.
+// x/net only implements the batch syscalls on Linux; elsewhere the
+// classic one-datagram calls are the correct path.
+func batchIO() bool {
+	return runtime.GOOS == "linux"
+}
+
 // receive reads datagrams in batches (recvmmsg) until at least one comes
 // from a known peer, tagging each with that peer's identity endpoint.
 // Unknown sources are dropped: only the path table (fed by the control
@@ -148,6 +156,9 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 	b.mu.Unlock()
 	if pc == nil {
 		return 0, net.ErrClosed
+	}
+	if !batchIO() {
+		return b.receiveOne(pc, packets, sizes, eps)
 	}
 	if len(b.rmsgs) < len(packets) {
 		b.rmsgs = make([]ipv6.Message, len(packets))
@@ -172,29 +183,8 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 			if !ok {
 				continue
 			}
-			src := ua.AddrPort()
-			// Disco traffic peels off before any peer check: hole-punch
-			// probes arrive from source addresses no table knows yet.
-			if disco.IsDisco(pkt) {
-				b.mu.Lock()
-				h := b.onDisco
-				b.mu.Unlock()
-				if h != nil {
-					h(normalize(src), append([]byte(nil), pkt...))
-				}
-				continue
-			}
-			if isSTUN(pkt) {
-				b.mu.Lock()
-				h := b.onSTUN
-				b.mu.Unlock()
-				if h != nil {
-					h(append([]byte(nil), pkt...))
-				}
-				continue
-			}
-			key, ok := b.lookupAddr(src)
-			if !ok {
+			key, keep := b.classify(pkt, ua.AddrPort())
+			if !keep {
 				continue
 			}
 			if out != i {
@@ -207,6 +197,50 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 		if out > 0 {
 			return out, nil
 		}
+	}
+}
+
+// classify demuxes one datagram: disco and STUN are dispatched to their
+// handlers (keep=false), known-peer WireGuard traffic returns its identity
+// (keep=true), and unknown sources are dropped. Disco peels off before any
+// peer check: hole-punch probes arrive from addresses no table knows yet.
+func (b *Bind) classify(pkt []byte, src netip.AddrPort) (key NodeKey, keep bool) {
+	if disco.IsDisco(pkt) {
+		b.mu.Lock()
+		h := b.onDisco
+		b.mu.Unlock()
+		if h != nil {
+			h(normalize(src), append([]byte(nil), pkt...))
+		}
+		return NodeKey{}, false
+	}
+	if isSTUN(pkt) {
+		b.mu.Lock()
+		h := b.onSTUN
+		b.mu.Unlock()
+		if h != nil {
+			h(append([]byte(nil), pkt...))
+		}
+		return NodeKey{}, false
+	}
+	key, ok := b.lookupAddr(src)
+	return key, ok
+}
+
+// receiveOne is the non-Linux receive path: one datagram per syscall.
+func (b *Bind) receiveOne(pc *net.UDPConn, packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	for {
+		n, src, err := pc.ReadFromUDPAddrPort(packets[0])
+		if err != nil {
+			return 0, err
+		}
+		key, keep := b.classify(packets[0][:n], src)
+		if !keep {
+			continue
+		}
+		sizes[0] = n
+		eps[0] = &endpoint{key: key}
+		return 1, nil
 	}
 }
 
@@ -299,6 +333,20 @@ func (b *Bind) sendBatch(bufs [][]byte, addr netip.AddrPort) error {
 	if br == nil {
 		return net.ErrClosed
 	}
+	if !batchIO() {
+		b.mu.Lock()
+		pc := b.pc
+		b.mu.Unlock()
+		if pc == nil {
+			return net.ErrClosed
+		}
+		for _, buf := range bufs {
+			if _, err := pc.WriteToUDPAddrPort(buf, addr); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	ua := net.UDPAddrFromAddrPort(addr)
 	msgsp := b.smsgPool.Get().(*[]ipv6.Message)
 	defer b.smsgPool.Put(msgsp)
@@ -322,6 +370,9 @@ func (b *Bind) sendBatch(bufs [][]byte, addr netip.AddrPort) error {
 }
 
 func (b *Bind) BatchSize() int {
+	if !batchIO() {
+		return 1
+	}
 	return conn.IdealBatchSize
 }
 

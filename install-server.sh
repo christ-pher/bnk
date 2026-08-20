@@ -52,7 +52,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now vpnd
+systemctl enable vpnd
+# restart, not `enable --now`: a re-run must replace a running daemon.
+systemctl restart vpnd
 
 # The fingerprint proves the server identity to enrolling clients; it is
 # printed on every start.

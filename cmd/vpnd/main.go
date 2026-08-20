@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"text/tabwriter"
 	"time"
 
 	"vpnmesh/internal/cliutil"
@@ -294,8 +293,7 @@ func keyLs(args []string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
 		return err
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PREFIX\tREUSABLE\tUSED\tREVOKED\tEXPIRES")
+	rows := make([][]string, 0, len(keys))
 	for _, k := range keys {
 		exp := "never"
 		if !k.ExpiresAt.IsZero() {
@@ -304,9 +302,10 @@ func keyLs(args []string) error {
 				exp += " (expired)"
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%v\t%v\t%v\t%s\n", k.Prefix, k.Reusable, k.Used, k.Revoked, exp)
+		rows = append(rows, []string{k.Prefix, fmt.Sprintf("%v", k.Reusable), fmt.Sprintf("%v", k.Used), fmt.Sprintf("%v", k.Revoked), exp})
 	}
-	return tw.Flush()
+	cliutil.Table(os.Stdout, []string{"PREFIX", "REUSABLE", "USED", "REVOKED", "EXPIRES"}, rows)
+	return nil
 }
 
 func keyRevoke(args []string) error {

@@ -106,11 +106,12 @@ func runClient(t *testing.T, ctx context.Context, tc *testControl, name, stateDi
 	go func() {
 		defer close(h.done)
 		err := vpnc.Run(ctx, vpnc.Config{
-			ServerURL: tc.url,
-			EnrollKey: enrollKey,
-			StateDir:  stateDir,
-			Hostname:  name,
-			CreateTUN: h.factory,
+			ServerURL:  tc.url,
+			EnrollKey:  enrollKey,
+			StateDir:   stateDir,
+			SocketPath: filepath.Join(stateDir, "vpn.sock"),
+			Hostname:   name,
+			CreateTUN:  h.factory,
 			// log.Printf, not t.Logf: this goroutine can outlive the test.
 			Logf: log.Printf,
 		})

@@ -44,6 +44,13 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
 		return nil, err
 	}
+	// A connectable socket means another daemon is serving it; removing
+	// it would silently hijack that daemon's CLI. A stale file (daemon
+	// gone, nothing accepting) refuses the dial and is safe to replace.
+	if probe, err := net.DialTimeout("unix", sock, time.Second); err == nil {
+		probe.Close()
+		return nil, fmt.Errorf("another daemon is already serving %s", sock)
+	}
 	os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
@@ -52,6 +59,20 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 	if err := os.Chmod(sock, 0o666); err != nil {
 		ln.Close()
 		return nil, err
+	}
+
+	// requireOwner gates control verbs: the socket is world-accessible
+	// so diagnostics work without root, but up/down must come from root
+	// or the uid the daemon runs as (SO_PEERCRED).
+	requireOwner := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			uid, ok := uidFromContext(r.Context())
+			if !ok || (uid != 0 && uid != os.Getuid()) {
+				http.Error(w, "permission denied: up/down need root (try sudo)", http.StatusForbidden)
+				return
+			}
+			h(w, r)
+		}
 	}
 
 	// withEngine gates handlers that need a live tunnel.
@@ -78,7 +99,7 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		out.Running = true
 		json.NewEncoder(w).Encode(out)
 	})
-	mux.HandleFunc("POST /up", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /up", requireOwner(func(w http.ResponseWriter, r *http.Request) {
 		if err := c.setDown(false); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -88,8 +109,8 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"running": true})
-	})
-	mux.HandleFunc("POST /down", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("POST /down", requireOwner(func(w http.ResponseWriter, r *http.Request) {
 		if err := c.setDown(true); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -99,7 +120,7 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"running": false})
-	})
+	}))
 	mux.HandleFunc("GET /ping", withEngine(func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine) {
 		name := r.URL.Query().Get("peer")
 		var key magicsock.NodeKey
@@ -166,8 +187,26 @@ func serveLocalAPI(sock string, c *controller) (net.Listener, error) {
 		}
 		json.NewEncoder(w).Encode(out)
 	}))
-	go http.Serve(ln, mux)
+	srv := &http.Server{
+		Handler: mux,
+		// Stamp each connection with the peer's uid so control verbs can
+		// distinguish root/daemon-owner from other local users.
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			if uid, ok := peerUID(conn); ok {
+				ctx = context.WithValue(ctx, peerUIDKey{}, uid)
+			}
+			return ctx
+		},
+	}
+	go srv.Serve(ln)
 	return ln, nil
+}
+
+type peerUIDKey struct{}
+
+func uidFromContext(ctx context.Context) (int, bool) {
+	uid, ok := ctx.Value(peerUIDKey{}).(int)
+	return uid, ok
 }
 
 func buildStatus(nm netmap.Netmap, selfName string, paths []dataplane.PeerPath) Status {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"log"
 	"net/netip"
+	"path/filepath"
 	"testing"
 
 	"vpnmesh/internal/vpnc"
@@ -17,11 +18,13 @@ import (
 func runDeadEndClient(t *testing.T, ctx context.Context, tc *testControl, name string, deadEp netip.AddrPort) *tnetHolder {
 	t.Helper()
 	h := &tnetHolder{}
+	stateDir := t.TempDir()
 	go func() {
 		err := vpnc.Run(ctx, vpnc.Config{
 			ServerURL:         tc.url,
 			EnrollKey:         tc.enrollKey,
-			StateDir:          t.TempDir(),
+			StateDir:          stateDir,
+			SocketPath:        filepath.Join(stateDir, "vpn.sock"),
 			Hostname:          name,
 			CreateTUN:         h.factory,
 			Logf:              log.Printf,

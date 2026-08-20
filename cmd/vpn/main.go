@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -104,12 +105,8 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 	}
 }
 
-// defaultSocket is where the daemon serves the local API. It lives under
-// /run (not the 0700 state dir) so status works without root.
-const defaultSocket = "/run/vpnmesh/vpn.sock"
-
 func socketFlag(fs *flag.FlagSet) *string {
-	return fs.String("socket", defaultSocket, "path to the daemon's local API socket")
+	return fs.String("socket", vpnc.DefaultSocket, "path to the daemon's local API socket")
 }
 
 func localClient(sock string) *http.Client {
@@ -150,6 +147,14 @@ func localPost(sock, path string) error {
 
 // upCmd tells the running daemon to (re)connect the tunnel.
 func upCmd(args []string) error {
+	// Machines deployed before the daemon split had units running
+	// `vpn up --server ... --key ...`; catch that with a pointer to the
+	// fix instead of a flag-parse error.
+	for _, a := range args {
+		if strings.HasPrefix(a, "--server") || strings.HasPrefix(a, "--key") {
+			return fmt.Errorf("the daemon now runs via `run`, not `up` — update the service (rerun the client install script), then use plain `up`/`down`")
+		}
+	}
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	sock := socketFlag(fs)
 	fs.Parse(args)
@@ -214,14 +219,8 @@ func status(args []string) error {
 	sock := socketFlag(fs)
 	fs.Parse(args)
 
-	hc := localClient(*sock)
-	resp, err := hc.Get("http://vpn/status")
-	if err != nil {
-		return fmt.Errorf("is vpn up running? %w", err)
-	}
-	defer resp.Body.Close()
 	var st vpnc.Status
-	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+	if err := localGet(*sock, "/status", &st); err != nil {
 		return err
 	}
 	if !st.Running {

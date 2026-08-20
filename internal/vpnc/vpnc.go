@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +26,15 @@ import (
 	"vpnmesh/internal/pin"
 )
 
+// DefaultSocket is the one place the daemon and the CLI agree on where
+// the local API lives when no --socket is given.
+const DefaultSocket = "/run/vpnmesh/vpn.sock"
+
 type Config struct {
 	ServerURL  string
 	EnrollKey  string // vpnkey:<secret>:<fingerprint>; required on first run
 	StateDir   string
-	SocketPath string // local API socket; default <StateDir>/vpn.sock
+	SocketPath string // local API socket; default DefaultSocket
 	Hostname   string
 	MTU        int // default 1280
 	CreateTUN func(prefix netip.Prefix, mtu int) (tun.Device, func() error, error)
@@ -110,7 +113,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	sock := cfg.SocketPath
 	if sock == "" {
-		sock = filepath.Join(cfg.StateDir, "vpn.sock")
+		sock = DefaultSocket
 	}
 	ln, err := serveLocalAPI(sock, c)
 	if err != nil {
@@ -145,11 +148,19 @@ func (c *controller) supervise(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if c.wantsUp() {
-			tctx, cancel := context.WithCancel(ctx)
-			c.mu.Lock()
+		// Check Down and publish stopTunnel under one lock: a `vpn down`
+		// arriving in between either flips Down before the check or finds
+		// stopTunnel set and cancels the tunnel — never neither.
+		c.mu.Lock()
+		down := c.st.Down
+		var tctx context.Context
+		var cancel context.CancelFunc
+		if !down {
+			tctx, cancel = context.WithCancel(ctx)
 			c.stopTunnel = cancel
-			c.mu.Unlock()
+		}
+		c.mu.Unlock()
+		if !down {
 			err := c.runTunnel(tctx)
 			cancel()
 			c.mu.Lock()
@@ -194,12 +205,15 @@ func (c *controller) runTunnel(ctx context.Context) error {
 		}
 		st.NodeID, st.IP, st.Prefix = resp.NodeID, resp.IP, resp.Prefix
 	}
-	if err := saveState(c.cfg.StateDir, st); err != nil {
+	// Merge only the enrollment fields: writing the whole snapshot back
+	// would clobber a Down flag persisted concurrently by `vpn down`.
+	c.mu.Lock()
+	c.st.NodeID, c.st.IP, c.st.Prefix = st.NodeID, st.IP, st.Prefix
+	snapshot := c.st
+	c.mu.Unlock()
+	if err := saveState(c.cfg.StateDir, snapshot); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	c.st = st
-	c.mu.Unlock()
 
 	tunDev, cleanup, err := c.cfg.CreateTUN(netip.PrefixFrom(st.IP, st.Prefix.Bits()), c.cfg.MTU)
 	if err != nil {
@@ -224,12 +238,6 @@ func (c *controller) runTunnel(ctx context.Context) error {
 
 	c.cfg.Logf("up: node %d, ip %s, wg port %d", st.NodeID, st.IP, engine.LocalPort())
 	return sessionLoop(ctx, c.cfg, st, c.tlsConf, c.pub, engine, c.cache)
-}
-
-func (c *controller) wantsUp() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return !c.st.Down
 }
 
 func (c *controller) setEngine(e *dataplane.Engine) {

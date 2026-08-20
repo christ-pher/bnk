@@ -46,6 +46,10 @@ VPN_SERVER=$SERVER
 VPN_KEY=$KEY
 EOF
     chmod 600 "$ENV_FILE"
+elif [ -n "$KEY" ]; then
+    # Re-enrollment with the stored server: refresh just the key.
+    [ -f "$ENV_FILE" ] || { echo "no $ENV_FILE yet — pass --server too" >&2; exit 1; }
+    sed -i "s|^VPN_KEY=.*|VPN_KEY=$KEY|" "$ENV_FILE"
 fi
 
 cat > "$UNIT" <<'EOF'
@@ -75,11 +79,20 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now vpn
+systemctl enable vpn
+# restart, not `enable --now`: a re-run (upgrade, re-enroll) must replace
+# an already-running daemon with the new binary and config.
+systemctl restart vpn
 
 echo "waiting for the tunnel..."
 i=0
-until out=$(vpn status 2>/dev/null) && case "$out" in "vpn is down"*) false ;; *) true ;; esac; do
+while :; do
+    out=$(vpn status 2>/dev/null) || out=""
+    case "$out" in
+        "") ;; # daemon not answering yet
+        "vpn is down"*) vpn up >/dev/null 2>&1 || true ;; # persisted `vpn down` from a past install
+        *) break ;;
+    esac
     i=$((i + 1))
     if [ "$i" -gt 30 ]; then
         echo "vpn service did not come up after 30s; check: journalctl -u vpn -n 20" >&2

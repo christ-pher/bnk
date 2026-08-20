@@ -31,3 +31,18 @@ func TestLocalAPISocketWorldAccessible(t *testing.T) {
 		t.Errorf("socket dir mode = %o, want 755", perm)
 	}
 }
+
+// A second daemon must refuse to replace a socket another daemon is
+// actively serving, instead of silently hijacking its CLI.
+func TestSecondDaemonCannotHijackLiveSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "vpn.sock")
+	c := &controller{cfg: Config{Hostname: "self"}, cache: &netmapCache{}, kick: make(chan struct{}, 1)}
+	ln, err := serveLocalAPI(sock, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if _, err := serveLocalAPI(sock, c); err == nil {
+		t.Fatal("second serveLocalAPI on a live socket succeeded, want error")
+	}
+}
