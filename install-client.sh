@@ -33,11 +33,17 @@ download_binary() {
     esac
     url="https://github.com/$REPO/releases/latest/download/$1-linux-$arch"
     echo "downloading $url"
-    curl -fSL -o "$BIN" "$url" || {
+    # Download beside the target, then rename over it: writing the
+    # installed path directly fails with "text file busy" while the
+    # service is running that binary.
+    tmp="$BIN.new"
+    curl -fSL -o "$tmp" "$url" || {
+        rm -f "$tmp"
         echo "download failed — no release published yet? Build from source: go build ./cmd/$1" >&2
         exit 1
     }
-    chmod 755 "$BIN"
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$BIN"
 }
 
 SERVER= KEY= UNINSTALL=0
