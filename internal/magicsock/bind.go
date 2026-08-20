@@ -39,13 +39,13 @@ func (k NodeKey) String() string {
 
 var ErrNoPath = errors.New("magicsock: no known path to peer")
 
-// Bind is a conn.Bind that multiplexes WireGuard, disco, and STUN traffic
-// over a single UDP socket.
 type relayPacket struct {
 	key NodeKey
 	pkt []byte
 }
 
+// Bind is a conn.Bind that multiplexes WireGuard, disco, and STUN traffic
+// over a single UDP socket.
 type Bind struct {
 	mu        sync.Mutex
 	pc        *net.UDPConn

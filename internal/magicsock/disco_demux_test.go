@@ -6,11 +6,38 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/conn"
+
 	"vpnmesh/internal/disco"
 )
 
 func discoPkt(payload string) []byte {
 	return append([]byte(disco.Magic), payload...)
+}
+
+// pump drives a Bind's ReceiveFuncs the way wireguard-go does, forwarding
+// surfaced WG packets to the returned channel. Without a pump the demux
+// never runs.
+func pump(t *testing.T, fns []conn.ReceiveFunc) <-chan []byte {
+	t.Helper()
+	out := make(chan []byte, 16)
+	for _, fn := range fns {
+		go func(fn conn.ReceiveFunc) {
+			for {
+				packets := [][]byte{make([]byte, 1500)}
+				sizes := make([]int, 1)
+				eps := make([]conn.Endpoint, 1)
+				n, err := fn(packets, sizes, eps)
+				if err != nil {
+					return
+				}
+				if n > 0 {
+					out <- append([]byte(nil), packets[0][:sizes[0]]...)
+				}
+			}
+		}(fn)
+	}
+	return out
 }
 
 func TestDiscoPacketsGoToHandlerNotWireGuard(t *testing.T) {
@@ -27,6 +54,7 @@ func TestDiscoPacketsGoToHandlerNotWireGuard(t *testing.T) {
 		got <- append([]byte(nil), pkt...)
 		srcs <- src
 	})
+	wgGot := pump(t, fnsB)
 
 	if err := bindA.SendDisco(addrB, discoPkt("probe")); err != nil {
 		t.Fatal(err)
@@ -52,20 +80,25 @@ func TestDiscoPacketsGoToHandlerNotWireGuard(t *testing.T) {
 	if err := bindA.Send([][]byte{[]byte("wg-data")}, ep); err != nil {
 		t.Fatal(err)
 	}
-	payload, _ := receiveOne(t, fnsB)
-	if !bytes.Equal(payload, []byte("wg-data")) {
-		t.Errorf("WG path surfaced %q, want wg-data (disco must not leak into WG)", payload)
+	select {
+	case payload := <-wgGot:
+		if !bytes.Equal(payload, []byte("wg-data")) {
+			t.Errorf("WG path surfaced %q, want wg-data (disco must not leak into WG)", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WG packet never surfaced")
 	}
 }
 
 func TestDiscoFromUnknownSourceStillDelivered(t *testing.T) {
 	bindB := NewBind()
-	_, addrB := openBind(t, bindB)
+	fnsB, addrB := openBind(t, bindB)
 
 	got := make(chan []byte, 1)
 	bindB.SetDiscoHandler(func(src netip.AddrPort, pkt []byte) {
 		got <- append([]byte(nil), pkt...)
 	})
+	pump(t, fnsB)
 
 	// A total stranger's disco packet must reach the handler: hole-punch
 	// pings arrive from addresses we have never seen.
