@@ -104,8 +104,15 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// NewEnrollKey mints and persists a new enrollment secret.
+// NewEnrollKey mints a reusable 24h key (legacy default used by tests and
+// scripts). Prefer MintEnrollKey for explicit control.
 func (s *Server) NewEnrollKey() (string, error) {
+	return s.MintEnrollKey(24*time.Hour, true)
+}
+
+// MintEnrollKey creates an enrollment secret. One-time keys (reusable ==
+// false) admit exactly one node; every key expires after ttl.
+func (s *Server) MintEnrollKey(ttl time.Duration, reusable bool) (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -113,20 +120,65 @@ func (s *Server) NewEnrollKey() (string, error) {
 	secret := hex.EncodeToString(raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.st.EnrollKeys = append(s.st.EnrollKeys, store.EnrollKey{Secret: secret, CreatedAt: time.Now().UTC()})
+	s.st.EnrollKeys = append(s.st.EnrollKeys, store.EnrollKey{
+		Secret:    secret,
+		Reusable:  reusable,
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(ttl),
+	})
 	if err := s.fs.Save(s.st); err != nil {
 		return "", err
 	}
 	return secret, nil
 }
 
-func (s *Server) validEnrollKey(secret string) bool {
-	for _, k := range s.st.EnrollKeys {
-		if !k.Revoked && subtle.ConstantTimeCompare([]byte(k.Secret), []byte(secret)) == 1 {
-			return true
+// EnrollKeys returns a copy of all minted keys for the admin CLI.
+func (s *Server) EnrollKeys() []store.EnrollKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]store.EnrollKey(nil), s.st.EnrollKeys...)
+}
+
+// RevokeEnrollKey revokes the single key whose secret starts with prefix.
+func (s *Server) RevokeEnrollKey(prefix string) error {
+	if len(prefix) < 6 {
+		return fmt.Errorf("prefix too short (need at least 6 chars)")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := -1
+	for i, k := range s.st.EnrollKeys {
+		if strings.HasPrefix(k.Secret, prefix) {
+			if idx >= 0 {
+				return fmt.Errorf("prefix %q matches more than one key", prefix)
+			}
+			idx = i
 		}
 	}
-	return false
+	if idx < 0 {
+		return fmt.Errorf("no key matches prefix %q", prefix)
+	}
+	s.st.EnrollKeys[idx].Revoked = true
+	return s.fs.Save(s.st)
+}
+
+// validKeyIndexLocked returns the index of a usable matching key, or -1.
+func (s *Server) validKeyIndexLocked(secret string) int {
+	now := time.Now().UTC()
+	for i, k := range s.st.EnrollKeys {
+		if subtle.ConstantTimeCompare([]byte(k.Secret), []byte(secret)) != 1 {
+			continue
+		}
+		if k.Revoked || (k.Used && !k.Reusable) {
+			return -1
+		}
+		// Zero ExpiresAt (pre-expiry state files) means never expires.
+		if !k.ExpiresAt.IsZero() && now.After(k.ExpiresAt) {
+			return -1
+		}
+		return i
+	}
+	return -1
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
@@ -137,11 +189,13 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if !s.validEnrollKey(req.EnrollKey) {
+	keyIdx := s.validKeyIndexLocked(req.EnrollKey)
+	if keyIdx < 0 {
 		s.mu.Unlock()
 		http.Error(w, "invalid enrollment key", http.StatusForbidden)
 		return
 	}
+	s.st.EnrollKeys[keyIdx].Used = true
 
 	node, ok := s.nodeByKey(req.NodeKey)
 	if !ok {

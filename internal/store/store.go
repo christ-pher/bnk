@@ -37,6 +37,9 @@ type Node struct {
 type EnrollKey struct {
 	Secret    string    `json:"secret"`
 	Revoked   bool      `json:"revoked"`
+	Reusable  bool      `json:"reusable,omitempty"`
+	Used      bool      `json:"used,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
