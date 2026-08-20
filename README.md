@@ -3,12 +3,14 @@
 A deliberately simple, open-source mesh VPN built on WireGuard, in Go.
 One CLI control server, one client binary, no web UI, no accounts.
 
-**Status: early but functional on Linux.** Working today: control plane
-(enroll, IP assignment, netmap push), encrypted relay through the server,
-port/protocol ACLs enforced by a userspace packet filter, and NAT
-traversal — clients behind NATs start on the relay, then hole-punch
-(STUN + authenticated disco probes) and upgrade to a direct path, falling
-back to relay if the punch fails. macOS/Windows clients compile but lack
+**Status: functional on Linux, NAT traversal validated.** Working today:
+control plane (enroll, IP assignment, netmap push), encrypted relay
+through the server, port/protocol ACLs enforced by a userspace packet
+filter, and NAT traversal — clients behind NATs start on the relay, then
+hole-punch (STUN + authenticated disco probes) and upgrade to a direct
+path, falling back to relay when the punch is impossible (e.g. two
+port-randomizing NATs). Both outcomes are exercised against real
+netfilter NATs in `test/natlab/`. macOS/Windows clients compile but lack
 interface configuration for now.
 
 Diagnostics: `vpn status` (per-peer path: direct/relay), `vpn ping <peer>`
