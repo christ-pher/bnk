@@ -56,7 +56,7 @@ func TestDiscoPacketsGoToHandlerNotWireGuard(t *testing.T) {
 	})
 	wgGot := pump(t, fnsB)
 
-	if err := bindA.SendDisco(addrB, discoPkt("probe")); err != nil {
+	if err := bindA.SendRaw(addrB, discoPkt("probe")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -104,7 +104,7 @@ func TestDiscoFromUnknownSourceStillDelivered(t *testing.T) {
 	// pings arrive from addresses we have never seen.
 	stranger := NewBind()
 	openBind(t, stranger)
-	if err := stranger.SendDisco(addrB, discoPkt("punch")); err != nil {
+	if err := stranger.SendRaw(addrB, discoPkt("punch")); err != nil {
 		t.Fatal(err)
 	}
 	select {

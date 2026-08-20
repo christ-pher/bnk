@@ -58,6 +58,7 @@ type Bind struct {
 	relayCh   chan relayPacket
 	closeCh   chan struct{}
 	onDisco   func(src netip.AddrPort, pkt []byte)
+	onSTUN    func(pkt []byte)
 }
 
 var _ conn.Bind = (*Bind)(nil)
@@ -135,6 +136,15 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 			}
 			continue
 		}
+		if isSTUN(packets[0][:n]) {
+			b.mu.Lock()
+			h := b.onSTUN
+			b.mu.Unlock()
+			if h != nil {
+				h(append([]byte(nil), packets[0][:n]...))
+			}
+			continue
+		}
 		key, ok := b.lookupAddr(src)
 		if !ok {
 			continue
@@ -143,6 +153,22 @@ func (b *Bind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (int,
 		eps[0] = &endpoint{key: key}
 		return 1, nil
 	}
+}
+
+// isSTUN classifies a datagram by the RFC 5389 shape: top two bits zero
+// and the magic cookie at bytes 4-8. WireGuard packets start 0x01-0x04
+// followed by three zero bytes, so they can never look like this.
+func isSTUN(pkt []byte) bool {
+	return len(pkt) >= 20 && pkt[0]>>6 == 0 &&
+		pkt[4] == 0x21 && pkt[5] == 0x12 && pkt[6] == 0xA4 && pkt[7] == 0x42
+}
+
+// SetSTUNHandler registers the callback for inbound STUN responses. The
+// callback runs on the receive goroutine and must not block.
+func (b *Bind) SetSTUNHandler(h func(pkt []byte)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onSTUN = h
 }
 
 func (b *Bind) lookupAddr(src netip.AddrPort) (NodeKey, bool) {
@@ -233,9 +259,10 @@ func (b *Bind) SetDiscoHandler(h func(src netip.AddrPort, pkt []byte)) {
 	b.onDisco = h
 }
 
-// SendDisco transmits a raw disco packet to addr, independent of any peer
-// path state — this is how candidate paths are probed before they exist.
-func (b *Bind) SendDisco(addr netip.AddrPort, pkt []byte) error {
+// SendRaw transmits a raw datagram (disco probe, STUN query) to addr,
+// independent of any peer path state — this is how candidate paths are
+// probed before they exist.
+func (b *Bind) SendRaw(addr netip.AddrPort, pkt []byte) error {
 	b.mu.Lock()
 	pc := b.pc
 	b.mu.Unlock()
