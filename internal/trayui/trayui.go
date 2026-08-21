@@ -23,6 +23,9 @@ type View struct {
 	Tooltip   string // hover text, where the long form belongs
 	Action    string // label of the connect-or-disconnect item
 	Connected bool
+	// NeedsJoin means the action item should ask for a key rather than
+	// toggle a tunnel this machine cannot yet have.
+	NeedsJoin bool
 	SelfIP    string // empty when down; what "Copy my IP" yields
 	Peers     []PeerRow
 	Overflow  string // "…and N more", empty when everything fits
@@ -42,6 +45,16 @@ func Build(st vpnc.Status, err error) View {
 			Title:   "Daemon not running",
 			Tooltip: "bnk — the daemon is not reachable",
 			Action:  "Connect",
+		}
+	}
+	if !st.Enrolled {
+		// Installed but never given a key: connecting is meaningless
+		// until the machine knows which mesh it belongs to.
+		return View{
+			Title:     "Not signed in",
+			Tooltip:   "bnk — not signed in to a mesh",
+			Action:    "Sign in…",
+			NeedsJoin: true,
 		}
 	}
 	if !st.Running {

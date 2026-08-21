@@ -16,8 +16,9 @@ func peer(name, ip string, online bool, path string) vpnc.PeerStatus {
 
 func connected() vpnc.Status {
 	return vpnc.Status{
-		Running: true,
-		Self:    vpnc.SelfStatus{Name: "desktop", IP: netip.MustParseAddr("100.64.0.4")},
+		Running:  true,
+		Enrolled: true,
+		Self:     vpnc.SelfStatus{Name: "desktop", IP: netip.MustParseAddr("100.64.0.4")},
 		Peers: []vpnc.PeerStatus{
 			peer("zulu", "100.64.0.9", false, "relay"),
 			peer("alpha", "100.64.0.1", true, "direct"),
@@ -74,7 +75,7 @@ func TestBuildOrdersOnlinePeersFirstThenByName(t *testing.T) {
 }
 
 func TestBuildWhenDown(t *testing.T) {
-	v := trayui.Build(vpnc.Status{Running: false}, nil)
+	v := trayui.Build(vpnc.Status{Running: false, Enrolled: true}, nil)
 	if v.Connected {
 		t.Error("view should not be connected")
 	}
@@ -97,7 +98,7 @@ func TestBuildWhenDaemonUnreachable(t *testing.T) {
 // systray cannot delete menu items, so the row pool is fixed and the
 // remainder has to be summarised.
 func TestBuildSummarisesPeersBeyondThePool(t *testing.T) {
-	st := vpnc.Status{Running: true, Self: vpnc.SelfStatus{Name: "self", IP: netip.MustParseAddr("100.64.0.1")}}
+	st := vpnc.Status{Running: true, Enrolled: true, Self: vpnc.SelfStatus{Name: "self", IP: netip.MustParseAddr("100.64.0.1")}}
 	for i := 0; i < trayui.MaxPeerRows+3; i++ {
 		st.Peers = append(st.Peers, peer("node", "100.64.1.1", true, "direct"))
 	}
@@ -107,5 +108,23 @@ func TestBuildSummarisesPeersBeyondThePool(t *testing.T) {
 	}
 	if v.Overflow != "…and 3 more" {
 		t.Errorf("overflow = %q, want \"…and 3 more\"", v.Overflow)
+	}
+}
+
+// A machine that was installed but never given a key needs a different
+// offer: connecting is meaningless until it knows which mesh to join.
+func TestBuildWhenNotEnrolled(t *testing.T) {
+	v := trayui.Build(vpnc.Status{Enrolled: false}, nil)
+	if !v.NeedsJoin {
+		t.Error("view should ask for sign-in")
+	}
+	if v.Action != "Sign in…" {
+		t.Errorf("action = %q, want a sign-in prompt", v.Action)
+	}
+	if v.Connected {
+		t.Error("an unenrolled node is not connected")
+	}
+	if !strings.Contains(v.Title, "Not signed in") {
+		t.Errorf("title = %q", v.Title)
 	}
 }

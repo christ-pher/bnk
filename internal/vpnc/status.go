@@ -11,9 +11,13 @@ import (
 type Status struct {
 	// Running reports whether the tunnel is up. False after `bnk down`:
 	// the daemon still answers, but there is no interface or session.
-	Running bool         `json:"running"`
-	Self    SelfStatus   `json:"self"`
-	Peers   []PeerStatus `json:"peers"`
+	Running bool `json:"running"`
+	// Enrolled is false on a machine that has been installed but never
+	// given a key, which is a different problem from being disconnected
+	// and needs a different offer from the UI.
+	Enrolled bool         `json:"enrolled"`
+	Self     SelfStatus   `json:"self"`
+	Peers    []PeerStatus `json:"peers"`
 }
 
 type SelfStatus struct {

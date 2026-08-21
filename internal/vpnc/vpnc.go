@@ -174,7 +174,9 @@ func (c *controller) supervise(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return err
 			}
-			if tctx.Err() == nil && err != nil {
+			if errors.Is(err, errNotEnrolled) {
+				c.cfg.Logf("not enrolled yet — waiting to be given a server and key (sign in from the tray, or run `bnk join`)")
+			} else if tctx.Err() == nil && err != nil {
 				return err
 			}
 			c.cfg.Logf("down: tunnel torn down")
@@ -196,7 +198,10 @@ func (c *controller) runTunnel(ctx context.Context) error {
 
 	if st.NodeID == 0 || !st.IP.IsValid() {
 		if c.secret == "" {
-			return fmt.Errorf("vpnc: not enrolled and no enrollment key given")
+			// Idle rather than exit: without this the service dies on a
+			// machine that was installed but never given a key, and
+			// nothing is left running for the tray to sign in through.
+			return errNotEnrolled
 		}
 		resp, err := client.Enroll(ctx, st.ServerURL, c.hc, coord.EnrollRequest{
 			EnrollKey: c.secret,
@@ -288,6 +293,62 @@ func (c *controller) reAddress(self netip.Prefix) error {
 		return err
 	}
 	c.cfg.Logf("mesh network changed: re-addressing %v -> %v (%v)", old, self.Addr(), mesh)
+	if stop != nil {
+		stop()
+	}
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// errNotEnrolled marks the one failure the supervisor waits out instead
+// of exiting on.
+var errNotEnrolled = errors.New("vpnc: not enrolled")
+
+// Enrolled reports whether this node has an identity yet.
+func (c *controller) enrolled() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.st.NodeID != 0 && c.st.IP.IsValid()
+}
+
+// Join supplies the server and enrollment key for a node that has none,
+// then brings the tunnel up. It is how the tray signs a machine in.
+func (c *controller) join(serverURL, key string) error {
+	if key == "" {
+		return fmt.Errorf("an enrollment key is required")
+	}
+	secret, fp, err := pin.ParseEnrollKey(key)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if serverURL != "" {
+		c.st.ServerURL = serverURL
+	}
+	if c.st.ServerURL == "" {
+		c.mu.Unlock()
+		return fmt.Errorf("no server known: paste the whole join command, which includes it")
+	}
+	c.st.Fingerprint = fp
+	// Signing in is also how you rejoin after being removed, so clear
+	// any stale identity rather than trying to reuse it.
+	c.st.NodeID, c.st.IP, c.st.Prefix = 0, netip.Addr{}, netip.Prefix{}
+	c.st.Down = false
+	snapshot := c.st
+	stop := c.stopTunnel
+	c.mu.Unlock()
+
+	if err := saveState(c.cfg.StateDir, snapshot); err != nil {
+		return err
+	}
+	c.secret = secret
+	c.tlsConf = pin.ClientTLSConfig(fp)
+	c.hc = &http.Client{Transport: &http.Transport{TLSClientConfig: c.tlsConf}}
+
 	if stop != nil {
 		stop()
 	}

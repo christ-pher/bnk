@@ -58,6 +58,24 @@ func Post(endpoint, path string) error {
 	return nil
 }
 
+// Join enrols this machine into a mesh. server may be empty when the
+// daemon already knows which server it belongs to.
+func Join(endpoint, server, key string) error {
+	body, err := json.Marshal(map[string]string{"server": server, "key": key})
+	if err != nil {
+		return err
+	}
+	resp, err := New(ControlEndpoint(endpoint)).Post("http://bnk/join", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("%s (%w)", DaemonDownHint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errorFrom(resp)
+	}
+	return nil
+}
+
 func Up(endpoint string) error   { return Post(endpoint, "/up") }
 func Down(endpoint string) error { return Post(endpoint, "/down") }
 

@@ -56,11 +56,15 @@ func registerDiagnostics(mux *http.ServeMux, c *controller) {
 		engine := c.getEngine()
 		if engine == nil {
 			st := c.state()
-			json.NewEncoder(w).Encode(Status{Self: SelfStatus{ID: st.NodeID, Name: c.cfg.Hostname, IP: st.IP}})
+			json.NewEncoder(w).Encode(Status{
+				Enrolled: c.enrolled(),
+				Self:     SelfStatus{ID: st.NodeID, Name: c.cfg.Hostname, IP: st.IP},
+			})
 			return
 		}
 		out := buildStatus(c.cache.get(), c.cfg.Hostname, engine.PeerPaths())
 		out.Running = true
+		out.Enrolled = true
 		json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("GET /ping", withEngine(func(w http.ResponseWriter, r *http.Request, engine *dataplane.Engine) {
@@ -145,6 +149,27 @@ func registerControl(mux *http.ServeMux, c *controller, gate func(http.HandlerFu
 		}
 		if !c.waitEngine(r.Context(), true, 15*time.Second) {
 			http.Error(w, "still connecting; check the daemon logs", http.StatusGatewayTimeout)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"running": true})
+	}))
+	// Joining is a control verb: it decides which mesh this machine
+	// belongs to, so it is gated exactly like up and down.
+	mux.HandleFunc("POST /join", gate(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Server string `json:"server"`
+			Key    string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := c.join(req.Server, req.Key); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		if !c.waitEngine(r.Context(), true, 30*time.Second) {
+			http.Error(w, "signed in, but the tunnel has not come up yet — check the daemon logs", http.StatusGatewayTimeout)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"running": true})

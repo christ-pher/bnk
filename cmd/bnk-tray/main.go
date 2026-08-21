@@ -117,7 +117,11 @@ func (m *menu) run() {
 		case <-ticker.C:
 			m.refresh()
 		case <-m.action.ClickedCh:
-			m.toggle()
+			if m.lastView.NeedsJoin {
+				m.signIn()
+			} else {
+				m.toggle()
+			}
 		case <-m.copyIP.ClickedCh:
 			if ip := m.lastView.SelfIP; ip != "" {
 				setClipboard(ip)
@@ -139,6 +143,27 @@ func (m *menu) run() {
 			return
 		}
 	}
+}
+
+// signIn asks for a join command and hands it to the daemon. Anything
+// the server printed is accepted, so the user can paste the whole line
+// rather than picking the key out of it.
+func (m *menu) signIn() {
+	pasted, ok := promptForJoin()
+	if !ok {
+		return // cancelled
+	}
+	join, err := trayui.ParseJoin(pasted)
+	if err != nil {
+		m.status.SetTitle(truncate(err.Error()))
+		return
+	}
+	m.status.SetTitle("Signing in…")
+	if err := localclient.Join(*socket, join.Server, join.Key); err != nil {
+		m.status.SetTitle(truncate("Sign-in failed: " + err.Error()))
+		return
+	}
+	m.refresh()
 }
 
 // toggle flips the tunnel and reports failures in the status line, which

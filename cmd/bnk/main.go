@@ -42,7 +42,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk <up|down|status|ping|netcheck|leave|update|version|run|service> [flags]")
+		return fmt.Errorf("usage: bnk <up|down|status|join|leave|ping|netcheck|update|version|run|service> [flags]")
 	}
 	switch args[0] {
 	case "status":
@@ -64,6 +64,8 @@ func run(args []string) error {
 		return serviceCmd(args[1:])
 	case "leave":
 		return leaveCmd(args[1:])
+	case "join":
+		return joinCmd(args[1:])
 	}
 	if args[0] != "run" {
 		return fmt.Errorf("usage: bnk run --server https://host:8443 [--key bnkkey:...] [flags]")
@@ -111,6 +113,29 @@ func realTUN(ifName string) func(prefix netip.Prefix, mtu int) (tun.Device, func
 		}
 		return dev, dev.Close, nil
 	}
+}
+
+// joinCmd enrols a running daemon into a mesh. It exists so a machine
+// installed without a key — a plain double-click of the installer — can
+// be signed in afterwards, from the command line or the tray.
+func joinCmd(args []string) error {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	sock := socketFlag(fs)
+	server := fs.String("server", "", "control server URL (optional if this node already knows it)")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: bnk join [--server https://host:8443] <bnkkey:...>")
+	}
+	if err := localclient.Join(*sock, *server, fs.Arg(0)); err != nil {
+		return err
+	}
+	var st vpnc.Status
+	if err := localclient.Get(*sock, "/status", &st); err == nil && st.Running {
+		fmt.Printf("joined: %s (%s)\n", st.Self.Name, st.Self.IP)
+	} else {
+		fmt.Println("joined")
+	}
+	return nil
 }
 
 // leaveCmd deregisters this node from the control server. The installers
