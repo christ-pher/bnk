@@ -10,7 +10,10 @@ import (
 	"regexp"
 	"syscall"
 
+	"time"
+
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
 	"github.com/christ-pher/bnk/internal/vpnc"
@@ -37,7 +40,8 @@ func serviceInstall(args []string) error {
 	server := fs.String("server", "", "control server URL, e.g. https://host:8443")
 	key := fs.String("key", "", "enrollment key (bnkkey:...); omit once enrolled")
 	stateDir := fs.String("state-dir", vpnc.DefaultStateDir, "directory for client state")
-	operator := fs.String("operator", "", "SID of an account allowed to toggle the tunnel without elevating")
+	operator := fs.String("operator", "", "account (SID or name) allowed to toggle the tunnel without elevating")
+	start := fs.Bool("start", false, "start the service once it is registered")
 	fs.Parse(args)
 	if *server == "" {
 		return fmt.Errorf("--server is required")
@@ -78,6 +82,9 @@ func serviceInstall(args []string) error {
 		}
 		setTrayAutostart(operatorSID, exe)
 		fmt.Println("bnk service updated")
+		if *start {
+			return startService()
+		}
 		return nil
 	}
 
@@ -96,6 +103,31 @@ func serviceInstall(args []string) error {
 	defer s.Close()
 	setTrayAutostart(operatorSID, exe)
 	fmt.Println("bnk service installed")
+	if *start {
+		return startService()
+	}
+	return nil
+}
+
+// startService starts the registered service, treating "already
+// running" as success so a re-install is idempotent.
+func startService() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if err := s.Start(); err != nil {
+		if st, serr := s.Query(); serr == nil && st.State == svc.Running {
+			return nil
+		}
+		return fmt.Errorf("start bnk service: %w", err)
+	}
 	return nil
 }
 
@@ -149,6 +181,7 @@ func serviceUninstall() error {
 			disableTrayAutostart(sid)
 		}
 	}
+	stopService(s)
 	if err := s.Delete(); err != nil {
 		return err
 	}
@@ -172,4 +205,21 @@ func commandLine(exe string, args []string) string {
 func updateCmd() error {
 	return fmt.Errorf("on Windows, update by re-running the installer:\n" +
 		`  & ([scriptblock]::Create((irm ` + rawInstallerURL + `))) -Server <your server URL>`)
+}
+
+// stopService stops the service and waits for it, because deleting a
+// running service only marks it for deletion — leaving its process
+// holding the very files an uninstall is about to remove.
+func stopService(s *mgr.Service) {
+	st, err := s.Control(svc.Stop)
+	if err != nil {
+		return // not running, or already stopping
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for st.State != svc.Stopped && time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		if st, err = s.Query(); err != nil {
+			return
+		}
+	}
 }

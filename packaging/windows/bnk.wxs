@@ -73,7 +73,7 @@
          Uninstall reverses it before they are removed. -->
     <CustomAction Id="SetRegisterCmd"
                   Property="RegisterService"
-                  Value="&quot;[INSTALLFOLDER]bnk.exe&quot; service install --server &quot;[BNK_SERVER]&quot; --key &quot;[BNK_KEY]&quot; --operator &quot;[USERDOMAIN]\[LogonUser]&quot;" />
+                  Value="&quot;[INSTALLFOLDER]bnk.exe&quot; service install --server &quot;[BNK_SERVER]&quot; --key &quot;[BNK_KEY]&quot; --operator &quot;[USERDOMAIN]\[LogonUser]&quot; --start" />
     <CustomAction Id="RegisterService"
                   BinaryRef="Wix4UtilCA_X64"
                   DllEntry="WixQuietExec64"

@@ -212,3 +212,32 @@ jobs:
             Get-Content uninstall.log -Tail 40
             throw 'files survived uninstall'
           }
+
+      # The files-only path above never runs the custom actions. This is
+      # the one that does: BNK_SERVER makes the package register, and
+      # start, the service through `bnk service install`.
+      - name: Configured install registers and starts the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cd packaging\windows
+          Start-Process msiexec -ArgumentList '/i','bnk-test.msi','/qn',
+            'BNK_SERVER=https://example.invalid:8443','/l*v','configured.log' -Wait
+
+          $svc = Get-CimInstance Win32_Service -Filter "Name='bnk'"
+          if (-not $svc) {
+            Get-Content configured.log -Tail 60
+            throw 'the package did not register the service'
+          }
+          Write-Host "registered: $($svc.PathName)"
+          if ($svc.PathName -notlike '*--server*') { throw "server missing: $($svc.PathName)" }
+          if ($svc.PathName -notlike '*--operator*') { throw "operator missing: $($svc.PathName)" }
+          if ($svc.StartMode -ne 'Auto') { throw "start mode $($svc.StartMode), want Auto" }
+
+          # Uninstall must stop and remove the service, then the files.
+          Start-Process msiexec -ArgumentList '/x','bnk-test.msi','/qn','/l*v','unconfig.log' -Wait
+          if (Get-CimInstance Win32_Service -Filter "Name='bnk'") {
+            Get-Content unconfig.log -Tail 60
+            throw 'service survived uninstall'
+          }
+          if (Test-Path "$env:ProgramFiles\bnk\bnk.exe") { throw 'files survived uninstall' }
