@@ -348,7 +348,13 @@ func serve(args []string) error {
 	hs := &http.Server{
 		Addr:      *listen,
 		Handler:   srv.Handler(),
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
+		// This port faces the internet. Without these, anyone can hold
+		// connections open indefinitely — a partial request line is
+		// enough — and pin a goroutine and buffers per socket.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	return hs.ListenAndServeTLS("", "")
 }

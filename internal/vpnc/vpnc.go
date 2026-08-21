@@ -97,6 +97,10 @@ func Run(ctx context.Context, cfg Config) error {
 		secret, st.Fingerprint = s, fp
 	}
 
+	if st.ServerURL != "" && !strings.HasPrefix(st.ServerURL, "https://") {
+		return fmt.Errorf("vpnc: server URL must be https:// (got %q) — plaintext would send the enrollment key in the clear and leave the netmap unauthenticated", st.ServerURL)
+	}
+
 	// A pinned fingerprint arrives with the enrollment key, so a machine
 	// given a server but no key legitimately has none yet. That is the
 	// unenrolled resting state, not a reason to exit — leaving nothing
@@ -332,6 +336,9 @@ func (c *controller) join(serverURL, key string) error {
 		return err
 	}
 
+	if serverURL != "" && !strings.HasPrefix(serverURL, "https://") {
+		return fmt.Errorf("server URL must be https://, got %q", serverURL)
+	}
 	c.mu.Lock()
 	if serverURL != "" {
 		c.st.ServerURL = serverURL

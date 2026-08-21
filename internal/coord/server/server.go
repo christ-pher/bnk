@@ -183,7 +183,18 @@ func (s *Server) validKeyIndexLocked(secret string) int {
 	return -1
 }
 
+// maxEnrollBody bounds the only unauthenticated body the server parses.
+// Without it, a stranger can make the JSON decoder allocate a buffer as
+// large as they care to send, before the key is even checked.
+const maxEnrollBody = 16 << 10
+
+// maxEndpoints bounds what one node can advertise. Every peer both
+// rebroadcasts these and probes them, so an unbounded list is a way to
+// aim the whole mesh at a third party.
+const maxEndpoints = 32
+
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnrollBody)
 	var req coord.EnrollRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -199,6 +210,12 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.st.EnrollKeys[keyIdx].Used = true
 	keyConsumed := !s.st.EnrollKeys[keyIdx].Reusable
+
+	// Hostname and OS are echoed into every other node's netmap, which
+	// has a hard frame limit. Unbounded, one node's absurd name makes
+	// every peer's netmap unsendable and takes the mesh down.
+	req.Hostname = truncateField(req.Hostname, 64)
+	req.OS = truncateField(req.OS, 32)
 
 	node, ok := s.nodeByKey(req.NodeKey)
 	if !ok {
@@ -247,6 +264,15 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(coord.EnrollResponse{NodeID: node.ID, IP: node.IP, Prefix: prefix})
 }
 
+// truncateField bounds a client-supplied string that the server will
+// store and rebroadcast.
+func truncateField(s string, max int) string {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
 func (s *Server) nodeByKey(key netmap.Key) (store.Node, bool) {
 	for _, n := range s.st.Nodes {
 		if n.NodeKey == key {
@@ -271,7 +297,11 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// First frame must be a hello identifying an enrolled node.
+	// First frame must be a hello identifying an enrolled node. The
+	// deadline matters here, not just at the challenge: an attacker who
+	// upgrades and then says nothing would otherwise hold a goroutine,
+	// its buffers, and a claimed allocation forever.
+	conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 	typ, payload, err := coord.ReadFrame(bufrw.Reader)
 	if err != nil || typ != coord.FrameControl {
 		conn.Close()
@@ -412,6 +442,9 @@ func (s *Server) readLoop(sess *session, r *bufio.Reader) {
 				}
 				return
 			case coord.MsgEndpoints:
+				if len(msg.Endpoints) > maxEndpoints {
+					msg.Endpoints = msg.Endpoints[:maxEndpoints]
+				}
 				s.mu.Lock()
 				s.endpoints[sess.id] = msg.Endpoints
 				s.mu.Unlock()
