@@ -1,4 +1,29 @@
+# Build outputs. The .syso resource objects are NOT ignored: they are
+# committed on purpose so the release build needs no icon tooling.
 /bnk
 /bnk-server
+/bnk-tray
 *.exe
+*.msi
 /dist/
+
+# The MSI build stages its payload beside the .wxs; none of it is source.
+/packaging/windows/wintun.dll
+/packaging/windows/WINTUN-LICENSE.txt
+
+# Go test and profiling artifacts
+*.test
+*.out
+*.pprof
+
+# Logs and pasted terminal transcripts. A transcript committed here once
+# carried a live enrollment key into public history; never again.
+*.log
+windows-ps-output.txt
+*-output.txt
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
