@@ -111,6 +111,9 @@
     <CustomAction Id="SetUnregisterCmd"
                   Property="UnregisterService"
                   Value="&quot;[INSTALLFOLDER]bnk.exe&quot; service uninstall" />
+    <!-- Return="ignore": a machine with nothing registered must still
+         uninstall cleanly. The action stops the service and the tray,
+         which is what frees the files for removal. -->
     <CustomAction Id="UnregisterService"
                   BinaryRef="Wix4UtilCA_X64"
                   DllEntry="WixQuietExec64"

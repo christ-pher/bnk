@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"syscall"
@@ -174,6 +175,10 @@ func serviceUninstall() error {
 		return fmt.Errorf("bnk service is not installed")
 	}
 	defer s.Close()
+	// The tray holds its own executable open, so an uninstaller that
+	// only stops the service still cannot delete the files.
+	stopTray()
+
 	// Clear the tray's autostart entry for whichever operator the
 	// registered command line names, before the service record is gone.
 	if cfg, err := s.Config(); err == nil {
@@ -205,6 +210,13 @@ func commandLine(exe string, args []string) string {
 func updateCmd() error {
 	return fmt.Errorf("on Windows, update by re-running the installer:\n" +
 		`  & ([scriptblock]::Create((irm ` + rawInstallerURL + `))) -Server <your server URL>`)
+}
+
+// stopTray ends any running tray process. It is best-effort: no tray
+// running is the normal case, and taskkill reports that as a failure.
+func stopTray() {
+	cmd := exec.Command("taskkill", "/IM", "bnk-tray.exe", "/F")
+	cmd.Run()
 }
 
 // stopService stops the service and waits for it, because deleting a

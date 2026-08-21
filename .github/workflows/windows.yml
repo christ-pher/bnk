@@ -247,6 +247,9 @@ jobs:
 
           Start-Process msiexec -ArgumentList '/x','bnk-test.msi','/qn','/l*v','uninstall.log' -Wait
           if (Test-Path $exe) {
+            Write-Host '--- still running? ---'
+            Get-Process bnk,bnk-tray -ErrorAction SilentlyContinue | Select-Object Name,Id | Format-Table | Out-String | Write-Host
+            Get-Service bnk -ErrorAction SilentlyContinue | Select-Object Name,Status | Format-Table | Out-String | Write-Host
             Get-Content uninstall.log -Tail 40
             throw 'files survived uninstall'
           }
