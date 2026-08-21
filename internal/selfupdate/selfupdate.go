@@ -47,17 +47,9 @@ func Run(cfg Config) error {
 	}
 
 	asset := fmt.Sprintf("%s-linux-%s", cfg.Asset, runtime.GOARCH)
-	base := fmt.Sprintf("%s/releases/download/%s/", cfg.BaseURL, tag)
 	fmt.Fprintf(cfg.Out, "downloading %s %s...\n", asset, tag)
-	bin, err := fetch(base + asset)
+	bin, err := FetchVerified(cfg.BaseURL, tag, asset)
 	if err != nil {
-		return err
-	}
-	sums, err := fetch(base + "SHA256SUMS")
-	if err != nil {
-		return err
-	}
-	if err := verify(bin, sums, asset); err != nil {
 		return err
 	}
 
@@ -115,6 +107,27 @@ func latestTag(baseURL string) (string, error) {
 		return "", fmt.Errorf("no release found (releases/latest answered %d %q)", resp.StatusCode, loc)
 	}
 	return loc[i+len("/tag/"):], nil
+}
+
+// FetchVerified downloads one release asset and checks it against the
+// same release's SHA256SUMS before handing it back. Nothing it returns
+// has skipped that check: an asset the sums file does not list is an
+// error, not a pass. Callers are about to write it over a binary or
+// hand it to an installer, which is why there is no unverified variant.
+func FetchVerified(baseURL, tag, asset string) ([]byte, error) {
+	base := fmt.Sprintf("%s/releases/download/%s/", baseURL, tag)
+	bin, err := fetch(base + asset)
+	if err != nil {
+		return nil, err
+	}
+	sums, err := fetch(base + "SHA256SUMS")
+	if err != nil {
+		return nil, err
+	}
+	if err := verify(bin, sums, asset); err != nil {
+		return nil, err
+	}
+	return bin, nil
 }
 
 func fetch(url string) ([]byte, error) {

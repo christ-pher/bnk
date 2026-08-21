@@ -3,48 +3,35 @@
 package main
 
 import (
-	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/christ-pher/bnk/internal/selfupdate"
 )
 
-// msiURL is where a release publishes its installer.
-func msiURL(tag string) string {
-	return fmt.Sprintf("%s/releases/download/%s/bnk-windows-amd64.msi", repoURL, tag)
-}
+// msiAsset is the installer's name in a release, which is also its key
+// in the release's SHA256SUMS.
+const msiAsset = "bnk-windows-amd64.msi"
 
-// launchUpdater downloads the release's MSI and hands it to Windows to
-// install. Installing per-machine needs elevation, so msiexec raises the
-// consent prompt itself — the tray never holds privileges it would then
-// have to be trusted with.
+// launchUpdater downloads the release's MSI, checks it against the
+// release's SHA256SUMS, and hands it to Windows to install. The check
+// gives the installer the same verification the Linux binary path has
+// always had: what runs is what the release workflow checksummed, not
+// merely whatever the download returned. Installing per-machine needs
+// elevation, so msiexec raises the consent prompt itself — the tray
+// never holds privileges it would then have to be trusted with.
 func launchUpdater(tag string) error {
+	msi, err := selfupdate.FetchVerified(repoURL, tag, msiAsset)
+	if err != nil {
+		return err
+	}
 	dst := filepath.Join(os.TempDir(), "bnk-"+tag+".msi")
-	if err := download(msiURL(tag), dst); err != nil {
+	if err := os.WriteFile(dst, msi, 0o600); err != nil {
 		return err
 	}
 	return shellExecute("open", dst, "")
-}
-
-func download(url, dst string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", url, resp.Status)
-	}
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
 }
 
 // shellExecute runs a file the way a double-click would, which is what

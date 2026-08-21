@@ -59,82 +59,69 @@ removed with `bnk-server node rm`.
 | High | Hostname, OS, and advertised endpoints were rebroadcast to every peer without bounds. One node could exceed the netmap frame limit and take the mesh down, or aim every peer's probes at a third party. |
 | Medium | A plaintext `http://` server URL was accepted, silently disabling the trust bootstrap. Now refused. |
 
+## Fixed since the audit
+
+| Date | Severity | Issue |
+|---|---|---|
+| 2026-08-20 | High | `%ProgramData%\bnk` inherited a `BUILTIN\Users`-readable DACL, so any local user could copy the node's private key and impersonate the node from anywhere. The state directory now gets an explicit SYSTEM+Administrators DACL at install (`internal/vpnc/harden_windows.go`), asserted in CI. |
+| 2026-08-20 | High | Enrollment accepted duplicate names and disco keys, letting a key-holder enroll as an existing node and inherit its ACL identity or capture its path attribution. Both are rejected now (`internal/coord/server/unique_test.go`); re-enrollment is allowed only for the same node key. |
+| 2026-08-20 | Medium | Inbound disco packets were decrypted before the sender was looked up, so unauthenticated junk cost a key exchange each. The lookup now happens first; `Open` still proves the claim. |
+| 2026-08-21 | High | A live enrollment key was committed to this public repository in a pasted PowerShell transcript (`windows-ps-output.txt`, from commit `47f41e4`). The file is removed, but the key is in public git history and must be treated as burned: revoke it (`bnk-server key revoke <prefix>`) and audit `bnk-server node ls` for machines you do not recognise. Keys minted before expiry existed never expire, which makes rotation the only off switch. |
+| 2026-08-21 | Medium | The tray downloaded its MSI with no checksum and handed it to msiexec. It is now fetched through `selfupdate.FetchVerified`, which refuses anything that does not match the release's `SHA256SUMS` — the same gate the Linux binary path always had. |
+| 2026-08-21 | Medium | The `ci` and `windows` workflows ran with the default `GITHUB_TOKEN` grants. Both now declare `permissions: contents: read`, so a compromised step cannot push, tag, or write releases with the workflow's token. |
+
+## GitHub code scanning triage (2026-08-21)
+
+Code scanning was enabled and produced seven alerts. Six were the
+workflow-permissions findings fixed above. The seventh —
+`go/disabled-certificate-check` against `internal/pin/pin.go`, severity
+high — is a false positive: `InsecureSkipVerify` there is paired with a
+`VerifyPeerCertificate` that *replaces* chain and hostname verification
+with a constant-time SHA-256 pin of the leaf certificate, which is the
+entire trust design (no CA, no domains; the fingerprint travels in the
+enrollment key). `TestClientTLSConfigRejectsWrongFingerprint` and
+`TestPinRejectsRealCertAppendedToAttackerChain` prove the property
+CodeQL cannot see. Dismiss the alert with that justification rather than
+"fixing" it — routing this through the WebPKI would weaken the design,
+not strengthen it.
+
 ## Known weaknesses, in the order they deserve attention
 
-### 1. Windows: the node's private key is readable by any local user
+### 1. A member can make every other member flood a third party
 
-`%ProgramData%\bnk\client.json` holds the node's private key. Go's
-`Chmod` and `MkdirAll` modes are no-ops on Windows, and `C:\ProgramData`
-grants `BUILTIN\Users` read by inheritance. Nothing sets a DACL.
-
-Anyone who can run code as *any* local user — including malware running
-as you, without elevation — can copy that key and impersonate the node
-from anywhere, until it is removed server-side. Linux is unaffected
-(`/var/lib/bnk/client.json` is 0600 root).
-
-**Worry level: real on a shared or malware-exposed Windows machine.**
-The fix is to set an explicit DACL on the state directory at install.
-
-### 2. Enrollment does not enforce unique names or disco keys
-
-Node names are chosen by the enrolling node and the ACL is keyed by
-name, last one wins. A member holding a valid enrollment key can enroll
-as `admin-laptop`, inherit that name's permissions as a *source*, and
-lock the real one out. `node rm` matches by name and would delete the
-wrong node. Duplicate disco keys similarly let a member hijack another
-peer's path attribution.
-
-**Worry level: near zero while every node is yours; high the moment
-someone else's machine joins.** Fix before sharing the mesh: reject
-duplicate names and disco keys at enrollment, and remove nodes by ID.
-
-### 3. A member can make every other member flood a third party
-
-Advertised endpoints are now capped at 32, which bounds this, but each
-peer still probes whatever addresses a member advertises, with no
-filtering of private or off-mesh ranges. A hostile member can still
-direct modest reflected traffic at a chosen host.
+Advertised endpoints are capped at 32, which bounds this, but each peer
+still probes whatever addresses a member advertises, with no filtering
+of private or off-mesh ranges. A hostile member can still direct modest
+reflected traffic at a chosen host.
 
 **Worry level: low for you, but it is collateral risk to strangers.**
 Filter advertised endpoints against bogon and private ranges.
 
-### 4. Unauthenticated disco floods can stall a client
-
-Inbound disco packets are decrypted before checking whether the sender
-is a known peer, and handled inline on the receive path. Roughly 15k
-packets per second to a client's WireGuard port can starve it enough to
-stop passing traffic. The port must be known, which a mesh member always
-knows.
-
-**Worry level: low unless someone is deliberately targeting you.** Look
-up the sender before doing the key exchange.
-
-### 5. Windows local privilege details
+### 2. Windows local privilege details
 
 `bnk leave` reads state directly rather than going through the gated
-API, so on Windows — where the state file is readable (weakness 1) — any
-local user can deregister the machine. The tray's operator account can
-also call `/join`, which re-points the daemon at a different control
-server. Both are narrower than weakness 1, which grants the key itself.
+API. The state directory DACL now stops ordinary users, but the tray's
+operator account can still call `/join`, which re-points the daemon at a
+different control server.
 
-**Worry level: follows from weakness 1.** Fixing the DACL removes most
-of it; routing `leave` through the control pipe removes the rest.
+**Worry level: low.** Routing `leave` through the control pipe and
+narrowing what the operator may pass to `/join` would close the rest.
 
-### 6. Releases are trusted because GitHub is trusted
+### 3. Releases are trusted because GitHub is trusted
 
 `SHA256SUMS` is generated by the same job that builds the artifacts and
-published to the same release, unsigned. It detects a corrupted
-download, not a malicious one. The install one-liners fetch scripts from
-`main` unpinned, and the Windows tray downloads its MSI with no checksum
-at all. Anyone who can push to the repository, or who steals the release
-token, gets root on every machine at the next update.
+published to the same release, unsigned. Every installer and updater now
+checks it, but it still detects a corrupted download, not a malicious
+release: anyone who can push to the repository, or who steals the
+release token, gets root on every machine at the next update. The
+install one-liners also fetch scripts from `main` unpinned.
 
 **Worry level: proportional to your GitHub account's security.** Enable
 two-factor authentication and treat that account as the mesh's root of
 trust. Signing (Sigstore for binaries, Authenticode for Windows) is the
 real fix; see the code-signing notes in DEPLOY.md.
 
-### 7. Smaller items
+### 4. Smaller items
 
 - Removing a node that a policy group still references makes the policy
   fail to compile, which fails *closed* — the whole mesh goes deny-all
@@ -152,8 +139,11 @@ real fix; see the code-signing notes in DEPLOY.md.
 
 ## If you take three actions
 
-1. Turn on two-factor authentication for the GitHub account. It is the
-   root of trust for every binary on every machine.
-2. Set a restrictive ACL on `%ProgramData%\bnk` on Windows machines.
-3. Before adding anyone else's machine, fix enrollment uniqueness — and
-   remember the ACL will still not contain a hostile member.
+1. Revoke the leaked enrollment key and audit the node list. The key is
+   in public git history; assume it has been read.
+2. Turn on two-factor authentication for the GitHub account, plus secret
+   scanning with push protection so the next pasted transcript is caught
+   at push time. It is the root of trust for every binary on every
+   machine.
+3. Before adding anyone else's machine, remember the ACL will still not
+   contain a hostile member.
