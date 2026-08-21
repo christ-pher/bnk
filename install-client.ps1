@@ -33,7 +33,6 @@ $InstallDir  = Join-Path $env:ProgramFiles 'bnk'
 $StateDir    = Join-Path $env:ProgramData 'bnk'
 $Exe         = Join-Path $InstallDir 'bnk.exe'
 $TrayExe     = Join-Path $InstallDir 'bnk-tray.exe'
-$RunKey      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -100,7 +99,6 @@ function Invoke-Uninstall {
         }
     }
     Stop-Tray
-    Remove-ItemProperty -Path $RunKey -Name 'bnk-tray' -ErrorAction SilentlyContinue
     Remove-FromMachinePath $InstallDir
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
@@ -223,9 +221,8 @@ if (-not $joined) {
 # Re-register without it so the service never resubmits a dead key.
 & $Exe service install --server $Server --state-dir $StateDir --operator $operatorSid | Out-Null
 
-# Start the tray now and at every login. HKCU is the operator's hive:
-# elevation does not change which user you are.
-Set-ItemProperty -Path $RunKey -Name 'bnk-tray' -Value "`"$TrayExe`"" -Force
+# `bnk service install` registered the tray to start at login under the
+# operator's hive; start it now so it appears without a sign-out.
 Start-Process -FilePath $TrayExe
 
 Write-Host ''

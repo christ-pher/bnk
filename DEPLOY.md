@@ -68,7 +68,21 @@ Paste the command `key new` printed — it prints one for each platform.
 curl -fsSL https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.sh | sudo sh -s -- --server https://YOUR_VPS_IP:8443 --key bnkkey:PASTE_HERE
 ```
 
-**Windows**, from an elevated PowerShell:
+**Windows** — either the installer package or the script.
+
+Download `bnk-windows-amd64.msi` from the
+[latest release](https://github.com/christ-pher/bnk/releases/latest) and
+double-click it, or install it silently with your settings baked in:
+
+```
+msiexec /i bnk-windows-amd64.msi /qn BNK_SERVER=https://YOUR_VPS_IP:8443 BNK_KEY=bnkkey:PASTE_HERE
+```
+
+The package registers and starts the service, puts `bnk` on PATH, and
+sets the tray to start at login. It appears in Add or Remove Programs,
+and installing a newer version upgrades in place.
+
+Or, from an elevated PowerShell:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/christ-pher/bnk/main/install-client.ps1))) -Server https://YOUR_VPS_IP:8443 -Key bnkkey:PASTE_HERE
@@ -88,8 +102,11 @@ is granted control.
 
 The operator is whoever ran the installer. Install for a different
 account with `-Operator DOMAIN\user` (or a SID). `bnk.exe` is unsigned, so SmartScreen may warn on first run.
-Re-running the installer is how you update a Windows client — `bnk
-update` is Linux-only for now. Throughput trails Linux because Wintun
+To update a Windows client, use **Check for updates** in the tray menu —
+it fetches the release's MSI and hands it to Windows, which upgrades in
+place and keeps your identity and settings. Re-running the script
+installer also works. (`bnk update` on the command line is Linux-only:
+on Windows the MSI owns what is installed.) Throughput trails Linux because Wintun
 has no batched I/O upstream.
 
 ## Part 3 — verify (2 min, run on client A, no sudo needed)
