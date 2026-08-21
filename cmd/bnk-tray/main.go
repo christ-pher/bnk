@@ -10,7 +10,6 @@
 package main
 
 import (
-	_ "embed"
 	"errors"
 	"flag"
 	"log"
@@ -23,15 +22,17 @@ import (
 
 	"github.com/christ-pher/bnk/internal/localclient"
 	"github.com/christ-pher/bnk/internal/selfupdate"
+	"github.com/christ-pher/bnk/internal/trayicon"
 	"github.com/christ-pher/bnk/internal/trayui"
 	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
-//go:embed icons/connected.ico
-var iconConnected []byte
-
-//go:embed icons/disconnected.ico
-var iconDisconnected []byte
+// icons maps a view's chosen state onto the artwork for it.
+var icons = map[trayui.Icon][]byte{
+	trayui.IconConnected:    trayicon.Connected,
+	trayui.IconDisconnected: trayicon.Disconnected,
+	trayui.IconAttention:    trayicon.Attention,
+}
 
 const (
 	pollInterval  = 3 * time.Second
@@ -94,7 +95,10 @@ type menu struct {
 }
 
 func onReady() {
-	systray.SetIcon(iconDisconnected)
+	// Grey until the first poll answers. Amber would be a false alarm
+	// for the second before the daemon replies, and green would be a
+	// lie; "off" is the one that is usually about to be true anyway.
+	systray.SetIcon(trayicon.Disconnected)
 	systray.SetTitle("bnk")
 	systray.SetTooltip("bnk")
 
@@ -334,11 +338,7 @@ func (m *menu) apply(v trayui.View) {
 	m.status.SetTitle(v.Title)
 	systray.SetTooltip(v.Tooltip)
 	m.action.SetTitle(v.Action)
-	if v.Connected {
-		systray.SetIcon(iconConnected)
-	} else {
-		systray.SetIcon(iconDisconnected)
-	}
+	systray.SetIcon(icons[v.Icon])
 	if v.SelfIP == "" {
 		m.copyIP.Hide()
 	} else {

@@ -32,7 +32,7 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of bnk is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="bnkicon" SourceFile="connected.ico" />
+    <Icon Id="bnkicon" SourceFile="bnk.ico" />
     <Property Id="ARPPRODUCTICON" Value="bnkicon" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/christ-pher/bnk" />
 
@@ -74,9 +74,14 @@
              in a per-machine package. It is named "bnk" because the tray
              is what someone means when they go looking for this. -->
         <File Id="bnkTrayExe" Source="bnk-tray.exe" KeyPath="yes">
+          <!-- The icon is stated rather than inherited from the .exe:
+               a non-advertised shortcut caches whatever the target had
+               when it was created, and stating it means the Start menu
+               is right even if the resource in the binary changes. -->
           <Shortcut Id="TrayShortcut" Directory="ProgramMenuFolder" Name="bnk"
                     Description="Open the bnk tray: connect, disconnect, and see the mesh"
-                    WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+                    WorkingDirectory="INSTALLFOLDER" Advertise="no"
+                    Icon="bnkicon" IconIndex="0" />
         </File>
       </Component>
       <Component Id="wintunDll" Guid="*">

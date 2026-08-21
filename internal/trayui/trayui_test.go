@@ -131,3 +131,25 @@ func TestBuildWhenNotEnrolled(t *testing.T) {
 		t.Errorf("title = %q", v.Title)
 	}
 }
+
+// The icon is the only part of the tray visible without opening the
+// menu, so "off on purpose" and "cannot work yet" must not look alike.
+func TestBuildChoosesIcon(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		st   vpnc.Status
+		err  error
+		want trayui.Icon
+	}{
+		{"connected", connected(), nil, trayui.IconConnected},
+		{"disconnected", vpnc.Status{Enrolled: true}, nil, trayui.IconDisconnected},
+		{"not signed in", vpnc.Status{}, nil, trayui.IconAttention},
+		{"daemon unreachable", vpnc.Status{}, errors.New("no pipe"), trayui.IconAttention},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trayui.Build(tc.st, tc.err).Icon; got != tc.want {
+				t.Errorf("icon = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
