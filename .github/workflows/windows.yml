@@ -243,11 +243,24 @@ jobs:
             throw "service is $state, want Running"
           }
 
-          # And the tray must be set to come back at login.
+          # And the tray must be set to come back at login. The entry is
+          # written under the operator's hive, so check the SID the
+          # package actually recorded rather than assuming it is ours.
           $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          $run = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Run"
+          $recorded = if ($svc.PathName -match '--operator\s+"?(S-1-[\d-]+)"?') { $Matches[1] } else { '' }
+          Write-Host "current SID : $sid"
+          Write-Host "recorded SID: $recorded"
+          $run = "Registry::HKEY_USERS\$recorded\Software\Microsoft\Windows\CurrentVersion\Run"
           $tray = (Get-ItemProperty -Path $run -Name 'bnk-tray' -ErrorAction SilentlyContinue).'bnk-tray'
-          if (-not $tray) { throw 'no tray autostart entry was written for the operator' }
+          if (-not $tray) {
+            Write-Host "--- HKEY_USERS hives present ---"
+            Get-ChildItem Registry::HKEY_USERS | Select-Object -ExpandProperty Name
+            Write-Host "--- does the Run key exist for the operator? ---"
+            Write-Host (Test-Path $run)
+            Write-Host "--- installer log tail ---"
+            Get-Content configured.log -Tail 40
+            throw 'no tray autostart entry was written for the operator'
+          }
           Write-Host "tray autostart: $tray"
 
           # Uninstall must stop and remove the service, then the files.
