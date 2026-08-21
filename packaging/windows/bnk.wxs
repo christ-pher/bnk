@@ -37,10 +37,18 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/christ-pher/bnk" />
 
     <Property Id="BNK_SERVER" Secure="yes" />
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="bnk is installed and connecting. The tray icon controls it."
+                 After="AppSearch" Condition="BNK_SERVER" Sequence="first" />
     <Property Id="BNK_KEY" Secure="yes" />
 
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+    <!-- The minimal wizard has nowhere to ask for a server and key, so a
+         double-click installs files only. Say so on the last page
+         instead of leaving the user with nothing running. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="Files are installed. To join a mesh, open an Administrator prompt and run:    bnk service install --server https://YOUR_SERVER:8443 --key bnkkey:... --start" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="bnk" />
@@ -87,11 +95,18 @@
                   DllEntry="WixQuietExec64"
                   Execute="deferred" Return="ignore" Impersonate="no" />
 
+    <!-- Launch the tray as the installing user. This runs immediate and
+         impersonated on purpose: a deferred action runs as SYSTEM, whose
+         windows never appear in the user's session. -->
+    <CustomAction Id="LaunchTray" FileRef="bnkTrayExe" ExeCommand=""
+                  Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
+
     <InstallExecuteSequence>
       <Custom Action="SetRegisterCmd" After="InstallFiles" Condition="BNK_SERVER" />
       <Custom Action="RegisterService" After="SetRegisterCmd" Condition="BNK_SERVER" />
       <Custom Action="SetUnregisterCmd" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="UnregisterService" After="SetUnregisterCmd" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="LaunchTray" After="InstallFinalize" Condition="NOT Installed OR REINSTALL" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

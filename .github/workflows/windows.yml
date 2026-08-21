@@ -234,6 +234,22 @@ jobs:
           if ($svc.PathName -notlike '*--operator*') { throw "operator missing: $($svc.PathName)" }
           if ($svc.StartMode -ne 'Auto') { throw "start mode $($svc.StartMode), want Auto" }
 
+          # --start means the service should be running, not merely
+          # registered to run after the next reboot.
+          $state = (Get-Service bnk).Status
+          Write-Host "service state: $state"
+          if ($state -ne 'Running') {
+            Get-Content configured.log -Tail 60
+            throw "service is $state, want Running"
+          }
+
+          # And the tray must be set to come back at login.
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $run = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Run"
+          $tray = (Get-ItemProperty -Path $run -Name 'bnk-tray' -ErrorAction SilentlyContinue).'bnk-tray'
+          if (-not $tray) { throw 'no tray autostart entry was written for the operator' }
+          Write-Host "tray autostart: $tray"
+
           # Uninstall must stop and remove the service, then the files.
           Start-Process msiexec -ArgumentList '/x','bnk-test.msi','/qn','/l*v','unconfig.log' -Wait
           if (Get-CimInstance Win32_Service -Filter "Name='bnk'") {
@@ -241,3 +257,5 @@ jobs:
             throw 'service survived uninstall'
           }
           if (Test-Path "$env:ProgramFiles\bnk\bnk.exe") { throw 'files survived uninstall' }
+          $left = (Get-ItemProperty -Path $run -Name 'bnk-tray' -ErrorAction SilentlyContinue).'bnk-tray'
+          if ($left) { throw 'tray autostart entry survived uninstall' }
