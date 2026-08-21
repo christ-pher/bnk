@@ -15,7 +15,10 @@ import _ "embed"
 //go:embed icons/connected.ico
 var Connected []byte
 
-// Disconnected is shown when the tunnel is down on purpose.
+// Disconnected is shown when the tunnel is down on purpose. It carries
+// no status dot: the absence is the signal, because a grey dot and a
+// green one differ only in lightness and a 16px icon does not carry
+// that difference.
 //
 //go:embed icons/disconnected.ico
 var Disconnected []byte

@@ -30,13 +30,16 @@ TRAY_SIZES = [16, 20, 24, 32, 48, 64]
 # the Add or Remove Programs list both reach for 256.
 APP_SIZES = [16, 20, 24, 32, 48, 64, 128, 256]
 
-# Grey rather than red for "disconnected": being off is not an error,
-# and the tray already used grey for it. Amber means the tray needs
-# something from you — the service is down, or this machine has not
-# signed in — states the menu distinguishes but the icon never did.
+# Disconnected has no dot at all. A grey dot and a green one differ only
+# in lightness, which is the one difference a 16px icon glimpsed in the
+# corner of a screen does not carry; dot-versus-no-dot is a difference in
+# shape, which it does. Amber survives as a dot because it differs from
+# green in hue rather than lightness, and because the state it marks —
+# the service down, or this machine not signed in — is one the user has
+# to act on and must not read as a deliberate disconnect.
 STATES = {
     "connected":    (46, 204, 113, 255),
-    "disconnected": (150, 158, 164, 255),
+    "disconnected": None,
     "attention":    (240, 173, 38, 255),
 }
 
@@ -67,11 +70,15 @@ def fit(src, sz, pad):
 def tray(src, sz, colour):
     """One tray icon: the head, with a status dot over the lower jaw.
 
+    A colour of None means no dot, which is how "disconnected" reads.
+
     The dot carries a white outline because the logo is nearly black and
     the taskbar may be either colour — without it the dot merges into
     one or the other.
     """
     c = fit(src, sz, max(1, round(sz / 16)))
+    if colour is None:
+        return c
     r = sz * DOT
     ImageDraw.Draw(c).ellipse(
         [sz - r, sz - r, sz - 1, sz - 1],

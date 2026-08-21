@@ -36,10 +36,16 @@ make the status legible anyway:
 - the dot has a white outline, which separates it from both the black
   logo and either taskbar colour.
 
-Green is connected, grey is disconnected, amber is "needs you" — the
-service is not running, or this machine has not signed in. The menu has
-always distinguished those two from a deliberate disconnect; the icon
-now does too.
+Green is connected and **disconnected has no dot at all**. Two dots
+differing only in lightness is the one difference a 16px icon glimpsed
+in the corner of a screen does not carry; dot-versus-no-dot is a
+difference in shape, which it does.
+
+Amber is "needs you" — the service is not running, or this machine has
+not signed in. It stays a dot because it differs from green in hue
+rather than lightness, and because it marks a state the user has to act
+on and must not read as a deliberate disconnect. The menu has always
+distinguished those two; the icon now does too.
 
 Each `.ico` holds every size rendered at its own size rather than
 downscaled from one large frame, because the small ones are what the
