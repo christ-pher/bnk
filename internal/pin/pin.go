@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -62,18 +63,28 @@ func Fingerprint(certPEM []byte) (string, error) {
 // ClientTLSConfig trusts exactly one certificate: the one whose DER hashes
 // to fingerprint. Chain and hostname verification are replaced, not merely
 // skipped.
+//
+// Only the leaf is examined, and that is the whole point. TLS proves
+// possession of the private key for rawCerts[0] alone; the rest of the
+// chain is unauthenticated attacker-supplied data. Accepting a match at
+// any other position would let anyone terminate the connection with
+// their own key and simply append the real certificate — which is
+// public to anyone who connects to the server.
 func ClientTLSConfig(fingerprint string) *tls.Config {
-	want := strings.ToLower(fingerprint)
+	want := []byte(strings.ToLower(fingerprint))
 	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			for _, raw := range rawCerts {
-				sum := sha256.Sum256(raw)
-				if hex.EncodeToString(sum[:]) == want {
-					return nil
-				}
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("pin: server presented no certificate")
 			}
-			return fmt.Errorf("pin: server certificate does not match pinned fingerprint")
+			sum := sha256.Sum256(rawCerts[0])
+			got := []byte(hex.EncodeToString(sum[:]))
+			if subtle.ConstantTimeCompare(got, want) != 1 {
+				return fmt.Errorf("pin: server certificate does not match pinned fingerprint")
+			}
+			return nil
 		},
 	}
 }
