@@ -1,13 +1,16 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,17 +106,45 @@ func key32(b byte) netmap.Key {
 
 func (e *env) enroll(t *testing.T, name string, nodeKey netmap.Key) coord.EnrollResponse {
 	t.Helper()
+	// Derive the disco key from the node key: they must be distinct per
+	// node, since sharing one lets a node hijack another's path
+	// attribution.
+	disco := nodeKey
+	disco[0] ^= 0xD0
 	resp, err := client.Enroll(context.Background(), e.ts.URL, e.ts.Client(), coord.EnrollRequest{
 		EnrollKey: e.enrollKey,
 		Hostname:  name,
 		OS:        "linux",
 		NodeKey:   nodeKey,
-		DiscoKey:  key32(0xD0),
+		DiscoKey:  disco,
 	})
 	if err != nil {
 		t.Fatalf("enroll %s: %v", name, err)
 	}
 	return resp
+}
+
+// enrollRaw posts an enrollment directly so a test can inspect the
+// rejection rather than failing on it.
+func (e *env) enrollRaw(t *testing.T, name string, nodeKey, discoKey netmap.Key) (int, string) {
+	t.Helper()
+	body, err := json.Marshal(coord.EnrollRequest{
+		EnrollKey: e.enrollKey,
+		Hostname:  name,
+		OS:        "linux",
+		NodeKey:   nodeKey,
+		DiscoKey:  discoKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := e.ts.Client().Post(e.ts.URL+"/enroll", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, strings.TrimSpace(string(out))
 }
 
 func TestEnrollAssignsDistinctIPsAndPersists(t *testing.T) {

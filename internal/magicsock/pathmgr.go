@@ -241,17 +241,31 @@ func (pm *PathManager) pingAll(key NodeKey, discoKey [32]byte, addrs []netip.Add
 
 // HandleDisco processes a disco packet that arrived over UDP from src.
 func (pm *PathManager) HandleDisco(src netip.AddrPort, pkt []byte) {
+	// Check who this claims to be before decrypting. The claim is not
+	// trusted — Open verifies it below — but doing the lookup first
+	// means junk from strangers costs a map read instead of a key
+	// exchange, and this runs inline on the receive path where a flood
+	// would otherwise starve the tunnel.
+	claimed, ok := disco.Sender(pkt)
+	if !ok {
+		return
+	}
+	pm.mu.Lock()
+	key, known := pm.byDiscoKey[claimed]
+	ps := pm.peers[key]
+	pm.mu.Unlock()
+	if !known || ps == nil {
+		return // unknown sender: never seen a netmap naming this key
+	}
+
 	sender, msg, err := disco.Open(pkt, pm.cfg.DiscoPriv)
 	if err != nil {
 		return
 	}
-	pm.mu.Lock()
-	key, known := pm.byDiscoKey[sender]
-	ps := pm.peers[key]
-	pm.mu.Unlock()
-	if !known || ps == nil {
-		pm.logEvent("drop %s: unknown disco sender", src)
-		return // decryption is not authentication: sender must be a known peer
+	// The header is attacker-controlled; only a successful Open proves
+	// the sender holds the matching private key.
+	if sender != claimed {
+		return
 	}
 
 	switch m := msg.(type) {

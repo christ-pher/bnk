@@ -174,6 +174,12 @@ function Show-ServiceDiagnostics {
     Write-Host "  & `"$Exe`" run --server $Server --state-dir `"$StateDir`""
 }
 
+# Lock down the state directory before anything writes a key into it.
+# Windows ignores the file modes the daemon asks for, and ProgramData
+# grants Users read by inheritance.
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+icacls $StateDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+
 $operatorSid = Get-OperatorSid
 Write-Host "tray operator: $operatorSid"
 & $Exe service install --server $Server --key $Key --state-dir $StateDir --operator $operatorSid

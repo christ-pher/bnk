@@ -62,6 +62,12 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logf = func(string, ...any) {}
 	}
 
+	// Do this before anything is written: the private key must never
+	// exist in a world-readable directory, even briefly.
+	if err := hardenStateDir(cfg.StateDir); err != nil {
+		cfg.Logf("warning: could not restrict %s: %v", cfg.StateDir, err)
+	}
+
 	st, haveState, err := loadState(cfg.StateDir)
 	if err != nil {
 		return err

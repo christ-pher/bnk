@@ -23,7 +23,11 @@ func (s *Server) RemoveNode(name string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("no node named %q", name)
 	}
-	id := s.st.Nodes[idx].ID
+	return s.removeAtLocked(idx)
+}
+
+// removeAtLocked removes the node at idx and releases s.mu.
+func (s *Server) removeAtLocked(idx int) error {
 	removed := s.st.Nodes[idx]
 	s.st.Nodes = append(s.st.Nodes[:idx], s.st.Nodes[idx+1:]...)
 	if err := s.fs.Save(s.st); err != nil {
@@ -32,9 +36,9 @@ func (s *Server) RemoveNode(name string) error {
 		s.mu.Unlock()
 		return err
 	}
-	sess := s.sessions[id]
-	delete(s.sessions, id)
-	delete(s.endpoints, id)
+	sess := s.sessions[removed.ID]
+	delete(s.sessions, removed.ID)
+	delete(s.endpoints, removed.ID)
 	s.mu.Unlock()
 
 	// Drop the node's own session so it stops receiving netmaps at once.
@@ -45,20 +49,22 @@ func (s *Server) RemoveNode(name string) error {
 	return nil
 }
 
-// removeNodeByID backs the session leave path, where the caller is
-// identified by its authenticated session rather than by name.
+// removeNodeByID removes the node an authenticated session belongs to.
+// It matches on ID rather than resolving to a name first: names are
+// chosen by the enrolling node, so a name lookup could delete a
+// different node than the one that asked to leave.
 func (s *Server) removeNodeByID(id netmap.NodeID) error {
 	s.mu.Lock()
-	name := ""
-	for _, n := range s.st.Nodes {
+	idx := -1
+	for i, n := range s.st.Nodes {
 		if n.ID == id {
-			name = n.Name
+			idx = i
 			break
 		}
 	}
-	s.mu.Unlock()
-	if name == "" {
+	if idx < 0 {
+		s.mu.Unlock()
 		return fmt.Errorf("no node with id %d", id)
 	}
-	return s.RemoveNode(name)
+	return s.removeAtLocked(idx)
 }

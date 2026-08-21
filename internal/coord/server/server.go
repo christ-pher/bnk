@@ -219,6 +219,15 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 
 	node, ok := s.nodeByKey(req.NodeKey)
 	if !ok {
+		// Names key the ACL and disco keys identify probe traffic, so a
+		// duplicate of either lets a new node impersonate an existing
+		// one: inheriting its permissions as a source, or capturing its
+		// path attribution on every other machine.
+		if why := s.conflictLocked(req.Hostname, req.DiscoKey); why != "" {
+			s.mu.Unlock()
+			http.Error(w, why, http.StatusConflict)
+			return
+		}
 		used := make(map[netip.Addr]bool)
 		var maxID netmap.NodeID
 		for _, n := range s.st.Nodes {
@@ -271,6 +280,20 @@ func truncateField(s string, max int) string {
 		return s[:max]
 	}
 	return s
+}
+
+// conflictLocked reports why a new node may not join, or "" if it may.
+// s.mu must be held.
+func (s *Server) conflictLocked(name string, disco netmap.Key) string {
+	for _, n := range s.st.Nodes {
+		if n.Name == name {
+			return fmt.Sprintf("a node named %q is already enrolled — pick another name, or remove it with `bnk-server node rm %s`", name, name)
+		}
+		if disco != (netmap.Key{}) && n.DiscoKey == disco {
+			return fmt.Sprintf("that disco key is already in use by node %q", n.Name)
+		}
+	}
+	return ""
 }
 
 func (s *Server) nodeByKey(key netmap.Key) (store.Node, bool) {

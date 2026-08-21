@@ -140,6 +140,20 @@ func Seal(msg Message, senderPriv, senderPub, recvPub [32]byte) []byte {
 
 // Open verifies and decrypts a disco packet, returning the sender's public
 // disco key and the message.
+// Sender reads the claimed sender key from a packet header without
+// decrypting anything. The claim is unverified — Open still proves it —
+// but it lets a receiver discard traffic from senders it does not know
+// before spending a key exchange on it, which is otherwise a cheap way
+// to burn a client's CPU.
+func Sender(pkt []byte) ([32]byte, bool) {
+	var sender [32]byte
+	if !IsDisco(pkt) || len(pkt) < headerLen+box.Overhead {
+		return sender, false
+	}
+	copy(sender[:], pkt[len(Magic):len(Magic)+32])
+	return sender, true
+}
+
 func Open(pkt []byte, recvPriv [32]byte) ([32]byte, Message, error) {
 	var sender [32]byte
 	if !IsDisco(pkt) || len(pkt) < headerLen+box.Overhead {
