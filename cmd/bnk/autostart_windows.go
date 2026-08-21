@@ -24,9 +24,11 @@ func enableTrayAutostart(operatorSID, exeDir string) error {
 	if operatorSID == "" {
 		return nil // no operator: nobody to start a tray for
 	}
-	k, err := registry.OpenKey(registry.USERS, operatorSID+`\`+runKeyPath, registry.SET_VALUE)
+	// CreateKey, not OpenKey: a profile that has never had a startup
+	// entry has no Run key at all, and opening a missing key fails.
+	k, _, err := registry.CreateKey(registry.USERS, operatorSID+`\`+runKeyPath, registry.SET_VALUE)
 	if err != nil {
-		return fmt.Errorf("open Run key for %s (is that user logged in?): %w", operatorSID, err)
+		return fmt.Errorf("open Run key for %s (is that user's profile loaded?): %w", operatorSID, err)
 	}
 	defer k.Close()
 	tray := filepath.Join(exeDir, "bnk-tray.exe")
