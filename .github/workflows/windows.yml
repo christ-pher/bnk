@@ -250,7 +250,9 @@ jobs:
             Write-Host '--- still running? ---'
             Get-Process bnk,bnk-tray -ErrorAction SilentlyContinue | Select-Object Name,Id | Format-Table | Out-String | Write-Host
             Get-Service bnk -ErrorAction SilentlyContinue | Select-Object Name,Status | Format-Table | Out-String | Write-Host
-            Get-Content uninstall.log -Tail 40
+            Write-Host '--- uninstall action trace ---'
+            Select-String -Path uninstall.log -Pattern 'Action start|Action ended|returned actual error|Note: 1: 1[0-9]{3}|CustomAction|Disallowed|MSI \(s\).*Error' |
+              Select-Object -Last 60 | ForEach-Object { $_.Line } | Write-Host
             throw 'files survived uninstall'
           }
 
