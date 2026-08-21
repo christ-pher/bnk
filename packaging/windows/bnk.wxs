@@ -119,8 +119,13 @@
                   Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
 
     <InstallExecuteSequence>
-      <Custom Action="SetRegisterCmd" After="InstallFiles" />
-      <Custom Action="RegisterService" After="SetRegisterCmd" />
+      <!-- NOT REMOVE: install, repair, and upgrade register the
+           service; uninstall must not, or it runs `service install`
+           against files it is in the middle of deleting and fails the
+           removal. Dropping the old BNK_SERVER condition to make the
+           service always install is what exposed this. -->
+      <Custom Action="SetRegisterCmd" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="RegisterService" After="SetRegisterCmd" Condition="NOT REMOVE" />
       <Custom Action="SetUnregisterCmd" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="UnregisterService" After="SetUnregisterCmd" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchTray" After="InstallFinalize" Condition="NOT Installed OR REINSTALL" />
