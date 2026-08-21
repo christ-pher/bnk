@@ -45,12 +45,13 @@ type PeerRow struct {
 func Build(st vpnc.Status, err error) View {
 	if err != nil {
 		// Offering "Connect" here was misleading: there is nothing to
-		// connect. The tray cannot start a service without privileges,
-		// so say what is wrong and let the user retry.
+		// connect to. Offer the thing that would actually help — the
+		// tray elevates to do it, since starting a service needs
+		// privileges it deliberately does not hold.
 		return View{
-			Title:       "Daemon not running",
+			Title:       "Not running",
 			Tooltip:     "bnk — the background service is not running",
-			Action:      "Retry",
+			Action:      "Start the bnk service",
 			Unreachable: true,
 		}
 	}

@@ -11,17 +11,31 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/christ-pher/bnk/internal/vpnc"
 )
 
+// dialTimeout bounds how long a call waits for the daemon. It matters
+// most on Windows, where dialling a named pipe WAITS for the pipe to
+// appear rather than failing: without a deadline a caller blocks
+// forever when the daemon is not running.
+const dialTimeout = 5 * time.Second
+
 // New returns a client bound to one local API endpoint.
 func New(endpoint string) *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dial(ctx, endpoint)
+	return &http.Client{
+		// Long enough for a slow status, short enough that a caller is
+		// never wedged by an absent daemon.
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+				defer cancel()
+				return dial(ctx, endpoint)
+			},
 		},
-	}}
+	}
 }
 
 // Get fetches a diagnostics endpoint and decodes it into out.

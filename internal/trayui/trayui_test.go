@@ -90,7 +90,10 @@ func TestBuildWhenDown(t *testing.T) {
 // An unreachable daemon must say so rather than looking disconnected.
 func TestBuildWhenDaemonUnreachable(t *testing.T) {
 	v := trayui.Build(vpnc.Status{}, errors.New("dial: no such file"))
-	if !strings.Contains(v.Title, "not running") {
+	if v.Action != "Start the bnk service" {
+		t.Errorf("action = %q, want an offer to start the service", v.Action)
+	}
+	if !strings.Contains(v.Title, "Not running") {
 		t.Errorf("title = %q, want it to say the daemon is not running", v.Title)
 	}
 }

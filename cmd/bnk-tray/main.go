@@ -11,7 +11,12 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"flag"
+	"log"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"fyne.io/systray"
@@ -41,7 +46,31 @@ var socket = flag.String("socket", vpnc.DefaultSocket, "daemon diagnostics pipe"
 
 func main() {
 	flag.Parse()
-	systray.Run(onReady, func() {})
+	startLogging()
+
+	// One tray per session: clicking the Start menu entry again should
+	// not leave a second icon behind, and two trays toggling the same
+	// daemon only confuses whoever is looking at them.
+	release, already := claimSingleInstance()
+	if already {
+		log.Printf("another bnk-tray is already running; exiting")
+		return
+	}
+	defer release()
+
+	log.Printf("bnk-tray %s starting (socket %s)", version, *socket)
+	systray.Run(onReady, func() { log.Printf("bnk-tray exiting") })
+}
+
+// startLogging sends the tray's log to a file: a windowsgui binary has
+// no console, so without this a failure leaves no trace at all.
+func startLogging() {
+	f, err := os.OpenFile(filepath.Join(os.TempDir(), "bnk-tray.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	log.SetOutput(f)
 }
 
 // menu holds the fixed set of items; systray cannot delete items, so
@@ -56,13 +85,12 @@ type menu struct {
 	update   *systray.MenuItem
 	quit     *systray.MenuItem
 
-	// newVersion is the release the update item would install, empty
-	// when the check has not found anything newer.
-	newVersion string
+	views chan trayui.View // rendered status from the poller
+	wake  chan struct{}    // ask the poller for an immediate refresh
 
-	// lastView backs the click handlers, which need the addresses that
-	// were on screen when the user clicked.
-	lastView trayui.View
+	mu         sync.Mutex
+	lastView   trayui.View
+	newVersion string
 }
 
 func onReady() {
@@ -70,7 +98,10 @@ func onReady() {
 	systray.SetTitle("bnk")
 	systray.SetTooltip("bnk")
 
-	m := &menu{}
+	m := &menu{
+		views: make(chan trayui.View, 4),
+		wake:  make(chan struct{}, 4),
+	}
 	m.status = systray.AddMenuItem("Starting…", "")
 	m.status.Disable()
 	systray.AddSeparator()
@@ -89,16 +120,39 @@ func onReady() {
 	m.update = systray.AddMenuItem("Check for updates", "Ask GitHub for a newer release")
 	m.quit = systray.AddMenuItem("Quit", "Close the tray (the VPN keeps running)")
 
+	go m.poll()
 	go m.run()
 }
 
-func (m *menu) run() {
-	m.refresh()
+// poll owns every call to the daemon. It runs off the event loop so a
+// slow or absent daemon can never stop a menu click being handled —
+// which is what made Quit and Sign in appear dead.
+func (m *menu) poll() {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	for {
+		st, err := localclient.Status(*socket)
+		select {
+		case m.views <- trayui.Build(st, err):
+		default: // one is already queued; the newer one follows shortly
+		}
+		select {
+		case <-ticker.C:
+		case <-m.wake:
+		}
+	}
+}
 
-	// Check once at startup, then occasionally: a tray that only checks
-	// when asked never tells you anything you did not already suspect.
+func (m *menu) refreshSoon() {
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
+}
+
+// run is the event loop. Everything here must return promptly, so work
+// that talks to the network is handed to a goroutine.
+func (m *menu) run() {
 	go m.checkForUpdate(false)
 	updates := time.NewTicker(updateCheckIn)
 	defer updates.Stop()
@@ -114,82 +168,168 @@ func (m *menu) run() {
 
 	for {
 		select {
-		case <-ticker.C:
-			m.refresh()
+		case v := <-m.views:
+			m.apply(v)
 		case <-m.action.ClickedCh:
-			switch {
-			case m.lastView.Unreachable:
-				m.refresh() // Retry
-			case m.lastView.NeedsJoin:
-				m.signIn()
-			default:
-				m.toggle()
-			}
+			go m.onAction()
 		case <-m.copyIP.ClickedCh:
-			if ip := m.lastView.SelfIP; ip != "" {
+			if ip := m.view().SelfIP; ip != "" {
 				setClipboard(ip)
 			}
 		case i := <-clicks:
-			if i < len(m.lastView.Peers) {
-				setClipboard(m.lastView.Peers[i].IP)
+			if peers := m.view().Peers; i < len(peers) {
+				setClipboard(peers[i].IP)
 			}
 		case <-updates.C:
 			go m.checkForUpdate(false)
 		case <-m.update.ClickedCh:
-			if m.newVersion != "" {
-				m.installUpdate()
-			} else {
-				go m.checkForUpdate(true)
-			}
+			go m.onUpdateClicked()
 		case <-m.quit.ClickedCh:
+			log.Printf("quit clicked")
 			systray.Quit()
 			return
 		}
 	}
 }
 
-// signIn asks for a join command and hands it to the daemon. Anything
-// the server printed is accepted, so the user can paste the whole line
-// rather than picking the key out of it.
-func (m *menu) signIn() {
-	pasted, ok := promptForJoin()
-	if !ok {
-		return // cancelled
-	}
-	join, err := trayui.ParseJoin(pasted)
-	if err != nil {
-		m.status.SetTitle(truncate(err.Error()))
-		return
-	}
-	m.status.SetTitle("Signing in…")
-	if err := localclient.Join(*socket, join.Server, join.Key); err != nil {
-		m.status.SetTitle(truncate("Sign-in failed: " + err.Error()))
-		return
-	}
-	m.refresh()
+func (m *menu) view() trayui.View {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastView
 }
 
-// toggle flips the tunnel and reports failures in the status line, which
-// is where a non-operator account learns why nothing happened.
+// onAction runs the button whose meaning depends on the current state.
+func (m *menu) onAction() {
+	switch v := m.view(); {
+	case v.Unreachable:
+		m.startService()
+	case v.NeedsJoin:
+		m.signIn()
+	default:
+		m.toggle()
+	}
+}
+
+func (m *menu) onUpdateClicked() {
+	m.mu.Lock()
+	newer := m.newVersion
+	m.mu.Unlock()
+	if newer != "" {
+		m.status.SetTitle("Starting the installer…")
+		if err := launchUpdater(newer); err != nil {
+			alert("Could not start the installer:\n\n"+err.Error(), "bnk — update")
+		}
+		return
+	}
+	m.checkForUpdate(true)
+}
+
+// startService asks Windows to start the daemon, elevating on the way:
+// starting a service needs privileges the tray deliberately does not
+// hold, so this raises a consent prompt rather than failing quietly.
+func (m *menu) startService() {
+	exe, err := os.Executable()
+	if err != nil {
+		alert(err.Error(), "bnk")
+		return
+	}
+	bnk := filepath.Join(filepath.Dir(exe), "bnk.exe")
+	log.Printf("starting service via %s", bnk)
+	if err := shellExecute("runas", bnk, "service start"); err != nil {
+		alert("Could not start the bnk service:\n\n"+err.Error()+
+			"\n\nIf it is not installed, reinstall bnk from the latest release.", "bnk")
+		return
+	}
+	time.Sleep(2 * time.Second) // let the service come up before polling
+	m.refreshSoon()
+}
+
+// signIn asks for a join command and hands it to the daemon.
+func (m *menu) signIn() {
+	log.Printf("sign-in: prompting")
+	pasted, err := promptForJoin()
+	if errors.Is(err, errCancelled) {
+		log.Printf("sign-in: cancelled")
+		return
+	}
+	if err != nil {
+		log.Printf("sign-in: prompt failed: %v", err)
+		alert(err.Error(), "bnk — sign in")
+		return
+	}
+	join, perr := trayui.ParseJoin(pasted)
+	if perr != nil {
+		log.Printf("sign-in: parse failed: %v", perr)
+		alert(perr.Error(), "bnk — sign in")
+		return
+	}
+
+	m.status.SetTitle("Signing in…")
+	log.Printf("sign-in: joining server=%q", join.Server)
+	if err := localclient.Join(*socket, join.Server, join.Key); err != nil {
+		log.Printf("sign-in: join failed: %v", err)
+		alert("Sign-in failed:\n\n"+err.Error(), "bnk — sign in")
+		m.refreshSoon()
+		return
+	}
+	log.Printf("sign-in: joined")
+	m.refreshSoon()
+}
+
+// toggle flips the tunnel and reports failures where they can be seen,
+// which is where a non-operator account learns why nothing happened.
 func (m *menu) toggle() {
+	connected := m.view().Connected
 	m.status.SetTitle("Working…")
 	var err error
-	if m.lastView.Connected {
+	if connected {
 		err = localclient.Down(*socket)
 	} else {
 		err = localclient.Up(*socket)
 	}
 	if err != nil {
-		m.status.SetTitle(truncate("Failed: " + err.Error()))
-		return
+		log.Printf("toggle failed: %v", err)
+		alert(err.Error(), "bnk")
 	}
-	m.refresh()
+	m.refreshSoon()
 }
 
-func (m *menu) refresh() {
-	st, err := localclient.Status(*socket)
-	v := trayui.Build(st, err)
+// checkForUpdate asks GitHub what the latest release is. announce marks
+// a check the user asked for, which should say something either way.
+func (m *menu) checkForUpdate(announce bool) {
+	if announce {
+		m.update.SetTitle("Checking…")
+	}
+	latest, available, err := selfupdate.UpdateAvailable(repoURL, version)
+
+	m.mu.Lock()
+	if err == nil && available {
+		m.newVersion = latest
+	} else {
+		m.newVersion = ""
+	}
+	m.mu.Unlock()
+
+	switch {
+	case err != nil:
+		log.Printf("update check failed: %v", err)
+		m.update.SetTitle("Check for updates")
+		if announce {
+			alert("Could not check for updates:\n\n"+err.Error(), "bnk — update")
+		}
+	case available:
+		m.update.SetTitle("Update to " + latest)
+	default:
+		m.update.SetTitle("Up to date (" + version + ")")
+	}
+}
+
+// apply renders one view. It runs only on the event loop, so menu items
+// are never written from two goroutines at once.
+func (m *menu) apply(v trayui.View) {
+	m.mu.Lock()
 	m.lastView = v
+	m.mu.Unlock()
 
 	m.status.SetTitle(v.Title)
 	systray.SetTooltip(v.Tooltip)
@@ -204,7 +344,6 @@ func (m *menu) refresh() {
 	} else {
 		m.copyIP.Show()
 	}
-
 	for i, row := range m.peerRows {
 		if i < len(v.Peers) {
 			row.SetTitle(v.Peers[i].Label)
@@ -224,47 +363,4 @@ func (m *menu) refresh() {
 	} else {
 		m.peers.Enable()
 	}
-}
-
-// checkForUpdate asks GitHub what the latest release is. announce marks
-// a check the user asked for, which should say something either way.
-func (m *menu) checkForUpdate(announce bool) {
-	if announce {
-		m.update.SetTitle("Checking…")
-	}
-	latest, available, err := selfupdate.UpdateAvailable(repoURL, version)
-	switch {
-	case err != nil:
-		m.newVersion = ""
-		m.update.SetTitle("Check for updates")
-		if announce {
-			m.status.SetTitle(truncate("Update check failed: " + err.Error()))
-		}
-	case available:
-		m.newVersion = latest
-		m.update.SetTitle("Update to " + latest)
-	default:
-		m.newVersion = ""
-		m.update.SetTitle("Up to date (" + version + ")")
-	}
-}
-
-// installUpdate hands off to the installer rather than swapping files
-// itself: the tray is unprivileged by design, and letting it replace
-// binaries behind the installer's back would leave Windows' record of
-// what is installed out of step with what is on disk.
-func (m *menu) installUpdate() {
-	m.status.SetTitle("Starting the installer…")
-	if err := launchUpdater(m.newVersion); err != nil {
-		m.status.SetTitle(truncate("Could not start the installer: " + err.Error()))
-	}
-}
-
-// truncate keeps a long error from stretching the menu off screen.
-func truncate(s string) string {
-	const max = 70
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-1] + "…"
 }

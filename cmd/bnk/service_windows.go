@@ -24,15 +24,17 @@ import (
 // installer calls it so the logic lives here rather than in the script.
 func serviceCmd(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk service <install|uninstall> [flags]")
+		return fmt.Errorf("usage: bnk service <install|uninstall|start> [flags]")
 	}
 	switch args[0] {
 	case "install":
 		return serviceInstall(args[1:])
 	case "uninstall":
 		return serviceUninstall()
+	case "start":
+		return startService()
 	default:
-		return fmt.Errorf("usage: bnk service <install|uninstall> [flags]")
+		return fmt.Errorf("usage: bnk service <install|uninstall|start> [flags]")
 	}
 }
 
