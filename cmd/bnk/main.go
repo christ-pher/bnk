@@ -42,9 +42,11 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: bnk <up|down|status|join|leave|ping|netcheck|update|version|run|service> [flags]")
+		return noArgs()
 	}
 	switch args[0] {
+	case "tray":
+		return trayCmd()
 	case "status":
 		return status(args[1:])
 	case "ping":
@@ -55,6 +57,8 @@ func run(args []string) error {
 		return upCmd(args[1:])
 	case "down":
 		return downCmd(args[1:])
+	case "help", "-h", "--help":
+		return noArgsUsage()
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -68,7 +72,7 @@ func run(args []string) error {
 		return joinCmd(args[1:])
 	}
 	if args[0] != "run" {
-		return fmt.Errorf("usage: bnk run --server https://host:8443 [--key bnkkey:...] [flags]")
+		return noArgsUsage()
 	}
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	serverURL := fs.String("server", "", "control server URL, e.g. https://bnk.example:8443")
@@ -94,6 +98,11 @@ func run(args []string) error {
 		CreateTUN:   realTUN(*ifName),
 		Logf:        log.Printf,
 	})
+}
+
+// noArgsUsage lists what the command line can do.
+func noArgsUsage() error {
+	return fmt.Errorf("usage: bnk <up|down|status|join|leave|ping|netcheck|tray|update|version|run|service> [flags]")
 }
 
 // realTUN creates a kernel TUN device and applies OS addressing/routes.

@@ -48,10 +48,17 @@
          double-click installs files only. Say so on the last page
          instead of leaving the user with nothing running. -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
-              Value="Files are installed. To join a mesh, open an Administrator prompt and run:    bnk service install --server https://YOUR_SERVER:8443 --key bnkkey:... --start" />
+              Value="bnk is installed and running. Open it from the Start menu, then choose Sign in and paste the join command from your server." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="bnk" />
+    </StandardDirectory>
+
+    <!-- Without a Start Menu entry the tray is unreachable except from a
+         command line: Windows Search only indexes shortcuts, not files
+         in Program Files. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="bnk" />
     </StandardDirectory>
 
     <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
@@ -73,8 +80,22 @@
       </Component>
     </ComponentGroup>
 
+    <!-- The shortcut is named "bnk" and points at the tray, because the
+         tray is what a person means when they go looking for this. -->
+    <ComponentGroup Id="Shortcuts" Directory="AppShortcutFolder">
+      <Component Id="TrayShortcut" Guid="*">
+        <Shortcut Id="TrayShortcut" Name="bnk"
+                  Description="Open the bnk tray: connect, disconnect, and see the mesh"
+                  Target="[INSTALLFOLDER]bnk-tray.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\bnk" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <Feature Id="Main" Title="bnk" Level="1">
       <ComponentGroupRef Id="Binaries" />
+      <ComponentGroupRef Id="Shortcuts" />
     </Feature>
 
     <!-- Registration runs deferred and elevated, after the files exist.
@@ -102,8 +123,8 @@
                   Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
 
     <InstallExecuteSequence>
-      <Custom Action="SetRegisterCmd" After="InstallFiles" Condition="BNK_SERVER" />
-      <Custom Action="RegisterService" After="SetRegisterCmd" Condition="BNK_SERVER" />
+      <Custom Action="SetRegisterCmd" After="InstallFiles" />
+      <Custom Action="RegisterService" After="SetRegisterCmd" />
       <Custom Action="SetUnregisterCmd" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="UnregisterService" After="SetUnregisterCmd" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchTray" After="InstallFinalize" Condition="NOT Installed OR REINSTALL" />

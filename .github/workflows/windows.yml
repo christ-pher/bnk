@@ -207,6 +207,20 @@ jobs:
           if (-not $arp) { throw 'no Add/Remove Programs entry' }
           Write-Host "ARP entry: $($arp.DisplayName) $($arp.DisplayVersion)"
 
+          # A plain double-click passes no properties. It must still leave
+          # a running daemon, or there is nothing for the tray to sign in
+          # through — which is exactly how an install looked "installed
+          # but dead".
+          $svc = Get-Service bnk -ErrorAction SilentlyContinue
+          if (-not $svc) { throw 'a property-less install registered no service' }
+          if ($svc.Status -ne 'Running') { throw "unconfigured service is $($svc.Status), want Running" }
+          Write-Host "unconfigured service: $($svc.Status)"
+
+          # And it must be findable: Windows Search indexes shortcuts.
+          $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\bnk\bnk.lnk'
+          if (-not (Test-Path $lnk)) { throw "no Start Menu shortcut at $lnk" }
+          Write-Host "start menu shortcut: $lnk"
+
           Start-Process msiexec -ArgumentList '/x','bnk-test.msi','/qn','/l*v','uninstall.log' -Wait
           if (Test-Path $exe) {
             Get-Content uninstall.log -Tail 40

@@ -117,9 +117,12 @@ func (m *menu) run() {
 		case <-ticker.C:
 			m.refresh()
 		case <-m.action.ClickedCh:
-			if m.lastView.NeedsJoin {
+			switch {
+			case m.lastView.Unreachable:
+				m.refresh() // Retry
+			case m.lastView.NeedsJoin:
 				m.signIn()
-			} else {
+			default:
 				m.toggle()
 			}
 		case <-m.copyIP.ClickedCh:

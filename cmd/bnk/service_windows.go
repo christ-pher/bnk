@@ -43,9 +43,9 @@ func serviceInstall(args []string) error {
 	operator := fs.String("operator", "", "account (SID or name) allowed to toggle the tunnel without elevating")
 	start := fs.Bool("start", false, "start the service once it is registered")
 	fs.Parse(args)
-	if *server == "" {
-		return fmt.Errorf("--server is required")
-	}
+	// No --server is fine: the daemon idles unenrolled and waits to be
+	// signed in from the tray. Requiring one here is what left a
+	// double-clicked install with no service at all.
 	// Accept either a SID or an account name: the MSI can only pass a
 	// name, since Windows Installer has no built-in SID property.
 	operatorSID, err := resolveOperator(*operator)

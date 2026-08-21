@@ -26,9 +26,12 @@ type View struct {
 	// NeedsJoin means the action item should ask for a key rather than
 	// toggle a tunnel this machine cannot yet have.
 	NeedsJoin bool
-	SelfIP    string // empty when down; what "Copy my IP" yields
-	Peers     []PeerRow
-	Overflow  string // "…and N more", empty when everything fits
+	// Unreachable means the daemon did not answer at all, so neither
+	// toggling nor signing in can work yet.
+	Unreachable bool
+	SelfIP      string // empty when down; what "Copy my IP" yields
+	Peers       []PeerRow
+	Overflow    string // "…and N more", empty when everything fits
 }
 
 // PeerRow is one entry in the Peers submenu.
@@ -41,10 +44,14 @@ type PeerRow struct {
 // tray can explain itself when the daemon is unreachable.
 func Build(st vpnc.Status, err error) View {
 	if err != nil {
+		// Offering "Connect" here was misleading: there is nothing to
+		// connect. The tray cannot start a service without privileges,
+		// so say what is wrong and let the user retry.
 		return View{
-			Title:   "Daemon not running",
-			Tooltip: "bnk — the daemon is not reachable",
-			Action:  "Connect",
+			Title:       "Daemon not running",
+			Tooltip:     "bnk — the background service is not running",
+			Action:      "Retry",
+			Unreachable: true,
 		}
 	}
 	if !st.Enrolled {

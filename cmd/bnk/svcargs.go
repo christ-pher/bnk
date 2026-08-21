@@ -10,7 +10,10 @@ import "strings"
 // then re-registers without it once the node has enrolled, mirroring how
 // the Linux installer blanks BNK_KEY in the env file.
 func serviceArgs(server, key, stateDir, operatorSID string) []string {
-	args := []string{"run", "--server", server, "--state-dir", stateDir}
+	args := []string{"run", "--state-dir", stateDir}
+	if server != "" {
+		args = append(args, "--server", server)
+	}
 	if operatorSID != "" {
 		args = append(args, "--operator", operatorSID)
 	}
