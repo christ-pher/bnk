@@ -42,5 +42,16 @@ func Leave(ctx context.Context, stateDir string) error {
 		return fmt.Errorf("contacting %s: %w", st.ServerURL, err)
 	}
 	defer sess.Close()
-	return sess.Leave()
+	if err := sess.Leave(); err != nil {
+		return err
+	}
+	// The server drops the session once it has removed the node, so the
+	// close is the acknowledgement. Waiting for it matters because the
+	// uninstaller tears the machine down the moment this returns.
+	select {
+	case <-sess.Done():
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("left, but the server did not confirm in time")
+	}
 }

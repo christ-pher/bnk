@@ -202,6 +202,7 @@ func TestRunReusesStateWithoutEnrollKey(t *testing.T) {
 	h := runClient(t, ctx1, tc, "alpha", stateA, tc.enrollKey)
 	h.get(t)
 	cancel1()
+	<-h.done // release the local API socket before the second daemon binds
 
 	raw, err := os.ReadFile(filepath.Join(stateA, "client.json"))
 	if err != nil {

@@ -97,11 +97,12 @@ func Run(ctx context.Context, cfg Config) error {
 		secret, st.Fingerprint = s, fp
 	}
 
+	// A pinned fingerprint arrives with the enrollment key, so a machine
+	// given a server but no key legitimately has none yet. That is the
+	// unenrolled resting state, not a reason to exit — leaving nothing
+	// running is what made a keyless install look completely dead.
 	var tlsConf *tls.Config
-	if strings.HasPrefix(st.ServerURL, "https://") {
-		if st.Fingerprint == "" {
-			return fmt.Errorf("vpnc: no pinned fingerprint; enrollment key required")
-		}
+	if strings.HasPrefix(st.ServerURL, "https://") && st.Fingerprint != "" {
 		tlsConf = pin.ClientTLSConfig(st.Fingerprint)
 	}
 
@@ -194,17 +195,23 @@ func (c *controller) supervise(ctx context.Context) error {
 func (c *controller) runTunnel(ctx context.Context) error {
 	c.mu.Lock()
 	st := c.st
+	secret, hc := c.secret, c.hc
 	c.mu.Unlock()
 
+	if strings.HasPrefix(st.ServerURL, "https://") && st.Fingerprint == "" {
+		// Never dial https unpinned: without the fingerprint there is
+		// nothing authenticating the server.
+		return errNotEnrolled
+	}
 	if st.NodeID == 0 || !st.IP.IsValid() {
-		if c.secret == "" {
+		if secret == "" {
 			// Idle rather than exit: without this the service dies on a
 			// machine that was installed but never given a key, and
 			// nothing is left running for the tray to sign in through.
 			return errNotEnrolled
 		}
-		resp, err := client.Enroll(ctx, st.ServerURL, c.hc, coord.EnrollRequest{
-			EnrollKey: c.secret,
+		resp, err := client.Enroll(ctx, st.ServerURL, hc, coord.EnrollRequest{
+			EnrollKey: secret,
 			Hostname:  c.cfg.Hostname,
 			OS:        osName(),
 			NodeKey:   c.pub,
@@ -345,9 +352,12 @@ func (c *controller) join(serverURL, key string) error {
 	if err := saveState(c.cfg.StateDir, snapshot); err != nil {
 		return err
 	}
+	tlsConf := pin.ClientTLSConfig(fp)
+	c.mu.Lock()
 	c.secret = secret
-	c.tlsConf = pin.ClientTLSConfig(fp)
-	c.hc = &http.Client{Transport: &http.Transport{TLSClientConfig: c.tlsConf}}
+	c.tlsConf = tlsConf
+	c.hc = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}
+	c.mu.Unlock()
 
 	if stop != nil {
 		stop()
@@ -398,7 +408,10 @@ func (c *controller) waitEngine(ctx context.Context, want bool, timeout time.Dur
 // sessionLoop keeps a coordination session alive, reapplying netmaps and
 // reporting endpoints, with jittered backoff between attempts.
 func sessionLoop(ctx context.Context, c *controller, st state, engine *dataplane.Engine) error {
-	cfg, tlsConf, cache := c.cfg, c.tlsConf, c.cache
+	c.mu.Lock()
+	tlsConf := c.tlsConf
+	c.mu.Unlock()
+	cfg, cache := c.cfg, c.cache
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
