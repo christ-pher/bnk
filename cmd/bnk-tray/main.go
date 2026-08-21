@@ -37,7 +37,13 @@ var icons = map[trayui.Icon][]byte{
 const (
 	pollInterval  = 3 * time.Second
 	updateCheckIn = 6 * time.Hour
-	repoURL       = "https://github.com/christ-pher/bnk"
+	// confirmFor is how long a check the user asked for keeps saying it
+	// found nothing. The answer is true when it is shown and stops
+	// being true the moment a release is published, so it is
+	// deliberately short-lived: a permanent "Up to date" is what made
+	// the menu look wrong until it was clicked.
+	confirmFor = 8 * time.Second
+	repoURL    = "https://github.com/christ-pher/bnk"
 )
 
 // version is stamped by the release workflow; local builds say "dev".
@@ -92,6 +98,9 @@ type menu struct {
 	mu         sync.Mutex
 	lastView   trayui.View
 	newVersion string
+	// checkGen counts update checks, so a transient answer can tell
+	// whether a later check has already replaced it.
+	checkGen int
 }
 
 func onReady() {
@@ -121,7 +130,8 @@ func onReady() {
 	m.overflow.Hide()
 	m.copyIP = systray.AddMenuItem("Copy my IP", "Copy this machine's mesh address")
 	systray.AddSeparator()
-	m.update = systray.AddMenuItem("Check for updates", "Ask GitHub for a newer release")
+	m.update = systray.AddMenuItem(trayui.UpdateLabel(trayui.UpdateUnknown, version, ""),
+		"Ask GitHub for a newer release")
 	m.quit = systray.AddMenuItem("Quit", "Close the tray (the VPN keeps running)")
 
 	go m.poll()
@@ -301,8 +311,13 @@ func (m *menu) toggle() {
 // checkForUpdate asks GitHub what the latest release is. announce marks
 // a check the user asked for, which should say something either way.
 func (m *menu) checkForUpdate(announce bool) {
+	m.mu.Lock()
+	m.checkGen++
+	gen := m.checkGen
+	m.mu.Unlock()
+
 	if announce {
-		m.update.SetTitle("Checking…")
+		m.setUpdateTitle(trayui.UpdateChecking, "")
 	}
 	latest, available, err := selfupdate.UpdateAvailable(repoURL, version)
 
@@ -317,15 +332,38 @@ func (m *menu) checkForUpdate(announce bool) {
 	switch {
 	case err != nil:
 		log.Printf("update check failed: %v", err)
-		m.update.SetTitle("Check for updates")
+		// Back to the resting label: which version is running is still
+		// known even when GitHub is not reachable.
+		m.setUpdateTitle(trayui.UpdateUnknown, "")
 		if announce {
 			alert("Could not check for updates:\n\n"+err.Error(), "bnk — update")
 		}
 	case available:
-		m.update.SetTitle("Update to " + latest)
+		m.setUpdateTitle(trayui.UpdateFound, latest)
+	case announce:
+		// The user just asked, so answer them — then let the answer
+		// expire, because it is only true until the next release.
+		m.setUpdateTitle(trayui.UpdateCurrent, latest)
+		go m.expireConfirmation(gen)
 	default:
-		m.update.SetTitle("Up to date (" + version + ")")
+		m.setUpdateTitle(trayui.UpdateUnknown, "")
 	}
+}
+
+// expireConfirmation returns the menu to its resting label, unless
+// another check has run since and has its own answer on show.
+func (m *menu) expireConfirmation(gen int) {
+	time.Sleep(confirmFor)
+	m.mu.Lock()
+	superseded := m.checkGen != gen
+	m.mu.Unlock()
+	if !superseded {
+		m.setUpdateTitle(trayui.UpdateUnknown, "")
+	}
+}
+
+func (m *menu) setUpdateTitle(state trayui.UpdateState, latest string) {
+	m.update.SetTitle(trayui.UpdateLabel(state, version, latest))
 }
 
 // apply renders one view. It runs only on the event loop, so menu items
