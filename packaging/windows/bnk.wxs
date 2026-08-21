@@ -57,9 +57,7 @@
     <!-- Without a Start Menu entry the tray is unreachable except from a
          command line: Windows Search only indexes shortcuts, not files
          in Program Files. -->
-    <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="AppShortcutFolder" Name="bnk" />
-    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
 
     <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
       <Component Id="bnkExe" Guid="*">
@@ -70,7 +68,16 @@
                      Permanent="no" Part="last" Action="set" System="yes" />
       </Component>
       <Component Id="bnkTrayExe" Guid="*">
-        <File Id="bnkTrayExe" Source="bnk-tray.exe" KeyPath="yes" />
+        <!-- The shortcut lives with the file it points at, so the file
+             is the component's keypath. A separate component would need
+             one of its own, and a registry keypath under HKCU is wrong
+             in a per-machine package. It is named "bnk" because the tray
+             is what someone means when they go looking for this. -->
+        <File Id="bnkTrayExe" Source="bnk-tray.exe" KeyPath="yes">
+          <Shortcut Id="TrayShortcut" Directory="ProgramMenuFolder" Name="bnk"
+                    Description="Open the bnk tray: connect, disconnect, and see the mesh"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+        </File>
       </Component>
       <Component Id="wintunDll" Guid="*">
         <File Id="wintunDll" Source="wintun.dll" KeyPath="yes" />
@@ -80,22 +87,8 @@
       </Component>
     </ComponentGroup>
 
-    <!-- The shortcut is named "bnk" and points at the tray, because the
-         tray is what a person means when they go looking for this. -->
-    <ComponentGroup Id="Shortcuts" Directory="AppShortcutFolder">
-      <Component Id="TrayShortcut" Guid="*">
-        <Shortcut Id="TrayShortcut" Name="bnk"
-                  Description="Open the bnk tray: connect, disconnect, and see the mesh"
-                  Target="[INSTALLFOLDER]bnk-tray.exe"
-                  WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\bnk" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-    </ComponentGroup>
-
     <Feature Id="Main" Title="bnk" Level="1">
       <ComponentGroupRef Id="Binaries" />
-      <ComponentGroupRef Id="Shortcuts" />
     </Feature>
 
     <!-- Registration runs deferred and elevated, after the files exist.

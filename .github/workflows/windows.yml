@@ -241,7 +241,7 @@ jobs:
           Write-Host "unconfigured service: $($svc.Status)"
 
           # And it must be findable: Windows Search indexes shortcuts.
-          $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\bnk\bnk.lnk'
+          $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\bnk.lnk'
           if (-not (Test-Path $lnk)) { throw "no Start Menu shortcut at $lnk" }
           Write-Host "start menu shortcut: $lnk"
 
