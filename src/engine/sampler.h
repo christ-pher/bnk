@@ -29,7 +29,7 @@ public:
     float uniform() { return std::uniform_real_distribution<float>(0.f, 1.f)(rng_); }
 
 private:
-    std::mt19937_64 rng_{0x9E3779B97F4A7C15ull};
+    std::mt19937_64 rng_{std::random_device{}()};  // per process; a request's "seed" makes it reproducible
     std::vector<float> scratch_;
     std::vector<int32_t> idx_;
 };
