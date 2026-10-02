@@ -68,40 +68,8 @@ export function OverviewPage({ range }: { range: Range }) {
         </StatCard>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
         <NowCard />
-        <Card className="xl:col-span-2">
-          <CardHeader>
-            <CardTitle>Decode speed</CardTitle>
-            <CardDescription>Tokens per second while generating, 1 s resolution; gaps are idle time</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <TimeChart
-              rows={rows}
-              series={[{ key: "gen", label: "Decode", color: "var(--chart-1)", value: (r) => r.gen_tps }]}
-              unit="tok/s"
-              digits={1}
-              height={230}
-            />
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-3">
-        <Card className="xl:col-span-2">
-          <CardHeader>
-            <CardTitle>Prompt processing</CardTitle>
-            <CardDescription>New prompt tokens per second while reading a prompt; long prompts run at full rate</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <TimeChart
-              rows={rows}
-              series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]}
-              unit="tok/s"
-              height={230}
-            />
-          </CardContent>
-        </Card>
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Layers className="size-4 text-muted-foreground" />Totals</CardTitle>
@@ -114,6 +82,38 @@ export function OverviewPage({ range }: { range: Range }) {
             <Total label="Prefilled" value={fmt.compact(live?.life.prefill_tokens)} unit="tok" />
             <Total label="Cache swaps" value={fmt.compact(live?.life.swaps)} />
             <Total label="Context" value={`${fmt.compact(live?.pos)} / ${fmt.compact(live?.n_ctx)}`} />
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Decode speed</CardTitle>
+            <CardDescription>Tokens per second while generating</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <TimeChart
+              rows={rows}
+              series={[{ key: "gen", label: "Decode", color: "var(--chart-1)", value: (r) => r.gen_tps }]}
+              unit="tok/s"
+              digits={1}
+              height={230}
+            />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Prompt processing</CardTitle>
+            <CardDescription>New prompt tokens per second while reading a prompt</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <TimeChart
+              rows={rows}
+              series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]}
+              unit="tok/s"
+              height={230}
+            />
           </CardContent>
         </Card>
       </div>
