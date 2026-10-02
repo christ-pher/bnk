@@ -75,6 +75,8 @@ struct Model {
     void load(const std::string & path, bool verbose = true);  // dense weights to VRAM
     ~Model();
 
+    bool repack_ = true;  // R layouts for dense quant matrices
+
 private:
     std::vector<void *> device_allocs_;
     QMat upload(const std::string & name, bool required = true);

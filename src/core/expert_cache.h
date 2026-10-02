@@ -31,6 +31,12 @@ public:
     int slots(int il) const { return (int) slot_expert_[il].size(); }
     // Replace the expert in `slot` of layer il by `expert` (stream-ordered; host map updated too).
     void swap(int il, int slot, int expert, cudaStream_t s);
+
+    // Adaptive tier. Call between forwards on the compute stream: finishes copies that are done, then
+    // plans new swaps from routing counts (device [n_layer][n_expert], cumulative) and starts their
+    // copies on a side stream. Returns the number of swaps started.
+    int adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps);
+    int64_t swaps_done = 0;
     const std::vector<int> & slot_experts(int il) const { return slot_expert_[il]; }
     int slot_of(int il, int e) const { return slot_of_host_[(size_t) il * n_expert_ + e]; }
 
@@ -44,6 +50,13 @@ private:
     std::vector<std::vector<int>> slot_expert_;
     std::vector<int32_t> slot_of_host_;
     int32_t * slot_of_dev_ = nullptr;
+    // adaptive state
+    cudaStream_t copy_ = nullptr;
+    std::vector<uint32_t> last_counts_;
+    std::vector<float> score_;
+    struct Pending { int il, slot, expert; cudaEvent_t done; };
+    std::vector<Pending> pending_;
+    std::vector<char> busy_;   // [n_layer * n_expert]: expert involved in an in-flight swap
 };
 
 }  // namespace bnk

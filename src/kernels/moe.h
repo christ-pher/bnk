@@ -70,6 +70,7 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 // out[t] = sum hits + shared * sgate[t] + cpu answer
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
                 int k, int E, cudaStream_t st);
+void moe_debug_times(uint64_t (*out)[3], int n);
 // seq += 1 (first kernel of a forward)
 void bump_seq(uint32_t * seq, cudaStream_t st);
 

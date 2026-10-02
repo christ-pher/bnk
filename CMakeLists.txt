@@ -44,6 +44,8 @@ add_library(bnk_core STATIC
   src/cpu/expert_pool.cpp
   src/cpu/kernels.cpp
   src/kernels/quant_gemv.cu
+  src/kernels/gemv_r.cu
+  src/kernels/rfmt.cpp
   src/kernels/ops.cu
   src/kernels/moe.cu
   src/engine/engine.cpp
@@ -71,3 +73,6 @@ add_executable(bench_cpu_experts tests/bench_cpu_experts.cpp)
 target_link_libraries(bench_cpu_experts PRIVATE bnk_core)
 add_executable(test_cpu_kernels tests/test_cpu_kernels.cpp)
 target_link_libraries(test_cpu_kernels PRIVATE bnk_core)
+add_executable(bench_gemv tests/bench_gemv.cu)
+target_link_libraries(bench_gemv PRIVATE bnk_core)
+target_compile_options(bench_gemv PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)

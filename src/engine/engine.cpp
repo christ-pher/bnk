@@ -132,14 +132,18 @@ void Engine::reset() {
 }
 
 void Engine::save_counts() {
+    // the device counters are cumulative for the session; the file gets this session's total added
     const Config & c = model_.cfg;
     std::vector<uint32_t> now((size_t) c.n_layer * c.n_expert);
     CUDA_CHECK(cudaMemcpy(now.data(), counts_.p, now.size() * 4, cudaMemcpyDeviceToHost));
+    if (saved_counts_.size() != now.size()) saved_counts_.assign(now.size(), 0);
+    std::vector<uint32_t> delta(now.size());
+    for (size_t i = 0; i < now.size(); ++i) delta[i] = now[i] - saved_counts_[i];
+    saved_counts_ = now;
     auto old = load_counts(opt_.counts_out, c.n_layer, c.n_expert);
-    if (old.size() == now.size())
-        for (size_t i = 0; i < now.size(); ++i) now[i] += old[i];
-    bnk::save_counts(opt_.counts_out, now, c.n_layer, c.n_expert);
-    CUDA_CHECK(cudaMemset(counts_.p, 0, now.size() * 4));
+    if (old.size() == delta.size())
+        for (size_t i = 0; i < delta.size(); ++i) delta[i] += old[i];
+    bnk::save_counts(opt_.counts_out, delta, c.n_layer, c.n_expert);
 }
 
 // xn = norm(res); mixed = mean(xn * sigmoid(up(silu(down(xn)/hc)))); inj = inject(xn)
@@ -323,7 +327,10 @@ void Engine::service_cpu(uint32_t seq, int T) {
             cpu_.run(il, T, m->x(), tasks_, m->out(E));
             __atomic_thread_fence(__ATOMIC_RELEASE);
             m->seq_done = seq;
-            times.cpu_experts_ms += now_ms() - t1;
+            const double t2 = now_ms();
+            times.cpu_experts_ms += t2 - t1;
+            static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
+            if (prof) fprintf(stderr, "svc L%02d n=%d wait %.1f us  cpu %.1f us\n", il, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
         }
     }
 }
@@ -349,10 +356,20 @@ void Engine::forward(const int32_t * tokens, int T) {
         }
         CUDA_CHECK(cudaGraphLaunch(graphs_[T], st_));
         service_cpu(seq_, T);
+        static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
+        if (prof) {
+            CUDA_CHECK(cudaStreamSynchronize(st_));
+            uint64_t ts[64][3];
+            moe_debug_times(ts, model_.cfg.n_layer);
+            for (int il = 0; il < model_.cfg.n_layer; ++il)
+                fprintf(stderr, "gpu L%02d plan->wait %.1f us  wait %.1f us\n", il, (ts[il][1] - ts[il][0]) / 1e3,
+                        (ts[il][2] - ts[il][1]) / 1e3);
+        }
     } else {
         enqueue_forward(T);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
     times.total_ms += now_ms() - t0;
     times.calls++;
 }

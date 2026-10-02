@@ -86,8 +86,88 @@ std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_e
 }
 
 ExpertCache::~ExpertCache() {
+    for (auto & p : pending_) cudaEventDestroy(p.done);
+    if (copy_) cudaStreamDestroy(copy_);
     if (region_) cudaFree(region_);
     if (slot_of_dev_) cudaFree(slot_of_dev_);
+}
+
+int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps) {
+    const size_t NN = (size_t) n_layer_ * n_expert_;
+    if (!copy_) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
+        last_counts_.assign(NN, 0);
+        score_.assign(NN, 0.f);
+        busy_.assign(NN, 0);
+    }
+    // 1. map the experts whose copies finished
+    for (size_t i = 0; i < pending_.size();) {
+        Pending & p = pending_[i];
+        if (cudaEventQuery(p.done) != cudaSuccess) { ++i; continue; }
+        int32_t sl = p.slot;
+        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) p.il * n_expert_ + p.expert, &sl, 4, cudaMemcpyHostToDevice, s));
+        slot_of_host_[(size_t) p.il * n_expert_ + p.expert] = p.slot;
+        busy_[(size_t) p.il * n_expert_ + p.expert] = 0;
+        cudaEventDestroy(p.done);
+        pending_[i] = pending_.back();
+        pending_.pop_back();
+        ++swaps_done;
+    }
+    // 2. decayed routing frequency
+    std::vector<uint32_t> now(NN);
+    CUDA_CHECK(cudaMemcpyAsync(now.data(), counts_dev, NN * 4, cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    for (size_t i = 0; i < NN; ++i) {
+        const uint32_t d = now[i] - last_counts_[i];
+        score_[i] = score_[i] * 0.97f + (float) d;
+    }
+    last_counts_.swap(now);
+    if (max_swaps <= 0 || !pending_.empty()) return 0;
+    // 3. per layer: the hottest non-resident vs the coldest resident
+    struct Cand { float gain; int il, slot, in; };
+    std::vector<Cand> cands;
+    for (int il = 0; il < n_layer_; ++il) {
+        if (slot_expert_[il].empty()) continue;
+        const float * sc = score_.data() + (size_t) il * n_expert_;
+        int best = -1, worst_slot = -1;
+        for (int e = 0; e < n_expert_; ++e)
+            if (slot_of_host_[(size_t) il * n_expert_ + e] < 0 && !busy_[(size_t) il * n_expert_ + e] &&
+                (best < 0 || sc[e] > sc[best]))
+                best = e;
+        for (int sl = 0; sl < (int) slot_expert_[il].size(); ++sl) {
+            const int e = slot_expert_[il][sl];
+            if (busy_[(size_t) il * n_expert_ + e]) continue;
+            if (worst_slot < 0 || sc[e] < sc[slot_expert_[il][worst_slot]]) worst_slot = sl;
+        }
+        if (best < 0 || worst_slot < 0) continue;
+        const float gain = sc[best] - sc[slot_expert_[il][worst_slot]];
+        if (gain > 1.5f) cands.push_back({gain, il, worst_slot, best});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) { return a.gain > b.gain; });
+    int started = 0;
+    for (const Cand & c : cands) {
+        if (started >= max_swaps) break;
+        const int old = slot_expert_[c.il][c.slot];
+        int32_t minus1 = -1;
+        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) c.il * n_expert_ + old, &minus1, 4, cudaMemcpyHostToDevice, s));
+        slot_of_host_[(size_t) c.il * n_expert_ + old] = -1;
+        cudaEvent_t unmapped;
+        CUDA_CHECK(cudaEventCreateWithFlags(&unmapped, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(unmapped, s));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_, unmapped, 0));
+        cudaEventDestroy(unmapped);
+        const size_t b = st_->blob_bytes(c.il);
+        CUDA_CHECK(cudaMemcpyAsync(layer_base_[c.il] + (size_t) c.slot * b, st_->blob(c.il, c.in), b,
+                                   cudaMemcpyHostToDevice, copy_));
+        Pending p{c.il, c.slot, c.in, nullptr};
+        CUDA_CHECK(cudaEventCreateWithFlags(&p.done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(p.done, copy_));
+        pending_.push_back(p);
+        slot_expert_[c.il][c.slot] = c.in;
+        busy_[(size_t) c.il * n_expert_ + c.in] = 1;
+        ++started;
+    }
+    return started;
 }
 
 void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s,

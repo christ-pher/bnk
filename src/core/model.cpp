@@ -73,16 +73,11 @@ QMat Model::upload(const std::string & name, bool required) {
         return QMat{};
     }
     void * d = nullptr;
-    CUDA_CHECK(cudaMalloc(&d, t->nbytes));
-    CUDA_CHECK(cudaMemcpy(d, t->data, t->nbytes, cudaMemcpyHostToDevice));
+    // token embeddings stay in ggml layout (gathered by row); every other matrix is repacked when possible
+    const bool repack = repack_ && name != "token_embd.weight";
+    QMat m = upload_matrix(t->data, (int) t->type, t->nrows(), t->ne[0], t->row_bytes(), repack, &d);
     device_allocs_.push_back(d);
-    vram_dense_bytes += t->nbytes;
-    QMat m;
-    m.data = d;
-    m.type = (int) t->type;
-    m.cols = t->ne[0];
-    m.rows = t->nrows();
-    m.row_bytes = t->row_bytes();
+    vram_dense_bytes += m.row_bytes * m.rows;
     return m;
 }
 

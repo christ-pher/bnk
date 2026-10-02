@@ -19,11 +19,9 @@ static int test_tensor(const TensorRef & t) {
     const int64_t cols = t.ne[0];
     const int64_t rows = std::min<int64_t>(t.nrows(), 512);
     const size_t rb = t.row_bytes();
-    QMat W{nullptr, (int) t.type, rows, cols, rb};
     void * dw;
-    CK(cudaMalloc(&dw, rows * rb));
-    CK(cudaMemcpy(dw, t.data, rows * rb, cudaMemcpyHostToDevice));
-    W.data = dw;
+    static const bool use_r = getenv("BNK_TEST_R") != nullptr;
+    QMat W = upload_matrix(t.data, (int) t.type, rows, cols, rb, use_r, &dw);
 
     // 1. dequantization vs ggml
     std::vector<float> ref(rows * cols), got(rows * cols);
@@ -72,8 +70,8 @@ static int test_tensor(const TensorRef & t) {
         }
     const double gerr = sqrt(num / (den + 1e-30));
     const bool ok = bad == 0 && gerr < 2e-2;
-    printf("%-8s %-40s %6lld x %-6lld dequant max rel %.2e (%lld bad)  gemv rel rms %.2e  %s\n",
-           ggml_type_name(t.type), t.name.c_str(), (long long) rows, (long long) cols, maxrel, (long long) bad, gerr,
+    printf("%s%-8s %-40s %6lld x %-6lld dequant max rel %.2e (%lld bad)  gemv rel rms %.2e  %s\n",
+           W.layout ? "R " : "  ", ggml_type_name(t.type), t.name.c_str(), (long long) rows, (long long) cols, maxrel, (long long) bad, gerr,
            ok ? "OK" : "FAIL");
     cudaFree(dw); cudaFree(dout); cudaFree(dx); cudaFree(dy); cudaFree(a.q); cudaFree(a.d);
     return ok ? 0 : 1;

@@ -30,6 +30,8 @@ struct EngineOptions {
     double expert_cache_gib = -1;    // < 0: everything that fits
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
+    int adapt_every = 4;             // forwards between adaptive cache updates (0 = static cache)
+    int adapt_swaps = 16;            // max expert swaps started per update
 };
 
 struct StageTimes {
@@ -91,6 +93,7 @@ private:
     cudaStream_t st_ = nullptr;
     std::vector<int32_t> history_;
     uint32_t seq_ = 0;
+    int64_t fwd_count_ = 0;
     cudaGraphExec_t graphs_[kMaxWindow + 1] = {};
 
     // window inputs (pinned host) and their device copy
@@ -115,6 +118,7 @@ private:
     DevBuf<float> gu_buf_, hd_buf_, part_buf_;
     DevBuf<int8_t> hq_buf_;
     DevBuf<uint32_t> counts_;
+    std::vector<uint32_t> saved_counts_;
     uint8_t * mail_ = nullptr;  // host-mapped mailboxes, one per layer
     size_t mail_stride_ = 0;
     MoeMsg * msg(int il) const { return (MoeMsg *) (mail_ + (size_t) il * mail_stride_); }

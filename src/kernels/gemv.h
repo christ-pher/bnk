@@ -17,6 +17,8 @@ struct QMat {
     int type = 0;                 // ggml_type
     int64_t rows = 0, cols = 0;
     size_t row_bytes = 0;
+    int layout = 0;               // 0: ggml blocks, 1: R layout (rfmt.h)
+    uint32_t r_off[5] = {0, 0, 0, 0, 0};
     bool valid() const { return data != nullptr; }
 };
 
@@ -40,6 +42,14 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T,
 // Convenience: quantizes into `scratch` when W needs it.
 void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
                bool accumulate, ActQ8 & scratch, cudaStream_t s);
+
+// GEMV v2 kernels (gemv_r.cu): R-layout quant rows and float rows.
+void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s);
+void gemv_float2(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,
+                 cudaStream_t s);
+// Upload a ggml-layout host matrix to the device, repacked to the R layout when supported.
+QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size_t row_bytes, bool repack,
+                   void ** dev_alloc);
 
 // Dequantize rows [r0, r0+n) of W to fp32 (tests / embeddings).
 void dequant_rows(const QMat & W, int64_t r0, int64_t n, float * out, cudaStream_t s);

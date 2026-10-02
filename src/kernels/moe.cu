@@ -4,6 +4,15 @@
 namespace bnk {
 
 __global__ void bump_seq_k(uint32_t * seq) { *seq += 1; }
+
+__device__ __forceinline__ uint64_t gtimer() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+// debug timestamps per layer: [0] plan signalled, [1] wait start, [2] wait end
+__device__ uint64_t g_moe_ts[64][3];
+__device__ int g_moe_layer;
 void bump_seq(uint32_t * seq, cudaStream_t st) { bump_seq_k<<<1, 1, 0, st>>>(seq); }
 
 // ------------------------------------------------------------------------------------------- plan
@@ -78,7 +87,10 @@ __global__ void moe_plan_k(const int32_t * ids, const float * w, int T, int k, c
         __threadfence_system();
     }
     __syncthreads();
-    if (threadIdx.x == 0) msg->seq_req = *seq;
+    if (threadIdx.x == 0) {
+        msg->seq_req = *seq;
+        g_moe_ts[g_moe_layer & 63][0] = gtimer();
+    }
 }
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
@@ -209,10 +221,21 @@ void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, i
 
 // ------------------------------------------------------------------------------------------- wait / reduce
 __global__ void moe_wait_k(const HitList * hits, MoeMsg * msg, const uint32_t * seq) {
-    if (hits->n_miss == 0) return;
-    const uint32_t want = *seq;
-    while (msg->seq_done != want) __nanosleep(200);
-    __threadfence_system();
+    const int L = g_moe_layer & 63;
+    g_moe_ts[L][1] = gtimer();
+    if (hits->n_miss != 0) {
+        const uint32_t want = *seq;
+        while (msg->seq_done != want) __nanosleep(200);
+        __threadfence_system();
+    }
+    g_moe_ts[L][2] = gtimer();
+    g_moe_layer = L + 1;
+}
+
+void moe_debug_times(uint64_t (*out)[3], int n) {
+    cudaMemcpyFromSymbol(out, g_moe_ts, sizeof(uint64_t) * 3 * n);
+    int zero = 0;
+    cudaMemcpyToSymbol(g_moe_layer, &zero, 4);
 }
 void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStream_t st) {
     moe_wait_k<<<1, 1, 0, st>>>(s.hits, msg, seq);

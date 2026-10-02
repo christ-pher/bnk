@@ -66,6 +66,8 @@ int main(int argc, char ** argv) {
         else if (a == "--counts") opt.counts_out = next();
         else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
+        else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
+        else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     auto prompt = read_tokens(tokfile);
@@ -139,7 +141,8 @@ int main(int argc, char ** argv) {
     printf("decode %zu tokens in %.1f ms (%.2f tok/s); per token: total %.2f ms, CPU experts %.2f ms, PLE host %.2f ms\n",
            out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), tm.total_ms / tm.calls,
            tm.cpu_experts_ms / tm.calls, tm.ple_ms / tm.calls);
-    printf("expert misses %.2f%% (%.2f per token)\n", 100.0 * tm.misses / std::max<int64_t>(1, tm.routed),
-           (double) tm.misses / tm.calls);
+    printf("expert misses %.2f%% (%.2f per token), %lld cache swaps\n",
+           100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / tm.calls,
+           (long long) eng.cache().swaps_done);
     return 0;
 }

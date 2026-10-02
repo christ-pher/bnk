@@ -6,6 +6,8 @@
 
 #include "kernels/gemv.h"
 #include "kernels/quant.cuh"
+#include "kernels/rfmt.cuh"
+#include <vector>
 
 namespace bnk {
 
@@ -262,6 +264,15 @@ static void launch_float(const QMat & W, const float * x, int64_t ldx, int T, fl
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
           bool accumulate, cudaStream_t s) {
     if (T < 1 || T > kMaxWindow) throw std::runtime_error("gemv: window out of range");
+    if (W.layout == 1) {
+        if (!a || a->cols != W.cols) throw std::runtime_error("gemv: activation not quantized for this width");
+        gemv_r(W, *a, T, y, ldy, accumulate, s);
+        return;
+    }
+    if (is_float_format(W.type) && !getenv("BNK_OLD_FLOAT")) {
+        gemv_float2(W, x, ldx, T, y, ldy, accumulate, s);
+        return;
+    }
     if (is_float_format(W.type)) {
         if (T == 1) launch_float<1>(W, x, ldx, T, y, ldy, accumulate, s);
         else if (T == 2) launch_float<2>(W, x, ldx, T, y, ldy, accumulate, s);
@@ -337,7 +348,37 @@ __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, cons
     }
 }
 
+template <int FMT>
+__global__ void dequant_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, const int32_t * __restrict__ ids,
+                            int64_t r0, int n, int64_t cols, float * __restrict__ out) {
+    const int64_t nsb = cols / 32;
+    const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (int64_t) n * nsb) return;
+    const int i = (int) (gid / nsb);
+    const int sb = (int) (gid % nsb);
+    const int64_t r = ids ? ids[i] : r0 + i;
+    Unpacked u;
+    RT<FMT>::unpack(W + (size_t) r * row_bytes, o, sb, u);
+    float * op = out + (int64_t) i * cols + sb * 32;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float dd = k < 4 ? u.d0 : u.d1, mm = k < 4 ? u.m0 : u.m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) op[4 * k + j] = dd * (float) (int8_t) (u.w[k] >> (8 * j)) - mm;
+    }
+}
+
 static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int n, float * out, cudaStream_t s) {
+    if (W.layout == 1) {
+        const int64_t total = (int64_t) n * (W.cols / 32);
+        const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
+        auto f = [&]<int FMT>() {
+            dequant_r_k<FMT><<<(int) ((total + 127) / 128), 128, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o, ids,
+                                                                        r0, n, W.cols, out);
+        };
+        BNK_DISPATCH_R(W.type, f);
+        return;
+    }
     const int64_t total = (int64_t) n * (W.cols / 32);
     const int threads = 128;
     const int grid = (int) ((total + threads - 1) / threads);
@@ -359,4 +400,33 @@ void dequant_gather(const QMat & W, const int32_t * ids, int n, float * out, cud
     dequant_launch(W, ids, 0, n, out, s);
 }
 
+}  // namespace bnk
+
+namespace bnk {
+QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size_t row_bytes, bool repack,
+                   void ** dev_alloc) {
+    QMat m;
+    m.type = type;
+    m.rows = rows;
+    m.cols = cols;
+    void * d = nullptr;
+    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0) ? 32 : type == QT_Q2_0 ? 64 : 256;
+    if (repack && r_supported(type) && cols % need == 0) {
+        const RLayout L = r_layout(type, cols);
+        std::vector<uint8_t> buf(L.row_bytes * rows);
+        r_repack(L, (const uint8_t *) host, row_bytes, rows, buf.data());
+        if (cudaMalloc(&d, buf.size()) != cudaSuccess) throw std::runtime_error("cudaMalloc failed");
+        cudaMemcpy(d, buf.data(), buf.size(), cudaMemcpyHostToDevice);
+        m.row_bytes = L.row_bytes;
+        m.layout = 1;
+        m.r_off[0] = L.off_a; m.r_off[1] = L.off_b; m.r_off[2] = L.off_c; m.r_off[3] = L.off_d; m.r_off[4] = L.off_e;
+    } else {
+        if (cudaMalloc(&d, row_bytes * rows) != cudaSuccess) throw std::runtime_error("cudaMalloc failed");
+        cudaMemcpy(d, host, row_bytes * rows, cudaMemcpyHostToDevice);
+        m.row_bytes = row_bytes;
+    }
+    m.data = d;
+    *dev_alloc = d;
+    return m;
+}
 }  // namespace bnk
