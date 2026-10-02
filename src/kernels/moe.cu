@@ -1,5 +1,7 @@
 #include "kernels/moe.h"
 #include "kernels/qdot.cuh"
+#include "kernels/rfmt.cuh"
+#include "kernels/rfmt_impl.h"
 
 namespace bnk {
 
@@ -194,6 +196,185 @@ __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ h
     }
 }
 
+// ---- R-layout hit kernels: LPR lanes per row, the entry's token activations staged in shared memory
+template <int FMT, int NT, int LPR>
+__global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
+                                                  size_t blob, size_t up_off, size_t grow, ROff o, int F, int E,
+                                                  const int8_t * __restrict__ aq, const float * __restrict__ ad,
+                                                  int64_t cols_pad, float * __restrict__ gu_out) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    const int ent = blockIdx.x;
+    if (ent >= hits->n) return;
+    const HitEntry & h = hits->e[ent];
+    const uint32_t mask = h.mask;
+    int8_t * aqs = (int8_t *) sm;
+    float * ads = (float *) (sm + (size_t) NT * E);
+    const int nb = E / 32;
+    for (int t = 0; t < NT; ++t) {
+        if (!(mask & (1u << t))) continue;
+        for (int i = threadIdx.x; i < E / 16; i += blockDim.x)
+            ((int4 *) (aqs + (size_t) t * E))[i] = __ldg((const int4 *) (aq + t * cols_pad) + i);
+        for (int i = threadIdx.x; i < nb; i += blockDim.x) ads[t * nb + i] = __ldg(ad + t * (cols_pad / 32) + i);
+    }
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int sub = lane % LPR;
+    const int r = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR;
+    const bool ok = r < 2 * F;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    if (ok) {
+        const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
+        for (int sb = sub; sb < nb; sb += LPR) {
+            Unpacked u;
+            RT<FMT>::unpack(row, o, sb, u);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (mask & (1u << t)) {
+                    const int4 * ap = (const int4 *) (aqs + (size_t) t * E + sb * 32);
+                    acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], ads[t * nb + sb]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off);
+    }
+    if (ok && sub == 0) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+            if (mask & (1u << t)) gu_out[((size_t) ent * kMaxWindow + t) * 2 * F + r] = acc[t];
+    }
+}
+
+template <int FMT, int NT, int LPR>
+__global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
+                                                    size_t blob, size_t down_off, size_t drow, ROff o, int F, int E,
+                                                    const int8_t * __restrict__ hq, const float * __restrict__ hd,
+                                                    float * __restrict__ part) {
+    extern __shared__ __align__(16) uint8_t sm[];
+    const int ent = blockIdx.x;
+    if (ent >= hits->n) return;
+    const HitEntry & h = hits->e[ent];
+    const uint32_t mask = h.mask;
+    const int nb = F / 32;
+    int8_t * hqs = (int8_t *) sm;
+    float * hds = (float *) (sm + (size_t) NT * F);
+    for (int t = 0; t < NT; ++t) {
+        if (!(mask & (1u << t))) continue;
+        const size_t b = (size_t) ent * kMaxWindow + t;
+        for (int i = threadIdx.x; i < F / 16; i += blockDim.x) ((int4 *) (hqs + (size_t) t * F))[i] = ((const int4 *) (hq + b * F))[i];
+        for (int i = threadIdx.x; i < nb; i += blockDim.x) hds[t * nb + i] = hd[b * nb + i];
+    }
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int sub = lane % LPR;
+    const int r = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR;
+    const bool ok = r < E;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    if (ok) {
+        const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
+        for (int sb = sub; sb < nb; sb += LPR) {
+            Unpacked u;
+            RT<FMT>::unpack(row, o, sb, u);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                if (mask & (1u << t)) {
+                    const int4 * ap = (const int4 *) (hqs + (size_t) t * F + sb * 32);
+                    acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], hds[t * nb + sb]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off);
+    }
+    if (ok && sub == 0) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+            if (mask & (1u << t)) part[((size_t) ent * kMaxWindow + t) * E + r] = acc[t];
+    }
+}
+
+static int lpr_for(int nsb) { return nsb >= 128 ? 32 : nsb >= 48 ? 16 : nsb >= 24 ? 8 : 4; }
+
+template <int NT>
+static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
+                          cudaStream_t st) {
+    const int maxent = T * k;
+    const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
+    const size_t smg = (size_t) NT * E + (size_t) NT * (E / 32) * 4;
+    const size_t smd = (size_t) NT * F + (size_t) NT * (F / 32) * 4;
+    auto gu = [&]<int FMT>() {
+        auto L = [&]<int LPR>() {
+            constexpr int rows = 8 * (32 / LPR);
+            moe_gu_r_k<FMT, NT, LPR><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, smg, st>>>(
+                s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+        };
+        switch (lpr_for(E / 32)) {
+            case 32: L.template operator()<32>(); break;
+            case 16: L.template operator()<16>(); break;
+            case 8: L.template operator()<8>(); break;
+            default: L.template operator()<4>();
+        }
+    };
+    BNK_DISPATCH_R(d.gate_type, gu);
+    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd);
+    auto dn = [&]<int FMT>() {
+        auto L = [&]<int LPR>() {
+            constexpr int rows = 8 * (32 / LPR);
+            moe_down_r_k<FMT, NT, LPR><<<dim3(maxent, (E + rows - 1) / rows), 256, smd, st>>>(
+                s.hits, d.base, d.blob, d.gate_bytes + d.up_bytes, d.drow, dof, F, E, s.hq, s.hd, s.part);
+        };
+        switch (lpr_for(F / 32)) {
+            case 32: L.template operator()<32>(); break;
+            case 16: L.template operator()<16>(); break;
+            case 8: L.template operator()<8>(); break;
+            default: L.template operator()<4>();
+        }
+    };
+    BNK_DISPATCH_R(d.down_type, dn);
+}
+
+// ---- cache fill: ggml blob -> R slot, one thread per row
+// one thread per (row, sub-block) of an expert: gate/up rows have gl.nsb sub-blocks, down rows dl.nsb
+__global__ void moe_repack_k(const uint8_t * src, size_t src_stride, uint8_t * const * dst, int F, int E, RLayout gl,
+                             size_t g_srb, RLayout dl, size_t d_srb) {
+    const int e = blockIdx.y;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n_gu = (int64_t) 2 * F * gl.nsb;
+    if (i >= n_gu + (int64_t) E * dl.nsb) return;
+    const uint8_t * s = src + (size_t) e * src_stride;
+    uint8_t * d = dst[e];
+    if (i < n_gu) {
+        const int r = (int) (i / gl.nsb), sb = (int) (i % gl.nsb);
+        rfmt_repack_sb(gl, s + (size_t) r * g_srb, d + (size_t) r * gl.row_bytes, sb);
+    } else {
+        const int64_t j = i - n_gu;
+        const int r = (int) (j / dl.nsb), sb = (int) (j % dl.nsb);
+        rfmt_repack_sb(dl, s + (size_t) 2 * F * g_srb + (size_t) r * d_srb,
+                       d + (size_t) 2 * F * gl.row_bytes + (size_t) r * dl.row_bytes, sb);
+    }
+}
+
+void moe_repack_blobs(const uint8_t * src, size_t src_stride, uint8_t * const * dst, int n, int F, int E,
+                      int gate_type, size_t g_rb, int down_type, size_t d_rb, cudaStream_t st) {
+    if (n <= 0) return;
+    const RLayout gl = r_layout(gate_type, E), dl = r_layout(down_type, F);
+    const int64_t work = (int64_t) 2 * F * gl.nsb + (int64_t) E * dl.nsb;
+    moe_repack_k<<<dim3((unsigned) ((work + 255) / 256), n), 256, 0, st>>>(src, src_stride, dst, F, E, gl, g_rb, dl, d_rb);
+    check_launch("moe_repack");
+}
+
 template <int NT>
 static void hits_launch(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
                         cudaStream_t st) {
@@ -213,6 +394,14 @@ static void hits_launch(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq
 }
 
 void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st) {
+    if (d.rlay) {
+        if (T == 1) hits_launch_r<1>(d, s, xq, T, k, E, F, st);
+        else if (T == 2) hits_launch_r<2>(d, s, xq, T, k, E, F, st);
+        else if (T <= 4) hits_launch_r<4>(d, s, xq, T, k, E, F, st);
+        else hits_launch_r<8>(d, s, xq, T, k, E, F, st);
+        check_launch("moe_hits_r");
+        return;
+    }
     if (T == 1) hits_launch<1>(d, s, xq, T, k, E, F, st);
     else if (T == 2) hits_launch<2>(d, s, xq, T, k, E, F, st);
     else if (T <= 4) hits_launch<4>(d, s, xq, T, k, E, F, st);
@@ -266,11 +455,11 @@ void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const 
 
 namespace bnk {
 
-template <int FMT>
+template <int FMT, bool RL>
 __global__ void __launch_bounds__(256) moe_gu_list_k(const PfItem * __restrict__ items, size_t gate_bytes, size_t grow,
                                                      int F, int E, const int8_t * __restrict__ aq,
                                                      const float * __restrict__ ad, int64_t cols_pad,
-                                                     float * __restrict__ gu) {
+                                                     float * __restrict__ gu, ROff ro) {
     const PfItem & it = items[blockIdx.x];
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
@@ -283,7 +472,8 @@ __global__ void __launch_bounds__(256) moe_gu_list_k(const PfItem * __restrict__
     for (int t = 0; t < kMaxWindow; ++t) acc[t] = 0.f;
     for (int sb = lane; sb < nsb; sb += 32) {
         Unpacked u;
-        unpack_sub<FMT>(row, sb, u);
+        if constexpr (RL) RT<FMT>::unpack(row, ro, sb, u);
+        else unpack_sub<FMT>(row, sb, u);
 #pragma unroll
         for (int t = 0; t < kMaxWindow; ++t) {
             if (t < n) {
@@ -319,10 +509,10 @@ __global__ void moe_act_list_k(const PfItem * __restrict__ items, const float * 
     }
 }
 
-template <int FMT>
+template <int FMT, bool RL>
 __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict__ items, size_t down_off, size_t drow,
                                                        int F, int E, const int8_t * __restrict__ hq,
-                                                       const float * __restrict__ hd, half * __restrict__ D) {
+                                                       const float * __restrict__ hd, half * __restrict__ D, ROff ro) {
     const PfItem & it = items[blockIdx.x];
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
@@ -334,7 +524,8 @@ __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict
     for (int t = 0; t < kMaxWindow; ++t) acc[t] = 0.f;
     for (int sb = lane; sb < nsb; sb += 32) {
         Unpacked u;
-        unpack_sub<FMT>(row, sb, u);
+        if constexpr (RL) RT<FMT>::unpack(row, ro, sb, u);
+        else unpack_sub<FMT>(row, sb, u);
 #pragma unroll
         for (int t = 0; t < kMaxWindow; ++t) {
             if (t < n) {
@@ -356,15 +547,24 @@ __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict
 void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const ActQ8 & xq, int E, int F, float * gu,
               int8_t * hq, float * hd, half * D, cudaStream_t st) {
     if (n_items <= 0) return;
+    const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
     auto g = [&]<int FMT>() {
-        moe_gu_list_k<FMT><<<dim3(n_items, (2 * F + 7) / 8), 256, 0, st>>>(items, d.gate_bytes, d.grow, F, E, xq.q,
-                                                                          xq.d, xq.cols_pad, gu);
+        if (d.rlay)
+            moe_gu_list_k<FMT, true><<<dim3(n_items, (2 * F + 7) / 8), 256, 0, st>>>(items, d.gate_bytes, d.grow, F, E,
+                                                                                   xq.q, xq.d, xq.cols_pad, gu, go);
+        else
+            moe_gu_list_k<FMT, false><<<dim3(n_items, (2 * F + 7) / 8), 256, 0, st>>>(items, d.gate_bytes, d.grow, F, E,
+                                                                                    xq.q, xq.d, xq.cols_pad, gu, go);
     };
     BNK_DISPATCH_DP4A(d.gate_type, g);
     moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
     auto dn = [&]<int FMT>() {
-        moe_down_list_k<FMT><<<dim3(n_items, (E + 7) / 8), 256, 0, st>>>(items, d.gate_bytes + d.up_bytes, d.drow, F,
-                                                                        E, hq, hd, D);
+        if (d.rlay)
+            moe_down_list_k<FMT, true><<<dim3(n_items, (E + 7) / 8), 256, 0, st>>>(items, d.gate_bytes + d.up_bytes,
+                                                                                 d.drow, F, E, hq, hd, D, dof);
+        else
+            moe_down_list_k<FMT, false><<<dim3(n_items, (E + 7) / 8), 256, 0, st>>>(items, d.gate_bytes + d.up_bytes,
+                                                                                  d.drow, F, E, hq, hd, D, dof);
     };
     BNK_DISPATCH_DP4A(d.down_type, dn);
     check_launch("moe_list");

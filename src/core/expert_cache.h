@@ -27,12 +27,12 @@ public:
     void init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s, bool verbose);
     // The per-layer slot counts init() would choose, without allocating.
     static std::vector<int> plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank);
+    // VRAM bytes of one expert of layer il (R-layout rows)
+    static size_t slot_bytes(const Model & m, int il);
     MoeLayerDesc desc(int il) const;
     int resident() const { return resident_; }
     size_t bytes() const { return bytes_; }
     int slots(int il) const { return (int) slot_expert_[il].size(); }
-    // Replace the expert in `slot` of layer il by `expert` (stream-ordered; host map updated too).
-    void swap(int il, int slot, int expert, cudaStream_t s);
 
     // Adaptive tier. Call between forwards on the compute stream: finishes copies that are done, then
     // plans new swaps from routing counts (device [n_layer][n_expert], cumulative) and starts their
@@ -58,6 +58,14 @@ private:
     std::vector<float> score_;
     struct Pending { int il, slot, expert; cudaEvent_t done; };
     std::vector<Pending> pending_;
+    uint8_t * stage_ = nullptr;       // ggml blobs on their way to an R slot
+    size_t stage_bytes_ = 0;
+    uint8_t ** dst_ptrs_ = nullptr;   // device array of slot pointers for the repack kernel
+    uint8_t * swap_stage_ = nullptr;  // adaptive swaps: one stage per in-flight swap
+    uint8_t ** swap_ptrs_ = nullptr;
+    int swap_n_ = 0;
+    int stage_n_ = 0;
+    void fill(int il, const std::vector<int> & slots, const std::vector<int> & experts, cudaStream_t s);
     std::vector<char> busy_;   // [n_layer * n_expert]: expert involved in an in-flight swap
 };
 

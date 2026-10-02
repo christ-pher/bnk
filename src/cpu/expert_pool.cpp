@@ -14,6 +14,7 @@
 
 #include "core/util.h"
 #include "cpu/kernels.h"
+#include "cpu/mdot.h"
 #include "ggml-cpu.h"
 
 namespace bnk {
@@ -152,6 +153,8 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     if (tg->vec_dot_type != tu->vec_dot_type) throw std::runtime_error("gate/up vec_dot types differ");
     const ggml_type xt = tg->vec_dot_type;
     const bool down_q2 = L.down_type == GGML_TYPE_Q2_0;
+    const bool gu_multi = mdot_supported(L.gate_type) && L.gate_type == L.up_type;
+    const bool dn_multi = mdot_supported(L.down_type);
     const size_t xrow = ggml_row_size(xt, E);
     const size_t hrow = down_q2 ? (F / 64) * sizeof(A8P64) : ggml_row_size(td->vec_dot_type, F);
     const size_t grow = ggml_row_size((ggml_type) L.gate_type, E), urow = ggml_row_size((ggml_type) L.up_type, E);
@@ -159,72 +162,88 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     auto xfrom = ggml_get_type_traits_cpu(xt)->from_float;
     auto hfrom = ggml_get_type_traits_cpu(td->vec_dot_type)->from_float;
 
+    // group the tasks by expert: one decode of each weight row serves all of the expert's tokens
+    groups_.clear();
+    std::vector<int> gidx(nt);
+    for (int i = 0; i < nt; ++i) {
+        int g = 0;
+        while (g < (int) groups_.size() && tasks[groups_[g][0]].expert != tasks[i].expert) ++g;
+        if (g == (int) groups_.size()) groups_.emplace_back();
+        groups_[g].push_back(i);
+        gidx[i] = g;
+    }
+    const int ng = (int) groups_.size();
+
     xq_.resize(xrow * T);
     gu_.resize((size_t) nt * 2 * F);
     hq_.resize(hrow * nt + 64);
-    if (rows_done_n_ < nt) {
-        rows_done_.reset(new std::atomic<int>[nt]);
-        rows_done_n_ = nt;
+    if (rows_done_n_ < ng) {
+        rows_done_.reset(new std::atomic<int>[ng]);
+        rows_done_n_ = ng;
     }
-    for (int i = 0; i < nt; ++i) rows_done_[i].store(0, std::memory_order_relaxed);
-
-    // the inputs, quantized here (small) so the pool starts on the rows at once
+    for (int i = 0; i < ng; ++i) rows_done_[i].store(0, std::memory_order_relaxed);
     for (int t = 0; t < T; ++t) xfrom(x + (size_t) t * E, xq_.data() + t * xrow, E);
 
-    // phase 1: all gate/up rows of all tasks, split evenly; the thread that completes a task's rows
-    // computes its h = silu(g)*u and quantizes it for the down product
-    const int R = nt * 2 * F;
+    // phase 1: the gate/up rows of every expert group, split evenly
+    const int R = ng * 2 * F;
     pool_->run([&](int part, int nparts) {
         int b, e;
         split(R, part, nparts, b, e);
+        const void * ys[kMaxWindow * 2];
+        float vals[kMaxWindow * 2];
         int g = b;
         while (g < e) {
-            const int ti = g / (2 * F);
-            const int r_end = std::min(e, (ti + 1) * 2 * F);
-            const ExpertTask & tk = tasks[ti];
-            const uint8_t * blob = st_->blob(il, tk.expert);
-            const uint8_t * xq = xq_.data() + tk.t * xrow;
-            float * gu = gu_.data() + (size_t) ti * 2 * F;
+            const int gi = g / (2 * F);
+            const int r_end = std::min(e, (gi + 1) * 2 * F);
+            const std::vector<int> & grp = groups_[gi];
+            const int n = (int) grp.size();
+            const uint8_t * blob = st_->blob(il, tasks[grp[0]].expert);
+            for (int k = 0; k < n; ++k) ys[k] = xq_.data() + tasks[grp[k]].t * xrow;
             for (; g < r_end; ++g) {
-                const int r = g - ti * 2 * F;
-                if (r < F) tg->vec_dot(E, &gu[r], 0, blob + (size_t) r * grow, 0, xq, 0, 1);
-                else tu->vec_dot(E, &gu[r], 0, blob + L.gate_bytes + (size_t) (r - F) * urow, 0, xq, 0, 1);
+                const int r = g - gi * 2 * F;
+                const uint8_t * w = r < F ? blob + (size_t) r * grow : blob + L.gate_bytes + (size_t) (r - F) * urow;
+                if (gu_multi && n > 1) {
+                    mdot(L.gate_type, E, w, ys, n, vals);
+                } else {
+                    for (int k = 0; k < n; ++k) (r < F ? tg : tu)->vec_dot(E, &vals[k], 0, w, 0, ys[k], 0, 1);
+                }
+                for (int k = 0; k < n; ++k) gu_[(size_t) grp[k] * 2 * F + r] = vals[k];
             }
-            const int mine = r_end - std::max(b, ti * 2 * F);
-            if (rows_done_[ti].fetch_add(mine, std::memory_order_acq_rel) + mine == 2 * F) {
-                for (int r = 0; r < F; ++r) gu[r] = silu(gu[r]) * gu[F + r];
-                if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + ti * hrow));
-                else hfrom(gu, hq_.data() + ti * hrow, F);
+            const int mine = r_end - std::max(b, gi * 2 * F);
+            if (rows_done_[gi].fetch_add(mine, std::memory_order_acq_rel) + mine == 2 * F) {
+                for (int k = 0; k < n; ++k) {
+                    float * gu = gu_.data() + (size_t) grp[k] * 2 * F;
+                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r]) * gu[F + r];
+                    if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + grp[k] * hrow));
+                    else hfrom(gu, hq_.data() + grp[k] * hrow, F);
+                }
             }
         }
     });
 
-    // phase 2: output rows of every token, split evenly; each row sums over that token's experts
-    const int RO = T * E;
+    // phase 2: output rows, split evenly; each row decodes every group's down row once
+    for (int t = 0; t < T; ++t) memset(out + (size_t) t * E, 0, sizeof(float) * E);
     pool_->run([&](int part, int nparts) {
         int b, e;
-        split(RO, part, nparts, b, e);
-        for (int g = b; g < e;) {
-            const int t = g / E;
-            const int r0 = g % E, r1 = std::min(E, r0 + (e - g));
-            float * o = out + (size_t) t * E;
-            for (int r = r0; r < r1; ++r) o[r] = 0.f;
-            for (int ti = 0; ti < nt; ++ti) {
-                if (tasks[ti].t != t) continue;
-                const float w = tasks[ti].w;
-                const uint8_t * dn = st_->blob(il, tasks[ti].expert) + L.gate_bytes + L.up_bytes;
-                const uint8_t * hq = hq_.data() + ti * hrow;
-                if (down_q2) {
-                    for (int r = r0; r < r1; ++r) o[r] += w * dot_q2_0(dn + (size_t) r * drow, (const A8P64 *) hq, F);
+        split(E, part, nparts, b, e);
+        const void * hs[kMaxWindow * 2];
+        float vals[kMaxWindow * 2];
+        for (int gi = 0; gi < ng; ++gi) {
+            const std::vector<int> & grp = groups_[gi];
+            const int n = (int) grp.size();
+            const uint8_t * dn = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes;
+            for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
+            for (int r = b; r < e; ++r) {
+                const uint8_t * w = dn + (size_t) r * drow;
+                if (dn_multi && n > 1) {
+                    mdot(L.down_type, F, w, hs, n, vals);
+                } else if (down_q2) {
+                    for (int k = 0; k < n; ++k) vals[k] = dot_q2_0(w, (const A8P64 *) hs[k], F);
                 } else {
-                    for (int r = r0; r < r1; ++r) {
-                        float v;
-                        td->vec_dot(F, &v, 0, dn + (size_t) r * drow, 0, hq, 0, 1);
-                        o[r] += w * v;
-                    }
+                    for (int k = 0; k < n; ++k) td->vec_dot(F, &vals[k], 0, w, 0, hs[k], 0, 1);
                 }
+                for (int k = 0; k < n; ++k) out[(size_t) tasks[grp[k]].t * E + r] += tasks[grp[k]].w * vals[k];
             }
-            g += r1 - r0;
         }
     });
     last_ms = now_ms() - t0;

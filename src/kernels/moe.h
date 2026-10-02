@@ -49,7 +49,13 @@ struct MoeLayerDesc {
     size_t gate_bytes, up_bytes;
     int gate_type, down_type;
     size_t grow, drow;        // row bytes of gate/up rows and of down rows
+    int rlay = 0;             // slots hold R-layout rows (rfmt.h) rather than ggml blocks
+    uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};  // R field offsets of gate/up and down rows
 };
+
+// Repacks n ggml expert blobs (src, stride src_stride) into R-layout slots (dst pointers device array).
+void moe_repack_blobs(const uint8_t * src, size_t src_stride, uint8_t * const * dst, int n, int F, int E,
+                      int gate_type, size_t g_rb, int down_type, size_t d_rb, cudaStream_t st);
 
 struct MoeScratch {
     HitList * hits = nullptr;  // device

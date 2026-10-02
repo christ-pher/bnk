@@ -43,6 +43,7 @@ add_library(bnk_core STATIC
   src/core/expert_cache.cpp
   src/cpu/expert_pool.cpp
   src/cpu/kernels.cpp
+  src/cpu/mdot.cpp
   src/kernels/quant_gemv.cu
   src/kernels/gemv_r.cu
   src/kernels/rfmt.cpp

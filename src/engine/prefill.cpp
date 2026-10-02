@@ -40,7 +40,7 @@ void Engine::prefill_alloc(int N) {
     }
     p.xq.alloc((size_t) N * E); p.xd.alloc((size_t) N * E / 32);
     p.hq.alloc((size_t) N * k * F); p.hd.alloc((size_t) N * k * F / 32); p.gu32.alloc((size_t) N * k * 2 * F);
-    p.max_items = N * k / 1 + c.n_expert;
+    p.max_items = 2 * (N * k + c.n_expert);
     p.items.alloc((size_t) p.max_items * sizeof(PfItem));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_items, (size_t) p.max_items * sizeof(PfItem), 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_x, (size_t) N * E * 4, 0));
@@ -326,8 +326,19 @@ void Engine::pf_moe(int il, int N) {
         CUDA_CHECK(cudaEventRecord(p.xready, st_));
     }
 
-    // the experts on the GPU: fp16 copies of a group, then two grouped GEMMs (resident ones first)
+    // the experts on the GPU: fp16 copies of a group, then two grouped GEMMs (resident ones first).
+    // Resident experts are R-layout cache slots; staged ones the host store's ggml blobs.
     const MoeLayerDesc d = cache_.desc(il);
+    MoeLayerDesc ds = d;   // the stage's view
+    {
+        const LayerWeights & Lw = model_.layers[il];
+        ds.rlay = 0;
+        ds.blob = blob;
+        ds.gate_bytes = Lw.gate_bytes;
+        ds.up_bytes = Lw.up_bytes;
+        ds.grow = ggml_row_size((ggml_type) Lw.gate_type, E);
+        ds.drow = ggml_row_size((ggml_type) Lw.down_type, F);
+    }
     const size_t gu_elems = (size_t) 2 * F * E, dn_elems = (size_t) E * F;
     std::vector<int> group;
     auto flush = [&]() {
@@ -340,9 +351,14 @@ void Engine::pf_moe(int il, int N) {
             half * wgu = p.wexp.p + i * (gu_elems + dn_elems);
             half * wdn = wgu + gu_elems;
             const int sl = cache_.slot_of(il, e);
-            const uint8_t * src = sl >= 0 ? d.base + (size_t) sl * blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
-            QMat mg{src, d.gate_type, 2 * F, E, d.grow};
-            QMat md{src + d.gate_bytes + d.up_bytes, d.down_type, E, F, d.drow};
+            const MoeLayerDesc & dv = sl >= 0 ? d : ds;
+            const uint8_t * src = sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
+            QMat mg{src, dv.gate_type, 2 * F, E, dv.grow};
+            QMat md{src + dv.gate_bytes + dv.up_bytes, dv.down_type, E, F, dv.drow};
+            if (dv.rlay) {
+                mg.layout = md.layout = 1;
+                for (int q = 0; q < 5; ++q) { mg.r_off[q] = dv.go[q]; md.r_off[q] = dv.dof[q]; }
+            }
             dequant_rows_f16(mg, 0, 2 * F, wgu, st_);
             dequant_rows_f16(md, 0, E, wdn, st_);
             wg.push_back(wgu);
@@ -361,7 +377,7 @@ void Engine::pf_moe(int il, int N) {
     };
     auto src_of = [&](int e) {
         const int sl = cache_.slot_of(il, e);
-        return sl >= 0 ? d.base + (size_t) sl * blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
+        return sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
     };
     for (int pass = 0; pass < 2; ++pass) {   // 0: resident, 1: staged (after their copy)
         if (pass == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
@@ -373,12 +389,15 @@ void Engine::pf_moe(int il, int N) {
         }
         flush();
     }
-    // experts with few tokens: dp4a straight on their quantized weights, in items of <= 8 tokens
-    int n_items = 0;
+    // experts with few tokens: dp4a straight on their quantized weights, in items of <= 8 tokens; resident
+    // (R slots) and staged (ggml) items go in two launches
+    int n_items[2] = {0, 0};
+    const int half_cap = p.max_items / 2;
     for (int e = 0; e < c.n_expert; ++e) {
         if (!cnt[e] || on_cpu[e] || cnt[e] >= opt_.gemm_min_tokens) continue;
+        const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
         for (int j0 = 0; j0 < cnt[e]; j0 += kMaxWindow) {
-            PfItem & it = p.h_items[n_items++];
+            PfItem & it = p.h_items[kind * half_cap + n_items[kind]++];
             it.blob = src_of(e);
             it.n = std::min(kMaxWindow, cnt[e] - j0);
             for (int j = 0; j < it.n; ++j) {
@@ -387,12 +406,14 @@ void Engine::pf_moe(int il, int N) {
             }
         }
     }
-    if (n_items) {
+    if (n_items[0] || n_items[1]) {
         ActQ8 xq;
         xq.q = p.xq; xq.d = p.xd;
         quantize_act(p.mixed, E, N, E, xq, st_);
-        CUDA_CHECK(cudaMemcpyAsync(p.items.p, p.h_items, (size_t) n_items * sizeof(PfItem), cudaMemcpyHostToDevice, st_));
-        moe_list((const PfItem *) p.items.p, n_items, d, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
+        CUDA_CHECK(cudaMemcpyAsync(p.items.p, p.h_items, (size_t) p.max_items * sizeof(PfItem), cudaMemcpyHostToDevice, st_));
+        const PfItem * dev = (const PfItem *) p.items.p;
+        moe_list(dev, n_items[0], d, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
+        moe_list(dev + half_cap, n_items[1], ds, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
     }
     CUDA_CHECK(cudaEventRecord(p.used[il & 1], st_));
     // the CPU part runs here while the GPU works through the queue

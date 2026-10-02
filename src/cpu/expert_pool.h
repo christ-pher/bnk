@@ -75,6 +75,7 @@ private:
     std::vector<float> gu_;        // per task: [2*n_ff]
     std::vector<uint8_t> hq_;      // per task: h quantized for the down product
     std::unique_ptr<std::atomic<int>[]> rows_done_;
+    std::vector<std::vector<int>> groups_;   // tasks of the same expert
     int rows_done_n_ = 0;
 };
 
