@@ -72,6 +72,7 @@ int main(int argc, char ** argv) {
         else if (a == "--counts") opt.counts_out = next();
         else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
+        else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
@@ -80,6 +81,28 @@ int main(int argc, char ** argv) {
     Engine eng;
     eng.load(model, opt);
     const Config & c = eng.cfg();
+
+    if (mode == "pcheck") {
+        // batched prompt pass: the last position's logits vs llama.cpp
+        std::vector<float> ref_logits;
+        read_floats(ref + ".logits", ref_logits);
+        const double t0 = now_ms();
+        eng.prefill(prompt);
+        const double t1 = now_ms();
+        auto lg = eng.logits_host(eng.last_T - 1);
+        const float * rl = ref_logits.data() + (prompt.size() - 1) * c.n_vocab;
+        int a = 0, b = 0;
+        for (int j = 1; j < c.n_vocab; ++j) { if (lg[j] > lg[a]) a = j; if (rl[j] > rl[b]) b = j; }
+        double mr = rl[b], mo = lg[a], zr = 0, zo = 0, kl = 0;
+        for (int j = 0; j < c.n_vocab; ++j) { zr += exp(rl[j] - mr); zo += exp(lg[j] - mo); }
+        for (int j = 0; j < c.n_vocab; ++j) {
+            const double pr = exp(rl[j] - mr) / zr;
+            if (pr > 1e-12) kl += pr * (log(pr) - ((lg[j] - mo) - log(zo)));
+        }
+        printf("prefill %zu tokens in %.1f ms (%.1f tok/s): last-token argmax bnk %d ref %d, KL %.4f\n", prompt.size(),
+               t1 - t0, prompt.size() / ((t1 - t0) / 1000), a, b, kl);
+        return 0;
+    }
 
     if (mode == "check") {
         // window by window, compare every layer's residual and the logits at every position

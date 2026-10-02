@@ -25,6 +25,8 @@ public:
     ~ExpertCache();
     // Fills up to `budget` bytes of VRAM following `rank` (completed with every remaining pair).
     void init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s, bool verbose);
+    // The per-layer slot counts init() would choose, without allocating.
+    static std::vector<int> plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank);
     MoeLayerDesc desc(int il) const;
     int resident() const { return resident_; }
     size_t bytes() const { return bytes_; }

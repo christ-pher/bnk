@@ -52,6 +52,9 @@ void attn_prep(const float * qfull, const float * k, const float * v, const floa
 void attention(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out,
                int T, int H, int Hkv, int D, const int * pos0, float scale, float * scratch, cudaStream_t s);
 size_t attention_scratch_floats(int T, int H, int D, int max_ctx);
+// Prompt attention: rows t < T at positions pos0+t over cache rows [0, pos0+t]; one warp per (t, head).
+void attention_prefill(const float * q, const half * kcache, const half * vcache, const float * qfull_gate,
+                       float * out, int T, int H, int Hkv, int D, int pos0, float scale, cudaStream_t s);
 
 // ---- MoE routing: softmax over n_exp, top-k, renormalized weights
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,

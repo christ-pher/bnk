@@ -170,23 +170,39 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
     return started;
 }
 
+static Ranking complete_ranking(const Ranking & rank, int n_layer, int n_expert) {
+    std::vector<char> seen((size_t) n_layer * n_expert, 0);
+    Ranking full;
+    for (auto [l, e] : rank)
+        if (l >= 0 && l < n_layer && e >= 0 && e < n_expert && !seen[(size_t) l * n_expert + e]) {
+            seen[(size_t) l * n_expert + e] = 1;
+            full.emplace_back(l, e);
+        }
+    for (int e = 0; e < n_expert; ++e)
+        for (int l = 0; l < n_layer; ++l)
+            if (!seen[(size_t) l * n_expert + e]) full.emplace_back(l, e);
+    return full;
+}
+
+std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank) {
+    std::vector<int> slots(m.cfg.n_layer, 0);
+    size_t used = 0;
+    for (auto [l, e] : complete_ranking(rank, m.cfg.n_layer, m.cfg.n_expert)) {
+        const size_t b = st.blob_bytes(l);
+        if (used + b > budget) continue;
+        used += b;
+        slots[l]++;
+    }
+    return slots;
+}
+
 void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s,
                        bool verbose) {
     m_ = &m;
     st_ = &st;
     n_layer_ = m.cfg.n_layer;
     n_expert_ = m.cfg.n_expert;
-    // complete the ranking with every pair not yet listed, interleaved across layers
-    std::vector<char> seen((size_t) n_layer_ * n_expert_, 0);
-    Ranking full;
-    for (auto [l, e] : rank)
-        if (l >= 0 && l < n_layer_ && e >= 0 && e < n_expert_ && !seen[(size_t) l * n_expert_ + e]) {
-            seen[(size_t) l * n_expert_ + e] = 1;
-            full.emplace_back(l, e);
-        }
-    for (int e = 0; e < n_expert_; ++e)
-        for (int l = 0; l < n_layer_; ++l)
-            if (!seen[(size_t) l * n_expert_ + e]) full.emplace_back(l, e);
+    const Ranking full = complete_ranking(rank, n_layer_, n_expert_);
 
     // take pairs in order while they fit
     slot_expert_.assign(n_layer_, {});

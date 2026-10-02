@@ -5,32 +5,16 @@
 namespace bnk {
 
 int Generator::prefill(const std::vector<int32_t> & prompt) {
-    const Config & c = eng_.cfg();
-    const int HC = c.hc_dim();
-    if (!last_R_) CUDA_CHECK(cudaMalloc(&last_R_, (size_t) HC * 4));
-    last_cell_ = -1;
     drafts_.clear();
-    for (size_t i = 0; i < prompt.size(); i += kMaxWindow) {
-        const int T = (int) std::min<size_t>(kMaxWindow, prompt.size() - i);
-        const int p = eng_.pos();
-        eng_.forward(prompt.data() + i, T, true);
-        if (mtp_) {
-            // the previous window's last row pairs with this window's first token
-            if (last_cell_ >= 0) mtp_->run(last_R_, prompt.data() + i, 1, last_cell_, false, nullptr);
-            if (T > 1) mtp_->run(eng_.residual_dev(), prompt.data() + i + 1, T - 1, p, false, nullptr);
-            CUDA_CHECK(cudaMemcpyAsync(last_R_, eng_.residual_dev() + (size_t) (T - 1) * HC, (size_t) HC * 4,
-                                       cudaMemcpyDeviceToDevice, eng_.stream()));
-            last_cell_ = p + T - 1;
-        }
-    }
+    eng_.prefill(prompt);
     const int b = eng_.argmax(eng_.last_T - 1);
     pending_ = b;
-    if (mtp_) {
+    if (mtp_ && eng_.mtp_pending_cell() >= 0) {
         const double t0 = now_ms();
         float pr = 0.f;
-        int d = mtp_->run(last_R_, &b, 1, last_cell_, true, &pr);
+        int d = mtp_->run(eng_.mtp_pending_R(), &b, 1, eng_.mtp_pending_cell(), true, &pr);
         drafts_.push_back(d);
-        int cell = last_cell_ + 1;
+        int cell = eng_.mtp_pending_cell() + 1;
         while ((int) drafts_.size() < opt_.max_draft && pr >= opt_.min_p) {
             d = mtp_->step(d, cell++, &pr);
             drafts_.push_back(d);

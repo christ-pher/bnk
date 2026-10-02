@@ -397,6 +397,54 @@ void attention(const float * q, const half * kcache, const half * vcache, const 
     attn_combine_k<<<T * H, D, 0, s>>>(part_o, part_ml, qfull_gate, out, H, D, ns);
 }
 
+// One warp per (t, h); D = 256 (8 dims per lane). Online softmax over the causal keys, then the output gate.
+__global__ void attn_prefill_k(const float * q, const half * kc, const half * vc, const float * qfull, float * out,
+                               int T, int H, int Hkv, int D, int pos0, float scale) {
+    const int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (w >= T * H) return;
+    const int t = w / H, h = w % H, hk = h / (H / Hkv);
+    float qv[8];
+    const float * qp = q + ((int64_t) t * H + h) * D + lane * 8;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) qv[d] = qp[d] * scale;
+    float m = -FLT_MAX, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int n_kv = pos0 + t + 1;
+    for (int key = 0; key < n_kv; ++key) {
+        const uint4 kraw = *(const uint4 *) (kc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const half2 * k2 = (const half2 *) &kraw;
+        float s = 0.f;
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            const float2 f = __half22float2(k2[d]);
+            s += qv[2 * d] * f.x + qv[2 * d + 1] * f.y;
+        }
+        s = warp_sum(s);
+        const float mn = fmaxf(m, s);
+        const float corr = __expf(m - mn), p = __expf(s - mn);
+        l = l * corr + p;
+        const uint4 vraw = *(const uint4 *) (vc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const half2 * v2 = (const half2 *) &vraw;
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            const float2 f = __half22float2(v2[d]);
+            acc[2 * d] = acc[2 * d] * corr + p * f.x;
+            acc[2 * d + 1] = acc[2 * d + 1] * corr + p * f.y;
+        }
+        m = mn;
+    }
+    const float * gate = qfull + ((int64_t) t * H + h) * 2 * D + D + lane * 8;
+    float * o = out + ((int64_t) t * H + h) * D + lane * 8;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) o[d] = acc[d] / l * sigmoidf_(gate[d]);
+}
+void attention_prefill(const float * q, const half * kcache, const half * vcache, const float * qfull_gate,
+                       float * out, int T, int H, int Hkv, int D, int pos0, float scale, cudaStream_t s) {
+    if (D != 256) { fprintf(stderr, "attention_prefill: head dim %d unsupported\n", D); abort(); }
+    const int warps = T * H;
+    attn_prefill_k<<<(warps + 7) / 8, 256, 0, s>>>(q, kcache, vcache, qfull_gate, out, T, H, Hkv, D, pos0, scale);
+}
+
 // ------------------------------------------------------------------------------------------- routing
 // one warp per token, n_exp <= 1024: softmax over all experts, top-k by repeated warp argmax
 __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale) {

@@ -126,23 +126,40 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
                 state_bytes / 1073741824.0, cpu_.threads());
 
     if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose);
+    if (opt.prefill_chunk > 0) prefill_alloc(opt.prefill_chunk);
 
-    // the VRAM expert tier takes what is left
+    // the VRAM expert tier takes what is left, minus the prompt path's expert staging (which depends on how
+    // many experts each layer keeps: iterate to a fixed point)
     size_t free_b, total_b;
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     const size_t reserve = (size_t) (opt.vram_reserve_gib * 1073741824.0);
-    size_t budget = free_b > reserve ? free_b - reserve : 0;
-    if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
+    const size_t avail = free_b > reserve ? free_b - reserve : 0;
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
     if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
     if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    size_t budget = avail;
+    if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
+    if (opt.prefill_chunk > 0) {
+        for (int it = 0; it < 6; ++it) {
+            const auto slots = ExpertCache::plan(model_, store_, budget, rank);
+            size_t need = 0;
+            for (int il = 0; il < c.n_layer; ++il)
+                need = std::max(need, (size_t) (c.n_expert - slots[il]) * store_.blob_bytes(il));
+            const size_t want = avail > 2 * need ? avail - 2 * need : 0;
+            const size_t nb = opt.expert_cache_gib >= 0 ? std::min(want, (size_t) (opt.expert_cache_gib * 1073741824.0)) : want;
+            if (nb == budget) break;
+            budget = nb;
+        }
+    }
     cache_.init(model_, store_, budget, rank, st_, opt.verbose);
+    if (opt.prefill_chunk > 0) prefill_staging_alloc();
     reset();
 }
 
 void Engine::reset() {
     const Config & c = model_.cfg;
     history_.clear();
+    mtp_cell_ = -1;
     for (int il = 0; il < c.n_layer; ++il) {
         if (!c.is_attn(il)) {
             CUDA_CHECK(cudaMemsetAsync(conv_buf_[il].p, 0, conv_buf_[il].n * 4, st_));
@@ -444,10 +461,37 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     times.calls++;
 }
 
+// The MTP layer's K/V for rows just processed: each row pairs with the token after it; the last row waits
+// for its successor (the next chunk's first token, or the first generated token).
+void Engine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
+    if (!mtp_.loaded()) return;
+    const int HC = model_.cfg.hc_dim();
+    if (!mtp_R_) CUDA_CHECK(cudaMalloc(&mtp_R_, (size_t) HC * 4));
+    if (mtp_cell_ >= 0 && mtp_cell_ == pos0 - 1) mtp_.run(mtp_R_, tokens, 1, mtp_cell_, false, nullptr);
+    for (int r0 = 0; r0 < n - 1; r0 += kMaxWindow) {
+        const int rr = std::min(kMaxWindow, n - 1 - r0);
+        mtp_.run(R_rows + (size_t) r0 * HC, tokens + r0 + 1, rr, pos0 + r0, false, nullptr);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mtp_R_, R_rows + (size_t) (n - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
+    mtp_cell_ = pos0 + n - 1;
+}
+
 void Engine::prefill(const std::vector<int32_t> & tokens) {
-    for (size_t i = 0; i < tokens.size(); i += kMaxWindow) {
-        const int T = (int) std::min<size_t>(kMaxWindow, tokens.size() - i);
-        forward(tokens.data() + i, T);
+    size_t i = 0;
+    while (i < tokens.size()) {
+        const size_t left = tokens.size() - i;
+        const int pos0 = pos();
+        if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+            const int N = (int) std::min<size_t>(pf_max_, left);
+            prefill_chunk(tokens.data() + i, N);
+            mtp_feed(pf_.res, tokens.data() + i, N, pos0);
+            i += N;
+        } else {
+            const int T = (int) std::min<size_t>(kMaxWindow, left);
+            forward(tokens.data() + i, T);
+            mtp_feed(res_, tokens.data() + i, T, pos0);
+            i += T;
+        }
     }
 }
 

@@ -318,9 +318,39 @@ void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, i
 }
 
 // ------------------------------------------------------------------------------ dequantize
-template <int FMT>
+template <typename O> __device__ __forceinline__ O cvt_out(float v);
+template <> __device__ __forceinline__ float cvt_out<float>(float v) { return v; }
+template <> __device__ __forceinline__ half cvt_out<half>(float v) { return __float2half(v); }
+
+// the 32 dequantized weights of a sub-block, written with vector stores
+template <typename O>
+__device__ __forceinline__ void store32(const Unpacked & u, O * o) {
+    float v[32];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float dd = k < 4 ? u.d0 : u.d1, mm = k < 4 ? u.m0 : u.m1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[4 * k + j] = dd * (float) (int8_t) (u.w[k] >> (8 * j)) - mm;
+    }
+    if constexpr (sizeof(O) == 2) {
+        uint4 * o4 = (uint4 *) o;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            half2 h[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) h[j] = __floats2half2_rn(v[8 * q + 2 * j], v[8 * q + 2 * j + 1]);
+            o4[q] = *(uint4 *) h;
+        }
+    } else {
+        float4 * o4 = (float4 *) o;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) o4[q] = make_float4(v[4 * q], v[4 * q + 1], v[4 * q + 2], v[4 * q + 3]);
+    }
+}
+
+template <int FMT, typename O = float>
 __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, const int32_t * __restrict__ ids,
-                          int64_t r0, int n, int64_t cols, float * __restrict__ out) {
+                          int64_t r0, int n, int64_t cols, O * __restrict__ out) {
     const int64_t nsb = cols / 32;
     const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (int64_t) n * nsb) return;
@@ -328,34 +358,25 @@ __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, cons
     const int sb = (int) (gid % nsb);
     const int64_t r = ids ? ids[i] : r0 + i;
     const uint8_t * row = W + (size_t) r * row_bytes;
-    float * o = out + (int64_t) i * cols + sb * 32;
+    O * o = out + (int64_t) i * cols + sb * 32;
     if constexpr (is_float_fmt(FMT)) {
         float w[8];
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             load8<FMT>(row, sb * 32 + 8 * k, w);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) o[8 * k + j] = w[j];
+            for (int j = 0; j < 8; ++j) o[8 * k + j] = cvt_out<O>(w[j]);
         }
     } else {
         Unpacked u;
         unpack_sub<FMT>(row, sb, u);
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const float dd = k < 4 ? u.d0 : u.d1;
-            const float mm = k < 4 ? u.m0 : u.m1;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int v = (int) (int8_t) (u.w[k] >> (8 * j));
-                o[4 * k + j] = dd * (float) v - mm;
-            }
-        }
+        store32<O>(u, o);
     }
 }
 
-template <int FMT>
+template <int FMT, typename O = float>
 __global__ void dequant_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, const int32_t * __restrict__ ids,
-                            int64_t r0, int n, int64_t cols, float * __restrict__ out) {
+                            int64_t r0, int n, int64_t cols, O * __restrict__ out) {
     const int64_t nsb = cols / 32;
     const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (int64_t) n * nsb) return;
@@ -364,22 +385,17 @@ __global__ void dequant_r_k(const uint8_t * __restrict__ W, size_t row_bytes, RO
     const int64_t r = ids ? ids[i] : r0 + i;
     Unpacked u;
     RT<FMT>::unpack(W + (size_t) r * row_bytes, o, sb, u);
-    float * op = out + (int64_t) i * cols + sb * 32;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        const float dd = k < 4 ? u.d0 : u.d1, mm = k < 4 ? u.m0 : u.m1;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) op[4 * k + j] = dd * (float) (int8_t) (u.w[k] >> (8 * j)) - mm;
-    }
+    store32<O>(u, out + (int64_t) i * cols + sb * 32);
 }
 
-static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int n, float * out, cudaStream_t s) {
+template <typename O>
+static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int n, O * out, cudaStream_t s) {
     if (W.layout == 1) {
         const int64_t total = (int64_t) n * (W.cols / 32);
         const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
         auto f = [&]<int FMT>() {
-            dequant_r_k<FMT><<<(int) ((total + 127) / 128), 128, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o, ids,
-                                                                        r0, n, W.cols, out);
+            dequant_r_k<FMT, O><<<(int) ((total + 127) / 128), 128, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o,
+                                                                           ids, r0, n, W.cols, out);
         };
         BNK_DISPATCH_R(W.type, f);
         return;
@@ -388,7 +404,7 @@ static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int 
     const int threads = 128;
     const int grid = (int) ((total + threads - 1) / threads);
     const uint8_t * w = (const uint8_t *) W.data;
-    auto f = [&]<int FMT>() { dequant_k<FMT><<<grid, threads, 0, s>>>(w, W.row_bytes, ids, r0, n, W.cols, out); };
+    auto f = [&]<int FMT>() { dequant_k<FMT, O><<<grid, threads, 0, s>>>(w, W.row_bytes, ids, r0, n, W.cols, out); };
     switch (W.type) {
         case QT_F32: f.template operator()<QT_F32>(); break;
         case QT_F16: f.template operator()<QT_F16>(); break;
@@ -403,6 +419,11 @@ void dequant_rows(const QMat & W, int64_t r0, int64_t n, float * out, cudaStream
 
 void dequant_gather(const QMat & W, const int32_t * ids, int n, float * out, cudaStream_t s) {
     dequant_launch(W, ids, 0, n, out, s);
+}
+
+void dequant_rows_f16(const QMat & W, int64_t r0, int64_t n, half * out, cudaStream_t s) {
+    dequant_launch(W, nullptr, r0, (int) n, out, s);
+    check_launch("dequant_f16");
 }
 
 }  // namespace bnk

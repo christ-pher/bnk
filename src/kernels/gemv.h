@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace bnk {
@@ -56,6 +57,8 @@ QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size
 
 // Dequantize rows [r0, r0+n) of W to fp32 (tests / embeddings).
 void dequant_rows(const QMat & W, int64_t r0, int64_t n, float * out, cudaStream_t s);
+// ... to fp16 (prefill GEMM operands)
+void dequant_rows_f16(const QMat & W, int64_t r0, int64_t n, half * out, cudaStream_t s);
 // Dequantize the rows listed in `ids` (device int32) into out[i*cols].
 void dequant_gather(const QMat & W, const int32_t * ids, int n, float * out, cudaStream_t s);
 

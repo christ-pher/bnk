@@ -36,8 +36,6 @@ private:
     GenOptions opt_;
     int32_t pending_ = -1;              // emitted, not yet processed by the main model
     std::vector<int32_t> drafts_;       // drafts for the next window
-    float * last_R_ = nullptr;          // device: the main residual of the last processed row
-    int last_cell_ = -1;
     std::vector<int32_t> argmax_buf_;
 };
 

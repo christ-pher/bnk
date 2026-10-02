@@ -71,6 +71,17 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
                 int k, int E, cudaStream_t st);
 void moe_debug_times(uint64_t (*out)[3], int n);
+// ---- prompt path: experts with few tokens, straight on their quantized weights
+struct PfItem {
+    const uint8_t * blob;     // the expert's blob on the device (cache slot or stage)
+    int32_t n;                // tokens in this item (<= 8)
+    int32_t tok[kMaxWindow];  // rows of the chunk's quantized input
+    int32_t pair[kMaxWindow]; // output rows (sorted pair positions)
+};
+// gu[pair][2F] = blob gate/up rows . x[tok]; h quantized per pair; D[pair][E] (fp16) = down . h
+void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const ActQ8 & xq, int E, int F,
+              float * gu, int8_t * hq, float * hd, half * D, cudaStream_t st);
+
 // seq += 1 (first kernel of a forward)
 void bump_seq(uint32_t * seq, cudaStream_t st);
 

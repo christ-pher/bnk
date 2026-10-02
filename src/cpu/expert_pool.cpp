@@ -44,20 +44,26 @@ void ExpertStore::build(const Model & m, int threads, bool verbose) {
     madvise(p, total_, MADV_HUGEPAGE);
     base_ = (uint8_t *) p;
 
-    // copy blobs in parallel (layer-major so each thread streams through the source files)
+    // copy in parallel; each job streams one contiguous range of one source tensor (a matrix of a run of
+    // experts), so a cold page cache reads the files sequentially
+    constexpr int PARTS = 4;
     std::atomic<int> next{0};
-    const int jobs = c.n_layer * 8;
+    const int jobs = c.n_layer * 3 * PARTS;
     auto worker = [&]() {
         for (int j; (j = next.fetch_add(1)) < jobs;) {
-            const int il = j / 8, part = j % 8;
+            const int il = j / (3 * PARTS), mat = (j / PARTS) % 3, part = j % PARTS;
             const LayerWeights & L = m.layers[il];
-            const int e0 = part * c.n_expert / 8, e1 = (part + 1) * c.n_expert / 8;
-            for (int e = e0; e < e1; ++e) {
-                uint8_t * dst = base_ + layer_off_[il] + (size_t) e * blob_[il];
-                memcpy(dst, L.gate_src + (size_t) e * L.gate_bytes, L.gate_bytes);
-                memcpy(dst + L.gate_bytes, L.up_src + (size_t) e * L.up_bytes, L.up_bytes);
-                memcpy(dst + L.gate_bytes + L.up_bytes, L.down_src + (size_t) e * L.down_bytes, L.down_bytes);
-            }
+            const int e0 = part * c.n_expert / PARTS, e1 = (part + 1) * c.n_expert / PARTS;
+            const uint8_t * src = mat == 0 ? L.gate_src : mat == 1 ? L.up_src : L.down_src;
+            const size_t sz = mat == 0 ? L.gate_bytes : mat == 1 ? L.up_bytes : L.down_bytes;
+            const size_t dst_off = mat == 0 ? 0 : mat == 1 ? L.gate_bytes : L.gate_bytes + L.up_bytes;
+            const uint8_t * s0 = src + (size_t) e0 * sz;
+            const size_t len = (size_t) (e1 - e0) * sz;
+            const uintptr_t pa = (uintptr_t) s0 & ~(uintptr_t) 4095;
+            madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_SEQUENTIAL);
+            madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_WILLNEED);
+            for (int e = e0; e < e1; ++e)
+                memcpy(base_ + layer_off_[il] + (size_t) e * blob_[il] + dst_off, src + (size_t) e * sz, sz);
         }
     };
     std::vector<std::thread> th;

@@ -51,9 +51,11 @@ add_library(bnk_core STATIC
   src/engine/engine.cpp
   src/engine/mtp.cpp
   src/engine/generate.cpp
+  src/engine/prefill.cpp
+  src/kernels/gemm.cu
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
-target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cuda_driver Threads::Threads)
+target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
 target_compile_options(bnk_core PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wno-unused-function>)

@@ -263,3 +263,111 @@ void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const 
 }
 
 }  // namespace bnk
+
+namespace bnk {
+
+template <int FMT>
+__global__ void __launch_bounds__(256) moe_gu_list_k(const PfItem * __restrict__ items, size_t gate_bytes, size_t grow,
+                                                     int F, int E, const int8_t * __restrict__ aq,
+                                                     const float * __restrict__ ad, int64_t cols_pad,
+                                                     float * __restrict__ gu) {
+    const PfItem & it = items[blockIdx.x];
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (r >= 2 * F) return;
+    const uint8_t * row = it.blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
+    const int nsb = E / 32, n = it.n;
+    const int64_t nb = cols_pad / 32;
+    float acc[kMaxWindow];
+#pragma unroll
+    for (int t = 0; t < kMaxWindow; ++t) acc[t] = 0.f;
+    for (int sb = lane; sb < nsb; sb += 32) {
+        Unpacked u;
+        unpack_sub<FMT>(row, sb, u);
+#pragma unroll
+        for (int t = 0; t < kMaxWindow; ++t) {
+            if (t < n) {
+                const int64_t tk = it.tok[t];
+                const int4 * ap = (const int4 *) (aq + tk * cols_pad + sb * 32);
+                acc[t] += qdot_sub<FMT>(u, __ldg(ap), __ldg(ap + 1), __ldg(ad + tk * nb + sb));
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < kMaxWindow; ++t) {
+        if (t < n) {
+            const float v = warp_reduce_sum(acc[t]);
+            if (lane == 0) gu[(size_t) it.pair[t] * 2 * F + r] = v;
+        }
+    }
+}
+
+// grid (items, 8 tokens); F threads
+__global__ void moe_act_list_k(const PfItem * __restrict__ items, const float * __restrict__ gu, int F,
+                               int8_t * __restrict__ hq, float * __restrict__ hd) {
+    const PfItem & it = items[blockIdx.x];
+    if ((int) blockIdx.y >= it.n) return;
+    const size_t pr = it.pair[blockIdx.y];
+    const float * g = gu + pr * 2 * F;
+    for (int r = threadIdx.x; r < F; r += blockDim.x) {
+        const float gv = g[r];
+        const float h = gv / (1.f + __expf(-gv)) * g[F + r];
+        float d;
+        const int8_t q = quant_lane(h, d);
+        hq[pr * F + r] = q;
+        if ((threadIdx.x & 31) == 0) hd[pr * (F / 32) + r / 32] = d;
+    }
+}
+
+template <int FMT>
+__global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict__ items, size_t down_off, size_t drow,
+                                                       int F, int E, const int8_t * __restrict__ hq,
+                                                       const float * __restrict__ hd, half * __restrict__ D) {
+    const PfItem & it = items[blockIdx.x];
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
+    if (r >= E) return;
+    const uint8_t * row = it.blob + down_off + (size_t) r * drow;
+    const int nsb = F / 32, n = it.n;
+    float acc[kMaxWindow];
+#pragma unroll
+    for (int t = 0; t < kMaxWindow; ++t) acc[t] = 0.f;
+    for (int sb = lane; sb < nsb; sb += 32) {
+        Unpacked u;
+        unpack_sub<FMT>(row, sb, u);
+#pragma unroll
+        for (int t = 0; t < kMaxWindow; ++t) {
+            if (t < n) {
+                const size_t pr = it.pair[t];
+                const int4 * ap = (const int4 *) (hq + pr * F + sb * 32);
+                acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], hd[pr * (F / 32) + sb]);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < kMaxWindow; ++t) {
+        if (t < n) {
+            const float v = warp_reduce_sum(acc[t]);
+            if (lane == 0) D[(size_t) it.pair[t] * E + r] = __float2half(v);
+        }
+    }
+}
+
+void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const ActQ8 & xq, int E, int F, float * gu,
+              int8_t * hq, float * hd, half * D, cudaStream_t st) {
+    if (n_items <= 0) return;
+    auto g = [&]<int FMT>() {
+        moe_gu_list_k<FMT><<<dim3(n_items, (2 * F + 7) / 8), 256, 0, st>>>(items, d.gate_bytes, d.grow, F, E, xq.q,
+                                                                          xq.d, xq.cols_pad, gu);
+    };
+    BNK_DISPATCH_DP4A(d.gate_type, g);
+    moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+    auto dn = [&]<int FMT>() {
+        moe_down_list_k<FMT><<<dim3(n_items, (E + 7) / 8), 256, 0, st>>>(items, d.gate_bytes + d.up_bytes, d.drow, F,
+                                                                        E, hq, hd, D);
+    };
+    BNK_DISPATCH_DP4A(d.down_type, dn);
+    check_launch("moe_list");
+}
+
+}  // namespace bnk
