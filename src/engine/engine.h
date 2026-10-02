@@ -16,6 +16,7 @@
 #include "core/model.h"
 #include "core/util.h"
 #include "cpu/expert_pool.h"
+#include "engine/mtp.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
 
@@ -30,6 +31,7 @@ struct EngineOptions {
     double expert_cache_gib = -1;    // < 0: everything that fits
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
+    std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     int adapt_every = 4;             // forwards between adaptive cache updates (0 = static cache)
     int adapt_swaps = 16;            // max expert swaps started per update
 };
@@ -53,11 +55,16 @@ public:
     void load(const std::string & path, const EngineOptions & opt);
     void reset();
 
-    // Runs tokens[0..T) at positions pos()..pos()+T-1 and commits them; logits of every window position
-    // stay on the device.
-    void forward(const int32_t * tokens, int T);
+    // Runs tokens[0..T) at positions pos()..pos()+T-1; logits of every window position stay on the device
+    // and the final residual of every row in residual_dev(). With commit_all the window is committed;
+    // otherwise (a verify window) nothing is until commit(c) keeps its first c rows.
+    void forward(const int32_t * tokens, int T, bool commit_all = true);
+    void commit(int c);
+    const float * residual_dev() const { return res_; }
+    cudaStream_t stream() const { return st_; }
     void prefill(const std::vector<int32_t> & tokens);
     int argmax(int t);
+    void argmax_all(int T, int32_t * out);  // argmax of every row of the last window
     std::vector<float> logits_host(int t);
     const float * logits_dev() const { return logits_; }
 
@@ -65,6 +72,7 @@ public:
     const Config & cfg() const { return model_.cfg; }
     const Model & model() const { return model_; }
     const ExpertCache & cache() const { return cache_; }
+    MtpLayer * mtp() { return mtp_.loaded() ? &mtp_ : nullptr; }
     StageTimes times;
     void save_counts();
 
@@ -84,17 +92,22 @@ private:
     void moe(int il, int T);
     void head(int T);
     void service_cpu(uint32_t seq, int T);
+    void enqueue_commit(int c);
 
     Model model_;
     ExpertStore store_;
     ExpertCache cache_;
+    MtpLayer mtp_;
     CpuExpertPool cpu_;
     EngineOptions opt_;
     cudaStream_t st_ = nullptr;
     std::vector<int32_t> history_;
     uint32_t seq_ = 0;
     int64_t fwd_count_ = 0;
-    cudaGraphExec_t graphs_[kMaxWindow + 1] = {};
+    cudaGraphExec_t graphs_[2][kMaxWindow + 1] = {};   // [commit_all][T]
+    cudaGraphExec_t commit_graphs_[kMaxWindow + 1] = {};
+    bool commit_all_ = true;
+    int pending_T_ = 0;  // rows of the last verify window not yet committed
 
     // window inputs (pinned host) and their device copy
     WinParams * h_par_ = nullptr;
@@ -126,6 +139,7 @@ private:
     // per-layer recurrent state
     std::vector<DevBuf<float>> conv_buf_;   // [(K-1)+W][C] per GDN layer
     std::vector<DevBuf<float>> ssm_state_;  // [nv][S][S]
+    std::vector<DevBuf<float>> gdn_co_, gdn_g_, gdn_b_;  // per GDN layer: the window's conv outputs, decay, beta
     std::vector<DevBuf<half>> kc_, vc_;     // [max_ctx][Hkv][D] per attention layer
     bool qsa_warned_ = false;
 };

@@ -129,6 +129,15 @@ void copy_f32(float * dst, const float * src, int64_t n, cudaStream_t s) {
     cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice, s);
 }
 
+__global__ void shift_rows_k(float * buf, int64_t row_elems, int from, int n) {
+    for (int64_t c = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; c < row_elems; c += (int64_t) gridDim.x * blockDim.x)
+        for (int i = 0; i < n; ++i) buf[(int64_t) i * row_elems + c] = buf[(int64_t) (from + i) * row_elems + c];
+}
+void shift_rows(float * buf, int64_t row_elems, int from, int n, cudaStream_t s) {
+    if (from == 0 || n <= 0) return;
+    shift_rows_k<<<nblk(row_elems, 256), 256, 0, s>>>(buf, row_elems, from, n);
+}
+
 __global__ void sigmoid_k(float * x, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         x[i] = sigmoidf_(x[i]);
@@ -523,6 +532,49 @@ __global__ void argmax_k(const float * lg, int n, int32_t * out) {
 }
 void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t s) {
     argmax_k<<<T, 1024, 0, s>>>(logits, n, out);
+}
+
+__global__ void argmax_prob_k(const float * x, int n, int32_t * out, float * prob) {
+    __shared__ float bv[32], sh[32];
+    __shared__ int bi[32];
+    float best = -FLT_MAX;
+    int idx = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (x[i] > best) { best = x[i]; idx = i; }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, best, o);
+        const int oi = __shfl_xor_sync(0xffffffff, idx, o);
+        if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { bv[wid] = best; bi[wid] = idx; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int q = 1; q < (int) (blockDim.x >> 5); ++q)
+            if (bv[q] > bv[0] || (bv[q] == bv[0] && bi[q] < bi[0])) { bv[0] = bv[q]; bi[0] = bi[q]; }
+    }
+    __syncthreads();
+    const float mx = bv[0];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += __expf(x[i] - mx);
+    s = block_sum(s, sh);
+    if (threadIdx.x == 0) {
+        out[0] = bi[0];
+        prob[0] = 1.f / s;
+    }
+}
+void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s) {
+    argmax_prob_k<<<1, 1024, 0, s>>>(logits, n, id, prob);
+}
+
+__global__ void add_bcast_k(float * R, const float * e, int hc, int E) {
+    const int t = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hc * E; i += gridDim.x * blockDim.x)
+        R[(int64_t) t * hc * E + i] += e[(int64_t) t * E + i % E];
+}
+void add_bcast_streams(float * R, const float * e, int T, int hc, int E, cudaStream_t s) {
+    add_bcast_k<<<dim3(nblk(hc * E, 256), T), 256, 0, s>>>(R, e, hc, E);
 }
 
 }  // namespace bnk

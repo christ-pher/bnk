@@ -20,7 +20,8 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
 }
 
 Engine::~Engine() {
-    for (auto & g : graphs_) if (g) cudaGraphExecDestroy(g);
+    for (auto & gm : graphs_) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
+    for (auto & g : commit_graphs_) if (g) cudaGraphExecDestroy(g);
     if (!opt_.counts_out.empty() && counts_.p) save_counts();
     if (mail_) cudaFreeHost(mail_);
     if (h_par_) cudaFreeHost(h_par_);
@@ -87,6 +88,9 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     }
     conv_buf_.resize(c.n_layer);
     ssm_state_.resize(c.n_layer);
+    gdn_co_.resize(c.n_layer);
+    gdn_g_.resize(c.n_layer);
+    gdn_b_.resize(c.n_layer);
     kc_.resize(c.n_layer);
     vc_.resize(c.n_layer);
     size_t state_bytes = 0;
@@ -98,12 +102,17 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         } else {
             conv_buf_[il].alloc((size_t) (c.ssm_conv - 1 + W) * C);
             ssm_state_[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
+            gdn_co_[il].alloc((size_t) W * C);
+            gdn_g_[il].alloc((size_t) W * c.ssm_vheads);
+            gdn_b_[il].alloc((size_t) W * c.ssm_vheads);
             state_bytes += (conv_buf_[il].n + ssm_state_[il].n) * 4;
         }
     }
     if (opt.verbose)
         fprintf(stderr, "bnk: context %d, KV + recurrent state %.2f GiB, %d CPU expert threads\n", opt.max_ctx,
                 state_bytes / 1073741824.0, cpu_.threads());
+
+    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose);
 
     // the VRAM expert tier takes what is left
     size_t free_b, total_b;
@@ -207,8 +216,7 @@ void Engine::ple(int il, int T) {
     ple_gate(ple_key_, res_, ple_val_, F(L.ple_norm_key), F(L.ple_norm_query), F(L.ple_norm_conv), ple_gated_,
              ple_hist_.p + (size_t) hist * HC, T, c.hc, E, c.rms_eps, st_);
     ple_conv_add(res_, ple_gated_, ple_hist_, (const half *) L.ple_conv1d.data, T, HC, c.ple_conv, c.ple_ngram, st_);
-    CUDA_CHECK(cudaMemcpyAsync(ple_hist_.p, ple_hist_.p + (size_t) T * HC, (size_t) hist * HC * 4,
-                               cudaMemcpyDeviceToDevice, st_));
+    if (commit_all_) shift_rows(ple_hist_, HC, T, hist, st_);
 }
 
 void Engine::gdn(int il, int T) {
@@ -219,14 +227,47 @@ void Engine::gdn(int il, int T) {
     quantize_act(mixed_, E, T, E, mixact_, st_);
     gemv_q(L.wqkv, mixact_, mixed_, E, T, cb + (size_t) (K - 1) * C, C, st_);
     gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, st_);
-    gemv_q(L.ssm_beta, mixact_, mixed_, E, T, beta_, nv, st_);
-    gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, alpha_, nv, st_);
-    gdn_conv(cb, F(L.ssm_conv1d), conv_out_, T, C, K, st_);
-    gdn_prep(conv_out_, T, C, c.ssm_groups, nv, S, alpha_, beta_, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-    gdn_recurrence(conv_out_, C, alpha_, beta_, ssm_state_[il], gdn_o_, T, c.ssm_groups, nv, S, T, st_);
+    float * co = gdn_co_[il], * gg = gdn_g_[il], * gb = gdn_b_[il];
+    gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, st_);
+    gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, st_);
+    gdn_conv(cb, F(L.ssm_conv1d), co, T, C, K, st_);
+    gdn_prep(co, T, C, c.ssm_groups, nv, S, gg, gb, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
+    gdn_recurrence(co, C, gg, gb, ssm_state_[il], gdn_o_, T, c.ssm_groups, nv, S, commit_all_ ? T : 0, st_);
     gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
     gemv_auto(L.ssm_out, gdn_n_, nv * S, T, out_, E, false, act_, st_);
-    CUDA_CHECK(cudaMemcpyAsync(cb, cb + (size_t) T * C, (size_t) (K - 1) * C * 4, cudaMemcpyDeviceToDevice, st_));
+    if (commit_all_) shift_rows(cb, C, T, K - 1, st_);
+}
+
+// Keep the first c rows of the last verify window: replay the delta rule over them and shift the histories.
+void Engine::enqueue_commit(int cnt) {
+    const Config & c = model_.cfg;
+    const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    for (int il = 0; il < c.n_layer; ++il) {
+        if (c.is_attn(il)) continue;
+        gdn_recurrence(gdn_co_[il], C, gdn_g_[il], gdn_b_[il], ssm_state_[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+        shift_rows(conv_buf_[il], C, cnt, K - 1, st_);
+    }
+    if (c.ple_layer >= 0) shift_rows(ple_hist_, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
+}
+
+void Engine::commit(int cnt) {
+    if (pending_T_ == 0) throw std::runtime_error("commit: no verify window pending");
+    if (cnt < 1 || cnt > pending_T_) throw std::runtime_error("commit: count out of range");
+    history_.resize(history_.size() - (pending_T_ - cnt));
+    pending_T_ = 0;
+    if (opt_.use_graphs) {
+        if (!commit_graphs_[cnt]) {
+            cudaGraph_t g;
+            CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+            enqueue_commit(cnt);
+            CUDA_CHECK(cudaStreamEndCapture(st_, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&commit_graphs_[cnt], g, 0));
+            cudaGraphDestroy(g);
+        }
+        CUDA_CHECK(cudaGraphLaunch(commit_graphs_[cnt], st_));
+    } else {
+        enqueue_commit(cnt);
+    }
 }
 
 void Engine::attn(int il, int T) {
@@ -335,8 +376,10 @@ void Engine::service_cpu(uint32_t seq, int T) {
     }
 }
 
-void Engine::forward(const int32_t * tokens, int T) {
+void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     if (T < 1 || T > kMaxWindow) throw std::runtime_error("forward: bad window");
+    if (pending_T_) throw std::runtime_error("forward: the previous verify window was not committed");
+    commit_all_ = commit_all;
     if (pos() + T > opt_.max_ctx) throw std::runtime_error("context full");
     const double t0 = now_ms();
     last_T = T;
@@ -346,15 +389,16 @@ void Engine::forward(const int32_t * tokens, int T) {
     *h_par_ = WinParams{pos0, T, ++seq_, 0};
     ple_gather(T);
     if (opt_.use_graphs && !dump_all) {
-        if (!graphs_[T]) {
+        cudaGraphExec_t & ge = graphs_[commit_all ? 1 : 0][T];
+        if (!ge) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             enqueue_forward(T);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&graphs_[T], g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
             cudaGraphDestroy(g);
         }
-        CUDA_CHECK(cudaGraphLaunch(graphs_[T], st_));
+        CUDA_CHECK(cudaGraphLaunch(ge, st_));
         service_cpu(seq_, T);
         static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
         if (prof) {
@@ -369,6 +413,7 @@ void Engine::forward(const int32_t * tokens, int T) {
         enqueue_forward(T);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (!commit_all) pending_T_ = T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
     times.total_ms += now_ms() - t0;
     times.calls++;
@@ -387,6 +432,12 @@ int Engine::argmax(int t) {
     CUDA_CHECK(cudaMemcpyAsync(&r, argmax_dev_.p, 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
     return r;
+}
+
+void Engine::argmax_all(int T, int32_t * out) {
+    argmax_rows(logits_.p, T, model_.cfg.n_vocab, argmax_dev_, st_);
+    CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 std::vector<float> Engine::logits_host(int t) {

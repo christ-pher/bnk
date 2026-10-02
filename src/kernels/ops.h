@@ -24,6 +24,8 @@ void rmsnorm_rows(const float * x, const float * w, float * y, int rows, int n, 
 void silu_mul(const float * g, const float * u, float * h, int64_t n, cudaStream_t s);
 void add_scaled(float * y, const float * x, const float * scale_per_token, int T, int n, cudaStream_t s);
 void copy_f32(float * dst, const float * src, int64_t n, cudaStream_t s);
+// rows [0, n) of buf (row_elems floats each) = rows [from, from + n): an in-order shift, overlap allowed
+void shift_rows(float * buf, int64_t row_elems, int from, int n, cudaStream_t s);
 
 // ---- gated delta net
 // conv_in [T+K-1][C]: the K-1 history rows then the new inputs; out = silu(conv) [T][C]
@@ -68,5 +70,9 @@ void ple_conv_add(float * res, const float * gated, const float * hist_new, cons
 
 // ---- head
 void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t s);
+// one row: argmax and its softmax probability
+void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s);
+// R[t][s][:] += e[t][:]
+void add_bcast_streams(float * R, const float * e, int T, int hc, int E, cudaStream_t s);
 
 }  // namespace bnk

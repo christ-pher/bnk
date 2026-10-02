@@ -49,6 +49,8 @@ add_library(bnk_core STATIC
   src/kernels/ops.cu
   src/kernels/moe.cu
   src/engine/engine.cpp
+  src/engine/mtp.cpp
+  src/engine/generate.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cuda_driver Threads::Threads)

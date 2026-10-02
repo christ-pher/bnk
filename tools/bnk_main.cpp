@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "engine/engine.h"
+#include "engine/generate.h"
+#include "engine/mtp.h"
 
 using namespace bnk;
 
@@ -50,8 +52,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "usage: bnk run|check --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n");
         return 1;
     }
-    std::string mode = argv[1], model, tokfile, ref;
+    std::string mode = argv[1], model, tokfile, ref, mtp_path;
     int max_new = 32;
+    GenOptions gopt;
     EngineOptions opt;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -63,6 +66,9 @@ int main(int argc, char ** argv) {
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
         else if (a == "--ref") ref = next();
         else if (a == "--profile") opt.profile = next();
+        else if (a == "--mtp") opt.mtp = next();
+        else if (a == "--draft") gopt.max_draft = std::stoi(next());
+        else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();
         else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
@@ -120,29 +126,33 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    Generator gen(eng, eng.mtp(), gopt);
     const double t0 = now_ms();
-    eng.prefill(prompt);
+    int tok = gen.prefill(prompt);
     const double t1 = now_ms();
-    int tok = eng.argmax(eng.last_T - 1);
     std::vector<int> out{tok};
     eng.times = StageTimes{};
     const double t2 = now_ms();
-    for (int i = 1; i < max_new; ++i) {
-        eng.forward(&tok, 1);
-        tok = eng.argmax(0);
-        out.push_back(tok);
-        if (tok == c.eos_token) break;
+    while ((int) out.size() < max_new && out.back() != c.eos_token) {
+        for (int t : gen.next()) {
+            out.push_back(t);
+            if (t == c.eos_token) break;
+        }
     }
     const double t3 = now_ms();
     printf("output:");
     for (int t : out) printf(" %d", t);
     printf("\nprefill %zu tokens in %.1f ms (%.1f tok/s)\n", prompt.size(), t1 - t0, prompt.size() / ((t1 - t0) / 1000));
     const auto & tm = eng.times;
-    printf("decode %zu tokens in %.1f ms (%.2f tok/s); per token: total %.2f ms, CPU experts %.2f ms, PLE host %.2f ms\n",
-           out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), tm.total_ms / tm.calls,
-           tm.cpu_experts_ms / tm.calls, tm.ple_ms / tm.calls);
-    printf("expert misses %.2f%% (%.2f per token), %lld cache swaps\n",
-           100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / tm.calls,
+    const auto & gs = gen.stats;
+    printf("decode %zu tokens in %.1f ms (%.2f tok/s); %lld rounds, %.2f tokens/round, drafts accepted %lld/%lld\n",
+           out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), (long long) gs.rounds,
+           (double) gs.emitted / std::max<int64_t>(1, gs.rounds), (long long) gs.accepted, (long long) gs.drafted);
+    printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms\n",
+           gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
+           gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls));
+    printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
+           100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
            (long long) eng.cache().swaps_done);
     return 0;
 }
