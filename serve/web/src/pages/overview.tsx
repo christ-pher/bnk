@@ -68,12 +68,12 @@ export function OverviewPage({ range }: { range: Range }) {
         </StatCard>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-2 xl:grid-cols-4">
         <NowCard />
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Layers className="size-4 text-muted-foreground" />Totals</CardTitle>
-            <CardDescription>Since the engine started · up {fmt.duration(overview?.uptime ?? 0)}</CardDescription>
+            <CardDescription>Up {fmt.duration(overview?.uptime ?? 0)}</CardDescription>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm">
             <Total label="Requests" value={fmt.n(live?.life.requests)} />
@@ -82,6 +82,35 @@ export function OverviewPage({ range }: { range: Range }) {
             <Total label="Prefilled" value={fmt.compact(live?.life.prefill_tokens)} unit="tok" />
             <Total label="Cache swaps" value={fmt.compact(live?.life.swaps)} />
             <Total label="Context" value={`${fmt.compact(live?.pos)} / ${fmt.compact(live?.n_ctx)}`} />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Gauge className="size-4 text-muted-foreground" />GPU</CardTitle>
+            <CardDescription>{overview?.gpu?.name ?? "GPU"}</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <Meter label="VRAM" reading={`${fmt.gib(live?.vram_used_mb)} / ${fmt.gib(live?.vram_total_mb)}`}
+              value={live ? live.vram_used_mb / live.vram_total_mb : null}
+              hint={`Expert cache ${fmt.n(live?.expert_cache_gb, 1)} GiB`} />
+            <Meter label="Utilization" reading={fmt.pct((live?.gpu?.util ?? 0) / 100)} value={(live?.gpu?.util ?? 0) / 100} />
+            <Meter label="Power" reading={`${fmt.n(live?.gpu?.power_w)} W`}
+              value={overview?.gpu?.power_limit_w && live?.gpu?.power_w != null ? live.gpu.power_w / overview.gpu.power_limit_w : null}
+              hint={`${fmt.n(live?.gpu?.temp_c)} °C · SM ${fmt.n(live?.gpu?.sm_clock)} MHz`} />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Cpu className="size-4 text-muted-foreground" />Host</CardTitle>
+            <CardDescription>CPU experts on {live?.cpu_threads ?? "—"} threads</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <Meter label="CPU" reading={fmt.pct((history.at(-1)?.cpu ?? 0) / 100)} value={(history.at(-1)?.cpu ?? 0) / 100} />
+            <Meter label="RAM" reading={`${fmt.gib(live ? live.ram_total_mb - live.ram_free_mb : null)} / ${fmt.gib(live?.ram_total_mb)}`}
+              value={live ? (live.ram_total_mb - live.ram_free_mb) / live.ram_total_mb : null}
+              hint={`Engine resident ${fmt.gib(live?.rss_mb)} (expert store, page-locked)`} />
+            <Meter label="PCIe host → GPU" reading={`${fmt.n((live?.gpu?.pcie_rx_mbs ?? 0) / 1024, 2)} GB/s`}
+              value={(live?.gpu?.pcie_rx_mbs ?? 0) / 13400} hint="Measured ceiling ≈ 13.1 GB/s" />
           </CardContent>
         </Card>
       </div>
@@ -114,38 +143,6 @@ export function OverviewPage({ range }: { range: Range }) {
               unit="tok/s"
               height={230}
             />
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Gauge className="size-4 text-muted-foreground" />GPU</CardTitle>
-            <CardDescription>{overview?.gpu?.name ?? "GPU"}</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-            <Meter label="VRAM" reading={`${fmt.gib(live?.vram_used_mb)} / ${fmt.gib(live?.vram_total_mb)}`}
-              value={live ? live.vram_used_mb / live.vram_total_mb : null}
-              hint={`Expert cache ${fmt.n(live?.expert_cache_gb, 1)} GiB`} />
-            <Meter label="Utilization" reading={fmt.pct((live?.gpu?.util ?? 0) / 100)} value={(live?.gpu?.util ?? 0) / 100} />
-            <Meter label="Power" reading={`${fmt.n(live?.gpu?.power_w)} W`}
-              value={overview?.gpu?.power_limit_w && live?.gpu?.power_w != null ? live.gpu.power_w / overview.gpu.power_limit_w : null}
-              hint={`${fmt.n(live?.gpu?.temp_c)} °C · SM ${fmt.n(live?.gpu?.sm_clock)} MHz`} />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Cpu className="size-4 text-muted-foreground" />Host</CardTitle>
-            <CardDescription>CPU experts on {live?.cpu_threads ?? "—"} threads</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-            <Meter label="CPU" reading={fmt.pct((history.at(-1)?.cpu ?? 0) / 100)} value={(history.at(-1)?.cpu ?? 0) / 100} />
-            <Meter label="RAM" reading={`${fmt.gib(live ? live.ram_total_mb - live.ram_free_mb : null)} / ${fmt.gib(live?.ram_total_mb)}`}
-              value={live ? (live.ram_total_mb - live.ram_free_mb) / live.ram_total_mb : null}
-              hint={`Engine resident ${fmt.gib(live?.rss_mb)} (expert store, page-locked)`} />
-            <Meter label="PCIe host → GPU" reading={`${fmt.n((live?.gpu?.pcie_rx_mbs ?? 0) / 1024, 2)} GB/s`}
-              value={(live?.gpu?.pcie_rx_mbs ?? 0) / 13400} hint="Measured ceiling ≈ 13.1 GB/s" />
           </CardContent>
         </Card>
       </div>
@@ -188,7 +185,7 @@ export function NowCard() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2"><Activity className="size-4 text-muted-foreground" />Now</CardTitle>
-        <CardDescription>{live ? `Context position ${fmt.n(live.pos)} of ${fmt.n(live.n_ctx)}` : "Connecting…"}</CardDescription>
+        <CardDescription>{live ? `Context ${fmt.compact(live.pos)} / ${fmt.compact(live.n_ctx)}` : "Connecting…"}</CardDescription>
         <CardAction>
           {live?.phase === "prefill" && <Badge className="gap-1.5"><Spinner className="size-3" />Reading prompt</Badge>}
           {live?.phase === "decode" && <Badge className="gap-1.5"><Zap className="size-3" />Generating</Badge>}
