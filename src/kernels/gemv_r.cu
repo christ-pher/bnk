@@ -1,6 +1,7 @@
 // GEMV v2: R-layout quant rows (dp4a) and float rows, LPR lanes per row, optional split-K.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 #include "kernels/gemv.h"
 #include "kernels/qdot.cuh"
@@ -22,10 +23,10 @@ static int sm_count2() {
 // Block: 8 warps. Without split-K each warp owns 32/LPR rows (LPR lanes per row) and blocks stride over
 // row groups. With split-K (SK = 8) all 8 warps share the block's row group and split its sub-blocks.
 template <int FMT, int NT, int LPR, bool SPLITK, bool SMEM>
-__global__ void __launch_bounds__(256) gemv_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
+__global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
                                                 int nsb, const int8_t * __restrict__ aq, const float * __restrict__ ad,
-                                                int64_t cols_pad, int T, float * __restrict__ y, int64_t ldy,
-                                                int accumulate) {
+                                                const int16_t * __restrict__ asum, int64_t cols_pad, int T,
+                                                float * __restrict__ y, int64_t ldy, int accumulate) {
     extern __shared__ __align__(16) uint8_t smem[];
     constexpr int RPW = 32 / LPR;  // rows per warp
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -34,15 +35,20 @@ __global__ void __launch_bounds__(256) gemv_r_k(const uint8_t * __restrict__ W, 
 
     const int8_t * aq_s = aq;
     const float * ad_s = ad;
+    const int16_t * as_s = asum;
     if constexpr (SMEM) {
         int8_t * q = (int8_t *) smem;
         float * d = (float *) (smem + (size_t) NT * cols_pad);
+        int * sm2 = (int *) (d + NT * nb);
         const int nq16 = (int) (T * cols_pad / 16);
         for (int i = threadIdx.x; i < nq16; i += 256) ((int4 *) q)[i] = ((const int4 *) aq)[i];
         for (int i = threadIdx.x; i < T * nb; i += 256) d[i] = ad[i];
+        if (RT<FMT>::HAS_MIN && asum)
+            for (int i = threadIdx.x; i < T * nb; i += 256) sm2[i] = ((const int *) asum)[i];
         __syncthreads();
         aq_s = q;
         ad_s = d;
+        if (asum) as_s = (const int16_t *) sm2;
     }
     __shared__ float red[SPLITK ? 8 : 1][32][NT];
 
@@ -82,14 +88,21 @@ __global__ void __launch_bounds__(256) gemv_r_k(const uint8_t * __restrict__ W, 
                         i1 = __dp4a(u.w[7], a1.w, i1);
                         float v = u.d0 * (float) i0 + u.d1 * (float) i1;
                         if constexpr (RT<FMT>::HAS_MIN) {
-                            int s0 = __dp4a(a0.x, 0x01010101, 0);
-                            s0 = __dp4a(a0.y, 0x01010101, s0);
-                            s0 = __dp4a(a0.z, 0x01010101, s0);
-                            s0 = __dp4a(a0.w, 0x01010101, s0);
-                            int s1 = __dp4a(a1.x, 0x01010101, 0);
-                            s1 = __dp4a(a1.y, 0x01010101, s1);
-                            s1 = __dp4a(a1.z, 0x01010101, s1);
-                            s1 = __dp4a(a1.w, 0x01010101, s1);
+                            int s0, s1;
+                            if (as_s) {
+                                const int pk = ((const int *) as_s)[t * nb + sb];
+                                s0 = (int) (int16_t) (pk & 0xffff);
+                                s1 = pk >> 16;
+                            } else {
+                                s0 = __dp4a(a0.x, 0x01010101, 0);
+                                s0 = __dp4a(a0.y, 0x01010101, s0);
+                                s0 = __dp4a(a0.z, 0x01010101, s0);
+                                s0 = __dp4a(a0.w, 0x01010101, s0);
+                                s1 = __dp4a(a1.x, 0x01010101, 0);
+                                s1 = __dp4a(a1.y, 0x01010101, s1);
+                                s1 = __dp4a(a1.z, 0x01010101, s1);
+                                s1 = __dp4a(a1.w, 0x01010101, s1);
+                            }
                             v -= u.m0 * (float) s0 + u.m1 * (float) s1;
                         }
                         acc[t] += ad_s[t * nb + sb] * v;
@@ -139,10 +152,11 @@ static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
     const int nsb = (int) (W.cols / 32);
     constexpr int RPW = 32 / LPR;
     const int ngroups = (int) ((W.rows + RPW - 1) / RPW);
-    const size_t smem = (size_t) NT * a.cols_pad + (size_t) NT * (a.cols_pad / 32) * 4;
+    const size_t smem = (size_t) NT * a.cols_pad + (size_t) NT * (a.cols_pad / 32) * 8;
     // static shared memory (the split-K reduction) plus this must stay under the 48 KiB default
     const size_t static_smem = SPLITK ? (size_t) 8 * 32 * NT * 4 : 0;
-    const bool use_smem = smem + static_smem <= 46 * 1024;
+    static const bool no_smem = getenv("BNK_GEMV_NOSMEM") != nullptr;
+    const bool use_smem = !no_smem && NT <= 4 && smem + static_smem <= 46 * 1024;
     int grid;
     if (SPLITK) grid = ngroups;
     else grid = std::min((ngroups + 7) / 8, sm_count2() * (use_smem ? 4 : 8));
@@ -150,11 +164,11 @@ static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
     const int accf = acc ? 1 : 0;
     if (use_smem)
         gemv_r_k<FMT, NT, LPR, SPLITK, true><<<grid, 256, smem, s>>>((const uint8_t *) W.data, W.row_bytes, o,
-                                                                    (int) W.rows, nsb, a.q, a.d, a.cols_pad, T, y,
+                                                                    (int) W.rows, nsb, a.q, a.d, a.s, a.cols_pad, T, y,
                                                                     ldy, accf);
     else
         gemv_r_k<FMT, NT, LPR, SPLITK, false><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o,
-                                                                  (int) W.rows, nsb, a.q, a.d, a.cols_pad, T, y, ldy,
+                                                                  (int) W.rows, nsb, a.q, a.d, a.s, a.cols_pad, T, y, ldy,
                                                                   accf);
     check_launch("gemv_r");
 }

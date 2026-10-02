@@ -189,8 +189,12 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     pool_->run([&](int part, int nparts) {
         int b, e;
         split(R, part, nparts, b, e);
-        const void * ys[kMaxWindow * 2];
-        float vals[kMaxWindow * 2];
+        thread_local std::vector<const void *> ysv;
+        thread_local std::vector<float> valsv;
+        ysv.resize(nt);
+        valsv.resize(nt);
+        const void ** ys = ysv.data();
+        float * vals = valsv.data();
         int g = b;
         while (g < e) {
             const int gi = g / (2 * F);
@@ -221,20 +225,25 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
         }
     });
 
-    // phase 2: output rows, split evenly; each row decodes every group's down row once
-    for (int t = 0; t < T; ++t) memset(out + (size_t) t * E, 0, sizeof(float) * E);
+    // phase 2: output rows, split evenly; each row decodes every group's down row once, then each token sums its
+    // experts in task order (the same order a one-token window uses, so speculation reproduces plain decoding)
     pool_->run([&](int part, int nparts) {
         int b, e;
         split(E, part, nparts, b, e);
-        const void * hs[kMaxWindow * 2];
-        float vals[kMaxWindow * 2];
-        for (int gi = 0; gi < ng; ++gi) {
-            const std::vector<int> & grp = groups_[gi];
-            const int n = (int) grp.size();
-            const uint8_t * dn = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes;
-            for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
-            for (int r = b; r < e; ++r) {
-                const uint8_t * w = dn + (size_t) r * drow;
+        thread_local std::vector<const void *> hsv;
+        thread_local std::vector<float> valsv, tvv;
+        hsv.resize(nt);
+        valsv.resize(nt);
+        tvv.resize(nt);
+        const void ** hs = hsv.data();
+        float * vals = valsv.data();
+        float * tv = tvv.data();
+        for (int r = b; r < e; ++r) {
+            for (int gi = 0; gi < ng; ++gi) {
+                const std::vector<int> & grp = groups_[gi];
+                const int n = (int) grp.size();
+                const uint8_t * w = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
+                for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
                 if (dn_multi && n > 1) {
                     mdot(L.down_type, F, w, hs, n, vals);
                 } else if (down_q2) {
@@ -242,8 +251,10 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 } else {
                     for (int k = 0; k < n; ++k) td->vec_dot(F, &vals[k], 0, w, 0, hs[k], 0, 1);
                 }
-                for (int k = 0; k < n; ++k) out[(size_t) tasks[grp[k]].t * E + r] += tasks[grp[k]].w * vals[k];
+                for (int k = 0; k < n; ++k) tv[grp[k]] = vals[k];
             }
+            for (int t = 0; t < T; ++t) out[(size_t) t * E + r] = 0.f;
+            for (int i = 0; i < nt; ++i) out[(size_t) tasks[i].t * E + r] += tasks[i].w * tv[i];
         }
     });
     last_ms = now_ms() - t0;

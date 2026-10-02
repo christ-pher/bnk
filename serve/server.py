@@ -44,6 +44,8 @@ class State:
         eargs = ["--model", args.model, "--ctx", str(args.ctx)]
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
+            if args.draft_vocab:
+                eargs += ["--draft-vocab", args.draft_vocab]
         if args.profile:
             eargs += ["--profile", args.profile]
         if args.counts:
@@ -480,6 +482,7 @@ def main():
     ap.add_argument("--model", required=True, help="first GGUF shard of the model")
     ap.add_argument("--mtp", default="", help="MTP draft layer GGUF (speculative decoding)")
     ap.add_argument("--draft", type=int, default=3)
+    ap.add_argument("--draft-vocab", default="", help="int32 token ids the drafter may propose (faster drafts)")
     ap.add_argument("--ctx", type=int, default=32768)
     ap.add_argument("--profile", default="", help="expert ranking for the initial VRAM cache")
     ap.add_argument("--counts", default="", help="file to learn expert routing counts in")

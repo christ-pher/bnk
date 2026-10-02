@@ -23,7 +23,7 @@ void bnk_unsupported_format(int fmt) {
 // ------------------------------------------------------------------------------ activation quantize
 // One warp per 32-value block: d = amax/127, q = round(x/d).
 __global__ void quantize_act_k(const float * __restrict__ x, int64_t ldx, int64_t cols, int8_t * __restrict__ q,
-                               float * __restrict__ d, int64_t cols_pad, int nblk_total) {
+                               float * __restrict__ d, int16_t * __restrict__ sums, int64_t cols_pad, int nblk_total) {
     const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (gw >= nblk_total) return;
@@ -37,8 +37,15 @@ __global__ void quantize_act_k(const float * __restrict__ x, int64_t ldx, int64_
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
     const float dd = amax / 127.f;
     const float id = dd > 0.f ? 1.f / dd : 0.f;
-    q[t * cols_pad + c] = (int8_t) __float2int_rn(v * id);
+    const int qi = __float2int_rn(v * id);
+    q[t * cols_pad + c] = (int8_t) qi;
     if (lane == 0) d[t * nb + b] = dd;
+    if (sums) {
+        int sm = qi;
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffff, sm, o);  // within each half-warp
+        if ((lane & 15) == 0) sums[(t * nb + b) * 2 + (lane >> 4)] = (int16_t) sm;
+    }
 }
 
 void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s) {
@@ -47,7 +54,7 @@ void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, 
     a.cols_pad = (cols + 31) / 32 * 32;
     const int nblk = (int) (T * (a.cols_pad / 32));
     const int threads = 256;
-    quantize_act_k<<<(nblk * 32 + threads - 1) / threads, threads, 0, s>>>(x, ldx, cols, a.q, a.d, a.cols_pad, nblk);
+    quantize_act_k<<<(nblk * 32 + threads - 1) / threads, threads, 0, s>>>(x, ldx, cols, a.q, a.d, a.s, a.cols_pad, nblk);
 }
 
 // ------------------------------------------------------------------------------ dp4a GEMV

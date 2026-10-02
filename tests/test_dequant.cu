@@ -56,6 +56,7 @@ static int test_tensor(const TensorRef & t) {
     int64_t cp = (cols + 31) / 32 * 32;
     CK(cudaMalloc(&a.q, T * cp));
     CK(cudaMalloc(&a.d, T * cp / 32 * 4));
+    CK(cudaMalloc(&a.s, T * cp / 16 * 2));
     gemv_auto(W, dx, cols, T, dy, rows, false, a, 0);
     CK(cudaDeviceSynchronize());
     std::vector<float> y(T * rows);

@@ -25,6 +25,7 @@ int main(int argc, char ** argv) {
     ActQ8 a;
     CUDA_CHECK(cudaMalloc(&a.q, 8 * 16384));
     CUDA_CHECK(cudaMalloc(&a.d, 8 * 16384 / 32 * 4));
+    CUDA_CHECK(cudaMalloc(&a.s, 8 * 16384 / 16 * 2));
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);

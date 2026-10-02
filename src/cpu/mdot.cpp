@@ -236,11 +236,12 @@ void iq4_xs_rows(const block_iq4_xs * x, int nb, const block_q8_K * const * y, f
 // ---------------------------------------------------------------------------------------------- IQ4_NL x Q8_0
 template <int NT>
 void iq4_nl_rows(const block_iq4_nl * x, int nb, const block_q8_0 * const * y, float * s) {
+    // two accumulators by block parity, as ggml's kernel, so the result is bit-identical to vec_dot (nb is even)
     const __m128i values128 = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
     const __m128i m4b = _mm_set1_epi8(0x0f);
     const __m256i ones = _mm256_set1_epi16(1);
-    __m256 acc[NT];
-    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    __m256 acc[2][NT];
+    for (int t = 0; t < NT; ++t) acc[0][t] = acc[1][t] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const __m128i b = _mm_loadu_si128((const __m128i *) x[ib].qs);
         const __m256i w = _mm256_set_m128i(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(b, 4), m4b)),
@@ -250,10 +251,10 @@ void iq4_nl_rows(const block_iq4_nl * x, int nb, const block_q8_0 * const * y, f
         for (int t = 0; t < NT; ++t) {
             const __m256i a = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[t][ib].qs), w);
             const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, a), ones);
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dw * fp16(y[t][ib].d)), _mm256_cvtepi32_ps(p), acc[t]);
+            acc[ib & 1][t] = _mm256_fmadd_ps(_mm256_set1_ps(fp16(y[t][ib].d) * dw), _mm256_cvtepi32_ps(p), acc[ib & 1][t]);
         }
     }
-    for (int t = 0; t < NT; ++t) s[t] = hsum8(acc[t]);
+    for (int t = 0; t < NT; ++t) s[t] = hsum8(_mm256_add_ps(acc[0][t], acc[1][t]));
 }
 
 template <typename BX, typename BY, void (*K1)(const BX *, int, const BY * const *, float *),

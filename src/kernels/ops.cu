@@ -625,4 +625,16 @@ void add_bcast_streams(float * R, const float * e, int T, int hc, int E, cudaStr
     add_bcast_k<<<dim3(nblk(hc * E, 256), T), 256, 0, s>>>(R, e, hc, E);
 }
 
+__global__ void gather_bytes_rows_k(const uint8_t * src, size_t rb, const int32_t * ids, int n, uint8_t * dst) {
+    const uint4 * sp = (const uint4 *) (src + (size_t) ids[blockIdx.x] * rb);
+    uint4 * dp = (uint4 *) (dst + (size_t) blockIdx.x * rb);
+    for (size_t k = threadIdx.x; k < rb / 16; k += blockDim.x) dp[k] = sp[k];
+}
+void gather_bytes_rows(const uint8_t * src, size_t row_bytes, const int32_t * ids, int n, uint8_t * dst, cudaStream_t s) {
+    if (n > 0) gather_bytes_rows_k<<<n, 256, 0, s>>>(src, row_bytes, ids, n, dst);
+}
+
+__global__ void map_id_k(int32_t * id, const int32_t * table) { id[0] = table[id[0]]; }
+void map_id(int32_t * id, const int32_t * table, cudaStream_t s) { map_id_k<<<1, 1, 0, s>>>(id, table); }
+
 }  // namespace bnk

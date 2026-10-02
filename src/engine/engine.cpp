@@ -69,9 +69,10 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     argmax_dev_.alloc(W);
     const int64_t maxcols = std::max<int64_t>(HC, 16384);
     actq_.alloc(W * maxcols); actd_.alloc(W * maxcols / 32);
-    act_.q = actq_; act_.d = actd_;
-    mixq_.alloc(W * E + 64); mixd_.alloc(W * E / 32 + 8);
-    mixact_.q = mixq_; mixact_.d = mixd_;
+    acts_.alloc(W * maxcols / 16);
+    act_.q = actq_; act_.d = actd_; act_.s = acts_;
+    mixq_.alloc(W * E + 64); mixd_.alloc(W * E / 32 + 8); mixs_.alloc(W * E / 16 + 16);
+    mixact_.q = mixq_; mixact_.d = mixd_; mixact_.s = mixs_;
 
     // MoE scratch
     const int F = c.n_ff_exp;
@@ -142,7 +143,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         fprintf(stderr, "bnk: context %d, KV + recurrent state %.2f GiB, %d CPU expert threads\n", opt.max_ctx,
                 state_bytes / 1073741824.0, cpu_.threads());
 
-    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose);
+    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab);
     if (opt.prefill_chunk > 0) prefill_alloc(opt.prefill_chunk);
 
     // the VRAM expert tier takes what is left, minus the prompt path's expert staging (which depends on how

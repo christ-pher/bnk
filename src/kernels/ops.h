@@ -78,4 +78,9 @@ void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaSt
 // R[t][s][:] += e[t][:]
 void add_bcast_streams(float * R, const float * e, int T, int hc, int E, cudaStream_t s);
 
+// dst row i = src row ids[i] (raw bytes, row_bytes a multiple of 16)
+void gather_bytes_rows(const uint8_t * src, size_t row_bytes, const int32_t * ids, int n, uint8_t * dst, cudaStream_t s);
+// id[0] = table[id[0]]
+void map_id(int32_t * id, const int32_t * table, cudaStream_t s);
+
 }  // namespace bnk

@@ -34,6 +34,7 @@ struct EngineOptions {
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
+    std::string draft_vocab;         // int32 token ids the drafter may propose (empty = the whole vocabulary)
     int prefill_chunk = 2048;        // tokens per batched prompt pass (0 = decode windows only)
     int prefill_min = 24;            // fewer tokens than this go through decode windows
     int prefetch_min = 1024;         // chunks this long stream every non-resident expert one layer ahead
@@ -159,6 +160,7 @@ private:
     DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_, ple_hist_;
     DevBuf<int8_t> actq_, mixq_;
     DevBuf<float> actd_, mixd_;
+    DevBuf<int16_t> acts_, mixs_;
     ActQ8 act_, mixact_;
     // MoE
     MoeScratch moes_;

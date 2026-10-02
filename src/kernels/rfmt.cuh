@@ -55,8 +55,10 @@ template <> struct RT<QT_Q5_K> {
     }
 };
 
+// The 6-bit codes stay unsigned (0..63); the -32 offset becomes a "min" of 32*d per half, which the GEMV folds in
+// through the activation sums (no per-weight subtraction).
 template <> struct RT<QT_Q6_K> {
-    static constexpr bool HAS_MIN = false;
+    static constexpr bool HAS_MIN = true;
     __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint4 q = *(const uint4 *) (row + o.a + 16 * sb);
         const uint2 h = *(const uint2 *) (row + o.b + 8 * sb);
@@ -64,14 +66,15 @@ template <> struct RT<QT_Q6_K> {
         const float d = h2f(*(const uint16_t *) (row + o.d + 2 * (sb >> 3)));
         u.d0 = d * sc[0];
         u.d1 = d * sc[1];
-        u.m0 = u.m1 = 0.f;
+        u.m0 = 32.f * u.d0;
+        u.m1 = 32.f * u.d1;
         const uint32_t x[4] = {q.x, q.y, q.z, q.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const uint32_t hl = spread2((h.x >> (8 * i)) & 0xff) << 4;
             const uint32_t hh = spread2((h.y >> (8 * i)) & 0xff) << 4;
-            u.w[i] = (int) __vsubss4((x[i] & 0x0F0F0F0F) | hl, 0x20202020);
-            u.w[4 + i] = (int) __vsubss4(((x[i] >> 4) & 0x0F0F0F0F) | hh, 0x20202020);
+            u.w[i] = (int) ((x[i] & 0x0F0F0F0F) | hl);
+            u.w[4 + i] = (int) (((x[i] >> 4) & 0x0F0F0F0F) | hh);
         }
     }
 };

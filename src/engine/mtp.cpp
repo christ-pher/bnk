@@ -10,6 +10,7 @@
 namespace bnk {
 
 MtpLayer::~MtpLayer() {
+    for (auto & g : graphs_) for (auto & x : g) if (x) cudaGraphExecDestroy(x);
     for (void * p : allocs_) cudaFree(p);
     if (msg_) cudaFreeHost(msg_);
     if (h_io_) cudaFreeHost(h_io_);
@@ -28,7 +29,8 @@ std::vector<float> plus_one(const TensorRef & t) {
 
 }  // namespace
 
-void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose) {
+void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
+                    const std::string & draft_vocab) {
     main_ = &main;
     st_ = st;
     max_ctx_ = max_ctx;
@@ -163,8 +165,37 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     CUDA_CHECK(cudaHostAlloc((void **) &h_io_, 64, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &h_prob_, 64, cudaHostAllocMapped));
     vram_ += 2 * kc_.n * sizeof(half);
+    // optional draft vocabulary: the head rows of a token subset
+    if (!draft_vocab.empty()) {
+        FILE * f = fopen(draft_vocab.c_str(), "rb");
+        if (f) {
+            std::vector<int32_t> ids;
+            int32_t v;
+            while (fread(&v, 4, 1, f) == 1)
+                if (v >= 0 && v < c.n_vocab) ids.push_back(v);
+            fclose(f);
+            const QMat & H = main.output;
+            if (!ids.empty() && H.row_bytes % 16 == 0) {
+                n_dvocab_ = (int) ids.size();
+                CUDA_CHECK(cudaMalloc(&dvocab_, ids.size() * 4));
+                allocs_.push_back(dvocab_);
+                CUDA_CHECK(cudaMemcpy(dvocab_, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                void * d;
+                CUDA_CHECK(cudaMalloc(&d, H.row_bytes * ids.size()));
+                allocs_.push_back(d);
+                gather_bytes_rows((const uint8_t *) H.data, H.row_bytes, dvocab_, n_dvocab_, (uint8_t *) d, nullptr);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                dhead_ = H;
+                dhead_.data = d;
+                dhead_.rows = n_dvocab_;
+                vram_ += H.row_bytes * ids.size();
+            }
+        }
+    }
     loaded_ = true;
-    if (verbose) fprintf(stderr, "bnk: MTP draft layer: %.2f GiB of VRAM\n", vram_ / 1073741824.0);
+    if (verbose)
+        fprintf(stderr, "bnk: MTP draft layer: %.2f GiB of VRAM, draft head over %s tokens\n", vram_ / 1073741824.0,
+                n_dvocab_ ? std::to_string(n_dvocab_).c_str() : "all");
 }
 
 void MtpLayer::hc_pre(const HcWeights & w, const float * res, int T, bool inject, float * mixed, float * inj) {
@@ -181,9 +212,9 @@ void MtpLayer::hc_pre(const HcWeights & w, const float * res, int T, bool inject
 int MtpLayer::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
     if (n < 1 || n > kMaxWindow) throw std::runtime_error("mtp: bad row count");
     const int HC = main_->cfg.hc_dim();
+    CUDA_CHECK(cudaStreamSynchronize(st_));   // the pinned inputs below may still be read by a previous graph
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_rows, (size_t) n * HC * 4, cudaMemcpyDeviceToDevice, st_));
     memcpy(h_io_ + 8, next_tokens, n * 4);
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_io_ + 8, n * 4, cudaMemcpyHostToDevice, st_));
     return forward(n, cell0, draft, prob);
 }
 
@@ -191,18 +222,38 @@ int MtpLayer::step(int32_t tok, int cell, float * prob) {
     const int HC = main_->cfg.hc_dim();
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_.p, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
     h_io_[8] = tok;
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_io_ + 8, 4, cudaMemcpyHostToDevice, st_));
     return forward(1, cell, true, prob);
 }
 
 int MtpLayer::forward(int n, int cell0, bool draft, float * prob) {
     const double t0 = now_ms();
-    const Config & c = main_->cfg;
-    const int E = c.n_embd, HC = c.hc_dim(), H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     if (cell0 + n > max_ctx_) throw std::runtime_error("mtp: context full");
     h_io_[16] = cell0;
     h_io_[17] = cell0 + n - 1;
+    cudaGraphExec_t & g = graphs_[n][draft ? 1 : 0];
+    if (!g) {
+        cudaGraph_t gr;
+        CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+        enqueue(n, draft);
+        CUDA_CHECK(cudaStreamEndCapture(st_, &gr));
+        CUDA_CHECK(cudaGraphInstantiate(&g, gr, 0));
+        cudaGraphDestroy(gr);
+    }
+    CUDA_CHECK(cudaGraphLaunch(g, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    ms += now_ms() - t0;
+    if (!draft) return -1;
+    if (prob) *prob = h_prob_[0];
+    ++calls;
+    return h_io_[0];
+}
+
+// The layer for n rows (window inputs read from pinned memory, so the graph replays with new values).
+void MtpLayer::enqueue(int n, bool draft) {
+    const Config & c = main_->cfg;
+    const int E = c.n_embd, HC = c.hc_dim(), H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     CUDA_CHECK(cudaMemcpyAsync(pos_dev_.p, h_io_ + 16, 8, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_io_ + 8, n * 4, cudaMemcpyHostToDevice, st_));
 
     // the two input branches
     dequant_gather(main_->tok_embd, tok_dev_, n, emb_, st_);
@@ -213,7 +264,6 @@ int MtpLayer::forward(int n, int cell0, bool draft, float * prob) {
         const int rr = std::min(kMaxWindow, n * c.hc - r0);
         gemv_auto(fc_hid_, hn_.p + (size_t) r0 * E, E, rr, h2_.p + (size_t) r0 * E, E, false, act_, st_);
     }
-    // R = h + e (e broadcast over the streams)
     copy_f32(R_, h2_, (int64_t) n * HC, st_);
     add_bcast_streams(R_, e2_, n, c.hc, E, st_);
     // attention hyper-connection, K/V for every row
@@ -223,10 +273,7 @@ int MtpLayer::forward(int n, int cell0, bool draft, float * prob) {
     gemv_auto(wv_, mixed_, E, n, v_, Hkv * D, false, act_, st_);
     attn_prep(qfull_, k_, v_, q_norm_, k_norm_, q_, kc_, vc_, n, H, Hkv, D, c.n_rot, c.rope_base, pos_dev_.p,
               c.rms_eps, st_);
-    if (!draft) {
-        ms += now_ms() - t0;
-        return -1;
-    }
+    if (!draft) return;
     // the rest of the layer on the last row
     const int L = n - 1;
     float * RL = R_.p + (size_t) L * HC;
@@ -249,18 +296,15 @@ int MtpLayer::forward(int n, int cell0, bool draft, float * prob) {
     sigmoid_inplace(sgate_, 1, st_);
     moe_reduce(moes_, msg_, shared_, sgate_, y_, 1, c.n_expert_used, E, st_);
     hc_combine(RL, y_, inj2_, 1, c.hc, E, st_);
-    // keep the residual for the next step, then the final mixer and the main head
+    // keep the residual for the next step, then the final mixer and the (draft) head
     if (L > 0) copy_f32(R_, RL, HC, st_);
     hc_pre(hc_mix_, R_, 1, false, sample_, nullptr);
-    gemv_auto(main_->output, sample_, E, 1, logits_, c.n_vocab, false, act_, st_);
-    argmax_prob(logits_, c.n_vocab, out_dev_, prob_, st_);
+    const QMat & head = n_dvocab_ ? dhead_ : main_->output;
+    gemv_auto(head, sample_, E, 1, logits_, (int) head.rows, false, act_, st_);
+    argmax_prob(logits_, (int) head.rows, out_dev_, prob_, st_);
+    if (n_dvocab_) map_id(out_dev_, dvocab_, st_);
     CUDA_CHECK(cudaMemcpyAsync(h_io_, out_dev_.p, 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_prob_, prob_.p, 4, cudaMemcpyDeviceToHost, st_));
-    CUDA_CHECK(cudaStreamSynchronize(st_));
-    if (prob) *prob = h_prob_[0];
-    ms += now_ms() - t0;
-    ++calls;
-    return h_io_[0];
 }
 
 }  // namespace bnk

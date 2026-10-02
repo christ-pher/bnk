@@ -6,7 +6,7 @@
 namespace bnk {
 
 // a0/a1: the 32 int8 activations of the sub-block, da: their scale.
-template <int FMT>
+template <int FMT, bool MIN = QTraits<FMT>::HAS_MIN>
 __device__ __forceinline__ float qdot_sub(const Unpacked & u, const int4 a0, const int4 a1, float da) {
     int i0 = __dp4a(u.w[0], a0.x, 0);
     i0 = __dp4a(u.w[1], a0.y, i0);
@@ -17,7 +17,7 @@ __device__ __forceinline__ float qdot_sub(const Unpacked & u, const int4 a0, con
     i1 = __dp4a(u.w[6], a1.z, i1);
     i1 = __dp4a(u.w[7], a1.w, i1);
     float v = u.d0 * (float) i0 + u.d1 * (float) i1;
-    if constexpr (QTraits<FMT>::HAS_MIN) {
+    if constexpr (MIN) {
         int s0 = __dp4a(a0.x, 0x01010101, 0);
         s0 = __dp4a(a0.y, 0x01010101, s0);
         s0 = __dp4a(a0.z, 0x01010101, s0);

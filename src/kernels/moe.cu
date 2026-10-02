@@ -234,7 +234,7 @@ __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ h
             for (int t = 0; t < NT; ++t) {
                 if (mask & (1u << t)) {
                     const int4 * ap = (const int4 *) (aqs + (size_t) t * E + sb * 32);
-                    acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], ads[t * nb + sb]);
+                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ads[t * nb + sb]);
                 }
             }
         }
@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
             for (int t = 0; t < NT; ++t) {
                 if (mask & (1u << t)) {
                     const int4 * ap = (const int4 *) (hqs + (size_t) t * F + sb * 32);
-                    acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], hds[t * nb + sb]);
+                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], hds[t * nb + sb]);
                 }
             }
         }
@@ -479,7 +479,8 @@ __global__ void __launch_bounds__(256) moe_gu_list_k(const PfItem * __restrict__
             if (t < n) {
                 const int64_t tk = it.tok[t];
                 const int4 * ap = (const int4 *) (aq + tk * cols_pad + sb * 32);
-                acc[t] += qdot_sub<FMT>(u, __ldg(ap), __ldg(ap + 1), __ldg(ad + tk * nb + sb));
+                acc[t] += RL ? qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, __ldg(ap), __ldg(ap + 1), __ldg(ad + tk * nb + sb))
+                             : qdot_sub<FMT>(u, __ldg(ap), __ldg(ap + 1), __ldg(ad + tk * nb + sb));
             }
         }
     }
@@ -531,7 +532,8 @@ __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict
             if (t < n) {
                 const size_t pr = it.pair[t];
                 const int4 * ap = (const int4 *) (hq + pr * F + sb * 32);
-                acc[t] += qdot_sub<FMT>(u, ap[0], ap[1], hd[pr * (F / 32) + sb]);
+                acc[t] += RL ? qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], hd[pr * (F / 32) + sb])
+                             : qdot_sub<FMT>(u, ap[0], ap[1], hd[pr * (F / 32) + sb]);
             }
         }
     }

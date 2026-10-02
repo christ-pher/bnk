@@ -24,7 +24,8 @@ class MtpLayer {
 public:
     ~MtpLayer();
     // Loads the MTP GGUF (Strata's mtp-*.gguf: mtp.* tensors) for the given main model.
-    void load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose);
+    void load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
+              const std::string & draft_vocab = "");
     bool loaded() const { return loaded_; }
     size_t vram_bytes() const { return vram_; }
 
@@ -39,6 +40,7 @@ public:
 
 private:
     int forward(int n, int cell0, bool draft, float * prob);
+    void enqueue(int n, bool draft);
     void hc_pre(const HcWeights & w, const float * res, int T, bool inject, float * mixed, float * inj);
 
     bool loaded_ = false;
@@ -69,8 +71,13 @@ private:
     DevBuf<int8_t> hq_buf_;
     DevBuf<uint32_t> seq_dev_;
     MoeMsg * msg_ = nullptr;
-    int32_t * h_io_ = nullptr;  // pinned: [0] token out, [1..] scratch
+    int32_t * h_io_ = nullptr;  // pinned: [0] token out, [8..15] tokens in, [16..17] cells
     float * h_prob_ = nullptr;
+    // draft head over a token subset (rows of the main head), and the ids its rows stand for
+    QMat dhead_;
+    int32_t * dvocab_ = nullptr;
+    int n_dvocab_ = 0;
+    cudaGraphExec_t graphs_[kMaxWindow + 1][2] = {};
 };
 
 }  // namespace bnk

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Start the bnk server.
 #   ./run.sh [iq3_s|orca|PATH-to-first-shard.gguf] [--port 8080] [--ctx 65536] [--no-mtp] [server options...]
+#   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MODELS="${BNK_MODELS:-/opt/models/Strata/models}"
 MTP_DEFAULT="${BNK_MTP:-/opt/models/Strata/runtime/mtp/mtp-q2_0.gguf}"
+# the drafter's token subset (English and code; drafts outside it are never proposed, never wrong). "" = all tokens
+DRAFT_VOCAB="${BNK_DRAFT_VOCAB-/opt/engines/Strata/data/draft_vocab.bin}"
 PROFILE_DEFAULT="${BNK_PROFILE:-/opt/engines/Strata/data/expert-profile.bin}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/bnk"
 mkdir -p "$CACHE"
@@ -41,6 +44,7 @@ fi
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --ctx "$CTX" --port "$PORT" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 [[ -n "$MTP" && -f "$MTP" ]] && ARGS+=(--mtp "$MTP")
+[[ -n "$MTP" && -n "$DRAFT_VOCAB" && -f "$DRAFT_VOCAB" ]] && ARGS+=(--draft-vocab "$DRAFT_VOCAB")
 # the learned routing counts rank the initial VRAM cache once they exist; until then Strata's profile does
 [[ ! -f "$COUNTS" && -f "$PROFILE_DEFAULT" ]] && ARGS+=(--profile "$PROFILE_DEFAULT")
 cd "$HERE"

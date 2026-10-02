@@ -30,6 +30,7 @@ struct QMat {
 struct ActQ8 {
     int8_t * q = nullptr;   // [T][cols_pad]
     float * d = nullptr;    // [T][cols_pad/32]
+    int16_t * s = nullptr;  // [T][cols_pad/16] sums of the codes per 16 (optional: kernels fall back to dp4a)
     int64_t cols_pad = 0;   // row stride of q, multiple of 32
     int T = 0;
     int64_t cols = 0;
