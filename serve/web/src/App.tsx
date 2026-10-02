@@ -133,7 +133,7 @@ function AppSidebar({ page }: { page: PageId }) {
   const live = useTelemetry((s) => s.live)
   const uptime = useTelemetry((s) => s.overview?.uptime)
   return (
-    <Sidebar collapsible="icon" variant="inset">
+    <Sidebar collapsible="icon">
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
