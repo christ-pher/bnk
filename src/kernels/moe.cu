@@ -217,6 +217,7 @@ void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, i
     else if (T == 2) hits_launch<2>(d, s, xq, T, k, E, F, st);
     else if (T <= 4) hits_launch<4>(d, s, xq, T, k, E, F, st);
     else hits_launch<8>(d, s, xq, T, k, E, F, st);
+    check_launch("moe_hits");
 }
 
 // ------------------------------------------------------------------------------------------- wait / reduce

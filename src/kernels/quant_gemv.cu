@@ -11,6 +11,11 @@
 
 namespace bnk {
 
+void check_launch(const char * what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": launch failed: " + cudaGetErrorString(e));
+}
+
 void bnk_unsupported_format(int fmt) {
     throw std::runtime_error("unsupported weight format (ggml type " + std::to_string(fmt) + ")");
 }

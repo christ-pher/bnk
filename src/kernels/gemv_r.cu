@@ -140,7 +140,9 @@ static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
     constexpr int RPW = 32 / LPR;
     const int ngroups = (int) ((W.rows + RPW - 1) / RPW);
     const size_t smem = (size_t) NT * a.cols_pad + (size_t) NT * (a.cols_pad / 32) * 4;
-    const bool use_smem = smem <= 48 * 1024;
+    // static shared memory (the split-K reduction) plus this must stay under the 48 KiB default
+    const size_t static_smem = SPLITK ? (size_t) 8 * 32 * NT * 4 : 0;
+    const bool use_smem = smem + static_smem <= 46 * 1024;
     int grid;
     if (SPLITK) grid = ngroups;
     else grid = std::min((ngroups + 7) / 8, sm_count2() * (use_smem ? 4 : 8));
@@ -154,6 +156,7 @@ static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
         gemv_r_k<FMT, NT, LPR, SPLITK, false><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o,
                                                                   (int) W.rows, nsb, a.q, a.d, a.cols_pad, T, y, ldy,
                                                                   accf);
+    check_launch("gemv_r");
 }
 
 template <int NT>
@@ -291,6 +294,7 @@ static void launch_f2(const QMat & W, const float * x, int64_t ldx, int T, float
     const int grid = SPLITK ? ngroups : std::min((ngroups + 7) / 8, sm_count2() * 8);
     gemv_f_k<FMT, NT, LPR, SPLITK><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows, nch, x,
                                                         ldx, T, y, ldy, acc ? 1 : 0);
+    check_launch("gemv_f");
 }
 
 template <int FMT, int NT>

@@ -12,6 +12,19 @@ namespace bnk {
 
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
+// Debug dumps of one layer's intermediates (BNK_DUMP_DIR, BNK_DUMP_LAYER; eager mode only): appended per window.
+static void dbg(cudaStream_t st, int il, const char * name, const float * dev, size_t n) {
+    static const char * dir = getenv("BNK_DUMP_DIR");
+    static int layer = env_int("BNK_DUMP_LAYER", 0);
+    if (!dir || il != layer) return;
+    std::vector<float> h(n);
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    CUDA_CHECK(cudaMemcpy(h.data(), dev, n * 4, cudaMemcpyDeviceToHost));
+    FILE * f = fopen((std::string(dir) + "/" + name).c_str(), "ab");
+    fwrite(h.data(), 4, n, f);
+    fclose(f);
+}
+
 // y = W x, with x already quantized in `xq` when W is a quant format.
 static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
                    cudaStream_t s) {
@@ -230,11 +243,18 @@ void Engine::gdn(int il, int T) {
     float * co = gdn_co_[il], * gg = gdn_g_[il], * gb = gdn_b_[il];
     gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, st_);
     gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, st_);
+    dbg(st_, il, "hc_mixed_attn", mixed_, (size_t) T * E);
+    dbg(st_, il, "linear_attn_qkv_mixed", cb + (size_t) (K - 1) * C, (size_t) T * C);
+    dbg(st_, il, "z", z_, (size_t) T * nv * S);
     gdn_conv(cb, F(L.ssm_conv1d), co, T, C, K, st_);
+    dbg(st_, il, "conv_output_silu", co, (size_t) T * C);
     gdn_prep(co, T, C, c.ssm_groups, nv, S, gg, gb, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
     gdn_recurrence(co, C, gg, gb, ssm_state_[il], gdn_o_, T, c.ssm_groups, nv, S, commit_all_ ? T : 0, st_);
     gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
+    dbg(st_, il, "attn_output", gdn_o_, (size_t) T * nv * S);
+    dbg(st_, il, "final_output", gdn_n_, (size_t) T * nv * S);
     gemv_auto(L.ssm_out, gdn_n_, nv * S, T, out_, E, false, act_, st_);
+    dbg(st_, il, "linear_attn_out", out_, (size_t) T * E);
     if (commit_all_) shift_rows(cb, C, T, K - 1, st_);
 }
 
@@ -329,9 +349,14 @@ void Engine::layer_forward(int il, int T) {
     hc_pre(L.hc_attn, T, true);
     if (L.attn) attn(il, T); else gdn(il, T);
     hc_combine(res_, out_, inj_, T, c.hc, c.n_embd, st_);
+    dbg(st_, il, "hc_combine", res_, (size_t) T * c.hc_dim());
     hc_pre(L.hc_ffn, T, true);
+    dbg(st_, il, "hc_mixed_ffn", mixed_, (size_t) T * c.n_embd);
+    dbg(st_, il, "hc_inject_ffn", inj_, (size_t) T * c.hc);
     moe(il, T);
+    dbg(st_, il, "ffn_out", moe_out_, (size_t) T * c.n_embd);
     hc_combine(res_, moe_out_, inj_, T, c.hc, c.n_embd, st_);
+    dbg(st_, il, "l_last", res_, (size_t) T * c.hc_dim());
     if (dump_all) {
         dumped_layers.resize(c.n_layer);
         dumped_layers[il].resize((size_t) T * c.hc_dim());

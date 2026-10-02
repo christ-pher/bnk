@@ -9,6 +9,9 @@ namespace bnk {
 
 constexpr int kMaxWindow = 8;  // tokens per decode/verify window
 
+// Throws if the last kernel launch failed (bad configuration); no synchronization.
+void check_launch(const char * what);
+
 inline bool is_float_format(int t) { return t == 0 || t == 1 || t == 30; }  // F32, F16, BF16
 
 // A weight matrix in its ggml format: `rows` output rows, each `cols` inputs wide.
