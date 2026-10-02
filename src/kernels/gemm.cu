@@ -21,15 +21,16 @@ void f32_to_f16(const float * x, half * y, int64_t n, cudaStream_t s) {
     f32_to_f16_k<<<(int) (b < 65535 * 4 ? b : 65535 * 4), 256, 0, s>>>(x, y, n);
 }
 
+// grid.x = rows (grid.y is capped at 65535; a chunk of 8192 tokens routes 81920 rows)
 __global__ void gather_rows_f16_k(const float * x, int64_t cols, const int32_t * rows, half * y) {
-    const int i = blockIdx.y;
+    const int i = blockIdx.x;
     const float * src = x + (int64_t) rows[i] * cols;
-    for (int64_t c = blockIdx.x * blockDim.x + threadIdx.x; c < cols; c += gridDim.x * blockDim.x)
+    for (int64_t c = blockIdx.y * blockDim.x + threadIdx.x; c < cols; c += gridDim.y * blockDim.x)
         y[(int64_t) i * cols + c] = __float2half(src[c]);
 }
 void gather_rows_f16(const float * x, int64_t cols, const int32_t * rows, int n, half * y, cudaStream_t s) {
     if (n <= 0) return;
-    gather_rows_f16_k<<<dim3((unsigned) ((cols + 255) / 256), n), 256, 0, s>>>(x, cols, rows, y);
+    gather_rows_f16_k<<<dim3(n, (unsigned) ((cols + 255) / 256)), 256, 0, s>>>(x, cols, rows, y);
 }
 
 __global__ void swiglu_f16_k(const half * gu, half * h, int F) {

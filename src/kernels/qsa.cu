@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <mma.h>
+
 #include "kernels/qsa.h"
 
 namespace bnk {
@@ -208,10 +210,74 @@ __global__ void qsa_topk_k(const float * scores, int max_blocks, int32_t * sel, 
     if (threadIdx.x == 0) n_sel[t] = K;
 }
 
+// Prompt rows: the same scores as a register-tiled fp32 product over 64 query rows x 64 blocks, the indexer heads'
+// relu summed in the epilogue. Each pooled key is read once per 64 queries instead of once per query.
+// 256 threads, each owning a 4 x 4 patch of the tile.
+__global__ void __launch_bounds__(256) qsa_score_tiled_k(const float * __restrict__ q, const float * __restrict__ pooled,
+                                                         float * __restrict__ scores, int T, int max_blocks, int ih,
+                                                         int id, int r, int dense_cells, const int * pos0p, int t_off) {
+    constexpr int TM = 64, TN = 64, TK = 32;
+    __shared__ float Qs[TK][TM + 4];
+    __shared__ float Ps[TK][TN + 4];
+    const int pos0 = *pos0p + t_off;
+    const int m0 = blockIdx.y * TM, b0 = blockIdx.x * TN;
+    const int last = min(T, m0 + TM) - 1;
+    if (last < 0 || b0 >= (pos0 + last + 1) / r) return;  // no row of this tile reaches these blocks
+    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    float sum[4][4] = {};
+    for (int h = 0; h < ih; ++h) {
+        float acc[4][4] = {};
+        for (int k0 = 0; k0 < id; k0 += TK) {
+            for (int i = threadIdx.x; i < TM * TK; i += 256) {
+                const int m = i / TK, kk = i % TK, t = m0 + m;
+                Qs[kk][m] = t < T ? q[((int64_t) t * ih + h) * id + k0 + kk] : 0.f;
+            }
+            for (int i = threadIdx.x; i < TN * TK; i += 256) {
+                const int n = i / TK, kk = i % TK, b = b0 + n;
+                Ps[kk][n] = b < max_blocks ? pooled[(int64_t) b * id + k0 + kk] : 0.f;
+            }
+            __syncthreads();
+#pragma unroll 8
+            for (int kk = 0; kk < TK; ++kk) {
+                const float4 a = *(const float4 *) &Qs[kk][ty * 4];
+                const float4 b = *(const float4 *) &Ps[kk][tx * 4];
+                const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) acc[i][j] += av[i] * bv[j];
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) sum[i][j] += fmaxf(acc[i][j], 0.f);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = m0 + ty * 4 + i;
+        if (t >= T) continue;
+        const int qpos = pos0 + t;
+        if (qpos + 1 <= dense_cells) continue;
+        const int nb = (qpos + 1) / r;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int b = b0 + tx * 4 + j;
+            if (b < nb) scores[(int64_t) t * max_blocks + b] = sum[i][j];
+        }
+    }
+}
+
 void qsa_select(const float * q, const float * pooled, float * scores, int max_blocks, int32_t * sel, int32_t * n_sel,
                 int T, const QsaShape & sh, const int * pos0, int t_off, cudaStream_t s) {
-    qsa_score_k<<<dim3((max_blocks + 255) / 256, T), 256, sh.ih * sh.id * sizeof(float), s>>>(
-        q, pooled, scores, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
+    static const bool old = getenv("BNK_QSA_OLD") != nullptr;
+    if (T > 8 && sh.id % 32 == 0 && !old)  // prompt rows: tiled
+        qsa_score_tiled_k<<<dim3((max_blocks + 63) / 64, (T + 63) / 64), 256, 0, s>>>(
+            q, pooled, scores, T, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
+    else  // a decode window: one pass per query over the blocks
+        qsa_score_k<<<dim3((max_blocks + 255) / 256, T), 256, sh.ih * sh.id * sizeof(float), s>>>(
+            q, pooled, scores, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
     qsa_topk_k<<<T, 1024, 0, s>>>(scores, max_blocks, sel, n_sel, sh.top_blocks, sh.ratio, sh.dense_cells(), pos0,
                                   t_off);
 }
@@ -375,11 +441,155 @@ __global__ void qsa_attn_prefill_k(const float * q, const half * kc, const half 
     for (int d = 0; d < 8; ++d) o[d] = acc[d] / l * qsa_sigmoid(gate[d]);
 }
 
+// Prompt rows on tensor cores: one block (4 warps) per (row, KV head) computes the G = H / Hkv query heads that
+// share the KV head together (padded to 16), so each gathered key/value tile is loaded once for all of them.
+// Per tile of 32 keys: S = Q K^T (wmma), online softmax, O = O * corr + P V (wmma, O kept in registers).
+constexpr int QA_KT = 32;   // keys per tile
+constexpr int QA_D = 256;   // head dim this kernel is built for
+constexpr int QA_LD = QA_D + 8;
+__global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, const half * kc, const half * vc,
+                                                              const float * qfull, const int32_t * sel,
+                                                              const int32_t * n_sel, float * out, int t0, int H,
+                                                              int Hkv, int r, int K, int pos0, float scale) {
+    using namespace nvcuda;
+    __shared__ __align__(32) half Qs[16 * QA_LD];
+    __shared__ __align__(32) half KVs[QA_KT * QA_LD];
+    __shared__ __align__(32) float Ss[16 * QA_KT];
+    __shared__ __align__(32) half Ps[16 * (QA_KT + 8)];
+    __shared__ __align__(32) float Tmp[16 * QA_D];
+    __shared__ float corr_s[16], l_s[16], m_s[16];
+    __shared__ int cells[QA_KT];
+    const int ti = blockIdx.x, hk = blockIdx.y, t = t0 + ti;
+    const int G = H / Hkv, tid = threadIdx.x, warp = tid >> 5;
+    const int qpos = pos0 + t;
+    const int ns = n_sel[ti];
+    const int tail_start = (qpos + 1) / r * r;
+    const int n_keys = ns == 0 ? qpos + 1 : ns * r + (qpos + 1 - tail_start);
+    const int32_t * sl = sel + (int64_t) ti * K;
+    // queries of the group (scaled), zero rows past G
+    for (int i = tid; i < 16 * QA_D; i += 128) {
+        const int g = i / QA_D, d = i % QA_D;
+        Qs[g * QA_LD + d] = __float2half(g < G ? q[((int64_t) t * H + hk * G + g) * QA_D + d] * scale : 0.f);
+    }
+    if (tid < 16) {
+        m_s[tid] = -FLT_MAX;
+        l_s[tid] = 0.f;
+    }
+    // this thread's slice of O[16][256]: row orow, dims [ocol, ocol + 32)
+    const int orow = tid / 8, ocol = (tid % 8) * 32;
+    float o[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) o[i] = 0.f;
+    for (int k0 = 0; k0 < n_keys; k0 += QA_KT) {
+        const int nk = min(QA_KT, n_keys - k0);
+        if (tid < QA_KT) cells[tid] = tid < nk ? (ns == 0 ? k0 + tid : qsa_cell(k0 + tid, sl, ns, r, tail_start)) : -1;
+        __syncthreads();
+        // K tile: 32 keys x 256 dims, 16-byte loads
+        for (int i = tid; i < QA_KT * QA_D / 8; i += 128) {
+            const int k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
+            const int c = cells[k];
+            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? *(const uint4 *) (kc + ((int64_t) c * Hkv + hk) * QA_D + d8)
+                                                     : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        // S[16][32]: warps 0 and 1 each own 16 keys
+        if (warp < 2) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
+            wmma::fill_fragment(sf, 0.f);
+#pragma unroll 4
+            for (int kd = 0; kd < QA_D; kd += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(af, Qs + kd, QA_LD);
+                wmma::load_matrix_sync(bf, KVs + warp * 16 * QA_LD + kd, QA_LD);
+                wmma::mma_sync(sf, af, bf, sf);
+            }
+            wmma::store_matrix_sync(Ss + warp * 16, sf, QA_KT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // V tile into the same buffer; meanwhile the softmax update (8 threads per row)
+        for (int i = tid; i < QA_KT * QA_D / 8; i += 128) {
+            const int k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
+            const int c = cells[k];
+            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? *(const uint4 *) (vc + ((int64_t) c * Hkv + hk) * QA_D + d8)
+                                                     : make_uint4(0, 0, 0, 0);
+        }
+        {
+            const int row = tid / 8, sub = tid % 8;  // each of the 8 threads takes 4 keys of the row
+            float mx = -FLT_MAX;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k = sub * 4 + j;
+                if (k < nk) mx = fmaxf(mx, Ss[row * QA_KT + k]);
+            }
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+            const float m_old = m_s[row], m_new = fmaxf(m_old, mx);
+            float ps = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k = sub * 4 + j;
+                const float p = k < nk ? __expf(Ss[row * QA_KT + k] - m_new) : 0.f;
+                Ps[row * (QA_KT + 8) + k] = __float2half(p);
+                ps += p;
+            }
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) ps += __shfl_xor_sync(0xffffffff, ps, off);
+            __syncwarp();
+            if (sub == 0) {
+                const float c = __expf(m_old - m_new);
+                corr_s[row] = c;
+                l_s[row] = l_s[row] * c + ps;
+                m_s[row] = m_new;
+            }
+        }
+        __syncthreads();
+        // P V: each warp 4 of the 16 dim tiles, into Tmp
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf[QA_KT / 16];
+#pragma unroll
+            for (int kk = 0; kk < QA_KT / 16; ++kk) wmma::load_matrix_sync(pf[kk], Ps + kk * 16, QA_KT + 8);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int dt = warp * 4 + j;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> of;
+                wmma::fill_fragment(of, 0.f);
+#pragma unroll
+                for (int kk = 0; kk < QA_KT / 16; ++kk) {
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+                    wmma::load_matrix_sync(vf, KVs + kk * 16 * QA_LD + dt * 16, QA_LD);
+                    wmma::mma_sync(of, pf[kk], vf, of);
+                }
+                wmma::store_matrix_sync(Tmp + dt * 16, of, QA_D, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+        const float c = corr_s[orow];
+#pragma unroll
+        for (int i = 0; i < 32; ++i) o[i] = o[i] * c + Tmp[orow * QA_D + ocol + i];
+        __syncthreads();
+    }
+    if (orow < G) {
+        const int h = hk * G + orow;
+        const float inv = 1.f / l_s[orow];
+        const float * gate = qfull + ((int64_t) t * H + h) * 2 * QA_D + QA_D + ocol;
+        float * op = out + ((int64_t) t * H + h) * QA_D + ocol;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) op[i] = o[i] * inv * qsa_sigmoid(gate[i]);
+    }
+}
+
 void qsa_attention_prefill(const float * q, const half * kc, const half * vc, const float * qfull_gate,
                            const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1,
                            const QsaShape & sh, int pos0, float scale, cudaStream_t s) {
     const int warps = (t1 - t0) * sh.H;
     if (warps <= 0) return;
+    static const bool old = getenv("BNK_QSA_OLD") != nullptr;
+    if (!old && sh.D == QA_D && sh.H / sh.Hkv <= 16) {
+        qsa_attn_prefill_tc_k<<<dim3(t1 - t0, sh.Hkv), 128, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, sh.H,
+                                                                   sh.Hkv, sh.ratio, sh.top_blocks, pos0, scale);
+        return;
+    }
     qsa_attn_prefill_k<<<(warps + 7) / 8, 256, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv,
                                                        sh.D, sh.ratio, sh.top_blocks, pos0, scale);
 }

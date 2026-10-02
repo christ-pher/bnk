@@ -89,6 +89,20 @@ int main(int argc, char ** argv) {
     eng.load(model, opt);
     const Config & c = eng.cfg();
 
+    if (mode == "pdump") {
+        // batched prompt pass; the last position's logits to --ref (raw float32), for comparing engine variants
+        const double t0 = now_ms();
+        eng.prefill(prompt);
+        const double t1 = now_ms();
+        auto lg = eng.logits_host(eng.last_T - 1);
+        FILE * f = fopen(ref.c_str(), "wb");
+        if (!f || fwrite(lg.data(), 4, lg.size(), f) != lg.size()) throw std::runtime_error("cannot write " + ref);
+        fclose(f);
+        printf("prefill %zu tokens in %.1f ms (%.1f tok/s) -> %s\n", prompt.size(), t1 - t0,
+               prompt.size() / ((t1 - t0) / 1000), ref.c_str());
+        return 0;
+    }
+
     if (mode == "pcheck") {
         // batched prompt pass: the last position's logits vs llama.cpp
         std::vector<float> ref_logits;
