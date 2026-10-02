@@ -208,7 +208,8 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     const Config & c = model_.cfg;
     const int E = c.n_embd, HC = c.hc_dim();
     hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
-    if (!is_float_format(w.down.type)) quantize_act(xn_, HC, T, HC, act_, st_);
+    if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))
+        quantize_act(xn_, HC, T, HC, act_, st_);
     gemv_q(w.down, act_, xn_, HC, T, lo_, c.hc_rank, st_);
     if (want_inject) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
     silu_scale(lo_, (int64_t) T * c.hc_rank, 1.f / c.hc, st_);

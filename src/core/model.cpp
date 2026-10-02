@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 
 #include "core/util.h"
+#include "ggml.h"
+#include <vector>
+#include <cstdlib>
 
 namespace bnk {
 
@@ -75,6 +78,27 @@ QMat Model::upload(const std::string & name, bool required) {
     void * d = nullptr;
     // token embeddings stay in ggml layout (gathered by row); every other matrix is repacked when possible
     const bool repack = repack_ && name != "token_embd.weight";
+    // BF16 hyper-connection / PLE projections become Q8_0: half the bytes and the dp4a path (the router and
+    // the small vectors keep their precision)
+    static const std::string which = getenv("BNK_HCQ8") ? getenv("BNK_HCQ8") : "down,inject,ple";
+    auto sel = [&](const char * part, const char * key) {
+        return which.find(key) != std::string::npos && name.find(part) != std::string::npos;
+    };
+    const bool to_q8 = hc_q8_ && t->type == GGML_TYPE_BF16 && t->ne[0] % 32 == 0 && t->nrows() >= 4 &&
+                       (sel("_down", "down") || sel("_up.", "up") || sel("_inject", "inject") ||
+                        sel("ple_key", "ple") || sel("ple_value", "ple"));
+    if (to_q8) {
+        const int64_t rows = t->nrows(), cols = t->ne[0];
+        std::vector<float> f((size_t) rows * cols);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, f.data(), rows * cols);
+        const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, cols);
+        std::vector<uint8_t> q(rb * rows);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, rows, cols, nullptr);
+        QMat m = upload_matrix(q.data(), GGML_TYPE_Q8_0, rows, cols, rb, repack, &d);
+        device_allocs_.push_back(d);
+        vram_dense_bytes += m.row_bytes * m.rows;
+        return m;
+    }
     QMat m = upload_matrix(t->data, (int) t->type, t->nrows(), t->ne[0], t->row_bytes(), repack, &d);
     device_allocs_.push_back(d);
     vram_dense_bytes += m.row_bytes * m.rows;

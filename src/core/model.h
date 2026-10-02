@@ -76,6 +76,7 @@ struct Model {
     ~Model();
 
     bool repack_ = true;  // R layouts for dense quant matrices
+    bool hc_q8_ = true;   // BF16 hyper-connection / PLE projections as Q8_0
 
 private:
     std::vector<void *> device_allocs_;
