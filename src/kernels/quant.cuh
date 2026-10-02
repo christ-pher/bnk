@@ -266,7 +266,7 @@ __host__ __device__ constexpr bool is_dp4a_format(int t) {
     return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ3_XXS ||
            t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0;
 }
-__host__ __device__ constexpr bool is_float_format(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
+__host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
 
 // Dispatch a functor templated on the format: f.template operator()<FMT>().
 #define BNK_DISPATCH_DP4A(fmt, F)                                    \

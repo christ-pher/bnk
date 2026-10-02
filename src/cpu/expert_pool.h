@@ -32,22 +32,22 @@ private:
     std::vector<size_t> layer_off_, blob_;
 };
 
-// A fixed set of spinning workers that run index-ranged jobs with low dispatch latency.
+// A fixed set of spinning workers. run() calls fn(part, nparts) once on every thread (the caller is
+// part 0); each part takes a static share of the work, so dispatch needs no shared counter.
 class SpinPool {
 public:
     explicit SpinPool(int n_workers = 0, int first_cpu = -1);
     ~SpinPool();
-    int size() const { return (int) workers_.size() + 1; }  // the caller participates
-    // Runs fn(i, worker) for i in [0, n); returns when all are done.
-    void run(int n, const std::function<void(int, int)> & fn);
+    int size() const { return (int) workers_.size() + 1; }
+    void run(const std::function<void(int, int)> & fn);
 
 private:
+    struct alignas(64) Flag { std::atomic<uint64_t> v{0}; };
     void loop(int id);
     std::vector<std::thread> workers_;
-    std::atomic<uint64_t> gen_{0};
-    std::atomic<int> next_{0}, done_{0};
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    std::unique_ptr<Flag[]> done_;
     std::atomic<bool> stop_{false};
-    int n_ = 0;
     const std::function<void(int, int)> * fn_ = nullptr;
 };
 
@@ -73,8 +73,9 @@ private:
     // scratch
     std::vector<uint8_t> xq_;      // per token: x quantized for the gate/up vec_dot type
     std::vector<float> gu_;        // per task: [2*n_ff]
-    std::vector<uint8_t> hq_;      // per task: h quantized for the down vec_dot type
-    std::vector<float> dout_;      // per task: [E]
+    std::vector<uint8_t> hq_;      // per task: h quantized for the down product
+    std::unique_ptr<std::atomic<int>[]> rows_done_;
+    int rows_done_n_ = 0;
 };
 
 }  // namespace bnk

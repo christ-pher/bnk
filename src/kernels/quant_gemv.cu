@@ -313,7 +313,7 @@ __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, cons
     const int64_t r = ids ? ids[i] : r0 + i;
     const uint8_t * row = W + (size_t) r * row_bytes;
     float * o = out + (int64_t) i * cols + sb * 32;
-    if constexpr (is_float_format(FMT)) {
+    if constexpr (is_float_fmt(FMT)) {
         float w[8];
 #pragma unroll
         for (int k = 0; k < 4; ++k) {

@@ -40,9 +40,12 @@ set(BNK_CUDA_FLAGS_QUIET -lineinfo --use_fast_math -Wno-deprecated-gpu-targets
 add_library(bnk_core STATIC
   src/core/gguf_model.cpp
   src/core/model.cpp
+  src/core/expert_cache.cpp
   src/cpu/expert_pool.cpp
+  src/cpu/kernels.cpp
   src/kernels/quant_gemv.cu
   src/kernels/ops.cu
+  src/kernels/moe.cu
   src/engine/engine.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
@@ -63,3 +66,8 @@ if(BNK_BUILD_TESTS)
   target_link_libraries(test_dequant PRIVATE bnk_core)
   target_compile_options(test_dequant PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
 endif()
+
+add_executable(bench_cpu_experts tests/bench_cpu_experts.cpp)
+target_link_libraries(bench_cpu_experts PRIVATE bnk_core)
+add_executable(test_cpu_kernels tests/test_cpu_kernels.cpp)
+target_link_libraries(test_cpu_kernels PRIVATE bnk_core)

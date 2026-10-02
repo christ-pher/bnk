@@ -62,6 +62,10 @@ int main(int argc, char ** argv) {
         else if (a == "--ctx") opt.max_ctx = std::stoi(next());
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
         else if (a == "--ref") ref = next();
+        else if (a == "--profile") opt.profile = next();
+        else if (a == "--counts") opt.counts_out = next();
+        else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
+        else if (a == "--no-graphs") opt.use_graphs = false;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     auto prompt = read_tokens(tokfile);
@@ -82,7 +86,7 @@ int main(int argc, char ** argv) {
         eng.dump_all = true;
         for (size_t p = 0; p < prompt.size(); p += kMaxWindow) {
             const int T = (int) std::min<size_t>(kMaxWindow, prompt.size() - p);
-            eng.forward(prompt.data() + p, T, true);
+            eng.forward(prompt.data() + p, T);
             for (int il = 0; il < c.n_layer; ++il) {
                 if (ref_layers[il].size() < (p + T) * HC) continue;
                 lerr[il] = std::max(lerr[il], rel_rms(eng.dumped_layers[il].data(), ref_layers[il].data() + p * HC, T * HC));
@@ -122,7 +126,7 @@ int main(int argc, char ** argv) {
     eng.times = StageTimes{};
     const double t2 = now_ms();
     for (int i = 1; i < max_new; ++i) {
-        eng.forward(&tok, 1, true);
+        eng.forward(&tok, 1);
         tok = eng.argmax(0);
         out.push_back(tok);
         if (tok == c.eos_token) break;
@@ -131,8 +135,11 @@ int main(int argc, char ** argv) {
     printf("output:");
     for (int t : out) printf(" %d", t);
     printf("\nprefill %zu tokens in %.1f ms (%.1f tok/s)\n", prompt.size(), t1 - t0, prompt.size() / ((t1 - t0) / 1000));
+    const auto & tm = eng.times;
     printf("decode %zu tokens in %.1f ms (%.2f tok/s); per token: total %.2f ms, CPU experts %.2f ms, PLE host %.2f ms\n",
-           out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), eng.times.total_ms / eng.times.calls,
-           eng.times.cpu_experts_ms / eng.times.calls, eng.times.ple_ms / eng.times.calls);
+           out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), tm.total_ms / tm.calls,
+           tm.cpu_experts_ms / tm.calls, tm.ple_ms / tm.calls);
+    printf("expert misses %.2f%% (%.2f per token)\n", 100.0 * tm.misses / std::max<int64_t>(1, tm.routed),
+           (double) tm.misses / tm.calls);
     return 0;
 }

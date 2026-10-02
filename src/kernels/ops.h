@@ -44,10 +44,11 @@ void gated_rmsnorm(const float * o, const float * z, const float * w, float * y,
 // writes q [T][H][D] and the cache rows at positions pos0+t.
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,
                float * q, half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base,
-               int pos0, float eps, cudaStream_t s);
+               const int * pos0, float eps, cudaStream_t s);
 // out[t][h][:] = softmax(q k^T * scale) v over cache rows [0, pos0+t]   (causal), then *= sigmoid(gate)
+// pos0 lives in device memory (graph-friendly); the split count is fixed.
 void attention(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out,
-               int T, int H, int Hkv, int D, int pos0, float scale, float * scratch, cudaStream_t s);
+               int T, int H, int Hkv, int D, const int * pos0, float scale, float * scratch, cudaStream_t s);
 size_t attention_scratch_floats(int T, int H, int D, int max_ctx);
 
 // ---- MoE routing: softmax over n_exp, top-k, renormalized weights

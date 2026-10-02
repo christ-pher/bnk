@@ -9,6 +9,8 @@ namespace bnk {
 
 constexpr int kMaxWindow = 8;  // tokens per decode/verify window
 
+inline bool is_float_format(int t) { return t == 0 || t == 1 || t == 30; }  // F32, F16, BF16
+
 // A weight matrix in its ggml format: `rows` output rows, each `cols` inputs wide.
 struct QMat {
     const void * data = nullptr;  // device (or mapped host) pointer

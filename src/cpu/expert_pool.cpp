@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include "core/util.h"
+#include "cpu/kernels.h"
 #include "ggml-cpu.h"
 
 namespace bnk {
@@ -73,6 +74,7 @@ void ExpertStore::build(const Model & m, int threads, bool verbose) {
 
 // ------------------------------------------------------------------------------------------ pool
 SpinPool::SpinPool(int n_workers, int first_cpu) {
+    done_.reset(new Flag[n_workers + 1]);
     for (int i = 0; i < n_workers; ++i) {
         workers_.emplace_back([this, i]() { loop(i + 1); });
         if (first_cpu >= 0) {
@@ -96,27 +98,22 @@ void SpinPool::loop(int id) {
         int spins = 0;
         uint64_t g;
         while ((g = gen_.load(std::memory_order_acquire)) == seen) {
-            if (++spins > 200000) usleep(50);
+            if (++spins > 2000000) usleep(20);
             else __builtin_ia32_pause();
         }
         seen = g;
         if (stop_) return;
-        const auto & fn = *fn_;
-        const int n = n_;
-        for (int i; (i = next_.fetch_add(1, std::memory_order_relaxed)) < n;) fn(i, id);
-        done_.fetch_add(1, std::memory_order_acq_rel);
+        (*fn_)(id, size());
+        done_[id].v.store(g, std::memory_order_release);
     }
 }
 
-void SpinPool::run(int n, const std::function<void(int, int)> & fn) {
-    if (n <= 0) return;
+void SpinPool::run(const std::function<void(int, int)> & fn) {
     fn_ = &fn;
-    n_ = n;
-    next_.store(0, std::memory_order_relaxed);
-    done_.store(0, std::memory_order_relaxed);
-    gen_.fetch_add(1, std::memory_order_acq_rel);
-    for (int i; (i = next_.fetch_add(1, std::memory_order_relaxed)) < n;) fn(i, 0);
-    while (done_.load(std::memory_order_acquire) < (int) workers_.size()) __builtin_ia32_pause();
+    const uint64_t g = gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    fn(0, size());
+    for (size_t i = 1; i <= workers_.size(); ++i)
+        while (done_[i].v.load(std::memory_order_acquire) != g) __builtin_ia32_pause();
 }
 
 // ------------------------------------------------------------------------------------------ experts
@@ -128,78 +125,100 @@ void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads)
 
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
 
+static inline void split(int n, int part, int nparts, int & b, int & e) {
+    b = (int) ((int64_t) n * part / nparts);
+    e = (int) ((int64_t) n * (part + 1) / nparts);
+}
+
 void CpuExpertPool::run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out) {
     const double t0 = now_ms();
     const Config & c = m_->cfg;
     const LayerWeights & L = m_->layers[il];
     const int E = c.n_embd, F = c.n_ff_exp;
     const int nt = (int) tasks.size();
-    memset(out, 0, sizeof(float) * T * E);
-    if (nt == 0) return;
-
+    if (nt == 0) {
+        memset(out, 0, sizeof(float) * T * E);
+        return;
+    }
     const auto * tg = ggml_get_type_traits_cpu((ggml_type) L.gate_type);
     const auto * tu = ggml_get_type_traits_cpu((ggml_type) L.up_type);
     const auto * td = ggml_get_type_traits_cpu((ggml_type) L.down_type);
     if (tg->vec_dot_type != tu->vec_dot_type) throw std::runtime_error("gate/up vec_dot types differ");
-    const ggml_type xt = tg->vec_dot_type, ht = td->vec_dot_type;
-    const size_t xrow = ggml_row_size(xt, E), hrow = ggml_row_size(ht, F);
+    const ggml_type xt = tg->vec_dot_type;
+    const bool down_q2 = L.down_type == GGML_TYPE_Q2_0;
+    const size_t xrow = ggml_row_size(xt, E);
+    const size_t hrow = down_q2 ? (F / 64) * sizeof(A8P64) : ggml_row_size(td->vec_dot_type, F);
     const size_t grow = ggml_row_size((ggml_type) L.gate_type, E), urow = ggml_row_size((ggml_type) L.up_type, E);
     const size_t drow = ggml_row_size((ggml_type) L.down_type, F);
     auto xfrom = ggml_get_type_traits_cpu(xt)->from_float;
-    auto hfrom = ggml_get_type_traits_cpu(ht)->from_float;
+    auto hfrom = ggml_get_type_traits_cpu(td->vec_dot_type)->from_float;
 
     xq_.resize(xrow * T);
     gu_.resize((size_t) nt * 2 * F);
-    hq_.resize(hrow * nt);
-    dout_.resize((size_t) nt * E);
+    hq_.resize(hrow * nt + 64);
+    if (rows_done_n_ < nt) {
+        rows_done_.reset(new std::atomic<int>[nt]);
+        rows_done_n_ = nt;
+    }
+    for (int i = 0; i < nt; ++i) rows_done_[i].store(0, std::memory_order_relaxed);
 
-    // 1. quantize the inputs, one job per token
-    pool_->run(T, [&](int t, int) { xfrom(x + (size_t) t * E, xq_.data() + t * xrow, E); });
+    // the inputs, quantized here (small) so the pool starts on the rows at once
+    for (int t = 0; t < T; ++t) xfrom(x + (size_t) t * E, xq_.data() + t * xrow, E);
 
-    // 2. gate and up rows: tasks x chunks of 64 rows over the 2F rows
-    constexpr int GU_CHUNK = 64;
-    const int gu_chunks = (2 * F + GU_CHUNK - 1) / GU_CHUNK;
-    pool_->run(nt * gu_chunks, [&](int j, int) {
-        const int ti = j / gu_chunks, ch = j % gu_chunks;
-        const ExpertTask & tk = tasks[ti];
-        const uint8_t * b = st_->blob(il, tk.expert);
-        const uint8_t * xq = xq_.data() + tk.t * xrow;
-        float * gu = gu_.data() + (size_t) ti * 2 * F;
-        const int r0 = ch * GU_CHUNK, r1 = std::min(2 * F, r0 + GU_CHUNK);
-        for (int r = r0; r < r1; ++r) {
-            if (r < F) tg->vec_dot(E, &gu[r], 0, b + (size_t) r * grow, 0, xq, 0, 1);
-            else tu->vec_dot(E, &gu[r], 0, b + L.gate_bytes + (size_t) (r - F) * urow, 0, xq, 0, 1);
+    // phase 1: all gate/up rows of all tasks, split evenly; the thread that completes a task's rows
+    // computes its h = silu(g)*u and quantizes it for the down product
+    const int R = nt * 2 * F;
+    pool_->run([&](int part, int nparts) {
+        int b, e;
+        split(R, part, nparts, b, e);
+        int g = b;
+        while (g < e) {
+            const int ti = g / (2 * F);
+            const int r_end = std::min(e, (ti + 1) * 2 * F);
+            const ExpertTask & tk = tasks[ti];
+            const uint8_t * blob = st_->blob(il, tk.expert);
+            const uint8_t * xq = xq_.data() + tk.t * xrow;
+            float * gu = gu_.data() + (size_t) ti * 2 * F;
+            for (; g < r_end; ++g) {
+                const int r = g - ti * 2 * F;
+                if (r < F) tg->vec_dot(E, &gu[r], 0, blob + (size_t) r * grow, 0, xq, 0, 1);
+                else tu->vec_dot(E, &gu[r], 0, blob + L.gate_bytes + (size_t) (r - F) * urow, 0, xq, 0, 1);
+            }
+            const int mine = r_end - std::max(b, ti * 2 * F);
+            if (rows_done_[ti].fetch_add(mine, std::memory_order_acq_rel) + mine == 2 * F) {
+                for (int r = 0; r < F; ++r) gu[r] = silu(gu[r]) * gu[F + r];
+                if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + ti * hrow));
+                else hfrom(gu, hq_.data() + ti * hrow, F);
+            }
         }
     });
 
-    // 3. h = silu(g)*u, quantized; then the down rows in chunks of 256
-    pool_->run(nt, [&](int ti, int) {
-        float * gu = gu_.data() + (size_t) ti * 2 * F;
-        for (int r = 0; r < F; ++r) gu[r] = silu(gu[r]) * gu[F + r];
-        hfrom(gu, hq_.data() + ti * hrow, F);
-    });
-    constexpr int D_CHUNK = 256;
-    const int d_chunks = (E + D_CHUNK - 1) / D_CHUNK;
-    pool_->run(nt * d_chunks, [&](int j, int) {
-        const int ti = j / d_chunks, ch = j % d_chunks;
-        const ExpertTask & tk = tasks[ti];
-        const uint8_t * b = st_->blob(il, tk.expert) + L.gate_bytes + L.up_bytes;
-        const uint8_t * hq = hq_.data() + ti * hrow;
-        float * d = dout_.data() + (size_t) ti * E;
-        const int r0 = ch * D_CHUNK, r1 = std::min(E, r0 + D_CHUNK);
-        for (int r = r0; r < r1; ++r) td->vec_dot(F, &d[r], 0, b + (size_t) r * drow, 0, hq, 0, 1);
-    });
-
-    // 4. weighted sum per token (in task order, for determinism)
-    pool_->run(T * d_chunks, [&](int j, int) {
-        const int t = j / d_chunks, ch = j % d_chunks;
-        const int r0 = ch * D_CHUNK, r1 = std::min(E, r0 + D_CHUNK);
-        float * o = out + (size_t) t * E;
-        for (int ti = 0; ti < nt; ++ti) {
-            if (tasks[ti].t != t) continue;
-            const float w = tasks[ti].w;
-            const float * d = dout_.data() + (size_t) ti * E;
-            for (int r = r0; r < r1; ++r) o[r] += w * d[r];
+    // phase 2: output rows of every token, split evenly; each row sums over that token's experts
+    const int RO = T * E;
+    pool_->run([&](int part, int nparts) {
+        int b, e;
+        split(RO, part, nparts, b, e);
+        for (int g = b; g < e;) {
+            const int t = g / E;
+            const int r0 = g % E, r1 = std::min(E, r0 + (e - g));
+            float * o = out + (size_t) t * E;
+            for (int r = r0; r < r1; ++r) o[r] = 0.f;
+            for (int ti = 0; ti < nt; ++ti) {
+                if (tasks[ti].t != t) continue;
+                const float w = tasks[ti].w;
+                const uint8_t * dn = st_->blob(il, tasks[ti].expert) + L.gate_bytes + L.up_bytes;
+                const uint8_t * hq = hq_.data() + ti * hrow;
+                if (down_q2) {
+                    for (int r = r0; r < r1; ++r) o[r] += w * dot_q2_0(dn + (size_t) r * drow, (const A8P64 *) hq, F);
+                } else {
+                    for (int r = r0; r < r1; ++r) {
+                        float v;
+                        td->vec_dot(F, &v, 0, dn + (size_t) r * drow, 0, hq, 0, 1);
+                        o[r] += w * v;
+                    }
+                }
+            }
+            g += r1 - r0;
         }
     });
     last_ms = now_ms() - t0;

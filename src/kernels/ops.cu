@@ -176,26 +176,29 @@ void gdn_prep(float * conv_out, int T, int C, int nk, int nv, int S, float * alp
     gdn_prep_k<<<dim3(2 * nk + 1, T), 128, 0, s>>>(conv_out, C, nk, nv, S, alpha_g, beta, dt, a, eps);
 }
 
-// One block per v-head, S threads; thread j owns column j of S (S[:, j]) in registers.
+// grid (nv, S/32): each block owns 32 columns j of one head's S (S[:, j]) in registers.
+// The state is stored row-major per head, state[h][i*S + j] = S[i][j], so the column loads coalesce.
 template <int S>
-__global__ void __launch_bounds__(S) gdn_rec_k(const float * __restrict__ co, int C, const float * __restrict__ g,
-                                               const float * __restrict__ beta, float * __restrict__ state,
-                                               float * __restrict__ out, int T, int nk, int nv, int commit) {
+__global__ void __launch_bounds__(32) gdn_rec_k(const float * __restrict__ co, int C, const float * __restrict__ g,
+                                                const float * __restrict__ beta, float * __restrict__ state,
+                                                float * __restrict__ out, int T, int nk, int nv, int commit) {
     const int h = blockIdx.x;
-    const int j = threadIdx.x;
+    const int j = blockIdx.y * 32 + threadIdx.x;
     const int hk = h % nk;
     __shared__ float qs[S], ks[S];
     float col[S];
-    float * st = state + (int64_t) h * S * S + (int64_t) j * S;
+    float * st = state + (int64_t) h * S * S + j;
 #pragma unroll
-    for (int i = 0; i < S; ++i) col[i] = st[i];
+    for (int i = 0; i < S; ++i) col[i] = st[(int64_t) i * S];
     const float scale = rsqrtf((float) S);
     for (int t = 0; t < T; ++t) {
         const float * row = co + (int64_t) t * C;
-        __syncthreads();
-        qs[j] = row[hk * S + j];
-        ks[j] = row[nk * S + hk * S + j];
-        __syncthreads();
+        __syncwarp();
+        for (int i = threadIdx.x; i < S; i += 32) {
+            qs[i] = row[hk * S + i];
+            ks[i] = row[nk * S + hk * S + i];
+        }
+        __syncwarp();
         const float v = row[2 * nk * S + h * S + j];
         const float decay = __expf(g[t * nv + h]);
         const float b = beta[t * nv + h];
@@ -215,14 +218,14 @@ __global__ void __launch_bounds__(S) gdn_rec_k(const float * __restrict__ co, in
         if (out) out[((int64_t) t * nv + h) * S + j] = o * scale;
         if (t + 1 == commit) {
 #pragma unroll
-            for (int i = 0; i < S; ++i) st[i] = col[i];
+            for (int i = 0; i < S; ++i) st[(int64_t) i * S] = col[i];
         }
     }
 }
 void gdn_recurrence(const float * conv_out, int C, const float * g, const float * beta, float * state, float * out,
                     int T, int nk, int nv, int S, int commit, cudaStream_t s) {
     if (S != 128) { fprintf(stderr, "gdn: unsupported state size %d\n", S); abort(); }
-    gdn_rec_k<128><<<nv, 128, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
+    gdn_rec_k<128><<<dim3(nv, 128 / 32), 32, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
 }
 
 __global__ void gated_rmsnorm_k(const float * o, const float * z, const float * w, float * y, int S, float eps) {
@@ -243,8 +246,9 @@ void gated_rmsnorm(const float * o, const float * z, const float * w, float * y,
 // ------------------------------------------------------------------------------------------- attention
 // grid (T, H + Hkv), block D threads
 __global__ void attn_prep_k(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,
-                            float * q, half * kc, half * vc, int H, int Hkv, int D, int n_rot, float base, int pos0,
-                            float eps) {
+                            float * q, half * kc, half * vc, int H, int Hkv, int D, int n_rot, float base,
+                            const int * pos0p, float eps) {
+    const int pos0 = *pos0p;
     __shared__ float sh[32];
     __shared__ float buf[512];
     const int t = blockIdx.x;
@@ -275,22 +279,23 @@ __global__ void attn_prep_k(const float * qfull, const float * k, const float * 
     }
 }
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn, float * q,
-               half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base, int pos0, float eps,
-               cudaStream_t s) {
+               half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base, const int * pos0,
+               float eps, cudaStream_t s) {
     attn_prep_k<<<dim3(T, H + Hkv), D, 0, s>>>(qfull, k, v, qn, kn, q, kcache, vcache, H, Hkv, D, n_rot, base, pos0,
                                                 eps);
 }
 
 // Split-KV flash decoding. grid (T*H, nsplit), 256 threads = 8 warps; each warp takes keys in turn.
 // lane holds dims [lane*8, lane*8+8) of D=256.
-constexpr int kAttnSplit = 64;  // keys per split chunk granularity
-__global__ void attn_partial_k(const float * q, const half * kc, const half * vc, int H, int Hkv, int D, int pos0,
-                               float scale, int keys_per_split, float * part_o, float * part_ml, int nsplit) {
+__global__ void attn_partial_k(const float * q, const half * kc, const half * vc, int H, int Hkv, int D,
+                               const int * pos0p, float scale, float * part_o, float * part_ml, int nsplit) {
     const int th = blockIdx.x;
     const int t = th / H, h = th % H;
     const int hk = h / (H / Hkv);
     const int split = blockIdx.y;
-    const int n_kv = pos0 + t + 1;
+    const int n_kv = *pos0p + t + 1;
+    // fixed split count; small contexts leave the tail splits empty
+    const int keys_per_split = max(64, (n_kv + nsplit - 1) / nsplit);
     const int k0 = split * keys_per_split;
     const int k1 = min(n_kv, k0 + keys_per_split);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -370,91 +375,72 @@ __global__ void attn_combine_k(const float * part_o, const float * part_ml, cons
     out[((int64_t) t * H + h) * D + i] = (o / L) * sigmoidf_(gate);
 }
 
-static int attn_nsplit(int n_kv, int & kps) {
-    int ns = (n_kv + 255) / 256;
-    if (ns > 64) ns = 64;
-    if (ns < 1) ns = 1;
-    kps = (n_kv + ns - 1) / ns;
-    return ns;
-}
+constexpr int kAttnSplits = 64;
 
-size_t attention_scratch_floats(int T, int H, int D, int) { return (size_t) T * H * 64 * (D + 2); }
+size_t attention_scratch_floats(int T, int H, int D, int) { return (size_t) T * H * kAttnSplits * (D + 2); }
 
 void attention(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out, int T,
-               int H, int Hkv, int D, int pos0, float scale, float * scratch, cudaStream_t s) {
-    int kps;
-    const int ns = attn_nsplit(pos0 + T, kps);
+               int H, int Hkv, int D, const int * pos0, float scale, float * scratch, cudaStream_t s) {
+    const int ns = kAttnSplits;
     float * part_o = scratch;
     float * part_ml = scratch + (size_t) T * H * ns * D;
-    attn_partial_k<<<dim3(T * H, ns), 256, 0, s>>>(q, kcache, vcache, H, Hkv, D, pos0, scale, kps, part_o, part_ml, ns);
+    attn_partial_k<<<dim3(T * H, ns), 256, 0, s>>>(q, kcache, vcache, H, Hkv, D, pos0, scale, part_o, part_ml, ns);
     attn_combine_k<<<T * H, D, 0, s>>>(part_o, part_ml, qfull_gate, out, H, D, ns);
 }
 
 // ------------------------------------------------------------------------------------------- routing
-// one block per token, n_exp <= 1024
+// one warp per token, n_exp <= 1024: softmax over all experts, top-k by repeated warp argmax
 __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale) {
-    __shared__ float p[1024];
-    __shared__ float sh[32];
-    __shared__ float bv[32];
-    __shared__ int bi[32];
     const int t = blockIdx.x;
+    const int lane = threadIdx.x;
     const float * lg = logits + (int64_t) t * n_exp;
+    constexpr int PER = 32;  // n_exp / 32 values per lane
+    float v[PER];
+    const int per = (n_exp + 31) / 32;
     float mx = -FLT_MAX;
-    for (int i = threadIdx.x; i < n_exp; i += blockDim.x) mx = fmaxf(mx, lg[i]);
-    // block max
-    {
-        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-        mx = warp_max(mx);
-        if (lane == 0) sh[wid] = mx;
-        __syncthreads();
-        if (wid == 0) {
-            mx = lane < (int) (blockDim.x >> 5) ? sh[lane] : -FLT_MAX;
-            mx = warp_max(mx);
-            if (lane == 0) sh[0] = mx;
-        }
-        __syncthreads();
-        mx = sh[0];
-        __syncthreads();
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        v[i] = (i < per && lane + 32 * i < n_exp) ? lg[lane + 32 * i] : -FLT_MAX;
+        mx = fmaxf(mx, v[i]);
     }
+    mx = warp_max(mx);
     float sum = 0.f;
-    for (int i = threadIdx.x; i < n_exp; i += blockDim.x) {
-        p[i] = __expf(lg[i] - mx);
-        sum += p[i];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        v[i] = v[i] == -FLT_MAX ? 0.f : __expf(v[i] - mx);
+        sum += v[i];
     }
-    sum = block_sum(sum, sh);
+    sum = warp_sum(sum);
     float wsum = 0.f;
+    float myw = 0.f;
+    int myid = 0;
     for (int j = 0; j < k; ++j) {
         float best = -1.f;
-        int bidx = 0;
-        for (int i = threadIdx.x; i < n_exp; i += blockDim.x)
-            if (p[i] > best) { best = p[i]; bidx = i; }
-        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        int bi = 0;
+#pragma unroll
+        for (int i = 0; i < PER; ++i)
+            if (v[i] > best) { best = v[i]; bi = lane + 32 * i; }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffff, best, o);
-            const int oi = __shfl_xor_sync(0xffffffff, bidx, o);
-            if (ov > best || (ov == best && oi < bidx)) { best = ov; bidx = oi; }
+            const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
         }
-        if (lane == 0) { bv[wid] = best; bi[wid] = bidx; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            for (int q = 1; q < (int) (blockDim.x >> 5); ++q)
-                if (bv[q] > bv[0] || (bv[q] == bv[0] && bi[q] < bi[0])) { bv[0] = bv[q]; bi[0] = bi[q]; }
-            ids[t * k + j] = bi[0];
-            w[t * k + j] = bv[0] / sum;
-            wsum += bv[0] / sum;
-            p[bi[0]] = -2.f;
-        }
-        __syncthreads();
+        if ((bi & 31) == lane) v[bi >> 5] = -2.f;
+        const float p = best / sum;
+        wsum += p;
+        if (lane == j) { myw = p; myid = bi; }
     }
-    if (threadIdx.x == 0) {
+    if (lane < k) {
         const float sc = (w_scale != 0.f ? w_scale : 1.f) / wsum;
-        for (int j = 0; j < k; ++j) w[t * k + j] *= sc;
+        ids[t * k + lane] = myid;
+        w[t * k + lane] = myw * sc;
     }
 }
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,
                 cudaStream_t s) {
-    route_topk_k<<<T, 256, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    if (n_exp > 1024 || k > 32) { fprintf(stderr, "route_topk: unsupported shape\n"); abort(); }
+    route_topk_k<<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
 }
 
 // ------------------------------------------------------------------------------------------- PLE
