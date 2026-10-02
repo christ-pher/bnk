@@ -279,6 +279,7 @@ void Engine::pf_moe(int il, int N) {
     for (int i = 0; i < P; ++i) cnt[p.h_ids[i]]++;
     for (int e = 0; e < c.n_expert; ++e) off[e + 1] = off[e] + cnt[e];
     for (int e = 0; e < c.n_expert; ++e) times.routed += cnt[e];
+    for (int e = 0; e < c.n_expert; ++e) layer_routed[il] += cnt[e];
 
     // where each used expert runs: VRAM cache, PCIe stage, or the CPU pool
     const size_t blob = store_.blob_bytes(il);
@@ -425,6 +426,7 @@ void Engine::pf_moe(int il, int N) {
         cpu_.run(il, N, p.h_x, cpu_tasks, p.h_cpu);
         times.cpu_experts_ms += now_ms() - tc;
         times.misses += (int64_t) cpu_tasks.size();
+        layer_misses[il] += (int64_t) cpu_tasks.size();
         CUDA_CHECK(cudaMemcpyAsync(p.cpu.p, p.h_cpu, (size_t) N * E * 4, cudaMemcpyHostToDevice, st_));
         extra = p.cpu.p;
     }

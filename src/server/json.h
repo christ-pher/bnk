@@ -131,7 +131,8 @@ public:
         key(k);
         if (std::isfinite(v)) {
             char b[64];
-            snprintf(b, sizeof b, "%.6g", v);
+            // timestamps and big counters need every digit; small readings stay short
+            snprintf(b, sizeof b, std::fabs(v) >= 1e5 ? "%.15g" : "%.6g", v);
             os_ << b;
         } else {
             os_ << "null";

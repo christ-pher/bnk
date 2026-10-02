@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,10 @@ public:
     const ExpertCache & cache() const { return cache_; }
     MtpLayer * mtp() { return mtp_.loaded() ? &mtp_ : nullptr; }
     StageTimes times;
+    // lifetime routing counters per layer (expert uses, and those served by the CPU)
+    std::vector<int64_t> layer_routed, layer_misses;
+    // called after every prefill chunk/window with (tokens done, tokens total)
+    std::function<void(size_t, size_t)> on_prefill_progress;
     void save_counts();
 
     // debugging (disables graphs): HC residual after every layer, dumped_layers[il] = [T][hc*E]

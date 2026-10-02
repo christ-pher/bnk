@@ -49,6 +49,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     model_.load(path, opt.verbose);
+    layer_routed.assign(model_.cfg.n_layer, 0);
+    layer_misses.assign(model_.cfg.n_layer, 0);
     store_.build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
     cpu_.init(model_, store_, opt.cpu_threads);
 
@@ -371,6 +373,8 @@ void Engine::moe(int il, int T) {
         if (!tasks_.empty()) cpu_.run(il, T, m->x(), tasks_, m->out(E));
         times.misses += m->n_miss;
         times.routed += (int64_t) T * k;
+        layer_misses[il] += m->n_miss;
+        layer_routed[il] += (int64_t) T * k;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         m->seq_done = m->seq_req;
     }
@@ -436,6 +440,8 @@ void Engine::service_cpu(uint32_t seq, int T) {
         const int n = m->n_miss;
         times.misses += n;
         times.routed += (int64_t) T * c.n_expert_used;
+        layer_misses[il] += n;
+        layer_routed[il] += (int64_t) T * c.n_expert_used;
         if (n > 0) {
             tasks_.clear();
             for (int i = 0; i < n; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
@@ -524,6 +530,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
             mtp_feed(res_, tokens.data() + i, T, pos0);
             i += T;
         }
+        if (on_prefill_progress) on_prefill_progress(i, tokens.size());
     }
 }
 

@@ -8,6 +8,7 @@ import argparse
 import collections
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -18,10 +19,12 @@ from pathlib import Path
 
 from .chat import ChatTemplate, OutputParser
 from .engine import Engine, EngineError
+from .telemetry import Telemetry
 from .tokenizer import StreamDecoder, Tokenizer
 
 ROOT = Path(__file__).resolve().parent
-WEB = ROOT / "web"
+WEB = ROOT / "web" / "dist"      # the built dashboard (serve/web: npm run build)
+REQ = threading.local()           # per-request context: which API it came through
 
 
 class State:
@@ -51,7 +54,9 @@ class State:
         if args.counts:
             eargs += ["--counts", args.counts]
         eargs += args.engine_args
-        self.engine = Engine(args.engine, eargs, log_path=args.log)
+        self.telemetry = Telemetry()
+        self.engine = Engine(args.engine, eargs, log_path=args.log, on_telemetry=self.telemetry.on_engine,
+                             on_log=lambda line: self.telemetry.bus.publish("log", {"t": time.time(), "line": line}))
 
 
 S: State | None = None
@@ -147,9 +152,13 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": done_msg.get("gen_tokens", 0),
              "total_tokens": len(prompt_ids) + done_msg.get("gen_tokens", 0)}
     timings = {k: done_msg.get(k) for k in ("prefill_ms", "prefill_tps", "gen_ms", "tps", "reused", "rounds",
-                                             "tokens_per_round", "accepted", "drafted", "expert_miss_rate")}
-    S.recent.append({"time": time.time(), "prompt_tokens": len(prompt_ids), "gen_tokens": usage["completion_tokens"],
-                     "finish": finish, **timings})
+                                             "tokens_per_round", "accepted", "drafted", "expert_miss_rate",
+                                             "verify_ms", "draft_ms", "cpu_expert_ms")}
+    rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
+           "gen_tokens": usage["completion_tokens"], "finish": finish, "temperature": params.get("temperature"),
+           "max_tokens": max_tokens, "thinking": thinking, **timings}
+    S.recent.append(rec)
+    S.telemetry.bus.publish("request", rec)
     return content, parser.reasoning_all, calls, finish, usage, timings
 
 
@@ -210,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
         self._cors()
         self.end_headers()
         self.close_connection = True
@@ -228,44 +238,79 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path in ("/", "/index.html"):
-            return self._static("index.html")
-        if path.startswith("/static/"):
-            return self._static(path[len("/static/"):])
         if path == "/v1/models":
             return self._json(200, {"object": "list", "data": [{"id": S.model_id, "object": "model", "created": now(),
                                                                   "owned_by": "bnk"}]})
         if path == "/api/stats":
-            st = S.engine.stats() if S.engine.alive() else {}
-            with S.lock:
-                active = dict(S.active) if S.active else None
-                waiting = S.waiting
-            if active:
-                active["elapsed"] = time.time() - active["started"]
-            return self._json(200, {"engine": st, "model": S.model_id, "uptime": time.time() - S.started,
-                                    "active": active, "waiting": waiting, "recent": list(S.recent)[-60:],
-                                    "defaults": S.defaults, "alive": S.engine.alive(),
-                                    "engine_log": list(S.engine.log_tail)[-30:]})
+            return self._json(200, self._overview())
+        if path == "/api/stream":
+            return self._stream()
         if path == "/health":
             return self._json(200 if S.engine.alive() else 503, {"status": "ok" if S.engine.alive() else "down"})
-        self._json(404, {"error": {"message": "not found"}})
+        if path.startswith("/v1/") or path.startswith("/api/"):
+            return self._json(404, {"error": {"message": "not found"}})
+        # the dashboard: files of the build, and index.html for anything else (client-side routes)
+        return self._static(path.lstrip("/") or "index.html")
+
+    def _overview(self) -> dict:
+        with S.lock:
+            waiting = S.waiting
+        info = S.engine.info
+        return {"model": S.model_id, "uptime": time.time() - S.started, "started": S.started,
+                "alive": S.engine.alive(), "waiting": waiting, "defaults": S.defaults,
+                "engine": {"n_ctx": info.get("n_ctx"), "n_vocab": info.get("n_vocab"), "mtp": info.get("mtp"),
+                           "name": info.get("model"), "args": S.engine.args},
+                "gpu": S.telemetry.gpu.static, "live": S.telemetry.live(),
+                "history": list(S.telemetry.history), "recent": list(S.recent),
+                "log": list(S.engine.log_tail)[-200:]}
+
+    def _stream(self):
+        """Server-sent events: `init` (everything), then `live` (~4/s), `sample` (1/s), `request`, `log`."""
+        q = S.telemetry.bus.subscribe()
+        try:
+            self._sse_start()
+            self._sse(self._overview(), "init")
+            last = time.time()
+            while True:
+                try:
+                    event, data = q.get(timeout=10)
+                    self._sse(data, event)
+                except queue.Empty:
+                    pass
+                if time.time() - last > 10:   # keep proxies and the browser from timing the stream out
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last = time.time()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            S.telemetry.bus.unsubscribe(q)
 
     def _static(self, name):
+        root = WEB.resolve()
         p = (WEB / name).resolve()
-        if not str(p).startswith(str(WEB.resolve())) or not p.is_file():
-            return self._json(404, {"error": {"message": "not found"}})
+        if not str(p).startswith(str(root)) or not p.is_file():
+            p = root / "index.html"
+            if not p.is_file():
+                return self._json(404, {"error": {"message": "dashboard not built: cd serve/web && npm run build"}})
         data = p.read_bytes()
         ctype = {".html": "text/html; charset=utf-8", ".js": "application/javascript", ".css": "text/css",
-                 ".svg": "image/svg+xml", ".png": "image/png"}.get(p.suffix, "application/octet-stream")
+                 ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".woff2": "font/woff2",
+                 ".json": "application/json"}.get(p.suffix, "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        # hashed build assets never change; the page itself is always revalidated
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if "/assets/" in str(p) else "no-cache")
         self.end_headers()
         self.wfile.write(data)
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        REQ.api = {"/v1/chat/completions": "openai", "/v1/completions": "completions",
+                   "/v1/messages": "anthropic"}.get(path, path)
+        if self.headers.get("X-Bnk-Client") == "dashboard":
+            REQ.api = "dashboard"
         if not self._auth():
             return
         try:

@@ -41,6 +41,18 @@ if [[ ! -x "$HERE/.venv/bin/python" ]]; then
   "$HERE/.venv/bin/pip" install -q regex jinja2 numpy
 fi
 
+# the dashboard (serve/web): built once, and again whenever its sources change
+WEB="$HERE/serve/web"
+if [[ ! -f "$WEB/dist/index.html" || -n "$(find "$WEB/src" "$WEB/index.html" -newer "$WEB/dist/index.html" -print -quit)" ]]; then
+  NODE_BIN="$(ls -d "$HERE"/.venv/lib/python3*/site-packages/nodejs_wheel 2>/dev/null | head -1)"
+  if command -v npm >/dev/null; then NPM=(npm)
+  elif [[ -n "$NODE_BIN" ]]; then NPM=("$NODE_BIN/bin/node" "$NODE_BIN/lib/node_modules/npm/bin/npm-cli.js"); export PATH="$NODE_BIN/bin:$PATH"
+  else "$HERE/.venv/bin/pip" install -q nodejs-wheel; NODE_BIN="$(ls -d "$HERE"/.venv/lib/python3*/site-packages/nodejs_wheel | head -1)"
+       NPM=("$NODE_BIN/bin/node" "$NODE_BIN/lib/node_modules/npm/bin/npm-cli.js"); export PATH="$NODE_BIN/bin:$PATH"; fi
+  echo "building the dashboard ..."
+  (cd "$WEB" && { [[ -d node_modules ]] || "${NPM[@]}" ci --silent; } && "${NPM[@]}" run build --silent) >/dev/null || echo "warning: dashboard build failed (the APIs still work)"
+fi
+
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --ctx "$CTX" --port "$PORT" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 [[ -n "$MTP" && -f "$MTP" ]] && ARGS+=(--mtp "$MTP")

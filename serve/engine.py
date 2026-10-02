@@ -16,7 +16,8 @@ class EngineError(RuntimeError):
 
 
 class Engine:
-    def __init__(self, exe: str, args: list[str], log_path: str | None = None, env: dict | None = None):
+    def __init__(self, exe: str, args: list[str], log_path: str | None = None, env: dict | None = None,
+                 on_telemetry=None, on_log=None):
         self.exe, self.args, self.log_path = exe, args, log_path
         self.proc = None
         self.ready = threading.Event()
@@ -27,6 +28,9 @@ class Engine:
         self.started_at = None
         self.log_tail = collections.deque(maxlen=400)
         self.env = env
+        self.on_telemetry = on_telemetry   # called with every telemetry snapshot
+        self.on_log = on_log               # called with every engine log line
+        self.last_telemetry: dict = {}
 
     def start(self, timeout: float = 900):
         log = open(self.log_path, "ab") if self.log_path else subprocess.DEVNULL
@@ -47,6 +51,8 @@ class Engine:
         for line in iter(self.proc.stderr.readline, b""):
             s = line.decode("utf-8", errors="replace").rstrip()
             self.log_tail.append(s)
+            if self.on_log:
+                self.on_log(s)
             if log is not subprocess.DEVNULL:
                 log.write(line)
                 log.flush()
@@ -63,7 +69,12 @@ class Engine:
                 self.info = msg
                 self.ready.set()
                 continue
-            key = msg.get("id") or ("_stats" if t == "stats" else "_misc")
+            if t == "telemetry":
+                self.last_telemetry = msg
+                if self.on_telemetry:
+                    self.on_telemetry(msg)
+                continue
+            key = msg.get("id") or "_misc"
             with self.qlock:
                 q = self.queues.get(key)
             if q is not None:
@@ -82,18 +93,9 @@ class Engine:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def stats(self, timeout: float = 5.0) -> dict:
-        q = queue.Queue()
-        with self.qlock:
-            self.queues["_stats"] = q
-        try:
-            self._send({"op": "stats"})
-            return q.get(timeout=timeout)
-        except queue.Empty:
-            return {}
-        finally:
-            with self.qlock:
-                self.queues.pop("_stats", None)
+    def stats(self) -> dict:
+        """The engine's last telemetry snapshot (it pushes one every 250 ms while working, 1 s while idle)."""
+        return self.last_telemetry
 
     def generate(self, prompt: list[int], params: dict):
         """Yields engine events for one request: prefill, tokens..., done (or error)."""

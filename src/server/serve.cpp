@@ -4,11 +4,17 @@
 //         "min_p":..,"presence_penalty":..,"repetition_penalty":..,"seed":..,"stop_ids":[ids],"draft":n}
 //        {"op":"cancel","id":..}   {"op":"stats"}   {"op":"reset"}   {"op":"quit"}
 //   out: {"type":"ready",..}  {"type":"prefill","id":..}  {"type":"tokens","id":..,"ids":[..]}
-//        {"type":"done","id":..,"reason":"stop|length|cancel|context"} {"type":"stats",..} {"type":"error",..}
+//        {"type":"done","id":..,"reason":"stop|length|cancel|context"} {"type":"error",..}
+//        {"type":"telemetry",..}: every 250 ms while working and every second while idle (also the answer to
+//        "stats", sent at once from the last snapshot). Counters under "life" are cumulative over the process,
+//        in-flight work included, so a reader gets exact rates from the differences of two snapshots.
 #include "server/serve.h"
 
 #include <sys/sysinfo.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <cstdio>
 
 #include <atomic>
 #include <condition_variable>
@@ -34,44 +40,116 @@ void emit(const std::string & line) {
 }
 
 struct Totals {
-    int64_t requests = 0, gen_tokens = 0, prompt_tokens = 0, reused = 0;
-    double gen_ms = 0, prefill_ms = 0;
-    double last_tps = 0, last_prefill_tps = 0, last_accept = 0, last_tpr = 0, last_miss = 0;
+    int64_t requests = 0, gen_tokens = 0, prompt_tokens = 0, prefill_tokens = 0, reused = 0;
+    int64_t rounds = 0, drafted = 0, accepted = 0;
+    double gen_ms = 0, prefill_ms = 0, verify_ms = 0, draft_ms = 0, cpu_expert_ms = 0;
 };
 
-std::string stats_json(Engine & eng, const Totals & tot, const std::string & model_name) {
+// What the request in flight has done so far (worker thread only).
+struct Current {
+    std::string id, phase = "idle";
+    int64_t prompt_tokens = 0, reused = 0, prefill_done = 0, prefill_total = 0, gen_tokens = 0;
+    double t_start = 0, prefill_ms = 0, gen_t0 = 0;
+};
+
+double wall_s() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+double rss_mb() {
+    long pages = 0, res = 0;
+    FILE * f = fopen("/proc/self/statm", "r");
+    if (f) {
+        if (fscanf(f, "%ld %ld", &pages, &res) != 2) res = 0;
+        fclose(f);
+    }
+    return (double) res * sysconf(_SC_PAGESIZE) / 1048576.0;
+}
+
+template <typename V>
+std::string arr(const V & v) {
+    std::string o = "[";
+    for (size_t i = 0; i < v.size(); ++i) o += (i ? "," : "") + std::to_string(v[i]);
+    return o + "]";
+}
+
+std::string telemetry_json(Engine & eng, const Generator & gen, const Totals & tot, const Current & cur,
+                           const std::string & model_name) {
     size_t vfree = 0, vtotal = 0;
     cudaMemGetInfo(&vfree, &vtotal);
     struct sysinfo si;
     sysinfo(&si);
+    const auto & c = eng.cfg();
+    const auto & gs = gen.stats;
     const auto & tm = eng.times;
+    const bool busy = cur.phase != "idle";
+    const double now = now_ms();
+    // the request in flight
+    JsonOut rq;
+    rq.kv("id", cur.id)
+        .kv("prompt_tokens", cur.prompt_tokens)
+        .kv("reused", cur.reused)
+        .kv("prefill_done", cur.prefill_done)
+        .kv("prefill_total", cur.prefill_total)
+        .kv("prefill_ms", cur.phase == "prefill" ? now - cur.t_start : cur.prefill_ms)
+        .kv("gen_tokens", cur.gen_tokens)
+        .kv("gen_ms", cur.phase == "decode" ? now - cur.gen_t0 : 0.0)
+        .kv("elapsed_ms", busy ? now - cur.t_start : 0.0)
+        .kv("rounds", busy ? gs.rounds : 0)
+        .kv("drafted", busy ? gs.drafted : 0)
+        .kv("accepted", busy ? gs.accepted : 0)
+        .kv("routed", busy ? tm.routed : 0)
+        .kv("misses", busy ? tm.misses : 0);
+    // lifetime counters, in-flight work included
+    const int64_t fresh_now = cur.phase == "prefill" ? std::max<int64_t>(0, cur.prefill_done) : 0;
+    int64_t routed = 0, misses = 0;
+    for (size_t i = 0; i < eng.layer_routed.size(); ++i) {
+        routed += eng.layer_routed[i];
+        misses += eng.layer_misses[i];
+    }
+    JsonOut lf;
+    lf.kv("requests", tot.requests)
+        .kv("prompt_tokens", tot.prompt_tokens)
+        .kv("prefill_tokens", tot.prefill_tokens + fresh_now)
+        .kv("prefill_ms", tot.prefill_ms + (cur.phase == "prefill" ? now - cur.t_start : 0.0))
+        .kv("gen_tokens", tot.gen_tokens + (busy ? cur.gen_tokens : 0))
+        .kv("gen_ms", tot.gen_ms + (cur.phase == "decode" ? now - cur.gen_t0 : 0.0))
+        .kv("rounds", tot.rounds + (cur.phase == "decode" ? gs.rounds : 0))
+        .kv("drafted", tot.drafted + (cur.phase == "decode" ? gs.drafted : 0))
+        .kv("accepted", tot.accepted + (cur.phase == "decode" ? gs.accepted : 0))
+        .kv("verify_ms", tot.verify_ms + (cur.phase == "decode" ? gs.verify_ms : 0.0))
+        .kv("draft_ms", tot.draft_ms + (cur.phase == "decode" ? gs.draft_ms : 0.0))
+        .kv("cpu_expert_ms", tot.cpu_expert_ms + (busy ? tm.cpu_experts_ms : 0.0))
+        .kv("routed", routed)
+        .kv("misses", misses)
+        .kv("swaps", (int64_t) eng.cache().swaps_done);
+    std::vector<int> slots(c.n_layer);
+    for (int il = 0; il < c.n_layer; ++il) slots[il] = eng.cache().slots(il);
     JsonOut o;
-    o.kv("type", "stats")
+    o.kv("type", "telemetry")
+        .kv("t", wall_s())
         .kv("model", model_name)
+        .kv("phase", cur.phase)
         .kv("n_ctx", eng.max_ctx())
         .kv("pos", eng.pos())
+        .kv("n_layer", c.n_layer)
+        .kv("n_expert", c.n_expert)
+        .kv("n_expert_used", c.n_expert_used)
         .kv("vram_total_mb", (double) vtotal / 1048576.0)
         .kv("vram_used_mb", (double) (vtotal - vfree) / 1048576.0)
         .kv("ram_total_mb", (double) si.totalram * si.mem_unit / 1048576.0)
         .kv("ram_free_mb", (double) (si.freeram + si.bufferram) * si.mem_unit / 1048576.0)
+        .kv("rss_mb", rss_mb())
         .kv("experts_resident", eng.cache().resident())
-        .kv("experts_total", eng.cfg().n_layer * eng.cfg().n_expert)
+        .kv("experts_total", c.n_layer * c.n_expert)
         .kv("expert_cache_gb", (double) eng.cache().bytes() / 1073741824.0)
-        .kv("cache_swaps", (int64_t) eng.cache().swaps_done)
-        .kv("routed", (int64_t) tm.routed)
-        .kv("misses", (int64_t) tm.misses)
         .kv("cpu_threads", eng.cpu_threads())
         .kv("mtp", eng.mtp() != nullptr)
-        .kv("requests", tot.requests)
-        .kv("gen_tokens", tot.gen_tokens)
-        .kv("prompt_tokens", tot.prompt_tokens)
-        .kv("reused_tokens", tot.reused)
-        .kv("avg_tps", tot.gen_ms > 0 ? tot.gen_tokens / (tot.gen_ms / 1000) : 0.0)
-        .kv("last_tps", tot.last_tps)
-        .kv("last_prefill_tps", tot.last_prefill_tps)
-        .kv("last_accept", tot.last_accept)
-        .kv("last_tokens_per_round", tot.last_tpr)
-        .kv("last_miss_rate", tot.last_miss);
+        .raw("req", rq.done())
+        .raw("life", lf.done())
+        .raw("layer_slots", arr(slots))
+        .raw("layer_routed", arr(eng.layer_routed))
+        .raw("layer_misses", arr(eng.layer_misses));
     return o.done();
 }
 
@@ -84,6 +162,7 @@ struct Pending {
 int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_name) {
     Generator gen(eng, eng.mtp(), gopt);
     Totals tot;
+    Current cur;
     std::mutex mu;
     std::condition_variable cv;
     std::deque<Json> queue;
@@ -91,6 +170,21 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
     std::atomic<bool> cancel{false};
     std::string current_id;
     std::mutex cur_mu;
+    // the last telemetry line, for "stats" answered from the reader thread
+    std::mutex snap_mu;
+    std::string snapshot;
+    double last_tel = 0;
+    auto telemetry = [&](bool force) {
+        const double t = now_ms();
+        if (!force && t - last_tel < 250) return;
+        last_tel = t;
+        std::string line = telemetry_json(eng, gen, tot, cur, model_name);
+        {
+            std::lock_guard<std::mutex> lk(snap_mu);
+            snapshot = line;
+        }
+        emit(line);
+    };
 
     {
         JsonOut o;
@@ -98,6 +192,12 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             .kv("mtp", eng.mtp() != nullptr).kv("eos", eng.cfg().eos_token);
         emit(o.done());
     }
+    telemetry(true);
+    eng.on_prefill_progress = [&](size_t done, size_t total) {
+        cur.prefill_done = (int64_t) done;
+        cur.prefill_total = (int64_t) total;
+        telemetry(false);
+    };
 
     std::thread reader([&]() {
         std::string line;
@@ -111,6 +211,11 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
                 continue;
             }
             const std::string op = j["op"].str();
+            if (op == "stats") {
+                std::lock_guard<std::mutex> lk(snap_mu);
+                if (!snapshot.empty()) emit(snapshot);
+                continue;
+            }
             if (op == "cancel") {
                 std::lock_guard<std::mutex> lk(cur_mu);
                 if (j["id"].str() == current_id) cancel = true;
@@ -138,7 +243,11 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         Json req;
         {
             std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&]() { return quit || !queue.empty(); });
+            if (!cv.wait_for(lk, std::chrono::milliseconds(1000), [&]() { return quit || !queue.empty(); })) {
+                lk.unlock();
+                telemetry(true);   // idle heartbeat
+                continue;
+            }
             if (quit && queue.empty()) break;
             req = queue.front();
             queue.pop_front();
@@ -146,10 +255,6 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         const std::string op = req["op"].str();
         const std::string id = req["id"].str();
         try {
-            if (op == "stats") {
-                emit(stats_json(eng, tot, model_name));
-                continue;
-            }
             if (op == "reset") {
                 eng.reset();
                 emit(JsonOut().kv("type", "reset").kv("id", id).done());
@@ -183,13 +288,26 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             }
             gen.stats = GenStats{};
             eng.times = StageTimes{};
+            cur = Current{};
+            cur.id = id;
+            cur.phase = "prefill";
+            cur.prompt_tokens = (int64_t) prompt.size();
+            cur.prefill_total = (int64_t) prompt.size();
             const double t0 = now_ms();
+            cur.t_start = t0;
+            telemetry(true);
             int32_t tok = gen.start(prompt, sp);
             const double t1 = now_ms();
             const int64_t fresh = gen.stats.prompt_tokens - gen.stats.reused_tokens;
+            cur.reused = gen.stats.reused_tokens;
+            cur.prefill_ms = t1 - t0;
+            cur.prefill_done = cur.prefill_total = fresh;
+            tot.prefill_tokens += fresh;
+            tot.prefill_ms += t1 - t0;
             emit(JsonOut().kv("type", "prefill").kv("id", id).kv("prompt_tokens", (int64_t) prompt.size())
                      .kv("reused", gen.stats.reused_tokens).kv("ms", t1 - t0)
                      .kv("tps", fresh > 0 ? fresh / ((t1 - t0) / 1000) : 0.0).done());
+            cur.phase = "decode";
             int produced = 0;
             std::string reason = "length";
             auto is_stop = [&](int32_t t) { return std::find(stop_ids.begin(), stop_ids.end(), t) != stop_ids.end(); };
@@ -197,6 +315,8 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             bool stop = is_stop(tok);
             if (stop) reason = "stop";
             const double tg0 = now_ms();
+            cur.gen_t0 = tg0;
+            telemetry(true);
             while (true) {
                 // emit what we have (minus a stop token)
                 std::vector<int32_t> send;
@@ -205,7 +325,9 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
                     send.push_back(t);
                     if (++produced >= max_tokens) { stop = true; break; }
                 }
+                cur.gen_tokens = produced;
                 if (!send.empty()) emit(JsonOut().kv("type", "tokens").kv("id", id).kv("ids", send).done());
+                telemetry(false);
                 if (stop) break;
                 if (cancel) { reason = "cancel"; break; }
                 if (eng.pos() + 2 >= eng.max_ctx()) { reason = "context"; break; }
@@ -219,16 +341,21 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             tot.gen_ms += gms;
             tot.prompt_tokens += (int64_t) prompt.size();
             tot.reused += gs.reused_tokens;
-            tot.last_tps = produced > 1 && gms > 0 ? (produced - 1) / (gms / 1000) : 0;
-            tot.last_prefill_tps = fresh > 0 ? fresh / ((t1 - t0) / 1000) : 0;
-            tot.last_accept = gs.drafted ? (double) gs.accepted / gs.drafted : 0;
-            tot.last_tpr = gs.rounds ? (double) gs.emitted / gs.rounds : 0;
-            tot.last_miss = eng.times.routed ? (double) eng.times.misses / eng.times.routed : 0;
+            tot.rounds += gs.rounds;
+            tot.drafted += gs.drafted;
+            tot.accepted += gs.accepted;
+            tot.verify_ms += gs.verify_ms;
+            tot.draft_ms += gs.draft_ms;
+            tot.cpu_expert_ms += eng.times.cpu_experts_ms;
+            const double tps = produced > 1 && gms > 0 ? (produced - 1) / (gms / 1000) : 0;
+            const double prefill_tps = fresh > 0 ? fresh / ((t1 - t0) / 1000) : 0;
             emit(JsonOut().kv("type", "done").kv("id", id).kv("reason", reason).kv("gen_tokens", produced)
-                     .kv("gen_ms", gms).kv("tps", tot.last_tps).kv("prompt_tokens", (int64_t) prompt.size())
-                     .kv("reused", gs.reused_tokens).kv("prefill_ms", t1 - t0).kv("prefill_tps", tot.last_prefill_tps)
+                     .kv("gen_ms", gms).kv("tps", tps).kv("prompt_tokens", (int64_t) prompt.size())
+                     .kv("reused", gs.reused_tokens).kv("prefill_ms", t1 - t0).kv("prefill_tps", prefill_tps)
                      .kv("rounds", gs.rounds).kv("drafted", gs.drafted).kv("accepted", gs.accepted)
-                     .kv("tokens_per_round", tot.last_tpr).kv("expert_miss_rate", tot.last_miss)
+                     .kv("tokens_per_round", gs.rounds ? (double) gs.emitted / gs.rounds : 0.0)
+                     .kv("expert_miss_rate", eng.times.routed ? (double) eng.times.misses / eng.times.routed : 0.0)
+                     .kv("verify_ms", gs.verify_ms).kv("draft_ms", gs.draft_ms)
                      .kv("cpu_expert_ms", eng.times.cpu_experts_ms).done());
         } catch (const std::exception & e) {
             emit(JsonOut().kv("type", "error").kv("id", id).kv("message", e.what()).done());
@@ -239,6 +366,8 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             std::lock_guard<std::mutex> lk(cur_mu);
             current_id.clear();
         }
+        cur = Current{};
+        telemetry(true);
         // keep the learned routing counts on disk (the process may be killed rather than quit)
         static double last_save = now_ms();
         if (now_ms() - last_save > 60000) {
