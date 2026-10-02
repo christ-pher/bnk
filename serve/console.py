@@ -1,0 +1,123 @@
+"""Terminal output while the server runs, fed by the same telemetry bus as the dashboard (no extra engine work).
+
+  quiet  startup and errors only
+  info   a line per request (prompt read, finished) and a live status line while generating (on a terminal)
+  debug  info, plus a line per second of telemetry, every engine log line and HTTP access lines
+"""
+from __future__ import annotations
+
+import queue
+import sys
+import threading
+import time
+
+LEVELS = ("quiet", "info", "debug")
+
+
+class Console:
+    def __init__(self, bus, level: str = "info"):
+        self.level = LEVELS.index(level)
+        self.tty = sys.stdout.isatty()
+        self.q = bus.subscribe()
+        self.status_shown = False
+        self.seen_decode: set[str] = set()
+        self.lock = threading.Lock()
+        if self.level > 0:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    # ---- output helpers
+    def _c(self, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if self.tty else s
+
+    def line(self, s: str):
+        """A permanent line (clears the status line first)."""
+        with self.lock:
+            if self.status_shown:
+                sys.stdout.write("\r\033[2K")
+                self.status_shown = False
+            sys.stdout.write(f"{self._c('2', time.strftime('%H:%M:%S'))} {s}\n")
+            sys.stdout.flush()
+
+    def status(self, s: str):
+        if not self.tty:
+            return
+        with self.lock:
+            sys.stdout.write("\r\033[2K" + s)
+            sys.stdout.flush()
+            self.status_shown = True
+
+    def clear_status(self):
+        with self.lock:
+            if self.status_shown:
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+                self.status_shown = False
+
+    # ---- events
+    def _run(self):
+        while True:
+            try:
+                event, data = self.q.get(timeout=5)
+            except queue.Empty:
+                continue
+            try:
+                getattr(self, f"_on_{event}", lambda d: None)(data)
+            except Exception as e:  # noqa: BLE001 (never let the console take the server down)
+                self.line(f"console: {e}")
+
+    def _on_live(self, m: dict):
+        r = m.get("req") or {}
+        rid = r.get("id") or ""
+        phase = m.get("phase")
+        if phase == "prefill":
+            done, total = r.get("prefill_done", 0), r.get("prefill_total", 0)
+            ms = r.get("prefill_ms", 0) or 0
+            rate = f" · {done / (ms / 1000):,.0f} tok/s" if ms > 200 and done else ""
+            self.status(self._c("33", "◐ reading prompt ") + f"{done:,}/{total:,} tokens{rate}")
+        elif phase == "decode":
+            if rid and rid not in self.seen_decode:
+                self.seen_decode.add(rid)
+                reused = r.get("reused", 0)
+                tps = (r.get("prefill_total", 0) / (r["prefill_ms"] / 1000)) if r.get("prefill_ms") else 0
+                self.line(self._c("36", "▶ ") + f"{rid[:6]}  prompt {r.get('prompt_tokens', 0):,} tokens"
+                          + (f" ({reused:,} reused)" if reused else "")
+                          + f" read in {r.get('prefill_ms', 0) / 1000:.2f} s" + (f" · {tps:,.0f} tok/s" if tps else ""))
+            n, ms = r.get("gen_tokens", 0), r.get("gen_ms", 0) or 0
+            tps = f"{(n - 1) / (ms / 1000):5.1f} tok/s" if ms > 400 and n > 1 else "  —  tok/s"
+            acc = f" · {r['accepted'] / r['drafted']:.0%} accepted" if r.get("drafted") else ""
+            tpr = f" · {n / r['rounds']:.2f} tok/round" if r.get("rounds") else ""
+            miss = f" · {r['misses'] / r['routed']:.1%} CPU misses" if r.get("routed") else ""
+            self.status(self._c("32", "● generating ") + f"{n:,} tokens · {tps}{tpr}{acc}{miss}")
+        else:
+            self.clear_status()
+            if len(self.seen_decode) > 1000:
+                self.seen_decode.clear()
+
+    def _on_request(self, r: dict):
+        acc = f" · {r['accepted'] / r['drafted']:.0%} accepted" if r.get("drafted") else ""
+        tpr = f" · {r['tokens_per_round']:.2f} tok/round" if r.get("tokens_per_round") else ""
+        miss = f" · {r['expert_miss_rate']:.1%} CPU misses" if r.get("expert_miss_rate") is not None else ""
+        self.line(self._c("32", "✓ ") + f"{(r.get('id') or '')[:6]}  {r.get('gen_tokens', 0):,} tokens"
+                  f" at {r.get('tps') or 0:.1f} tok/s{tpr}{acc}{miss} · {r.get('finish')} · {r.get('api') or '-'}")
+
+    def _on_log(self, d: dict):
+        s = d.get("line", "")
+        important = any(k in s.lower() for k in ("error", "warn", "fail", "exception"))
+        if self.level >= 2 or important:
+            self.line(self._c("31" if important else "2", "engine: ") + s)
+
+    def _on_sample(self, s: dict):
+        if self.level < 2:
+            return
+        parts = [f"{s.get('phase')}"]
+        if s.get("gen_tps"):
+            parts.append(f"decode {s['gen_tps']:.1f} tok/s")
+        if s.get("prefill_tps"):
+            parts.append(f"prefill {s['prefill_tps']:,.0f} tok/s")
+        if s.get("miss_rate") is not None:
+            parts.append(f"miss {s['miss_rate']:.1%}")
+        parts.append(f"gpu {s.get('gpu_util') or 0:.0f}% {s.get('gpu_power_w') or 0:.0f} W")
+        parts.append(f"cpu {s.get('cpu', 0):.0f}%")
+        if s.get("pcie_rx_mbs"):
+            parts.append(f"pcie {s['pcie_rx_mbs'] / 1024:.2f} GB/s")
+        self.line(self._c("2", "· " + " · ".join(parts)))

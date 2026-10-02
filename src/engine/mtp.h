@@ -23,7 +23,7 @@ namespace bnk {
 class MtpLayer {
 public:
     ~MtpLayer();
-    // Loads the MTP GGUF (Strata's mtp-*.gguf: mtp.* tensors) for the given main model.
+    // Loads the MTP GGUF (tools/build_mtp.py: the checkpoint's mtp.* tensors) for the given main model.
     void load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
               const std::string & draft_vocab = "");
     bool loaded() const { return loaded_; }

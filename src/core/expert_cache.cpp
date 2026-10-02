@@ -11,26 +11,10 @@
 
 namespace bnk {
 
+// The expert ranking from a routing-counts file (bnk's BNKC; empty when there is none).
 Ranking load_ranking(const std::string & path, int n_layer, int n_expert) {
     Ranking r;
     if (path.empty()) return r;
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) return r;
-    char magic[4];
-    if (fread(magic, 1, 4, f) != 4) { fclose(f); return r; }
-    if (!memcmp(magic, "STRP", 4)) {
-        uint32_t h[5];
-        if (fread(h, 4, 5, f) == 5 && (int) h[1] == n_layer && (int) h[2] == n_expert) {
-            for (uint32_t i = 0; i < h[4]; ++i) {
-                uint16_t le[2];
-                if (fread(le, 2, 2, f) != 2) break;
-                r.emplace_back(le[0], le[1]);
-            }
-        }
-        fclose(f);
-        return r;
-    }
-    fclose(f);
     auto counts = load_counts(path, n_layer, n_expert);
     if (!counts.empty()) r = ranking_from_counts(counts, n_layer, n_expert);
     return r;

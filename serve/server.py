@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .chat import ChatTemplate, OutputParser
+from .console import LEVELS, Console
 from .engine import Engine, EngineError
 from .telemetry import Telemetry
 from .tokenizer import StreamDecoder, Tokenizer
@@ -55,6 +56,7 @@ class State:
             eargs += ["--counts", args.counts]
         eargs += args.engine_args
         self.telemetry = Telemetry()
+        self.console = Console(self.telemetry.bus, args.log_level)
         self.engine = Engine(args.engine, eargs, log_path=args.log, on_telemetry=self.telemetry.on_engine,
                              on_log=lambda line: self.telemetry.bus.publish("log", {"t": time.time(), "line": line}))
 
@@ -182,8 +184,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "bnk"
 
     def log_message(self, fmt, *a):
-        if S.args.verbose:
-            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % a))
+        if S.args.verbose or S.args.log_level == "debug":
+            S.console.line("http: %s %s" % (self.address_string(), fmt % a))
 
     # ---- helpers
     def _auth(self) -> bool:
@@ -543,11 +545,21 @@ def main():
     ap.add_argument("--model-id", default="")
     ap.add_argument("--cache-dir", default="~/.cache/bnk")
     ap.add_argument("--log", default="", help="engine log file")
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--verbose", action="store_true", help="log HTTP requests")
+    ap.add_argument("--log-level", choices=LEVELS, default=os.environ.get("BNK_LOG_LEVEL", "info"),
+                    help="terminal output: quiet, info (requests + live status), debug (+ telemetry, engine log)")
     ap.add_argument("engine_args", nargs="*", help="extra engine arguments (after --)")
     args = ap.parse_args()
     S = State(args)
     print(f"bnk: starting the engine for {S.model_id} ...", flush=True)
+    if args.log_level != "quiet":
+        publish = S.engine.on_log
+
+        def on_log(line: str):
+            if not S.engine.ready.is_set():   # the engine's load progress, until it is ready
+                print(f"  {line}", flush=True)
+            publish(line)
+        S.engine.on_log = on_log
     S.engine.start()
     info = S.engine.info
     print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}",

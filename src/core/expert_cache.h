@@ -13,7 +13,7 @@ namespace bnk {
 
 using Ranking = std::vector<std::pair<int, int>>;  // (layer, expert), hottest first
 
-// Strata's STRP profile, or bnk's own counts file (BNKC); empty when unreadable.
+// The expert ranking from bnk's routing-counts file (BNKC); empty when unreadable.
 Ranking load_ranking(const std::string & path, int n_layer, int n_expert);
 // Ranking from routing counts [n_layer][n_expert]: most routed first, ties interleaved across layers.
 Ranking ranking_from_counts(const std::vector<uint32_t> & counts, int n_layer, int n_expert);

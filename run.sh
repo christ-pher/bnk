@@ -2,13 +2,14 @@
 # Start the bnk server.
 #   ./run.sh [iq3_s|orca|PATH-to-first-shard.gguf] [--port 8080] [--ctx 65536] [--no-mtp] [server options...]
 #   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
+#   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MODELS="${BNK_MODELS:-/opt/models/Strata/models}"
-MTP_DEFAULT="${BNK_MTP:-/opt/models/Strata/runtime/mtp/mtp-q2_0.gguf}"
-# the drafter's token subset (English and code; drafts outside it are never proposed, never wrong). "" = all tokens
-DRAFT_VOCAB="${BNK_DRAFT_VOCAB-/opt/engines/Strata/data/draft_vocab.bin}"
-PROFILE_DEFAULT="${BNK_PROFILE:-/opt/engines/Strata/data/expert-profile.bin}"
+# bnk's own MTP draft layer, built from the official Qwen checkpoint by tools/build_mtp.py
+MTP_DEFAULT="${BNK_MTP:-/opt/models/bnk/mtp/mtp-q2_0.gguf}"
+# the drafter's token subset (tools/draft_vocab.py: Latin scripts, code, symbols, emoji); a token outside it is never
+# drafted, never wrong. Set BNK_DRAFT_VOCAB= (empty) to draft over the whole vocabulary.
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/bnk"
 mkdir -p "$CACHE"
 
@@ -53,11 +54,21 @@ if [[ ! -f "$WEB/dist/index.html" || -n "$(find "$WEB/src" "$WEB/index.html" -ne
   (cd "$WEB" && { [[ -d node_modules ]] || "${NPM[@]}" ci --silent; } && "${NPM[@]}" run build --silent) >/dev/null || echo "warning: dashboard build failed (the APIs still work)"
 fi
 
+DRAFT_VOCAB="${BNK_DRAFT_VOCAB-$CACHE/draft-vocab-$NAME.bin}"
+if [[ -n "$MTP" && ! -f "$MTP" ]]; then
+  echo "note: no MTP draft layer at $MTP; running without speculative decoding."
+  echo "      build it once with: .venv/bin/python tools/build_mtp.py --out $MTP"
+  MTP=""
+fi
+if [[ -n "$MTP" && -n "$DRAFT_VOCAB" && ! -f "$DRAFT_VOCAB" ]]; then
+  "$HERE/.venv/bin/python" "$HERE/tools/draft_vocab.py" --gguf "$MODEL" --out "$DRAFT_VOCAB" >/dev/null
+fi
+
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --ctx "$CTX" --port "$PORT" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
-[[ -n "$MTP" && -f "$MTP" ]] && ARGS+=(--mtp "$MTP")
+[[ -n "$MTP" ]] && ARGS+=(--mtp "$MTP")
 [[ -n "$MTP" && -n "$DRAFT_VOCAB" && -f "$DRAFT_VOCAB" ]] && ARGS+=(--draft-vocab "$DRAFT_VOCAB")
-# the learned routing counts rank the initial VRAM cache once they exist; until then Strata's profile does
-[[ ! -f "$COUNTS" && -f "$PROFILE_DEFAULT" ]] && ARGS+=(--profile "$PROFILE_DEFAULT")
+# the learned routing counts (written as the server runs) rank the initial VRAM cache; on a model's first run the
+# cache starts unranked and adapts to the traffic
 cd "$HERE"
 exec "$HERE/.venv/bin/python" -m serve.server "${ARGS[@]}" "${EXTRA[@]}"
