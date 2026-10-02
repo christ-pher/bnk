@@ -52,7 +52,7 @@ export function OverviewPage({ range }: { range: Range }) {
             </span>
           }
         >
-          <Sparkline values={spark.map((s) => s.tokens_per_round)} color="var(--chart-3)" />
+          <Sparkline values={spark.map((s) => s.tokens_per_round)} color="var(--chart-3)" missing="connect" />
         </StatCard>
         <StatCard
           label="VRAM expert hit rate"
@@ -64,7 +64,7 @@ export function OverviewPage({ range }: { range: Range }) {
             </span>
           }
         >
-          <Sparkline values={spark.map((s) => (s.miss_rate == null ? null : 1 - s.miss_rate))} color="var(--chart-1)" />
+          <Sparkline values={spark.map((s) => (s.miss_rate == null ? null : 1 - s.miss_rate))} color="var(--chart-1)" missing="connect" />
         </StatCard>
       </div>
 
@@ -87,7 +87,38 @@ export function OverviewPage({ range }: { range: Range }) {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-3">
+        <Card className="xl:col-span-2">
+          <CardHeader>
+            <CardTitle>Prompt processing</CardTitle>
+            <CardDescription>New prompt tokens per second while reading a prompt; long prompts run at full rate</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <TimeChart
+              rows={rows}
+              series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]}
+              unit="tok/s"
+              height={230}
+            />
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Layers className="size-4 text-muted-foreground" />Totals</CardTitle>
+            <CardDescription>Since the engine started · up {fmt.duration(overview?.uptime ?? 0)}</CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm">
+            <Total label="Requests" value={fmt.n(live?.life.requests)} />
+            <Total label="Generated" value={fmt.compact(live?.life.gen_tokens)} unit="tok" />
+            <Total label="Prompt" value={fmt.compact(live?.life.prompt_tokens)} unit="tok" />
+            <Total label="Prefilled" value={fmt.compact(live?.life.prefill_tokens)} unit="tok" />
+            <Total label="Cache swaps" value={fmt.compact(live?.life.swaps)} />
+            <Total label="Context" value={`${fmt.compact(live?.pos)} / ${fmt.compact(live?.n_ctx)}`} />
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Gauge className="size-4 text-muted-foreground" />GPU</CardTitle>
@@ -115,20 +146,6 @@ export function OverviewPage({ range }: { range: Range }) {
               hint={`Engine resident ${fmt.gib(live?.rss_mb)} (expert store, page-locked)`} />
             <Meter label="PCIe host → GPU" reading={`${fmt.n((live?.gpu?.pcie_rx_mbs ?? 0) / 1024, 2)} GB/s`}
               value={(live?.gpu?.pcie_rx_mbs ?? 0) / 13400} hint="Measured ceiling ≈ 13.1 GB/s" />
-          </CardContent>
-        </Card>
-        <Card className="lg:col-span-2 xl:col-span-1">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Layers className="size-4 text-muted-foreground" />Totals</CardTitle>
-            <CardDescription>Since the engine started · up {fmt.duration(overview?.uptime ?? 0)}</CardDescription>
-          </CardHeader>
-          <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm">
-            <Total label="Requests" value={fmt.n(live?.life.requests)} />
-            <Total label="Generated" value={fmt.compact(live?.life.gen_tokens)} unit="tok" />
-            <Total label="Prompt" value={fmt.compact(live?.life.prompt_tokens)} unit="tok" />
-            <Total label="Prefilled" value={fmt.compact(live?.life.prefill_tokens)} unit="tok" />
-            <Total label="Cache swaps" value={fmt.compact(live?.life.swaps)} />
-            <Total label="Context" value={`${fmt.compact(live?.pos)} / ${fmt.compact(live?.n_ctx)}`} />
           </CardContent>
         </Card>
       </div>

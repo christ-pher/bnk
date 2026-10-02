@@ -125,9 +125,9 @@ export function ChatSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="flex w-full flex-col gap-0 p-0 sm:max-w-xl">
+      <SheetContent className="flex flex-col gap-0 p-0 data-[side=right]:w-full data-[side=right]:border-l-0 data-[side=right]:sm:w-1/2 data-[side=right]:sm:max-w-none data-[side=right]:sm:border-l">
         <SheetHeader className="border-b">
-          <SheetTitle>Test chat</SheetTitle>
+          <SheetTitle>Chat</SheetTitle>
           <SheetDescription className="truncate">{model ?? "bnk"} · requests appear in the dashboard as “dashboard”</SheetDescription>
           <div className="flex gap-2 pt-1">
             <Button variant={showSettings ? "secondary" : "outline"} size="sm" onClick={() => setShowSettings((v) => !v)}>

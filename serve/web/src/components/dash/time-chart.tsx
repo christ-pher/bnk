@@ -9,6 +9,9 @@ export interface Series {
   label: string
   color: string // a --chart-n token
   value: (row: any) => number | null | undefined
+  // what a missing reading means: "zero" for rates (the engine did none of that work), "connect" for ratios
+  // (acceptance, hit rate: undefined while idle, so the line bridges the gap rather than diving to 0)
+  missing?: "zero" | "connect"
 }
 
 export function TimeChart({
@@ -33,7 +36,7 @@ export function TimeChart({
     const o: Record<string, number | null> = { t: r.t }
     for (const s of series) {
       const v = s.value(r)
-      o[s.key] = v == null || Number.isNaN(v) ? null : Number(v.toFixed(digits))
+      o[s.key] = v == null || Number.isNaN(v) ? ((s.missing ?? "zero") === "zero" ? 0 : null) : Number(v.toFixed(digits))
     }
     return o
   })
@@ -116,7 +119,7 @@ export function TimeChart({
               strokeWidth={2}
               fill={`url(#fill-${s.key})`}
               isAnimationActive={false}
-              connectNulls={false}
+              connectNulls={s.missing === "connect"}
               dot={lone(s.key)}
               activeDot={{ r: 4, strokeWidth: 2, stroke: "var(--card)" }}
             />
@@ -133,7 +136,7 @@ export function TimeChart({
               stroke={`var(--color-${s.key})`}
               strokeWidth={2}
               isAnimationActive={false}
-              connectNulls={false}
+              connectNulls={s.missing === "connect"}
               dot={lone(s.key)}
               activeDot={{ r: 4, strokeWidth: 2, stroke: "var(--card)" }}
             />
@@ -145,8 +148,8 @@ export function TimeChart({
 }
 
 // A bare trend line for stat tiles: no axes, no tooltip (the tile's number is the reading).
-export function Sparkline({ values, color = "var(--chart-1)", height = 36 }: { values: (number | null)[]; color?: string; height?: number }) {
-  const data = values.map((v, i) => ({ i, v }))
+export function Sparkline({ values, color = "var(--chart-1)", height = 36, missing = "zero" }: { values: (number | null)[]; color?: string; height?: number; missing?: "zero" | "connect" }) {
+  const data = values.map((v, i) => ({ i, v: v == null && missing === "zero" ? 0 : v }))
   return (
     <ChartContainer config={{ v: { label: "", color } }} className="aspect-auto w-full" style={{ height }}>
       <AreaChart data={data} margin={{ top: 2, bottom: 0, left: 0, right: 0 }}>
@@ -164,6 +167,7 @@ export function Sparkline({ values, color = "var(--chart-1)", height = 36 }: { v
           strokeWidth={1.5}
           fill={`url(#spark-${color.replace(/[^a-z0-9]/gi, "")})`}
           isAnimationActive={false}
+          connectNulls
           dot={false}
         />
       </AreaChart>

@@ -87,10 +87,11 @@ export default function App() {
   const current = PAGES.find((p) => p.id === page)!
   return (
     <TooltipProvider delayDuration={150}>
-      <SidebarProvider style={{ "--sidebar-width": "15rem" } as React.CSSProperties}>
+      {/* fixed-height shell: only the page content scrolls, so the inset's margins never scroll the window */}
+      <SidebarProvider className="h-svh overflow-hidden" style={{ "--sidebar-width": "15rem" } as React.CSSProperties}>
         <AppSidebar page={page} />
-        <SidebarInset>
-          <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background/80 px-4 backdrop-blur lg:px-6">
+        <SidebarInset className="min-h-0 overflow-hidden">
+          <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4 lg:px-6">
             <SidebarTrigger className="-ml-1" />
             <Separator orientation="vertical" className="mx-1 data-[orientation=vertical]:h-4" />
             <h1 className="text-base font-medium">{current.title}</h1>
@@ -108,11 +109,11 @@ export default function App() {
               </Button>
               <Button size="sm" onClick={() => setChatOpen(true)}>
                 <MessageSquare />
-                <span className="hidden sm:inline">Test chat</span>
+                <span className="hidden sm:inline">Chat</span>
               </Button>
             </div>
           </header>
-          <main className="flex-1 p-4 lg:p-6">
+          <main className="min-h-0 flex-1 overflow-y-auto p-4 lg:p-6">
             {page === "overview" && <OverviewPage range={range} />}
             {page === "performance" && <PerformancePage range={range} />}
             {page === "experts" && <ExpertsPage range={range} />}
