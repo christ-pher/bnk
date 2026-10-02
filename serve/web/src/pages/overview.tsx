@@ -21,7 +21,7 @@ export function OverviewPage({ range }: { range: Range }) {
   const rows = windowed(history, range)
 
   return (
-    <div className="flex flex-col gap-4 md:gap-6">
+    <div className="flex min-h-full flex-col gap-4 md:gap-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Decode speed"
@@ -115,19 +115,20 @@ export function OverviewPage({ range }: { range: Range }) {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
+      {/* the charts take whatever height is left, so the page fills the window without scrolling */}
+      <div className="grid flex-1 grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>Decode speed</CardTitle>
             <CardDescription>Tokens per second while generating</CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="relative min-h-[130px] flex-1">
             <TimeChart
               rows={rows}
               series={[{ key: "gen", label: "Decode", color: "var(--chart-1)", value: (r) => r.gen_tps }]}
               unit="tok/s"
               digits={1}
-              height={230}
+              height="100%"
             />
           </CardContent>
         </Card>
@@ -136,12 +137,12 @@ export function OverviewPage({ range }: { range: Range }) {
             <CardTitle>Prompt processing</CardTitle>
             <CardDescription>New prompt tokens per second while reading a prompt</CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="relative min-h-[130px] flex-1">
             <TimeChart
               rows={rows}
               series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]}
               unit="tok/s"
-              height={230}
+              height="100%"
             />
           </CardContent>
         </Card>

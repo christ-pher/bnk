@@ -29,7 +29,7 @@ export function TimeChart({
   digits?: number
   domain?: [number | "auto" | "dataMin" | "dataMax", number | "auto" | "dataMin" | "dataMax"]
   kind?: "area" | "line"
-  height?: number
+  height?: number | string // a number of px, or "100%" to fill a sized parent
 }) {
   const config: ChartConfig = Object.fromEntries(series.map((s) => [s.key, { label: s.label, color: s.color }]))
   const data = rows.map((r) => {
@@ -72,18 +72,8 @@ export function TimeChart({
   const axes = (
     <>
       <CartesianGrid vertical={false} strokeOpacity={0.5} />
-      <XAxis
-        dataKey="t"
-        type="number"
-        scale="time"
-        domain={["dataMin", "dataMax"]}
-        tickFormatter={(t) => fmt.clock(t)}
-        tickLine={false}
-        axisLine={false}
-        minTickGap={56}
-        tickMargin={8}
-        className="tabular"
-      />
+      {/* time runs left to right; the moving clock labels are left out (the tooltip shows the time) */}
+      <XAxis dataKey="t" type="number" scale="time" domain={["dataMin", "dataMax"]} hide />
       <YAxis
         width={44}
         tickLine={false}
