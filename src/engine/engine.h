@@ -89,6 +89,7 @@ public:
     int pos() const { return (int) history_.size(); }
     const std::vector<int32_t> & history() const { return history_; }
     int max_ctx() const { return opt_.max_ctx; }
+    int cpu_threads() const { return cpu_.threads(); }
     void logits_rows_host(int T, float * out);   // rows 0..T-1 of the last window's logits
     void set_mtp_pending(const float * R_row_dev, int cell);
     const Config & cfg() const { return model_.cfg; }

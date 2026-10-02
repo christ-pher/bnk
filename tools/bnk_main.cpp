@@ -12,6 +12,7 @@
 #include "engine/engine.h"
 #include "engine/generate.h"
 #include "engine/mtp.h"
+#include "server/serve.h"
 
 using namespace bnk;
 
@@ -76,6 +77,11 @@ int main(int argc, char ** argv) {
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
+    }
+    if (mode == "serve") {
+        Engine eng;
+        eng.load(model, opt);
+        return serve_main(eng, gopt, eng.model().gguf.get_str("general.name", "bnk"));
     }
     auto prompt = read_tokens(tokfile);
     Engine eng;

@@ -53,6 +53,7 @@ add_library(bnk_core STATIC
   src/engine/mtp.cpp
   src/engine/generate.cpp
   src/engine/sampler.cpp
+  src/server/serve.cpp
   src/engine/prefill.cpp
   src/kernels/gemm.cu
 )

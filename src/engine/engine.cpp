@@ -35,7 +35,7 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
 Engine::~Engine() {
     for (auto & gm : graphs_) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     for (auto & g : commit_graphs_) if (g) cudaGraphExecDestroy(g);
-    if (!opt_.counts_out.empty() && counts_.p) save_counts();
+    if (counts_.p) save_counts();
     if (mail_) cudaFreeHost(mail_);
     if (h_par_) cudaFreeHost(h_par_);
     if (h_tok_) cudaFreeHost(h_tok_);
@@ -189,6 +189,7 @@ void Engine::reset() {
 
 void Engine::save_counts() {
     // the device counters are cumulative for the session; the file gets this session's total added
+    if (opt_.counts_out.empty()) return;
     const Config & c = model_.cfg;
     std::vector<uint32_t> now((size_t) c.n_layer * c.n_expert);
     CUDA_CHECK(cudaMemcpy(now.data(), counts_.p, now.size() * 4, cudaMemcpyDeviceToHost));
