@@ -39,7 +39,11 @@ set(BNK_CUDA_FLAGS_QUIET -lineinfo --use_fast_math -Wno-deprecated-gpu-targets
 
 add_library(bnk_core STATIC
   src/core/gguf_model.cpp
+  src/core/model.cpp
+  src/cpu/expert_pool.cpp
   src/kernels/quant_gemv.cu
+  src/kernels/ops.cu
+  src/engine/engine.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cuda_driver Threads::Threads)
@@ -47,6 +51,10 @@ target_compile_options(bnk_core PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wno-unused-function>)
 set_target_properties(bnk_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+add_executable(bnk tools/bnk_main.cpp)
+target_link_libraries(bnk PRIVATE bnk_core)
+target_compile_options(bnk PRIVATE -O2 -march=native)
 
 
 option(BNK_BUILD_TESTS "build kernel tests" ON)

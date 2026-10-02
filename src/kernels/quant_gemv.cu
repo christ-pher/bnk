@@ -1,5 +1,6 @@
 // Decode-window GEMV kernels: dp4a over unpacked quant formats, and a float path.
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -107,6 +108,43 @@ __global__ void __launch_bounds__(256) gemv_dp4a_k(const uint8_t * __restrict__ 
                 }
             }
         }
+    }
+}
+
+// Reference path: dequantized weights times fp32 activations (no activation quantization).
+template <int FMT, int NT>
+__global__ void __launch_bounds__(256) gemv_ref_k(const uint8_t * __restrict__ W, size_t row_bytes, int rows, int nsb,
+                                                  const float * __restrict__ x, int64_t ldx, int T,
+                                                  float * __restrict__ y, int64_t ldy, int accumulate) {
+    const int lane = threadIdx.x & 31;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int nwarps = (gridDim.x * blockDim.x) >> 5;
+    for (int r = warp; r < rows; r += nwarps) {
+        const uint8_t * row = W + (size_t) r * row_bytes;
+        float acc[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+        for (int sb = lane; sb < nsb; sb += 32) {
+            Unpacked u;
+            unpack_sub<FMT>(row, sb, u);
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const float w = (k < 16 ? u.d0 : u.d1) * (float) (int8_t) (u.w[k / 4] >> (8 * (k % 4))) - (k < 16 ? u.m0 : u.m1);
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+                    if (t < T) acc[t] += w * x[t * ldx + sb * 32 + k];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], o);
+        }
+        if (lane == 0)
+            for (int t = 0; t < NT && t < T; ++t) {
+                float * yp = y + t * ldy + r;
+                *yp = accumulate ? *yp + acc[t] : acc[t];
+            }
     }
 }
 
@@ -238,8 +276,23 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
     else launch_dp4a<8>(W, *a, T, y, ldy, accumulate, s);
 }
 
+static bool use_ref_gemv() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("BNK_GEMV_REF"); v = e && *e == '1'; }
+    return v == 1;
+}
+
 void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,
                ActQ8 & scratch, cudaStream_t s) {
+    if (!is_float_format(W.type) && use_ref_gemv()) {
+        const int grid = grid_for_rows(W.rows, 8);
+        auto f = [&]<int FMT>() {
+            gemv_ref_k<FMT, 8><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows,
+                                                    (int) (W.cols / 32), x, ldx, T, y, ldy, accumulate ? 1 : 0);
+        };
+        BNK_DISPATCH_DP4A(W.type, f);
+        return;
+    }
     if (is_float_format(W.type)) {
         gemv(W, nullptr, x, ldx, T, y, ldy, accumulate, s);
     } else {
