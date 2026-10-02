@@ -14,11 +14,11 @@ export function SystemPage({ range }: { range: Range }) {
   const ramGiB = (live?.ram_total_mb ?? 0) / 1024
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-2">
+    <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2 xl:grid-cols-3">
       <Card>
         <CardHeader>
           <CardTitle>GPU utilization</CardTitle>
-          <CardDescription>{gpu?.name ?? "GPU"} · SM busy share</CardDescription>
+          <CardDescription>{gpu?.name ?? "GPU"}</CardDescription>
           <CardAction><Badge variant="outline" className="tabular">{fmt.n(live?.gpu?.util)}%</Badge></CardAction>
         </CardHeader>
         <CardContent>
@@ -38,9 +38,7 @@ export function SystemPage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>PCIe traffic</CardTitle>
-          <CardDescription>
-            Gen {gpu?.pcie_gen ?? "—"} x{gpu?.pcie_width ?? "—"} · expert transfers on misses and cache swaps
-          </CardDescription>
+          <CardDescription>Gen {gpu?.pcie_gen ?? "—"} x{gpu?.pcie_width ?? "—"} · expert transfers</CardDescription>
         </CardHeader>
         <CardContent>
           <TimeChart
@@ -57,7 +55,7 @@ export function SystemPage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>GPU temperature</CardTitle>
-          <CardDescription>Core temperature · SM clock {fmt.n(live?.gpu?.sm_clock)} MHz</CardDescription>
+          <CardDescription>SM clock {fmt.n(live?.gpu?.sm_clock)} MHz</CardDescription>
           <CardAction><Badge variant="outline" className="tabular">{fmt.n(live?.gpu?.temp_c)} °C</Badge></CardAction>
         </CardHeader>
         <CardContent>
@@ -85,7 +83,7 @@ export function SystemPage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>CPU</CardTitle>
-          <CardDescription>All cores · the expert pool runs {live?.cpu_threads ?? "—"} threads</CardDescription>
+          <CardDescription>{cores.length || "—"} cores · {live?.cpu_threads ?? "—"} expert threads</CardDescription>
           <CardAction><Badge variant="outline" className="tabular">{fmt.n(history.at(-1)?.cpu)}%</Badge></CardAction>
         </CardHeader>
         <CardContent className="grid gap-4">

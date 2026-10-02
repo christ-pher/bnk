@@ -2,7 +2,7 @@
 //
 // The server sends `init` (everything it has), then `live` (~4/s, the engine's latest snapshot), `sample`
 // (1/s, rates computed server-side from cumulative counters), `request` (a finished request) and `log`.
-import { useSyncExternalStore } from "react"
+import { useEffect, useState, useSyncExternalStore } from "react"
 
 export type Phase = "idle" | "prefill" | "decode"
 
@@ -180,15 +180,7 @@ function connect() {
       log: o.log.map((line) => ({ t: 0, line })),
     })
   })
-  es.addEventListener("live", (e) => {
-    const l = JSON.parse((e as MessageEvent).data) as Live
-    const lastSnap = layerSnaps[layerSnaps.length - 1]
-    if (l.layer_routed && (!lastSnap || l.t - lastSnap.t >= 1)) {
-      layerSnaps.push({ t: l.t, routed: l.layer_routed, misses: l.layer_misses })
-      if (layerSnaps.length > 3700) layerSnaps.shift()
-    }
-    set({ conn: "open", live: l })
-  })
+  es.addEventListener("live", (e) => set({ conn: "open", live: JSON.parse((e as MessageEvent).data) }))
   es.addEventListener("sample", (e) => {
     const s = JSON.parse((e as MessageEvent).data) as Sample
     const h = state.history.length >= MAX_HISTORY ? state.history.slice(1) : state.history.slice()
@@ -223,23 +215,25 @@ export function useTelemetry<T>(select: (s: State) => T): T {
   return useSyncExternalStore(subscribe, () => select(state))
 }
 
-// Per-layer routing counters, one snapshot a second, for windowed per-layer miss rates.
-const layerSnaps: { t: number; routed: number[]; misses: number[] }[] = []
-
-// Per-layer (uses, CPU misses) over the last `seconds` (or as far back as this page has seen); null when no
-// expert was used in that window.
-export function layerWindow(live: Live, seconds: number | null): { routed: number[]; misses: number[] } {
-  if (seconds == null || !layerSnaps.length) return { routed: live.layer_routed, misses: live.layer_misses }
-  const t0 = live.t - seconds
-  let base = layerSnaps[0]
-  for (const s of layerSnaps) {
-    if (s.t <= t0) base = s
-    else break
-  }
-  return {
-    routed: live.layer_routed.map((v, i) => v - (base.routed[i] ?? 0)),
-    misses: live.layer_misses.map((v, i) => v - (base.misses[i] ?? 0)),
-  }
+// Per-layer (uses, CPU misses) over the last `seconds` (null: lifetime), from the server's 1 s history; polled
+// while the caller is mounted.
+export function useLayerWindow(seconds: number | null): { routed: number[]; misses: number[] } | null {
+  const [w, setW] = useState<{ routed: number[]; misses: number[] } | null>(null)
+  useEffect(() => {
+    let alive = true
+    const load = () =>
+      fetch(`/api/layers?window=${seconds ?? "life"}`)
+        .then((r) => r.json())
+        .then((j) => alive && setW(j))
+        .catch(() => {})
+    load()
+    const id = window.setInterval(load, 2000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [seconds])
+  return w
 }
 
 // Seconds a time window covers, for the range selector shared by every chart.

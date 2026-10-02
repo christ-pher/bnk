@@ -1,5 +1,6 @@
 import { Bar, BarChart, CartesianGrid, Scatter, ScatterChart, XAxis, YAxis, ZAxis } from "recharts"
 
+import { StatCard } from "@/components/dash/stat-card"
 import { TimeChart } from "@/components/dash/time-chart"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
@@ -15,7 +16,18 @@ export function PerformancePage({ range }: { range: Range }) {
   const perRound = (v?: number) => (life && life.rounds ? (v ?? 0) / life.rounds : null)
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-2">
+    <div className="flex flex-col gap-4 md:gap-6">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="Verify pass" value={fmt.ms(perRound(life?.verify_ms))} unit="/ round"
+          footer={<span>Full model over the drafted window</span>} />
+        <StatCard label="CPU experts" value={fmt.ms(perRound(life?.cpu_expert_ms))} unit="/ round"
+          footer={<span>Inside the verify pass, overlapped with the GPU</span>} />
+        <StatCard label="Drafting" value={fmt.ms(perRound(life?.draft_ms))} unit="/ round"
+          footer={<span>MTP layer proposing the next tokens</span>} />
+        <StatCard label="Rounds" value={fmt.compact(life?.rounds)}
+          footer={<span>{fmt.n(life && life.rounds ? life.gen_tokens / life.rounds : null, 2)} tokens each, since the engine started</span>} />
+      </div>
+    <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2 xl:grid-cols-3">
       <Card>
         <CardHeader>
           <CardTitle>Decode speed</CardTitle>
@@ -28,7 +40,7 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Prompt processing</CardTitle>
-          <CardDescription>New prompt tokens per second while reading a prompt</CardDescription>
+          <CardDescription>New tokens per second while reading a prompt</CardDescription>
         </CardHeader>
         <CardContent>
           <TimeChart rows={rows} series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]} unit="tok/s" />
@@ -37,7 +49,7 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Tokens per verify round</CardTitle>
-          <CardDescription>1 + accepted drafts; each round is one pass of the full model</CardDescription>
+          <CardDescription>1 + accepted drafts per full-model pass</CardDescription>
         </CardHeader>
         <CardContent>
           <TimeChart rows={rows} kind="line" series={[{ key: "tpr", label: "Tokens / round", color: "var(--chart-3)", value: (r) => r.tokens_per_round, missing: "connect" }]} digits={2} />
@@ -56,11 +68,11 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Decode speed by request</CardTitle>
-          <CardDescription>The last {reqs.length} requests, oldest first</CardDescription>
+          <CardDescription>Last {reqs.length} requests, oldest first</CardDescription>
         </CardHeader>
         <CardContent>
           {reqs.length ? (
-            <ChartContainer config={{ tps: { label: "Decode", color: "var(--chart-1)" } }} className="aspect-auto h-[220px] w-full">
+            <ChartContainer config={{ tps: { label: "Decode", color: "var(--chart-1)" } }} className="aspect-auto h-[200px] w-full">
               <BarChart data={reqs} margin={{ top: 8, right: 8 }} barCategoryGap={2}>
                 <CartesianGrid vertical={false} strokeOpacity={0.5} />
                 <XAxis dataKey="n" tickLine={false} axisLine={false} tickMargin={6} minTickGap={16} />
@@ -89,11 +101,11 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Prompt speed by prompt size</CardTitle>
-          <CardDescription>Longer prompts amortize the expert transfers over more tokens</CardDescription>
+          <CardDescription>New tokens vs. speed, per request</CardDescription>
         </CardHeader>
         <CardContent>
           {reqs.length ? (
-            <ChartContainer config={{ pf: { label: "Prefill", color: "var(--chart-2)" } }} className="aspect-auto h-[220px] w-full">
+            <ChartContainer config={{ pf: { label: "Prefill", color: "var(--chart-2)" } }} className="aspect-auto h-[200px] w-full">
               <ScatterChart margin={{ top: 8, right: 8 }}>
                 <CartesianGrid strokeOpacity={0.5} />
                 <XAxis dataKey="fresh" type="number" name="New prompt tokens" domain={[0, "auto"]}
@@ -129,33 +141,11 @@ export function PerformancePage({ range }: { range: Range }) {
           )}
         </CardContent>
       </Card>
-
-      <Card className="xl:col-span-2">
-        <CardHeader>
-          <CardTitle>Where a decode round goes</CardTitle>
-          <CardDescription>Averages over every round since the engine started</CardDescription>
-        </CardHeader>
-        <CardContent className="grid grid-cols-2 gap-6 sm:grid-cols-4">
-          <Figure label="Verify pass" value={fmt.ms(perRound(life?.verify_ms))} note="Full model over the drafted window" />
-          <Figure label="CPU experts" value={fmt.ms(perRound(life?.cpu_expert_ms))} note="Inside the verify pass, overlapped with the GPU" />
-          <Figure label="Drafting" value={fmt.ms(perRound(life?.draft_ms))} note="MTP layer proposing the next tokens" />
-          <Figure label="Rounds" value={fmt.compact(life?.rounds)} note={`${fmt.n(life && life.rounds ? life.gen_tokens / life.rounds : null, 2)} tokens each`} />
-        </CardContent>
-      </Card>
     </div>
-  )
-}
-
-function Figure({ label, value, note }: { label: string; value: string; note: string }) {
-  return (
-    <div className="grid content-start gap-1">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      <span className="text-2xl font-semibold tabular">{value}</span>
-      <span className="text-xs text-muted-foreground">{note}</span>
     </div>
   )
 }
 
 export function NoData({ text = "No requests yet" }: { text?: string }) {
-  return <div className="flex h-[220px] items-center justify-center text-sm text-muted-foreground">{text}</div>
+  return <div className="flex h-[200px] items-center justify-center text-sm text-muted-foreground">{text}</div>
 }

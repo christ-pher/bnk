@@ -1,13 +1,13 @@
 import { useState } from "react"
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
 
+import { StatCard } from "@/components/dash/stat-card"
 import { TimeChart } from "@/components/dash/time-chart"
-import { Badge } from "@/components/ui/badge"
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { fmt } from "@/lib/format"
-import { layerWindow, RANGES, useTelemetry, windowed, type Range } from "@/lib/telemetry"
+import { RANGES, useLayerWindow, useTelemetry, windowed, type Range } from "@/lib/telemetry"
 
 import { NoData } from "./performance"
 
@@ -16,9 +16,10 @@ export function ExpertsPage({ range }: { range: Range }) {
   const history = useTelemetry((s) => s.history)
   const [win, setWin] = useState<"range" | "life">("range")
   const rows = windowed(history, range)
+  const fetched = useLayerWindow(win === "life" ? null : RANGES[range])
   if (!live?.layer_slots) return <NoData text="Waiting for the engine…" />
 
-  const w = layerWindow(live, win === "life" ? null : RANGES[range])
+  const w = fetched ?? { routed: live.layer_slots.map(() => 0), misses: live.layer_slots.map(() => 0) }
   const layers = live.layer_slots.map((slots, il) => ({
     layer: il,
     resident: slots / live.n_expert,
@@ -31,14 +32,27 @@ export function ExpertsPage({ range }: { range: Range }) {
   const totalM = w.misses.reduce((a, b) => a + b, 0)
   const worst = [...layers].filter((l) => l.miss != null).sort((a, b) => (b.miss ?? 0) - (a.miss ?? 0)).slice(0, 5)
 
+  const swaps = rows.reduce((a, r) => a + (r.swaps ?? 0), 0)
+  const lf = live.life
   return (
-    <div className="grid grid-cols-1 gap-4 md:gap-6 xl:grid-cols-3">
+    <div className="flex flex-col gap-4 md:gap-6">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="VRAM hit rate" value={totalR ? fmt.pct(1 - totalM / totalR, 1) : "—"}
+          footer={<span>{win === "life" ? "Lifetime" : `Last ${range}`} · lifetime {fmt.pct(lf.routed ? 1 - lf.misses / lf.routed : null, 1)}</span>} />
+        <StatCard label="CPU misses" value={fmt.compact(totalM)}
+          footer={<span>of {fmt.compact(totalR)} expert uses in the window</span>} />
+        <StatCard label="Experts resident" value={fmt.n(live.experts_resident)} unit={`/ ${fmt.n(live.experts_total)}`}
+          footer={<span>{fmt.pct(live.experts_resident / live.experts_total)} of all experts · {fmt.n(live.expert_cache_gb, 1)} GiB of VRAM</span>} />
+        <StatCard label="Cache swaps" value={fmt.compact(swaps)}
+          footer={<span>Last {range} · {fmt.compact(lf.swaps)} since the engine started</span>} />
+      </div>
+    <div className="grid grid-cols-1 gap-4 md:gap-6 lg:grid-cols-2 xl:grid-cols-3">
       <Card className="xl:col-span-2">
         <CardHeader>
           <CardTitle>CPU misses by layer</CardTitle>
           <CardDescription>
-            Share of expert uses not resident in VRAM (served by the CPU) ·{" "}
-            {totalR ? `${fmt.pct(totalM / totalR, 1)} overall, ${fmt.compact(totalR)} uses` : "no traffic in this window"}
+            Uses served by the CPU (not in VRAM) ·{" "}
+            {totalR ? `${fmt.pct(totalM / totalR, 1)} overall` : "no traffic in this window"}
           </CardDescription>
           <CardAction>
             <ToggleGroup type="single" variant="outline" size="sm" value={win} onValueChange={(v) => v && setWin(v as "range" | "life")}>
@@ -49,7 +63,7 @@ export function ExpertsPage({ range }: { range: Range }) {
         </CardHeader>
         <CardContent>
           {totalR ? (
-            <ChartContainer config={{ miss: { label: "Miss rate", color: "var(--chart-1)" } }} className="aspect-auto h-[260px] w-full">
+            <ChartContainer config={{ miss: { label: "Miss rate", color: "var(--chart-1)" } }} className="aspect-auto h-[300px] w-full">
               <BarChart data={layers} margin={{ top: 8, right: 8 }} barCategoryGap={2}>
                 <CartesianGrid vertical={false} strokeOpacity={0.5} />
                 <XAxis dataKey="layer" tickLine={false} axisLine={false} interval={3} tickMargin={6} />
@@ -104,13 +118,10 @@ export function ExpertsPage({ range }: { range: Range }) {
         </CardContent>
       </Card>
 
-      <Card className="xl:col-span-2">
+      <Card>
         <CardHeader>
           <CardTitle>VRAM residency by layer</CardTitle>
-          <CardDescription>Cache slots per layer, sized from the routing statistics ({fmt.n(live.expert_cache_gb, 1)} GiB in all)</CardDescription>
-          <CardAction>
-            <Badge variant="outline" className="tabular">{fmt.n(live.experts_resident)} / {fmt.n(live.experts_total)}</Badge>
-          </CardAction>
+          <CardDescription>Cache slots per layer, sized from routing stats</CardDescription>
         </CardHeader>
         <CardContent>
           <ChartContainer config={{ resident: { label: "Resident", color: "var(--chart-1)" } }} className="aspect-auto h-[200px] w-full">
@@ -146,15 +157,16 @@ export function ExpertsPage({ range }: { range: Range }) {
         </CardContent>
       </Card>
 
-      <Card className="xl:col-span-3">
+      <Card>
         <CardHeader>
           <CardTitle>VRAM hit rate</CardTitle>
-          <CardDescription>Share of expert uses served from the VRAM cache, per second of traffic</CardDescription>
+          <CardDescription>Expert uses served from VRAM, per second</CardDescription>
         </CardHeader>
         <CardContent>
           <TimeChart rows={rows} kind="line" series={[{ key: "hit", label: "Hit rate", color: "var(--chart-1)", value: (r) => (r.miss_rate == null ? null : 100 * (1 - r.miss_rate)), missing: "connect" }]} unit="%" digits={1} domain={[0, 100]} />
         </CardContent>
       </Card>
+    </div>
     </div>
   )
 }

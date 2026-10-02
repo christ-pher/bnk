@@ -245,6 +245,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self._overview())
         if path == "/api/stream":
             return self._stream()
+        if path == "/api/layers":
+            q = dict(x.split("=", 1) for x in self.path.partition("?")[2].split("&") if "=" in x)
+            w = q.get("window", "life")
+            return self._json(200, S.telemetry.layer_window(None if w == "life" else float(w)))
         if path == "/health":
             return self._json(200 if S.engine.alive() else 503, {"status": "ok" if S.engine.alive() else "down"})
         if path.startswith("/v1/") or path.startswith("/api/"):

@@ -136,6 +136,7 @@ class Telemetry:
         self.cpu = CpuSampler()
         self.cores: list[float] = []
         self._prev: dict | None = None
+        self.layer_hist: collections.deque = collections.deque(maxlen=self.HISTORY + 60)  # (t, routed, misses)
         self._last_live = 0.0
         self.lock = threading.Lock()
         threading.Thread(target=self._sampler, daemon=True).start()
@@ -201,4 +202,23 @@ class Telemetry:
                  "gpu_temp_c": g.get("temp_c"), "pcie_rx_mbs": g.get("pcie_rx_mbs"),
                  "pcie_tx_mbs": g.get("pcie_tx_mbs"), "pos": cur.get("pos")}
             self.history.append(s)
+            if cur.get("layer_routed") is not None:
+                self.layer_hist.append((cur.get("t", 0), cur["layer_routed"], cur["layer_misses"]))
             self.bus.publish("sample", s)
+
+    def layer_window(self, seconds: float | None) -> dict:
+        """Per-layer expert uses and CPU misses over the last `seconds` (None: since the engine started)."""
+        with self.lock:
+            cur = dict(self.latest)
+        routed, misses = cur.get("layer_routed") or [], cur.get("layer_misses") or []
+        if seconds is None or not self.layer_hist:
+            return {"routed": routed, "misses": misses, "seconds": None}
+        t0 = cur.get("t", time.time()) - seconds
+        base = self.layer_hist[0]
+        for snap in self.layer_hist:
+            if snap[0] <= t0:
+                base = snap
+            else:
+                break
+        return {"routed": [a - b for a, b in zip(routed, base[1])], "misses": [a - b for a, b in zip(misses, base[2])],
+                "seconds": cur.get("t", 0) - base[0]}
