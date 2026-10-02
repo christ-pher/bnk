@@ -34,6 +34,10 @@ void Engine::prefill_alloc(int N) {
     p.xg.alloc((size_t) N * k * E); p.gu.alloc((size_t) N * k * 2 * F); p.hh.alloc((size_t) N * k * F);
     p.dd.alloc((size_t) (N * k + 1) * E);   // + a zero row for pairs computed elsewhere
     p.cpu.alloc((size_t) N * E);
+    if (qsa_on_) {
+        p.ik.alloc((size_t) N * c.idx_dim); p.iq.alloc((size_t) N * c.idx_heads * c.idx_dim);
+        p.scores.alloc((size_t) 64 * max_blocks_); p.sel.alloc((size_t) 64 * qsh_.top_blocks); p.nsel.alloc(64);
+    }
     p.xq.alloc((size_t) N * E); p.xd.alloc((size_t) N * E / 32);
     p.hq.alloc((size_t) N * k * F); p.hd.alloc((size_t) N * k * F / 32); p.gu32.alloc((size_t) N * k * 2 * F);
     p.max_items = N * k / 1 + c.n_expert;
@@ -200,13 +204,53 @@ void Engine::pf_attn(int il, int N) {
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     auto & p = pf_;
     const int pos0 = pos() - N;
+    auto attention_prefill_rows = [&](int t0, int t1) {
+        CUDA_CHECK(cudaMemsetAsync(p.nsel.p, 0, 64 * 4, st_));
+        qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, t0, t1, qsh_, pos0,
+                              1.f / sqrtf((float) D), st_);
+    };
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.wq, gemm_.xbuf(), E, N, p.qfull, H * D * 2);
     gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
     attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, kc_[il], vc_[il], N, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_);
-    attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
+    if (kraw_[il].p) {
+        gemm_.run_h(L.idx_k, gemm_.xbuf(), E, N, p.ik, c.idx_dim);
+        gemm_.run_h(L.idx_q, gemm_.xbuf(), E, N, p.iq, c.idx_heads * c.idx_dim);
+        qsa_store_keys(p.ik, kraw_[il], N, c.idx_dim, &d_par_->pos0, st_);
+        qsa_queries(p.iq, F(L.idx_q_norm), N, qsh_, &d_par_->pos0, st_);
+        qsa_pool(kraw_[il], F(L.idx_k_norm), pooled_[il], N, qsh_, &d_par_->pos0, st_);
+        // rows past the dense limit select blocks; 64 rows at a time bound the score scratch
+        for (int t0 = 0; t0 < N; t0 += 64) {
+            const int t1 = std::min(N, t0 + 64);
+            if (pos0 + t1 <= qsh_.dense_cells()) {
+                attention_prefill_rows(t0, t1);
+                continue;
+            }
+            qsa_select(p.iq.p + (size_t) t0 * c.idx_heads * c.idx_dim, pooled_[il], p.scores, max_blocks_, p.sel,
+                       p.nsel, t1 - t0, qsh_, &d_par_->pos0, t0, st_);
+            qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, t0, t1, qsh_, pos0,
+                                  1.f / sqrtf((float) D), st_);
+            static const char * dsel = getenv("BNK_DUMP_SEL");
+            if (dsel && il == env_int("BNK_DUMP_SEL_LAYER", 3)) {
+                std::vector<int32_t> h((size_t) (t1 - t0) * qsh_.top_blocks), hn(t1 - t0);
+                CUDA_CHECK(cudaStreamSynchronize(st_));
+                CUDA_CHECK(cudaMemcpy(h.data(), p.sel.p, h.size() * 4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hn.data(), p.nsel.p, hn.size() * 4, cudaMemcpyDeviceToHost));
+                FILE * f = fopen(dsel, "ab");
+                for (int t = 0; t < t1 - t0; ++t) {
+                    const int32_t row = pos0 + t0 + t;
+                    fwrite(&row, 4, 1, f);
+                    fwrite(&hn[t], 4, 1, f);
+                    fwrite(h.data() + (size_t) t * qsh_.top_blocks, 4, qsh_.top_blocks, f);
+                }
+                fclose(f);
+            }
+        }
+    } else {
+        attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
+    }
     gemm_.run(L.wo, p.ao, H * D, N, p.out, E);
 }
 

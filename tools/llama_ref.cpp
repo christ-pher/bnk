@@ -4,6 +4,7 @@
 // whose name starts with one of the filters (e.g. "l_last-", "attn_output-3"), OUT_PREFIX.<name>
 // as raw float32 in ggml's memory order. Default filter: "l_last-" (the HC residual after each layer).
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -26,8 +27,8 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * ud) {
     for (auto & f : d->filters)
         if (name.rfind(f, 0) == 0) want = true;
     if (ask) return want;
-    if (!want || t->type != GGML_TYPE_F32) return true;
-    std::vector<float> buf(ggml_nelements(t));
+    if (!want || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32)) return true;
+    std::vector<float> buf(ggml_nelements(t));  // 4-byte elements either way
     if (ggml_is_contiguous(t)) {
         ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
     } else {
@@ -69,7 +70,7 @@ int main(int argc, char ** argv) {
     auto cp = llama_context_default_params();
     cp.n_ctx = 4096;
     cp.n_batch = 4096;
-    cp.n_ubatch = 4096;
+    cp.n_ubatch = getenv("REF_UBATCH") ? atoi(getenv("REF_UBATCH")) : 4096;
     cp.n_threads = 24;
     cp.n_threads_batch = 24;
     cp.cb_eval = eval_cb;

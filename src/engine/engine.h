@@ -20,6 +20,7 @@
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
+#include "kernels/qsa.h"
 
 namespace bnk {
 
@@ -86,6 +87,10 @@ public:
     const float * logits_dev() const { return logits_; }
 
     int pos() const { return (int) history_.size(); }
+    const std::vector<int32_t> & history() const { return history_; }
+    int max_ctx() const { return opt_.max_ctx; }
+    void logits_rows_host(int T, float * out);   // rows 0..T-1 of the last window's logits
+    void set_mtp_pending(const float * R_row_dev, int cell);
     const Config & cfg() const { return model_.cfg; }
     const Model & model() const { return model_; }
     const ExpertCache & cache() const { return cache_; }
@@ -170,7 +175,14 @@ private:
     std::vector<DevBuf<float>> ssm_state_;  // [nv][S][S]
     std::vector<DevBuf<float>> gdn_co_, gdn_g_, gdn_b_;  // per GDN layer: the window's conv outputs, decay, beta
     std::vector<DevBuf<half>> kc_, vc_;     // [max_ctx][Hkv][D] per attention layer
-    bool qsa_warned_ = false;
+    // QSA: raw indexer keys and pooled block keys per attention layer, selection scratch
+    std::vector<DevBuf<half>> kraw_;
+    std::vector<DevBuf<float>> pooled_;
+    DevBuf<float> ik_, iq_, qsa_scores_;
+    DevBuf<int32_t> qsa_sel_, qsa_nsel_;
+    QsaShape qsh_{};
+    int max_blocks_ = 0;
+    bool qsa_on_ = false;
 
     // ---- batched prompt processing
     Gemm gemm_;
@@ -192,6 +204,8 @@ private:
         bool prefetch = false;                    // this chunk streams every non-resident expert ahead
         float * h_x = nullptr, * h_cpu = nullptr; // pinned: the chunk's MoE input, the CPU experts' output
         DevBuf<float> cpu;                        // [N][E] the CPU part on the device
+        DevBuf<float> ik, iq, scores;             // QSA for prompt rows
+        DevBuf<int32_t> sel, nsel;
         DevBuf<int8_t> xq, hq;                    // list path: the chunk's input quantized; h per pair
         DevBuf<float> xd, hd, gu32;
         DevBuf<uint8_t> items;                    // PfItem[]

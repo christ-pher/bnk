@@ -121,6 +121,11 @@ int main(int argc, char ** argv) {
             for (int il = 0; il < c.n_layer; ++il) {
                 if (ref_layers[il].size() < (p + T) * HC) continue;
                 lerr[il] = std::max(lerr[il], rel_rms(eng.dumped_layers[il].data(), ref_layers[il].data() + p * HC, T * HC));
+                static const bool lt = getenv("BNK_LAYER_TRACE") != nullptr;
+                if (lt)
+                    for (int t = 0; t < T; ++t)
+                        fprintf(stderr, "LE %d %zu %.5f\n", il, p + t,
+                                rel_rms(eng.dumped_layers[il].data() + t * HC, ref_layers[il].data() + (p + t) * HC, HC));
             }
             for (int t = 0; t < T; ++t) {
                 auto lg = eng.logits_host(t);
@@ -141,6 +146,14 @@ int main(int argc, char ** argv) {
                 }
                 kl_sum += kl;
                 kl_max = std::max(kl_max, kl);
+                static const char * dl = getenv("BNK_DUMP_LOGITS");
+                if (dl) {
+                    FILE * f = fopen(dl, (p + t) == 0 ? "wb" : "ab");
+                    fwrite(lg.data(), 4, c.n_vocab, f);
+                    fclose(f);
+                }
+                static const bool trace = getenv("BNK_KL_TRACE") != nullptr;
+                if (trace) fprintf(stderr, "KL %zu %.5f\n", p + t, kl);
             }
         }
         for (int il = 0; il < c.n_layer; ++il) printf("layer %2d  max rel rms vs llama.cpp %.3e\n", il, lerr[il]);

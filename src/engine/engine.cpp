@@ -101,6 +101,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     }
     conv_buf_.resize(c.n_layer);
     ssm_state_.resize(c.n_layer);
+    kraw_.resize(c.n_layer);
+    pooled_.resize(c.n_layer);
     gdn_co_.resize(c.n_layer);
     gdn_g_.resize(c.n_layer);
     gdn_b_.resize(c.n_layer);
@@ -112,6 +114,12 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             kc_[il].alloc((size_t) opt.max_ctx * c.n_head_kv * c.head_dim);
             vc_[il].alloc((size_t) opt.max_ctx * c.n_head_kv * c.head_dim);
             state_bytes += 2 * kc_[il].n * sizeof(half);
+            if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
+                kraw_[il].alloc((size_t) opt.max_ctx * c.idx_dim);
+                pooled_[il].alloc((size_t) (opt.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim);
+                state_bytes += kraw_[il].n * 2 + pooled_[il].n * 4;
+                qsa_on_ = true;
+            }
         } else {
             conv_buf_[il].alloc((size_t) (c.ssm_conv - 1 + W) * C);
             ssm_state_[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
@@ -120,6 +128,15 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             gdn_b_[il].alloc((size_t) W * c.ssm_vheads);
             state_bytes += (conv_buf_[il].n + ssm_state_[il].n) * 4;
         }
+    }
+    if (qsa_on_) {
+        int r = 0;
+        for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
+        qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
+                        c.rope_base, c.rms_eps};
+        max_blocks_ = opt.max_ctx / r + 1;
+        ik_.alloc(W * c.idx_dim); iq_.alloc(W * c.idx_heads * c.idx_dim);
+        qsa_scores_.alloc((size_t) W * max_blocks_); qsa_sel_.alloc((size_t) W * (c.idx_top_k / r)); qsa_nsel_.alloc(W);
     }
     if (opt.verbose)
         fprintf(stderr, "bnk: context %d, KV + recurrent state %.2f GiB, %d CPU expert threads\n", opt.max_ctx,
@@ -317,8 +334,20 @@ void Engine::attn(int il, int T) {
     gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
     attn_prep(qfull_, k_, v_, F(L.q_norm), F(L.k_norm), q_, kc_[il], vc_[il], T, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_);
-    attention(q_, kc_[il], vc_[il], qfull_, attn_o_, T, H, Hkv, D, &d_par_->pos0, 1.f / sqrtf((float) D),
-              attn_scratch_, st_);
+    if (kraw_[il].p) {
+        // QSA: indexer keys and queries, pooled blocks, the per-query block selection, sparse attention
+        gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, st_);
+        qsa_store_keys(ik_, kraw_[il], T, c.idx_dim, &d_par_->pos0, st_);
+        gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, st_);
+        qsa_queries(iq_, F(L.idx_q_norm), T, qsh_, &d_par_->pos0, st_);
+        qsa_pool(kraw_[il], F(L.idx_k_norm), pooled_[il], T, qsh_, &d_par_->pos0, st_);
+        qsa_select(iq_, pooled_[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, T, qsh_, &d_par_->pos0, 0, st_);
+        qsa_attention(q_, kc_[il], vc_[il], qfull_, qsa_sel_, qsa_nsel_, attn_o_, T, qsh_, &d_par_->pos0,
+                      1.f / sqrtf((float) D), attn_scratch_, st_);
+    } else {
+        attention(q_, kc_[il], vc_[il], qfull_, attn_o_, T, H, Hkv, D, &d_par_->pos0, 1.f / sqrtf((float) D),
+                  attn_scratch_, st_);
+    }
     gemv_auto(L.wo, attn_o_, H * D, T, out_, E, false, act_, st_);
 }
 
@@ -507,6 +536,17 @@ void Engine::argmax_all(int T, int32_t * out) {
     argmax_rows(logits_.p, T, model_.cfg.n_vocab, argmax_dev_, st_);
     CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+void Engine::logits_rows_host(int T, float * out) {
+    CUDA_CHECK(cudaMemcpy(out, logits_.p, (size_t) T * model_.cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
+}
+
+void Engine::set_mtp_pending(const float * R_row_dev, int cell) {
+    if (!mtp_.loaded()) return;
+    if (!mtp_R_) CUDA_CHECK(cudaMalloc(&mtp_R_, (size_t) model_.cfg.hc_dim() * 4));
+    CUDA_CHECK(cudaMemcpyAsync(mtp_R_, R_row_dev, (size_t) model_.cfg.hc_dim() * 4, cudaMemcpyDeviceToDevice, st_));
+    mtp_cell_ = cell;
 }
 
 std::vector<float> Engine::logits_host(int t) {

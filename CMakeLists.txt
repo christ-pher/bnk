@@ -48,9 +48,11 @@ add_library(bnk_core STATIC
   src/kernels/rfmt.cpp
   src/kernels/ops.cu
   src/kernels/moe.cu
+  src/kernels/qsa.cu
   src/engine/engine.cpp
   src/engine/mtp.cpp
   src/engine/generate.cpp
+  src/engine/sampler.cpp
   src/engine/prefill.cpp
   src/kernels/gemm.cu
 )

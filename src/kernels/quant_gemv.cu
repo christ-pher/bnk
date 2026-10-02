@@ -119,10 +119,10 @@ __global__ void __launch_bounds__(256) gemv_dp4a_k(const uint8_t * __restrict__ 
 }
 
 // Reference path: dequantized weights times fp32 activations (no activation quantization).
-template <int FMT, int NT>
+template <int FMT, int NT, bool RLAY>
 __global__ void __launch_bounds__(256) gemv_ref_k(const uint8_t * __restrict__ W, size_t row_bytes, int rows, int nsb,
                                                   const float * __restrict__ x, int64_t ldx, int T,
-                                                  float * __restrict__ y, int64_t ldy, int accumulate) {
+                                                  float * __restrict__ y, int64_t ldy, int accumulate, ROff ro) {
     const int lane = threadIdx.x & 31;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int nwarps = (gridDim.x * blockDim.x) >> 5;
@@ -133,7 +133,8 @@ __global__ void __launch_bounds__(256) gemv_ref_k(const uint8_t * __restrict__ W
         for (int t = 0; t < NT; ++t) acc[t] = 0.f;
         for (int sb = lane; sb < nsb; sb += 32) {
             Unpacked u;
-            unpack_sub<FMT>(row, sb, u);
+            if constexpr (RLAY) RT<FMT>::unpack(row, ro, sb, u);
+            else unpack_sub<FMT>(row, sb, u);
 #pragma unroll
             for (int k = 0; k < 32; ++k) {
                 const float w = (k < 16 ? u.d0 : u.d1) * (float) (int8_t) (u.w[k / 4] >> (8 * (k % 4))) - (k < 16 ? u.m0 : u.m1);
@@ -302,9 +303,14 @@ void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, i
                ActQ8 & scratch, cudaStream_t s) {
     if (!is_float_format(W.type) && use_ref_gemv()) {
         const int grid = grid_for_rows(W.rows, 8);
+        const ROff ro{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
         auto f = [&]<int FMT>() {
-            gemv_ref_k<FMT, 8><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows,
-                                                    (int) (W.cols / 32), x, ldx, T, y, ldy, accumulate ? 1 : 0);
+            if (W.layout == 1)
+                gemv_ref_k<FMT, 8, true><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows,
+                                                              (int) (W.cols / 32), x, ldx, T, y, ldy, accumulate ? 1 : 0, ro);
+            else
+                gemv_ref_k<FMT, 8, false><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows,
+                                                               (int) (W.cols / 32), x, ldx, T, y, ldy, accumulate ? 1 : 0, ro);
         };
         BNK_DISPATCH_DP4A(W.type, f);
         return;
