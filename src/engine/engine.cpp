@@ -111,16 +111,28 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     gdn_b_.resize(c.n_layer);
     kc_.resize(c.n_layer);
     vc_.resize(c.n_layer);
-    size_t state_bytes = 0;
+    kv_k_ = std::vector<ElasticBuf>(c.n_layer);
+    kv_v_ = std::vector<ElasticBuf>(c.n_layer);
+    kv_raw_ = std::vector<ElasticBuf>(c.n_layer);
+    kv_pool_ = std::vector<ElasticBuf>(c.n_layer);
+    size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = 0; il < c.n_layer; ++il) {
         if (c.is_attn(il)) {
-            kc_[il].alloc((size_t) opt.max_ctx * c.n_head_kv * c.head_dim);
-            vc_[il].alloc((size_t) opt.max_ctx * c.n_head_kv * c.head_dim);
-            state_bytes += 2 * kc_[il].n * sizeof(half);
+            // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
+            const size_t kv = (size_t) opt.max_ctx * c.n_head_kv * c.head_dim;
+            kv_k_[il].reserve(kv * sizeof(half), &budget_, "KV cache");
+            kv_v_[il].reserve(kv * sizeof(half), &budget_, "KV cache");
+            kc_[il].view(kv_k_[il].as<half>(), kv);
+            vc_[il].view(kv_v_[il].as<half>(), kv);
+            kv_cell_bytes += 2 * (size_t) c.n_head_kv * c.head_dim * sizeof(half);
             if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
-                kraw_[il].alloc((size_t) opt.max_ctx * c.idx_dim);
-                pooled_[il].alloc((size_t) (opt.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim);
-                state_bytes += kraw_[il].n * 2 + pooled_[il].n * 4;
+                const size_t nraw = (size_t) opt.max_ctx * c.idx_dim;
+                const size_t npool = (size_t) (opt.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim;
+                kv_raw_[il].reserve(nraw * sizeof(half), &budget_, "indexer keys");
+                kv_pool_[il].reserve(npool * sizeof(float), &budget_, "indexer keys");
+                kraw_[il].view(kv_raw_[il].as<half>(), nraw);
+                pooled_[il].view(kv_pool_[il].as<float>(), npool);
+                kv_cell_bytes += c.idx_dim * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
                 qsa_on_ = true;
             }
         } else {
@@ -142,21 +154,33 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         qsa_scores_.alloc((size_t) W * max_blocks_); qsa_sel_.alloc((size_t) W * (c.idx_top_k / r)); qsa_nsel_.alloc(W);
     }
     if (opt.verbose)
-        fprintf(stderr, "bnk: context %d, KV + recurrent state %.2f GiB, %d CPU expert threads\n", opt.max_ctx,
+        fprintf(stderr, "bnk: context %d: %.0f KiB of KV per token (%.2f GiB when full, mapped as used), "
+                        "recurrent state %.2f GiB, %d CPU expert threads\n",
+                opt.max_ctx, kv_cell_bytes / 1024.0, (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
                 state_bytes / 1073741824.0, cpu_.threads());
 
-    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab);
-    if (opt.prefill_chunk > 0) prefill_alloc(opt.prefill_chunk);
+    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_);
+    pf_base_ = opt.prefill_chunk;
+    pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
+    if (opt.prefill_chunk > 0) {
+        prefill_alloc(pf_big_);
+        pf_arena_.reserve(prefill_arena_bytes(pf_big_), &budget_, "prompt buffers");
+    }
 
-    // the VRAM expert tier takes what is left, minus the prompt path's expert staging (which depends on how
-    // many experts each layer keeps: iterate to a fixed point)
+    // Everything elastic draws on one budget: what is free now, less a reserve for cuBLAS and graph workspaces.
+    // The context and the prompt buffers take their baseline; the expert tier takes the rest, less the prompt
+    // path's expert staging (which depends on how many experts each layer keeps: iterate to a fixed point).
     size_t free_b, total_b;
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     const size_t reserve = (size_t) (opt.vram_reserve_gib * 1073741824.0);
-    const size_t avail = free_b > reserve ? free_b - reserve : 0;
+    budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
+    budget_.reclaim = [this](size_t need) { return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0; };
+    ensure_ctx(std::min(opt.max_ctx, kCtxBaseline));
+    if (opt.prefill_chunk > 0) prefill_layout(pf_base_);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
     if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
     if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    const size_t avail = budget_.free();
     size_t budget = avail;
     if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
     if (opt.prefill_chunk > 0) {
@@ -165,15 +189,92 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             size_t need = 0;
             for (int il = 0; il < c.n_layer; ++il)
                 need = std::max(need, (size_t) (c.n_expert - slots[il]) * store_.blob_bytes(il));
+            need = vmem_round(need);
             const size_t want = avail > 2 * need ? avail - 2 * need : 0;
             const size_t nb = opt.expert_cache_gib >= 0 ? std::min(want, (size_t) (opt.expert_cache_gib * 1073741824.0)) : want;
             if (nb == budget) break;
             budget = nb;
         }
     }
-    cache_.init(model_, store_, budget, rank, st_, opt.verbose);
-    if (opt.prefill_chunk > 0) prefill_staging_alloc();
+    cache_.init(model_, store_, budget, rank, st_, opt.verbose, &budget_);
+    cache_ready_ = true;
+    if (opt.prefill_chunk > 0) {
+        prefill_staging_alloc();
+        if (opt.verbose)
+            fprintf(stderr, "bnk: prompt path: chunks of %d tokens (%d for long prompts), 2 x %.2f GiB of expert staging\n",
+                    pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
+    }
     reset();
+}
+
+// KV cells [0, cells) backed by VRAM, in steps of kCtxStep cells; the expert cache gives the bytes up.
+void Engine::ensure_ctx(int cells) {
+    cells = std::min(opt_.max_ctx, (cells + kCtxStep - 1) / kCtxStep * kCtxStep);
+    if (cells <= ctx_mapped_) return;
+    map_ctx(cells);
+}
+
+void Engine::map_ctx(int cells) {
+    const Config & c = model_.cfg;
+    const bool grow = cells > ctx_mapped_;
+    if (grow) {
+        // one reclaim for everything below (each buffer asking on its own would shrink the cache ~50 times)
+        size_t need = 0;
+        auto add = [&](const ElasticBuf & b, size_t bytes) {
+            if (b.reserved()) need += vmem_round(std::min(bytes, b.reserved())) - std::min(vmem_round(std::min(bytes, b.reserved())), b.mapped());
+        };
+        for (int il = 0; il < c.n_layer; ++il) {
+            const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
+            add(kv_k_[il], kv);
+            add(kv_v_[il], kv);
+            if (kv_raw_[il].reserved()) {
+                add(kv_raw_[il], (size_t) cells * c.idx_dim * sizeof(half));
+                add(kv_pool_[il], (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
+            }
+        }
+        if (mtp_.loaded()) need += mtp_.ctx_bytes_needed(cells);
+        if (!budget_.make_room(need)) throw std::runtime_error("not enough VRAM for a context of " + std::to_string(cells));
+    }
+    for (int il = 0; il < c.n_layer; ++il) {
+        if (!kv_k_[il].reserved()) continue;
+        const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
+        if (grow) {
+            kv_k_[il].ensure(kv);
+            kv_v_[il].ensure(kv);
+        } else {
+            kv_k_[il].shrink_to(kv);
+            kv_v_[il].shrink_to(kv);
+        }
+        if (kv_raw_[il].reserved()) {
+            const size_t raw = (size_t) cells * c.idx_dim * sizeof(half);
+            const size_t pool = (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float);
+            if (grow) {
+                kv_raw_[il].ensure(raw);
+                kv_pool_[il].ensure(pool);
+            } else {
+                kv_raw_[il].shrink_to(raw);
+                kv_pool_[il].shrink_to(pool);
+            }
+        }
+    }
+    if (mtp_.loaded()) {
+        if (grow) mtp_.ensure_ctx(cells);
+        else mtp_.release_ctx(cells);
+    }
+    ctx_mapped_ = cells;
+}
+
+// After a prompt: the prompt buffers go back to their baseline, the context keeps what it uses (plus a step),
+// and the expert tier takes the free bytes back.
+void Engine::rebalance() {
+    if (pf_base_ > 0) prefill_layout(pf_base_);
+    const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kCtxStep) / kCtxStep * kCtxStep));
+    if (keep < ctx_mapped_) map_ctx(keep);
+    const size_t slack = 64ull << 20;
+    if (budget_.free() > slack) {
+        cache_.grow(budget_.free() - slack, st_);
+        if (pf_base_ > 0) prefill_staging_ensure();
+    }
 }
 
 void Engine::reset() {
@@ -188,6 +289,8 @@ void Engine::reset() {
     }
     if (ple_hist_.p) CUDA_CHECK(cudaMemsetAsync(ple_hist_.p, 0, ple_hist_.n * 4, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    // a new conversation: the context's VRAM back to its baseline (the cache takes it at the next rebalance)
+    if (ctx_mapped_ > kCtxBaseline) map_ctx(std::min(opt_.max_ctx, kCtxBaseline));
 }
 
 void Engine::save_counts() {
@@ -461,6 +564,7 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     if (pending_T_) throw std::runtime_error("forward: the previous verify window was not committed");
     commit_all_ = commit_all;
     if (pos() + T > opt_.max_ctx) throw std::runtime_error("context full");
+    ensure_ctx(pos() + T + kMaxWindow);
     const double t0 = now_ms();
     last_T = T;
     const int pos0 = pos();
@@ -514,8 +618,19 @@ void Engine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int p
     mtp_cell_ = pos0 + n - 1;
 }
 
+size_t Engine::kv_bytes_mapped() const {
+    size_t b = 0;
+    for (size_t il = 0; il < kv_k_.size(); ++il)
+        b += kv_k_[il].mapped() + kv_v_[il].mapped() + kv_raw_[il].mapped() + kv_pool_[il].mapped();
+    return b;
+}
+
 void Engine::prefill(const std::vector<int32_t> & tokens) {
     size_t i = 0;
+    ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
+    // a long prompt reads in big chunks, the prompt buffers borrowing VRAM from the expert cache meanwhile
+    if (pf_big_ > pf_base_ && (int) tokens.size() >= 2 * pf_base_) prefill_layout(pf_big_);
+    if (pf_base_ > 0) prefill_staging_ensure();
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
@@ -532,6 +647,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
         }
         if (on_prefill_progress) on_prefill_progress(i, tokens.size());
     }
+    rebalance();
 }
 
 int Engine::argmax(int t) {

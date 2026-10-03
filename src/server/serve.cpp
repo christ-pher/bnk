@@ -143,6 +143,7 @@ std::string telemetry_json(Engine & eng, const Generator & gen, const Totals & t
         .kv("experts_resident", eng.cache().resident())
         .kv("experts_total", c.n_layer * c.n_expert)
         .kv("expert_cache_gb", (double) eng.cache().bytes() / 1073741824.0)
+        .kv("kv_gb", (double) eng.kv_bytes_mapped() / 1073741824.0)
         .kv("cpu_threads", eng.cpu_threads())
         .kv("mtp", eng.mtp() != nullptr)
         .raw("req", rq.done())

@@ -74,7 +74,7 @@ std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_e
 void ExpertCache::fill(int il, const std::vector<int> & slots, const std::vector<int> & experts, cudaStream_t s) {
     const Config & c = m_->cfg;
     const LayerWeights & L = m_->layers[il];
-    const size_t sb = slot_bytes(*m_, il), bb = st_->blob_bytes(il);
+    const size_t sb = sb_[il], bb = st_->blob_bytes(il);
     const size_t grb = ggml_row_size((ggml_type) L.gate_type, c.n_embd), drb = ggml_row_size((ggml_type) L.down_type, c.n_ff_exp);
     for (size_t i0 = 0; i0 < slots.size(); i0 += stage_n_) {
         const int n = (int) std::min<size_t>(stage_n_, slots.size() - i0);
@@ -97,8 +97,40 @@ ExpertCache::~ExpertCache() {
     if (dst_ptrs_) cudaFree(dst_ptrs_);
     for (auto & p : pending_) cudaEventDestroy(p.done);
     if (copy_) cudaStreamDestroy(copy_);
-    if (region_) cudaFree(region_);
     if (slot_of_dev_) cudaFree(slot_of_dev_);
+}
+
+size_t ExpertCache::bytes() const {
+    size_t b = 0;
+    for (const auto & lb : layer_buf_) b += lb.mapped();
+    return b;
+}
+
+float ExpertCache::value(int il, int e) const {
+    const size_t i = (size_t) il * n_expert_ + e;
+    const float r = rank_value_.empty() ? 0.f : rank_value_[i];
+    return score_.empty() ? r : score_[i] + 1e-3f * r;  // routing frequency, the initial ranking breaking ties
+}
+
+// Maps the experts whose swap copies finished (with `wait`, waits for every in-flight copy first).
+void ExpertCache::finish_pending(cudaStream_t s, bool wait) {
+    if (wait && copy_) CUDA_CHECK(cudaStreamSynchronize(copy_));
+    for (size_t i = 0; i < pending_.size();) {
+        Pending & p = pending_[i];
+        if (cudaEventQuery(p.done) != cudaSuccess) { ++i; continue; }
+        int32_t sl = p.slot;
+        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) p.il * n_expert_ + p.expert, &sl, 4, cudaMemcpyHostToDevice, s));
+        slot_of_host_[(size_t) p.il * n_expert_ + p.expert] = p.slot;
+        busy_[(size_t) p.il * n_expert_ + p.expert] = 0;
+        if (p.was_empty) {
+            ++resident_;
+            ++resident_l_[p.il];
+        }
+        cudaEventDestroy(p.done);
+        pending_[i] = pending_.back();
+        pending_.pop_back();
+        ++swaps_done;
+    }
 }
 
 int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps) {
@@ -113,18 +145,7 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         busy_.assign(NN, 0);
     }
     // 1. map the experts whose copies finished
-    for (size_t i = 0; i < pending_.size();) {
-        Pending & p = pending_[i];
-        if (cudaEventQuery(p.done) != cudaSuccess) { ++i; continue; }
-        int32_t sl = p.slot;
-        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) p.il * n_expert_ + p.expert, &sl, 4, cudaMemcpyHostToDevice, s));
-        slot_of_host_[(size_t) p.il * n_expert_ + p.expert] = p.slot;
-        busy_[(size_t) p.il * n_expert_ + p.expert] = 0;
-        cudaEventDestroy(p.done);
-        pending_[i] = pending_.back();
-        pending_.pop_back();
-        ++swaps_done;
-    }
+    finish_pending(s, false);
     // 2. decayed routing frequency
     std::vector<uint32_t> now(NN);
     CUDA_CHECK(cudaMemcpyAsync(now.data(), counts_dev, NN * 4, cudaMemcpyDeviceToHost, s));
@@ -135,34 +156,42 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
     }
     last_counts_.swap(now);
     if (max_swaps <= 0 || !pending_.empty()) return 0;
-    // 3. per layer: the hottest non-resident vs the coldest resident
+    // 3. per layer: the hottest non-resident vs the coldest resident (an empty slot first)
     struct Cand { float gain; int il, slot, in; };
     std::vector<Cand> cands;
     for (int il = 0; il < n_layer_; ++il) {
         if (slot_expert_[il].empty()) continue;
         const float * sc = score_.data() + (size_t) il * n_expert_;
         int best = -1, worst_slot = -1;
+        float worst_v = 0.f;
         for (int e = 0; e < n_expert_; ++e)
             if (slot_of_host_[(size_t) il * n_expert_ + e] < 0 && !busy_[(size_t) il * n_expert_ + e] &&
                 (best < 0 || sc[e] > sc[best]))
                 best = e;
         for (int sl = 0; sl < (int) slot_expert_[il].size(); ++sl) {
             const int e = slot_expert_[il][sl];
-            if (busy_[(size_t) il * n_expert_ + e]) continue;
-            if (worst_slot < 0 || sc[e] < sc[slot_expert_[il][worst_slot]]) worst_slot = sl;
+            if (e >= 0 && busy_[(size_t) il * n_expert_ + e]) continue;
+            const float v = e < 0 ? -1.f : sc[e];
+            if (worst_slot < 0 || v < worst_v) {
+                worst_slot = sl;
+                worst_v = v;
+            }
         }
         if (best < 0 || worst_slot < 0) continue;
-        const float gain = sc[best] - sc[slot_expert_[il][worst_slot]];
-        if (gain > 1.5f) cands.push_back({gain, il, worst_slot, best});
+        const bool empty = slot_expert_[il][worst_slot] < 0;
+        const float gain = sc[best] - (empty ? 0.f : worst_v);
+        if (gain > 1.5f || (empty && sc[best] > 0.f)) cands.push_back({gain + (empty ? 1e6f : 0.f), il, worst_slot, best});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) { return a.gain > b.gain; });
     int started = 0;
     for (const Cand & c : cands) {
         if (started >= max_swaps || started >= swap_n_) break;
         const int old = slot_expert_[c.il][c.slot];
-        int32_t minus1 = -1;
-        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) c.il * n_expert_ + old, &minus1, 4, cudaMemcpyHostToDevice, s));
-        slot_of_host_[(size_t) c.il * n_expert_ + old] = -1;
+        if (old >= 0) {
+            int32_t minus1 = -1;
+            CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) c.il * n_expert_ + old, &minus1, 4, cudaMemcpyHostToDevice, s));
+            slot_of_host_[(size_t) c.il * n_expert_ + old] = -1;
+        }
         cudaEvent_t unmapped;
         CUDA_CHECK(cudaEventCreateWithFlags(&unmapped, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(unmapped, s));
@@ -171,16 +200,16 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         {
             const Config & cf = m_->cfg;
             const LayerWeights & L = m_->layers[c.il];
-            const size_t bb = st_->blob_bytes(c.il), sbytes = slot_bytes(*m_, c.il);
+            const size_t bb = st_->blob_bytes(c.il);
             uint8_t * stg = swap_stage_ + (size_t) started * stage_bytes_;
             CUDA_CHECK(cudaMemcpyAsync(stg, st_->blob(c.il, c.in), bb, cudaMemcpyHostToDevice, copy_));
-            uint8_t * dst = layer_base_[c.il] + (size_t) c.slot * sbytes;
+            uint8_t * dst = layer_base_[c.il] + (size_t) c.slot * sb_[c.il];
             CUDA_CHECK(cudaMemcpyAsync(swap_ptrs_ + started, &dst, sizeof(uint8_t *), cudaMemcpyHostToDevice, copy_));
             moe_repack_blobs(stg, bb, swap_ptrs_ + started, 1, cf.n_ff_exp, cf.n_embd, L.gate_type,
                              ggml_row_size((ggml_type) L.gate_type, cf.n_embd), L.down_type,
                              ggml_row_size((ggml_type) L.down_type, cf.n_ff_exp), copy_);
         }
-        Pending p{c.il, c.slot, c.in, nullptr};
+        Pending p{c.il, c.slot, c.in, old < 0, nullptr};
         CUDA_CHECK(cudaEventCreateWithFlags(&p.done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(p.done, copy_));
         pending_.push_back(p);
@@ -211,66 +240,211 @@ size_t ExpertCache::slot_bytes(const Model & m, int il) {
     return ((size_t) 2 * m.cfg.n_ff_exp * gl.row_bytes + (size_t) m.cfg.n_embd * dl.row_bytes + 63) / 64 * 64;
 }
 
-std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank) {
-    (void) st;
+// pairs in ranking order while they fit; a layer's region is mapped in whole granules
+static std::vector<int> plan_slots(const Model & m, size_t budget, const Ranking & full) {
     std::vector<int> slots(m.cfg.n_layer, 0);
+    std::vector<size_t> sb(m.cfg.n_layer);
+    for (int l = 0; l < m.cfg.n_layer; ++l) sb[l] = ExpertCache::slot_bytes(m, l);
     size_t used = 0;
-    for (auto [l, e] : complete_ranking(rank, m.cfg.n_layer, m.cfg.n_expert)) {
-        const size_t b = slot_bytes(m, l);
-        if (used + b > budget) continue;
-        used += b;
+    for (auto [l, e] : full) {
+        (void) e;
+        const size_t add = vmem_round((slots[l] + 1) * sb[l]) - vmem_round(slots[l] * sb[l]);
+        if (used + add > budget) continue;
+        used += add;
         slots[l]++;
     }
     return slots;
 }
 
+std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank) {
+    (void) st;
+    return plan_slots(m, budget, complete_ranking(rank, m.cfg.n_layer, m.cfg.n_expert));
+}
+
 void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s,
-                       bool verbose) {
+                       bool verbose, VramBudget * vb) {
     m_ = &m;
     st_ = &st;
     n_layer_ = m.cfg.n_layer;
     n_expert_ = m.cfg.n_expert;
     const Ranking full = complete_ranking(rank, n_layer_, n_expert_);
+    rank_value_.assign((size_t) n_layer_ * n_expert_, 0.f);
+    for (size_t i = 0; i < full.size(); ++i)
+        rank_value_[(size_t) full[i].first * n_expert_ + full[i].second] = (float) (full.size() - i) / full.size();
 
-    // take pairs in order while they fit
+    const std::vector<int> nslots = plan_slots(m, budget, full);
     slot_expert_.assign(n_layer_, {});
-    size_t used = 0;
-    for (auto [l, e] : full) {
-        const size_t b = slot_bytes(m, l);
-        if (used + b > budget) continue;
-        used += b;
-        slot_expert_[l].push_back(e);
+    {
+        std::vector<int> left = nslots;
+        for (auto [l, e] : full)
+            if (left[l] > 0) {
+                slot_expert_[l].push_back(e);
+                --left[l];
+            }
     }
-    bytes_ = used;
-    if (used) CUDA_CHECK(cudaMalloc(&region_, used));
+    sb_.resize(n_layer_);
+    layer_buf_ = std::vector<ElasticBuf>(n_layer_);
     layer_base_.assign(n_layer_, nullptr);
+    resident_l_.assign(n_layer_, 0);
     slot_of_host_.assign((size_t) n_layer_ * n_expert_, -1);
     // staging for ggml blobs on their way into R slots
     stage_n_ = 64;
     stage_bytes_ = st.max_blob_bytes();
     CUDA_CHECK(cudaMalloc(&stage_, stage_bytes_ * stage_n_));
     CUDA_CHECK(cudaMalloc(&dst_ptrs_, sizeof(uint8_t *) * stage_n_));
-    size_t off = 0;
     resident_ = 0;
     for (int l = 0; l < n_layer_; ++l) {
-        layer_base_[l] = region_ + off;
+        sb_[l] = slot_bytes(m, l);
+        layer_buf_[l].reserve((size_t) n_expert_ * sb_[l], vb, "expert cache");
+        layer_buf_[l].ensure(slot_expert_[l].size() * sb_[l]);
+        layer_base_[l] = layer_buf_[l].as<uint8_t>();
         std::vector<int> sl, ex;
         for (size_t i = 0; i < slot_expert_[l].size(); ++i) {
             const int e = slot_expert_[l][i];
             slot_of_host_[(size_t) l * n_expert_ + e] = (int) i;
             sl.push_back((int) i);
             ex.push_back(e);
-            ++resident_;
         }
+        resident_l_[l] = (int) ex.size();
+        resident_ += (int) ex.size();
         fill(l, sl, ex, s);
-        off += slot_expert_[l].size() * slot_bytes(m, l);
     }
     CUDA_CHECK(cudaMalloc(&slot_of_dev_, slot_of_host_.size() * 4));
     CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_, slot_of_host_.data(), slot_of_host_.size() * 4, cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     if (verbose)
         fprintf(stderr, "bnk: VRAM expert cache: %d of %d experts (%.1f%%), %.2f GiB\n", resident_,
-                n_layer_ * n_expert_, 100.0 * resident_ / (n_layer_ * n_expert_), used / 1073741824.0);
+                n_layer_ * n_expert_, 100.0 * resident_ / (n_layer_ * n_expert_), bytes() / 1073741824.0);
+}
+
+size_t ExpertCache::shrink(size_t need, cudaStream_t s) {
+    finish_pending(s, true);
+    const int L = n_layer_;
+    // per layer: its slots, coldest first (empty slots before any expert)
+    std::vector<std::vector<std::pair<float, int>>> order(L);
+    for (int l = 0; l < L; ++l) {
+        for (int sl = 0; sl < (int) slot_expert_[l].size(); ++sl) {
+            const int e = slot_expert_[l][sl];
+            order[l].push_back({e < 0 ? -1e30f : value(l, e), sl});
+        }
+        std::sort(order[l].begin(), order[l].end());
+    }
+    std::vector<int> cut(L, 0);
+    auto freed_of = [&](int l) {
+        const size_t n = slot_expert_[l].size() - cut[l];
+        return layer_buf_[l].mapped() - vmem_round(n * sb_[l]);
+    };
+    size_t freed = 0;
+    while (freed < need) {
+        int bl = -1;
+        float bv = 0.f;
+        for (int l = 0; l < L; ++l)
+            if (cut[l] < (int) order[l].size() && (bl < 0 || order[l][cut[l]].first < bv)) {
+                bl = l;
+                bv = order[l][cut[l]].first;
+            }
+        if (bl < 0) break;
+        freed -= freed_of(bl);
+        cut[bl]++;
+        freed += freed_of(bl);
+    }
+    for (int l = 0; l < L; ++l) {
+        if (!cut[l]) continue;
+        const int n = (int) slot_expert_[l].size(), nn = n - cut[l];
+        std::vector<char> evict(n, 0);
+        for (int i = 0; i < cut[l]; ++i) evict[order[l][i].second] = 1;
+        // kept experts past the new end move into evicted slots below it (there are as many of each)
+        std::vector<int> holes, movers;
+        for (int sl = 0; sl < nn; ++sl)
+            if (evict[sl]) holes.push_back(sl);
+        for (int sl = nn; sl < n; ++sl)
+            if (!evict[sl]) movers.push_back(sl);
+        for (int sl = 0; sl < n; ++sl) {
+            const int e = slot_expert_[l][sl];
+            if (evict[sl] && e >= 0) {
+                slot_of_host_[(size_t) l * n_expert_ + e] = -1;
+                --resident_;
+                --resident_l_[l];
+            }
+        }
+        for (size_t i = 0; i < movers.size(); ++i) {
+            const int from = movers[i], to = holes[i], e = slot_expert_[l][from];
+            CUDA_CHECK(cudaMemcpyAsync(layer_base_[l] + (size_t) to * sb_[l], layer_base_[l] + (size_t) from * sb_[l],
+                                       sb_[l], cudaMemcpyDeviceToDevice, s));
+            slot_expert_[l][to] = e;
+            if (e >= 0) slot_of_host_[(size_t) l * n_expert_ + e] = to;
+        }
+        slot_expert_[l].resize(nn);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_, slot_of_host_.data(), slot_of_host_.size() * 4, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    size_t done = 0;
+    for (int l = 0; l < L; ++l) {
+        const size_t before = layer_buf_[l].mapped();
+        layer_buf_[l].shrink_to(slot_expert_[l].size() * sb_[l]);
+        done += before - layer_buf_[l].mapped();
+    }
+    if (getenv("BNK_VMEM_LOG"))
+        fprintf(stderr, "bnk: expert cache shrank by %.2f GiB to %d experts\n", done / 1073741824.0, resident_);
+    return done;
+}
+
+size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
+    finish_pending(s, true);
+    const int L = n_layer_;
+    // per layer: its non-resident experts, hottest first
+    std::vector<std::vector<std::pair<float, int>>> cand(L);
+    for (int l = 0; l < L; ++l) {
+        for (int e = 0; e < n_expert_; ++e)
+            if (slot_of_host_[(size_t) l * n_expert_ + e] < 0 && (busy_.empty() || !busy_[(size_t) l * n_expert_ + e]))
+                cand[l].push_back({-value(l, e), e});
+        std::sort(cand[l].begin(), cand[l].end());
+    }
+    std::vector<int> take(L, 0);
+    size_t used = 0;
+    for (;;) {
+        int bl = -1;
+        float bv = 0.f;
+        for (int l = 0; l < L; ++l) {
+            if (take[l] >= (int) cand[l].size()) continue;
+            const size_t n = slot_expert_[l].size() + take[l];
+            const size_t add = vmem_round((n + 1) * sb_[l]) - std::max(vmem_round(n * sb_[l]), layer_buf_[l].mapped());
+            if (used + add > avail) continue;
+            const float v = -cand[l][take[l]].first;
+            if (bl < 0 || v > bv) {
+                bl = l;
+                bv = v;
+            }
+        }
+        if (bl < 0) break;
+        const size_t n = slot_expert_[bl].size() + take[bl];
+        used += vmem_round((n + 1) * sb_[bl]) - std::max(vmem_round(n * sb_[bl]), layer_buf_[bl].mapped());
+        take[bl]++;
+    }
+    size_t done = 0;
+    for (int l = 0; l < L; ++l) {
+        if (!take[l]) continue;
+        const int n0 = (int) slot_expert_[l].size();
+        const size_t before = layer_buf_[l].mapped();
+        layer_buf_[l].ensure((size_t) (n0 + take[l]) * sb_[l]);
+        done += layer_buf_[l].mapped() - before;
+        std::vector<int> sl, ex;
+        for (int i = 0; i < take[l]; ++i) {
+            const int e = cand[l][i].second;
+            slot_expert_[l].push_back(e);
+            slot_of_host_[(size_t) l * n_expert_ + e] = n0 + i;
+            sl.push_back(n0 + i);
+            ex.push_back(e);
+        }
+        fill(l, sl, ex, s);
+        resident_l_[l] += take[l];
+        resident_ += take[l];
+    }
+    CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_, slot_of_host_.data(), slot_of_host_.size() * 4, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    if (getenv("BNK_VMEM_LOG") && done)
+        fprintf(stderr, "bnk: expert cache grew by %.2f GiB to %d experts\n", done / 1073741824.0, resident_);
+    return done;
 }
 
 MoeLayerDesc ExpertCache::desc(int il) const {

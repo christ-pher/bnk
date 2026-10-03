@@ -23,6 +23,7 @@ export interface Live {
   experts_resident: number
   experts_total: number
   expert_cache_gb: number
+  kv_gb: number // VRAM holding the context (grows with the conversation, given back on a new one)
   cpu_threads: number
   mtp: boolean
   req: {

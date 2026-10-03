@@ -31,16 +31,24 @@ template <typename T>
 struct DevBuf {
     T * p = nullptr;
     size_t n = 0;
+    bool owned = true;   // false: a view into memory someone else manages (an ElasticBuf)
     void alloc(size_t count) {
         free();
         n = count;
         CUDA_CHECK(cudaMalloc(&p, count * sizeof(T)));
         CUDA_CHECK(cudaMemset(p, 0, count * sizeof(T)));
     }
+    void view(T * ptr, size_t count) {
+        free();
+        p = ptr;
+        n = count;
+        owned = false;
+    }
     void free() {
-        if (p) cudaFree(p);
+        if (p && owned) cudaFree(p);
         p = nullptr;
         n = 0;
+        owned = true;
     }
     ~DevBuf() { free(); }
     operator T *() const { return p; }

@@ -69,6 +69,7 @@ int main(int argc, char ** argv) {
         else if (a == "--profile") opt.profile = next();
         else if (a == "--mtp") opt.mtp = next();
         else if (a == "--draft-vocab") opt.draft_vocab = next();
+        else if (a == "--prefill-chunk-max") opt.prefill_chunk_max = std::stoi(next());
         else if (a == "--draft") gopt.max_draft = std::stoi(next());
         else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start the bnk server.
-#   ./run.sh [iq3_s|orca|PATH-to-first-shard.gguf] [--port 8080] [--ctx 65536] [--no-mtp] [server options...]
+#   ./run.sh [iq3_s|orca|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
 #   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
 #   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
 set -euo pipefail
@@ -22,7 +22,7 @@ case "$choice" in
   *) echo "unknown model '$choice' (iq3_s, orca, or a .gguf path)"; exit 1 ;;
 esac
 
-PORT=8080; CTX=65536; MTP="$MTP_DEFAULT"; EXTRA=()
+PORT=8080; CTX=262144; MTP="$MTP_DEFAULT"; EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;

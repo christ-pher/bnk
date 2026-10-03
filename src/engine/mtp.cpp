@@ -6,6 +6,7 @@
 
 #include "ggml.h"
 #include "kernels/ops.h"
+#include "kernels/qsa.h"
 
 namespace bnk {
 
@@ -29,8 +30,38 @@ std::vector<float> plus_one(const TensorRef & t) {
 
 }  // namespace
 
+void MtpLayer::ensure_ctx(int cells) {
+    kv_k_.ensure((size_t) cells * kv_cell_bytes_);
+    kv_v_.ensure((size_t) cells * kv_cell_bytes_);
+    if (sparse_) {
+        kv_raw_.ensure((size_t) cells * qsh_.id * sizeof(half));
+        kv_pool_.ensure((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+    }
+}
+
+size_t MtpLayer::ctx_bytes_needed(int cells) const {
+    auto more = [](const ElasticBuf & e, size_t bytes) {
+        const size_t b = vmem_round(bytes);
+        return e.reserved() && b > e.mapped() ? b - e.mapped() : 0;
+    };
+    size_t n = more(kv_k_, (size_t) cells * kv_cell_bytes_) + more(kv_v_, (size_t) cells * kv_cell_bytes_);
+    if (sparse_)
+        n += more(kv_raw_, (size_t) cells * qsh_.id * sizeof(half)) +
+             more(kv_pool_, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+    return n;
+}
+
+void MtpLayer::release_ctx(int cells) {
+    kv_k_.shrink_to((size_t) cells * kv_cell_bytes_);
+    kv_v_.shrink_to((size_t) cells * kv_cell_bytes_);
+    if (sparse_) {
+        kv_raw_.shrink_to((size_t) cells * qsh_.id * sizeof(half));
+        kv_pool_.shrink_to((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+    }
+}
+
 void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
-                    const std::string & draft_vocab) {
+                    const std::string & draft_vocab, VramBudget * budget) {
     main_ = &main;
     st_ = st;
     max_ctx_ = max_ctx;
@@ -67,6 +98,22 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
         vram_ += m.row_bytes * m.rows;
         return m;
     };
+    // rows [r0, r0 + n) of a BF16 matrix, as Q8_0 (R layout)
+    auto mat_rows = [&](const std::string & name, int64_t r0, int64_t n) {
+        const TensorRef & t = g.get(name);
+        if (t.type != GGML_TYPE_BF16) throw std::runtime_error(name + ": expected BF16");
+        const int64_t cols = t.ne[0];
+        std::vector<float> f((size_t) n * cols);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) t.data + r0 * cols, f.data(), n * cols);
+        const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, cols);
+        std::vector<uint8_t> q(rb * n);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, n, cols, nullptr);
+        void * d = nullptr;
+        QMat m = upload_matrix(q.data(), GGML_TYPE_Q8_0, n, cols, rb, true, &d);
+        allocs_.push_back(d);
+        vram_ += m.row_bytes * m.rows;
+        return m;
+    };
     auto norm = [&](const std::string & name) {
         QMat m;
         m.data = dev_f32(plus_one(g.get(name)));
@@ -95,6 +142,20 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     wo_ = mat(L + "self_attn.o_proj.weight");
     q_norm_ = dev_f32(plus_one(g.get(L + "self_attn.q_norm.weight")));
     k_norm_ = dev_f32(plus_one(g.get(L + "self_attn.k_norm.weight")));
+    // the layer's sparse-attention indexer: one projection whose first ih * id rows are the queries, the rest
+    // the key (as llama.cpp's converter splits it); zero-centred norms
+    if (g.find(L + "self_attn.indexer.index_qk_proj.weight") && c.idx_heads > 0 && !getenv("BNK_MTP_DENSE")) {
+        const int nq = c.idx_heads * c.idx_dim;
+        idx_q_ = mat_rows(L + "self_attn.indexer.index_qk_proj.weight", 0, nq);
+        idx_k_ = mat_rows(L + "self_attn.indexer.index_qk_proj.weight", nq, c.idx_dim);
+        idx_q_norm_ = dev_f32(plus_one(g.get(L + "self_attn.indexer.q_layernorm.weight")));
+        idx_k_norm_ = dev_f32(plus_one(g.get(L + "self_attn.indexer.k_layernorm.weight")));
+        int r = 0;
+        for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
+        qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
+                        c.rope_base, c.rms_eps};
+        sparse_ = r > 0;
+    }
     router_ = mat(L + "mlp.gate.weight", true);
     sh_gate_ = mat(L + "mlp.shared_expert.gate_proj.weight");
     sh_up_ = mat(L + "mlp.shared_expert.up_proj.weight");
@@ -150,8 +211,24 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     tok_dev_.alloc(W); pos_dev_.alloc(4); out_dev_.alloc(2);
     actq_.alloc(W * 4 * HC); actd_.alloc(W * 4 * HC / 32);
     act_.q = actq_; act_.d = actd_;
-    kc_.alloc((size_t) max_ctx * c.n_head_kv * c.head_dim);
-    vc_.alloc((size_t) max_ctx * c.n_head_kv * c.head_dim);
+    // K/V cells: address space for the whole context, mapped as it grows (ensure_ctx)
+    const size_t kv = (size_t) max_ctx * c.n_head_kv * c.head_dim;
+    kv_k_.reserve(kv * sizeof(half), budget, "MTP KV");
+    kv_v_.reserve(kv * sizeof(half), budget, "MTP KV");
+    kc_.view(kv_k_.as<half>(), kv);
+    vc_.view(kv_v_.as<half>(), kv);
+    if (sparse_) {
+        max_blocks_ = max_ctx / qsh_.ratio + 1;
+        kv_raw_.reserve((size_t) max_ctx * c.idx_dim * sizeof(half), budget, "MTP indexer keys");
+        kv_pool_.reserve((size_t) max_blocks_ * c.idx_dim * sizeof(float), budget, "MTP indexer keys");
+        kraw_.view(kv_raw_.as<half>(), (size_t) max_ctx * c.idx_dim);
+        pooled_.view(kv_pool_.as<float>(), (size_t) max_blocks_ * c.idx_dim);
+        ik_.alloc((size_t) W * c.idx_dim);
+        iq_.alloc((size_t) W * c.idx_heads * c.idx_dim);
+        scores_.alloc((size_t) max_blocks_);
+        sel_.alloc((size_t) qsh_.top_blocks);
+        nsel_.alloc(1);
+    }
     hits_buf_.alloc(sizeof(HitList));
     gu_buf_.alloc((size_t) kMaxRouted * W * 2 * F);
     hq_buf_.alloc((size_t) kMaxRouted * W * F);
@@ -164,7 +241,7 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     memset((void *) msg_, 0, MoeMsg::bytes(E));
     CUDA_CHECK(cudaHostAlloc((void **) &h_io_, 64, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &h_prob_, 64, cudaHostAllocMapped));
-    vram_ += 2 * kc_.n * sizeof(half);
+    kv_cell_bytes_ = (size_t) c.n_head_kv * c.head_dim * sizeof(half);
     // optional draft vocabulary: the head rows of a token subset
     if (!draft_vocab.empty()) {
         FILE * f = fopen(draft_vocab.c_str(), "rb");
@@ -273,12 +350,27 @@ void MtpLayer::enqueue(int n, bool draft) {
     gemv_auto(wv_, mixed_, E, n, v_, Hkv * D, false, act_, st_);
     attn_prep(qfull_, k_, v_, q_norm_, k_norm_, q_, kc_, vc_, n, H, Hkv, D, c.n_rot, c.rope_base, pos_dev_.p,
               c.rms_eps, st_);
+    if (sparse_) {  // index keys of every row (pooled blocks that end in the window), the draft row's query
+        gemv_auto(idx_k_, mixed_, E, n, ik_, c.idx_dim, false, act_, st_);
+        qsa_store_keys(ik_, kraw_, n, c.idx_dim, pos_dev_.p, st_);
+        qsa_pool(kraw_, idx_k_norm_, pooled_, n, qsh_, pos_dev_.p, st_);
+    }
     if (!draft) return;
     // the rest of the layer on the last row
     const int L = n - 1;
     float * RL = R_.p + (size_t) L * HC;
-    attention(q_.p + (size_t) L * H * D, kc_, vc_, qfull_.p + (size_t) L * H * D * 2, attn_o_, 1, H, Hkv, D,
-              pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+    if (sparse_) {
+        // the draft row attends to the blocks its indexer selects, plus its tail (dense while the context is short)
+        const float * mL = mixed_.p + (size_t) L * E;
+        gemv_auto(idx_q_, mL, E, 1, iq_, c.idx_heads * c.idx_dim, false, act_, st_);
+        qsa_queries(iq_, idx_q_norm_, 1, qsh_, pos_dev_.p + 1, st_);
+        qsa_select(iq_, pooled_, scores_, max_blocks_, sel_, nsel_, 1, qsh_, pos_dev_.p + 1, 0, st_);
+        qsa_attention(q_.p + (size_t) L * H * D, kc_, vc_, qfull_.p + (size_t) L * H * D * 2, sel_, nsel_, attn_o_, 1,
+                      qsh_, pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+    } else {
+        attention(q_.p + (size_t) L * H * D, kc_, vc_, qfull_.p + (size_t) L * H * D * 2, attn_o_, 1, H, Hkv, D,
+                  pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+    }
     gemv_auto(wo_, attn_o_, H * D, 1, bo_, E, false, act_, st_);
     hc_combine(RL, bo_, inj_.p + (size_t) L * c.hc, 1, c.hc, E, st_);
     hc_pre(hc_mlp_, RL, 1, true, mixed_, inj2_);

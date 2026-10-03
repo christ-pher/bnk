@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 
 #include "core/expert_cache.h"
+#include "core/vmem.h"
 #include "core/model.h"
 #include "core/util.h"
 #include "cpu/expert_pool.h"
@@ -35,6 +36,7 @@ struct EngineOptions {
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
+    int prefill_chunk_max = 8192;    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile)
     std::string draft_vocab;         // int32 token ids the drafter may propose (empty = the whole vocabulary)
     int prefill_chunk = 2048;        // tokens per batched prompt pass (0 = decode windows only)
     int prefill_min = 24;            // fewer tokens than this go through decode windows
@@ -76,6 +78,12 @@ public:
     // logits of its last token are in logits row 0... last_T-1 (argmax(last_T - 1)). With `mtp` set, the
     // draft layer's K/V are filled for every cell except the last token's (which pairs with the next one).
     void prefill(const std::vector<int32_t> & tokens);
+    // VRAM for the context and the prompt path is elastic: KV for cells [0, cells) is mapped on demand
+    // (the expert cache gives the bytes up), and rebalance() hands spare bytes back to the cache.
+    void ensure_ctx(int cells);
+    void rebalance();
+    size_t vram_budget() const { return budget_.limit(); }
+    size_t kv_bytes_mapped() const;
     // One batched prompt pass over N tokens (commits; logits of the last token in row 0).
     void prefill_chunk(const int32_t * tokens, int N);
     struct PrefillStats { double ms = 0, copy_wait_ms = 0; int64_t tokens = 0, chunks = 0; } pstats;
@@ -111,6 +119,8 @@ public:
     int last_T = 0;
 
 private:
+    // the VRAM budget shared by the expert cache, the context (KV) and the prompt path
+    VramBudget budget_;
     void enqueue_forward(int T);
     void layer_forward(int il, int T);
     void hc_pre(const HcWeights & w, int T, bool want_inject);
@@ -194,7 +204,20 @@ private:
 
     // ---- batched prompt processing
     Gemm gemm_;
-    int pf_max_ = 0;
+    int pf_max_ = 0;   // chunk size the prompt buffers are laid out for now
+    int pf_cap_ = 0;   // the largest chunk the host-side buffers take
+    // elastic VRAM (budget_ is declared first so it outlives every buffer charged to it)
+    ElasticBuf pf_arena_, pf_stage_b_[2];
+    std::vector<ElasticBuf> kv_k_, kv_v_, kv_raw_, kv_pool_;
+    int ctx_mapped_ = 0;   // cells of context whose KV is mapped
+    void prefill_layout(int N);
+    size_t prefill_arena_bytes(int N);
+    size_t prefill_carve(int N, bool dry_only);
+    void map_ctx(int cells);
+    int pf_base_ = 0, pf_big_ = 0;   // chunk sizes: normal, and for long prompts
+    bool cache_ready_ = false;
+    static constexpr int kCtxStep = 8192, kCtxBaseline = 16384;
+    void prefill_staging_ensure();
     struct {
         DevBuf<float> res, xn, lo, gpre, mixed, inj, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, rlog, w, sg, su,
             sh, sgate, shared, moe, ple_emb, ple_key, ple_val, ple_gated, ple_hist, x;

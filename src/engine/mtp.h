@@ -15,8 +15,10 @@
 
 #include "core/model.h"
 #include "core/util.h"
+#include "core/vmem.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
+#include "kernels/qsa.h"
 
 namespace bnk {
 
@@ -25,7 +27,11 @@ public:
     ~MtpLayer();
     // Loads the MTP GGUF (tools/build_mtp.py: the checkpoint's mtp.* tensors) for the given main model.
     void load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
-              const std::string & draft_vocab = "");
+              const std::string & draft_vocab = "", VramBudget * budget = nullptr);
+    // K/V cells [0, cells) backed by VRAM (the address space covers the whole context)
+    void ensure_ctx(int cells);
+    void release_ctx(int cells);
+    size_t ctx_bytes_needed(int cells) const;
     bool loaded() const { return loaded_; }
     size_t vram_bytes() const { return vram_; }
 
@@ -64,6 +70,17 @@ private:
     DevBuf<int8_t> actq_;
     DevBuf<float> actd_;
     ActQ8 act_;
+    ElasticBuf kv_k_, kv_v_, kv_raw_, kv_pool_;
+    // sparse attention (the layer's own indexer, as the main model's full-attention layers)
+    bool sparse_ = false;
+    QsaShape qsh_{};
+    int max_blocks_ = 0;
+    QMat idx_q_, idx_k_;
+    float * idx_q_norm_ = nullptr, * idx_k_norm_ = nullptr;
+    DevBuf<half> kraw_;
+    DevBuf<float> pooled_, ik_, iq_, scores_;
+    DevBuf<int32_t> sel_, nsel_;
+    size_t kv_cell_bytes_ = 0;
     DevBuf<half> kc_, vc_;
     MoeScratch moes_;
     DevBuf<uint8_t> hits_buf_;

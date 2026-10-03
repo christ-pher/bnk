@@ -12,49 +12,88 @@ namespace bnk {
 
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
-void Engine::prefill_alloc(int N) {
+// Every chunk-sized device buffer of the prompt path, carved from one elastic arena for chunks of N tokens: the
+// arena maps only what N needs, so a long prompt can borrow VRAM from the expert cache for bigger chunks.
+void Engine::prefill_layout(int N) {
+    if (N == pf_max_) return;
+    const size_t total = prefill_carve(N, false);
+    CUDA_CHECK(cudaMemsetAsync(pf_arena_.ptr(), 0, total, st_));
+    pf_.max_items = 2 * (N * model_.cfg.n_expert_used + model_.cfg.n_expert);
+    pf_max_ = N;
+}
+
+size_t Engine::prefill_arena_bytes(int N) { return prefill_carve(N, true); }
+
+// The arena's layout for chunks of N tokens: its size (dry), or map it and point every buffer into it.
+size_t Engine::prefill_carve(int N, bool dry_only) {
     const Config & c = model_.cfg;
     const int E = c.n_embd, HC = c.hc_dim(), C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state;
     const int F = c.n_ff_exp, k = c.n_expert_used;
-    pf_max_ = N;
     auto & p = pf_;
-    p.x.alloc((size_t) N * E); p.res.alloc((size_t) N * HC); p.xn.alloc((size_t) N * HC);
-    p.lo.alloc((size_t) N * c.hc_rank); p.gpre.alloc((size_t) N * HC); p.mixed.alloc((size_t) N * E);
-    p.inj.alloc((size_t) N * c.hc); p.out.alloc((size_t) N * E);
-    p.conv.alloc((size_t) (N + c.ssm_conv - 1) * C); p.co.alloc((size_t) N * C); p.z.alloc((size_t) N * VI);
-    p.g.alloc((size_t) N * c.ssm_vheads); p.b.alloc((size_t) N * c.ssm_vheads); p.o.alloc((size_t) N * VI);
-    p.n.alloc((size_t) N * VI);
-    p.qfull.alloc((size_t) N * c.n_head * c.head_dim * 2); p.k.alloc((size_t) N * c.n_head_kv * c.head_dim);
-    p.v.alloc((size_t) N * c.n_head_kv * c.head_dim); p.q.alloc((size_t) N * c.n_head * c.head_dim);
-    p.ao.alloc((size_t) N * c.n_head * c.head_dim);
-    p.rlog.alloc((size_t) N * c.n_expert); p.w.alloc((size_t) N * k); p.ids.alloc((size_t) N * k);
-    p.perm.alloc((size_t) N * k); p.inv.alloc((size_t) N * k); p.tok.alloc(N);
-    p.sg.alloc((size_t) N * c.n_ff_shexp); p.su.alloc((size_t) N * c.n_ff_shexp); p.sh.alloc((size_t) N * c.n_ff_shexp);
-    p.sgate.alloc(N); p.shared.alloc((size_t) N * E); p.moe.alloc((size_t) N * E);
-    p.xg.alloc((size_t) N * k * E); p.gu.alloc((size_t) N * k * 2 * F); p.hh.alloc((size_t) N * k * F);
-    p.dd.alloc((size_t) (N * k + 1) * E);   // + a zero row for pairs computed elsewhere
-    p.cpu.alloc((size_t) N * E);
-    if (qsa_on_) {
-        p.ik.alloc((size_t) N * c.idx_dim); p.iq.alloc((size_t) N * c.idx_heads * c.idx_dim);
-        p.scores.alloc((size_t) 64 * max_blocks_); p.sel.alloc((size_t) 64 * qsh_.top_blocks); p.nsel.alloc(64);
-    }
-    p.xq.alloc((size_t) N * E); p.xd.alloc((size_t) N * E / 32);
-    p.hq.alloc((size_t) N * k * F); p.hd.alloc((size_t) N * k * F / 32); p.gu32.alloc((size_t) N * k * 2 * F);
+    size_t off = 0;
+    bool dry = true;
+    auto carve = [&](auto & buf, size_t n) {
+        using T = std::remove_reference_t<decltype(*buf.p)>;
+        off = (off + 255) / 256 * 256;
+        if (!dry) buf.view((T *) (pf_arena_.as<uint8_t>() + off), n);
+        off += n * sizeof(T);
+    };
+    auto all = [&]() {
+        carve(p.x, (size_t) N * E); carve(p.res, (size_t) N * HC); carve(p.xn, (size_t) N * HC);
+        carve(p.lo, (size_t) N * c.hc_rank); carve(p.gpre, (size_t) N * HC); carve(p.mixed, (size_t) N * E);
+        carve(p.inj, (size_t) N * c.hc); carve(p.out, (size_t) N * E);
+        carve(p.conv, (size_t) (N + c.ssm_conv - 1) * C); carve(p.co, (size_t) N * C); carve(p.z, (size_t) N * VI);
+        carve(p.g, (size_t) N * c.ssm_vheads); carve(p.b, (size_t) N * c.ssm_vheads); carve(p.o, (size_t) N * VI);
+        carve(p.n, (size_t) N * VI);
+        carve(p.qfull, (size_t) N * c.n_head * c.head_dim * 2); carve(p.k, (size_t) N * c.n_head_kv * c.head_dim);
+        carve(p.v, (size_t) N * c.n_head_kv * c.head_dim); carve(p.q, (size_t) N * c.n_head * c.head_dim);
+        carve(p.ao, (size_t) N * c.n_head * c.head_dim);
+        carve(p.rlog, (size_t) N * c.n_expert); carve(p.w, (size_t) N * k); carve(p.ids, (size_t) N * k);
+        carve(p.perm, (size_t) N * k); carve(p.inv, (size_t) N * k); carve(p.tok, N);
+        carve(p.sg, (size_t) N * c.n_ff_shexp); carve(p.su, (size_t) N * c.n_ff_shexp); carve(p.sh, (size_t) N * c.n_ff_shexp);
+        carve(p.sgate, N); carve(p.shared, (size_t) N * E); carve(p.moe, (size_t) N * E);
+        carve(p.xg, (size_t) N * k * E); carve(p.gu, (size_t) N * k * 2 * F); carve(p.hh, (size_t) N * k * F);
+        carve(p.dd, (size_t) (N * k + 1) * E);   // + a zero row for pairs computed elsewhere
+        carve(p.cpu, (size_t) N * E);
+        if (qsa_on_) { carve(p.ik, (size_t) N * c.idx_dim); carve(p.iq, (size_t) N * c.idx_heads * c.idx_dim); }
+        carve(p.xq, (size_t) N * E); carve(p.xd, (size_t) N * E / 32);
+        carve(p.hq, (size_t) N * k * F); carve(p.hd, (size_t) N * k * F / 32); carve(p.gu32, (size_t) N * k * 2 * F);
+        carve(p.items, (size_t) (2 * (N * k + c.n_expert)) * sizeof(PfItem));
+        if (c.ple_layer >= 0) {
+            const int ph = c.ple_heads();
+            carve(p.ple_emb, (size_t) N * ph * c.ple_dim); carve(p.ple_key, (size_t) N * HC);
+            carve(p.ple_val, (size_t) N * E); carve(p.ple_gated, (size_t) N * HC);
+            carve(p.ple_hist, (size_t) ((c.ple_conv - 1) * c.ple_ngram + N) * HC);
+        }
+    };
+    all();
+    const size_t total = off;
+    if (dry_only) return total;
+    if (total > pf_arena_.mapped()) pf_arena_.ensure(total);
+    else pf_arena_.shrink_to(total);
+    dry = false;
+    off = 0;
+    all();
+    return total;
+}
+
+// Host-side and fixed parts of the prompt path, for chunks of up to N tokens.
+void Engine::prefill_alloc(int N) {
+    const Config & c = model_.cfg;
+    const int E = c.n_embd, HC = c.hc_dim(), F = c.n_ff_exp, k = c.n_expert_used;
+    auto & p = pf_;
+    pf_cap_ = N;
+    if (qsa_on_) { p.scores.alloc((size_t) 64 * max_blocks_); p.sel.alloc((size_t) 64 * qsh_.top_blocks); p.nsel.alloc(64); }
     p.max_items = 2 * (N * k + c.n_expert);
-    p.items.alloc((size_t) p.max_items * sizeof(PfItem));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_items, (size_t) p.max_items * sizeof(PfItem), 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_x, (size_t) N * E * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_cpu, (size_t) N * E * 4, 0));
     // fp16 copies of a group of experts' gate/up/down
     p.wexp_experts = 32;
     p.wexp.alloc((size_t) p.wexp_experts * 3 * F * E);
-    if (c.ple_layer >= 0) {
-        const int ph = c.ple_heads();
-        p.ple_emb.alloc((size_t) N * ph * c.ple_dim); p.ple_key.alloc((size_t) N * HC); p.ple_val.alloc((size_t) N * E);
-        p.ple_gated.alloc((size_t) N * HC);
-        p.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + N) * HC);
-        CUDA_CHECK(cudaHostAlloc((void **) &p.ple_rows, (size_t) N * ph * model_.ple_table->row_bytes(), cudaHostAllocMapped));
-    }
+    if (c.ple_layer >= 0)
+        CUDA_CHECK(cudaHostAlloc((void **) &p.ple_rows, (size_t) N * c.ple_heads() * model_.ple_table->row_bytes(),
+                                 cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_ids, (size_t) N * k * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_perm, (size_t) N * k * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_inv, (size_t) N * k * 4, 0));
@@ -77,18 +116,31 @@ void Engine::prefill_alloc(int N) {
 }
 
 // Sized after the cache: the largest number of non-resident experts in any layer, twice (double buffer).
+// Two stages for the next layers' non-resident experts, sized for the cache as it is now (a shrinking cache leaves
+// more experts outside, so this may take a few rounds to settle).
+void Engine::prefill_staging_ensure() {
+    const Config & c = model_.cfg;
+    for (int round = 0; round < 4; ++round) {
+        size_t need = 0;
+        for (int il = 0; il < c.n_layer; ++il)
+            need = std::max(need, (size_t) (c.n_expert - cache_.resident(il)) * store_.blob_bytes(il));
+        if (need <= pf_.stage_bytes && pf_stage_b_[0].mapped() >= need) break;
+        for (int i = 0; i < 2; ++i) pf_stage_b_[i].ensure(need);
+        pf_.stage_bytes = need;
+    }
+}
+
 void Engine::prefill_staging_alloc() {
     const Config & c = model_.cfg;
-    size_t need = 0;
-    for (int il = 0; il < c.n_layer; ++il)
-        need = std::max(need, (size_t) (c.n_expert - cache_.slots(il)) * store_.blob_bytes(il));
-    pf_.stage_bytes = need;
-    for (int i = 0; i < 2; ++i)
-        if (need) CUDA_CHECK(cudaMalloc(&pf_.stage[i], need));
+    size_t worst = 0;
+    for (int il = 0; il < c.n_layer; ++il) worst = std::max(worst, (size_t) c.n_expert * store_.blob_bytes(il));
+    for (int i = 0; i < 2; ++i) {
+        pf_stage_b_[i].reserve(worst, &budget_, "expert staging");
+        pf_.stage[i] = pf_stage_b_[i].as<uint8_t>();
+    }
+    pf_.stage_bytes = 0;
+    prefill_staging_ensure();
     pf_.stage_idx.assign(c.n_layer, std::vector<int>(c.n_expert, -1));
-    if (opt_.verbose)
-        fprintf(stderr, "bnk: prompt path: chunks of %d tokens, 2 x %.2f GiB of expert staging\n", pf_max_,
-                need / 1073741824.0);
 }
 
 // Copies layer il's non-resident experts into stage[il & 1] on the copy stream: every one (prefetch), or the

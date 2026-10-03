@@ -92,7 +92,7 @@ export function OverviewPage({ range }: { range: Range }) {
           <CardContent className="grid gap-4">
             <Meter label="VRAM" reading={`${fmt.gib(live?.vram_used_mb)} / ${fmt.gib(live?.vram_total_mb)}`}
               value={live ? live.vram_used_mb / live.vram_total_mb : null}
-              hint={`Expert cache ${fmt.n(live?.expert_cache_gb, 1)} GiB`} />
+              hint={`Experts ${fmt.n(live?.expert_cache_gb, 1)} GiB · context ${fmt.n(live?.kv_gb, 2)} GiB`} />
             <Meter label="Utilization" reading={fmt.pct((live?.gpu?.util ?? 0) / 100)} value={(live?.gpu?.util ?? 0) / 100} />
             <Meter label="Power" reading={`${fmt.n(live?.gpu?.power_w)} W`}
               value={overview?.gpu?.power_limit_w && live?.gpu?.power_w != null ? live.gpu.power_w / overview.gpu.power_limit_w : null}
