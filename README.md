@@ -9,7 +9,7 @@ cache until it is needed, a thinking-loop guard, an OpenAI/Anthropic-compatible 
 
 It is built for, and measured on, this machine:
 
-| | |
+| Component | Specification |
 |---|---|
 | GPU | Tesla V100 32 GB (PG500-216, sm_70), HBM 889 GB/s measured |
 | CPU | AMD EPYC 7402, 32 vCPUs (AVX2, no AVX-512) |
@@ -30,17 +30,23 @@ client sees.
 | Speculative, greedy, short context | **65 tok/s** | **71 tok/s** |
 | Speculative, served (sampled), short context | ~58 tok/s | ~61 tok/s |
 | Without speculation, greedy | 53 tok/s | 47 tok/s |
-| Speculative at 120K tokens of context | ~45 tok/s | – |
-| Speculative at 228K tokens of context | ~38 tok/s | – |
+| Speculative at 120K tokens of context | 44 tok/s | 59 tok/s |
+| Speculative at 228K tokens of context | 43 tok/s | 52 tok/s |
 
-**Prompt processing**
+The long-context rows decode 300 tokens after a prompt of real source code (llama.cpp's), greedily, with the
+models' speculation settings.
 
-| Prompt length | Speed |
-|---|---|
-| Short prompts (2K-token chunks) | ~525 tok/s |
-| 30K tokens (8K-token chunks) | 1,177 tok/s |
-| 120K tokens | 1,165 tok/s (1.7 min) |
-| 228K tokens | 1,094 tok/s (3.5 min) |
+**Prompt processing** — the same source-code prompts, read from scratch:
+
+| Prompt length | IQ3_S | Orca IQ4_XS |
+|---|---|---|
+| ~1.8K tokens | 338 tok/s | 290 tok/s |
+| ~30K tokens | 685 tok/s | 628 tok/s |
+| ~120K tokens | 714 tok/s (2.8 min) | 666 tok/s (3.0 min) |
+| ~228K tokens | 922 tok/s (4.1 min) | 848 tok/s (4.5 min) |
+
+Code routes to a wide spread of experts, so most of a chunk's experts stream over PCIe; text with narrower
+routing processes faster (a synthetic 228K-token prompt ran at 1,094 tok/s).
 
 **Long conversations** — the workload that matters most in practice. Logs of real use show agent-style sessions:
 a median context of 56–66K tokens (a quarter of requests above 100K), ~97% of each prompt shared with the previous
@@ -102,8 +108,8 @@ so the output distribution is the model's own. The drafter scores only a ~145K-t
 **Long context.** The full-attention layers use the model's QSA sparse attention: a learned indexer scores
 compressed 4-token blocks and each query attends to its top 2,048 tokens. bnk computes the block scores as a tiled
 fp32 product over 64 queries at a time and runs the attention on tensor cores, one block per KV head serving all
-twelve query heads that share it. Prompt processing therefore stays at ~1,100 tok/s from the first token to
-the 256Kth.
+twelve query heads that share it, so prompt processing does not slow down as the context fills: it is bound by
+streaming experts over PCIe, not by attention, from the first token to the 256Kth.
 
 **Elastic VRAM.** The KV cache, the indexer keys, the drafter's KV and the prompt-processing buffers each reserve
 address space for their maximum and map physical memory in 2 MiB pages only as needed. All of them draw on one
