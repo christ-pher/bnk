@@ -145,24 +145,31 @@ Ninja (recommended), and enough RAM to page-lock every expert (47 GB for IQ3_S, 
 
 ```bash
 git clone https://github.com/christ-pher/bnk.git && cd bnk
-
-# 1. the engine
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-
-# 2. the server's Python environment
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# 3. the MTP draft layer, built from the official Qwen checkpoint (downloads only the mtp.* tensors, ~5 GB)
-.venv/bin/python tools/build_mtp.py --out /opt/models/bnk/mtp/mtp-q2_0.gguf
-
-# 4. run (builds the dashboard and the per-model draft vocabulary on first start)
+./setup.sh --mtp --models /path/to/your/models
 ./run.sh iq3_s            # or: ./run.sh orca, or ./run.sh /path/to/model-00001-of-0000N.gguf
 ```
 
-Then open `http://<host>:8080` for the dashboard. `run.sh` looks for models under `$BNK_MODELS`
-(default `/opt/models/Strata/models`); edit the presets at the top of `run.sh` for other locations.
+`setup.sh` does everything in one pass:
+
+1. It checks the GPU, the driver, CUDA 12.x, RAM and AVX2.
+2. It installs missing system packages with `apt` (asking first; `--yes` skips the question, `--no-system` never
+   touches them) and uses pip-provided CMake and Ninja when the system's are too old.
+3. It builds the engine, the Python environment and the dashboard.
+4. With `--mtp`, it builds the MTP draft layer from the official Qwen checkpoint (downloading only the `mtp.*`
+   tensors, ~5 GB).
+5. With `--models`, it saves your model directory to `bnk.env`, which `run.sh` reads.
+
+The CUDA toolkit itself has to come from NVIDIA (`cuda-toolkit-12-8` from their apt repository); `setup.sh`
+points to it when it is missing. To do the same steps by hand:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python tools/build_mtp.py --out /opt/models/bnk/mtp/mtp-q2_0.gguf
+```
+
+Then open `http://<host>:8080` for the dashboard. `run.sh` looks for models under `$BNK_MODELS` (set by
+`setup.sh --models`); the `iq3_s` and `orca` presets at the top of `run.sh` name the files it expects there.
 
 First start takes about a minute: the experts are copied into page-locked RAM and the VRAM cache is filled.
 The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>.bnkc` and used next time.

@@ -6,6 +6,12 @@
 #   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# settings saved by setup.sh (BNK_MODELS, BNK_MTP); the environment still wins
+if [[ -f "$HERE/bnk.env" ]]; then
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ ^BNK_[A-Z_]+$ && -z "${!k:-}" ]] && export "$k=${v//\"/}"
+  done < "$HERE/bnk.env"
+fi
 MODELS="${BNK_MODELS:-/opt/models/Strata/models}"
 # bnk's own MTP draft layer, built from the official Qwen checkpoint by tools/build_mtp.py
 MTP_DEFAULT="${BNK_MTP:-/opt/models/bnk/mtp/mtp-q2_0.gguf}"
