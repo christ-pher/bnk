@@ -45,14 +45,18 @@ client sees.
 **Long conversations** — the workload that matters most in practice. Logs of real use show agent-style sessions:
 a median context of 56–66K tokens (a quarter of requests above 100K), ~97% of each prompt shared with the previous
 turn, and five to six times more time spent generating than processing prompts. Measured on an 80K-token coding
-conversation with Orca, ten turns each:
+conversation with Orca (`tools/agent_bench.py`: the repository's own sources as context, then turns that each
+add a tool result and a question):
 
 | | Orca IQ4_XS at ~80K tokens of context |
 |---|---|
-| Decode, greedy | 63 tok/s |
-| Decode, served (temperature 0.6) | 53–55 tok/s |
-| Expert misses (served by the CPU) | 8–10% |
-| Starting a follow-up turn | 0.5 s for a short message, ~4 s for a 1K-token tool result |
+| Decode, greedy | 65–74 tok/s |
+| Decode, served (temperature 0.6) | 58 tok/s |
+| Expert misses (served by the CPU) | 7–9% |
+| Starting a follow-up turn | ~0.5 s for a short message, ~4 s for a 1K-token tool result |
+
+Runs of this benchmark vary by about ±5% between batches (the adaptive expert cache, GPU clocks, the VM's host),
+so comparisons are made back to back and repeated.
 
 For reference, the engine bnk replaces reached ~57 tok/s for decoding and 400–700 tok/s for prompt processing
 on the same machine.
@@ -191,6 +195,7 @@ The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | where models and the MTP layer live |
+| `BNK_CPU_PIN=1`, `BNK_CPU_CHUNKS=3` | pin the CPU expert workers to cores / split their work dynamically (Strata's scheme; no measurable gain on this machine, so off by default) |
 
 **Per-model configs** — `configs/<name>.json`:
 
@@ -218,7 +223,8 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 
 **Dashboard** — live analytics built with [shadcn/ui](https://ui.shadcn.com/): decode and prompt-processing speeds,
 speculation, expert-cache hit rates per layer, GPU / PCIe / CPU / memory, requests, the engine log, and a chat
-panel for testing. Data arrives over server-sent events (`GET /api/stream`); `GET /api/stats` returns a snapshot.
+panel for testing. The sidebar lists the OpenAI and Claude API base URLs and the served model id, each with a copy
+button. Data arrives over server-sent events (`GET /api/stream`); `GET /api/stats` returns a snapshot.
 
 **Engine CLI** — `build/bnk` also runs on its own:
 
@@ -227,6 +233,9 @@ build/bnk run   --model M --tokens-file ids.csv --max-new 200 --mtp mtp.gguf   #
 build/bnk check --model M --tokens-file ids.csv --ref ref/prefix              # vs llama.cpp, layer by layer
 build/bnk pdump --model M --tokens-file ids.csv --ref out.bin                 # process a prompt, write its logits
 ```
+
+`BNK_SPLIT=N` makes `pdump` time only the tokens after the first N (a follow-up turn at depth), and
+`BNK_PROFILE_DECODE=1` limits an `nsys --capture-range=cudaProfilerApi` profile of `bnk run` to decoding.
 
 `tools/llama_ref.cpp` dumps llama.cpp's logits and per-layer states for `check`.
 
@@ -241,7 +250,7 @@ src/server/    the engine's JSON-lines protocol (bnk serve)
 serve/         HTTP server: APIs, chat templates, tokenizer, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
 configs/       per-model defaults
-tools/         CLI, MTP builder, draft-vocabulary builder, llama.cpp reference dumper
+tools/         CLI, MTP builder, draft-vocabulary builder, agent benchmark, llama.cpp reference dumper
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 ```
