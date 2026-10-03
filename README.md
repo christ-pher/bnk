@@ -64,6 +64,27 @@ add a tool result and a question):
 Runs of this benchmark vary by about ±5% between batches (the adaptive expert cache, GPU clocks, the VM's host),
 so comparisons are made back to back and repeated.
 
+**CYBER-FROST-3.8 (Q5_K_M)** — measured back to back with Orca on the same prompts (`bnk run`, greedy, warm
+routing counts, each model's speculation settings; the short-context rows average three chat prompts, the others
+decode 300 tokens after llama.cpp source code):
+
+| | CYBER-FROST Q5_K_M (78 GB of experts) | Orca IQ4_XS, same session |
+|---|---|---|
+| Speculative, greedy, short context | 52 tok/s | 58 tok/s |
+| Without speculation, greedy | 40 tok/s | 47 tok/s |
+| Speculative after ~1.7K / 30K tokens | 48 / 52 tok/s | 63 / 64 tok/s |
+| Speculative at 120K / 228K tokens | 46 / 42 tok/s | 57 / 54 tok/s |
+| Prompt processing, ~1.7K / 30K tokens | 212 / 627 tok/s | 248 / 697 tok/s |
+| Prompt processing, ~120K tokens | 674 tok/s (3.0 min) | 740 tok/s (2.7 min) |
+| Prompt processing, ~228K tokens | 742 tok/s (5.1 min) | 844 tok/s (4.5 min) |
+| 80K agent conversation, greedy (`tools/agent_bench.py`) | 53 tok/s, 4.7 s per turn read | |
+| 80K agent conversation, served (temperature 1.0) | 43 tok/s, 4.7–5.6 s per turn read | |
+
+Its experts are 28% larger than Orca's, so fewer fit in VRAM (27% of them vs 34%): more of each token's experts
+run on the CPU, which is bound by RAM bandwidth, and decoding is 10–22% slower (more so at long context). Speculation at temperature 1.0
+gains most from a high draft cutoff (draft 5 / cutoff 0.8: ~47.5 tok/s served at short context, against ~41 with
+the engine defaults 3 / 0.5).
+
 For reference, the engine bnk replaces reached ~57 tok/s for decoding and 400–700 tok/s for prompt processing
 on the same machine.
 
