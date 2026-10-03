@@ -96,10 +96,14 @@ int main(int argc, char ** argv) {
     const Config & c = eng.cfg();
 
     if (mode == "pdump") {
-        // batched prompt pass; the last position's logits to --ref (raw float32), for comparing engine variants
+        // batched prompt pass; the last position's logits to --ref (raw float32), for comparing engine variants.
+        // BNK_SPLIT=N: process the first N tokens untimed, then time the rest (a follow-up turn at depth)
+        const size_t split = std::min(prompt.size() - 1, (size_t) env_int("BNK_SPLIT", 0));
+        if (split) eng.prefill(std::vector<int32_t>(prompt.begin(), prompt.begin() + split));
         const double t0 = now_ms();
-        eng.prefill(prompt);
+        eng.prefill(std::vector<int32_t>(prompt.begin() + split, prompt.end()));
         const double t1 = now_ms();
+        if (split) printf("timed part: %zu tokens after %zu\n", prompt.size() - split, split);
         auto lg = eng.logits_host(eng.last_T - 1);
         FILE * f = fopen(ref.c_str(), "wb");
         if (!f || fwrite(lg.data(), 4, lg.size(), f) != lg.size()) throw std::runtime_error("cannot write " + ref);

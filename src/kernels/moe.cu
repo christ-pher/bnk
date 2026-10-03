@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "kernels/moe.h"
 #include "kernels/qdot.cuh"
 #include "kernels/rfmt.cuh"
@@ -19,77 +21,87 @@ void bump_seq(uint32_t * seq, cudaStream_t st) { bump_seq_k<<<1, 1, 0, st>>>(seq
 
 // ------------------------------------------------------------------------------------------- plan
 // One warp. Lane j < T*k takes routed pair j: hits are deduplicated by expert with ballots.
-__global__ void moe_plan_k(const int32_t * ids, const float * w, int T, int k, const int32_t * slot_of, HitList * hits,
-                           MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts) {
-    const int lane = threadIdx.x & 31;
-    const int n = T * k;
-    __shared__ int n_hit_s, n_miss_s;
-    if (threadIdx.x < 32) {
-        int nh = 0, nm = 0;
-        for (int base = 0; base < n; base += 32) {
-            const int j = base + lane;
-            const bool valid = j < n;
-            const int e = valid ? ids[j] : -1;
-            const int t = valid ? j / k : 0;
-            const float wt = valid ? w[j] : 0.f;
-            const int sl = valid ? slot_of[e] : -1;
-            if (valid && counts) atomicAdd(&counts[e], 1u);
-            // misses: compact in lane order
-            const unsigned mm = __ballot_sync(0xffffffff, valid && sl < 0);
-            if (valid && sl < 0) {
-                const int pos = nm + __popc(mm & ((1u << lane) - 1));
-                msg->miss_t[pos] = t;
-                msg->miss_e[pos] = e;
-                msg->miss_w[pos] = wt;
-            }
-            nm += __popc(mm);
-            // hits: the first lane (over the whole list) with a given expert creates the entry
-            for (int src = 0; src < 32; ++src) {
-                const int se = __shfl_sync(0xffffffff, e, src);
-                const int ssl = __shfl_sync(0xffffffff, sl, src);
-                const int st = __shfl_sync(0xffffffff, t, src);
-                const float sw = __shfl_sync(0xffffffff, wt, src);
-                if (ssl < 0) continue;  // also covers invalid lanes (sl = -1)
-                // find an existing entry (lanes scan the list in parallel)
-                int found = -1;
-                for (int b = 0; b < nh; b += 32) {
-                    const int q = b + lane;
-                    const unsigned m = __ballot_sync(0xffffffff, q < nh && hits->e[q].expert == se);
-                    if (m) { found = b + __ffs(m) - 1; break; }
-                }
-                if (found < 0) {
-                    found = nh++;
-                    if (lane == 0) {
-                        hits->e[found].expert = se;
-                        hits->e[found].slot = ssl;
-                        hits->e[found].mask = 0;
-                    }
-                }
-                if (lane == 0) {
-                    hits->e[found].mask |= 1u << st;
-                    hits->e[found].w[st] = sw;
-                }
-                __syncwarp();
-            }
+// One thread per (token, slot) pair, everything in shared memory (n = T * k <= kMaxRouted = 128). The outputs are
+// in pair order, as before: a hit entry is created by the first pair of its expert, misses keep their pair order
+// (the CPU sums a token's experts in that order, so results do not depend on this kernel's scheduling).
+__global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, const float * w, int T, int k,
+                                                         const int32_t * slot_of, HitList * hits, MoeMsg * msg,
+                                                         const float * x, int E, const uint32_t * seq,
+                                                         uint32_t * counts) {
+    __shared__ int s_e[kMaxRouted], s_sl[kMaxRouted];
+    __shared__ int s_first[kMaxRouted], s_miss[kMaxRouted];
+    __shared__ unsigned s_mask[kMaxRouted];
+    __shared__ int s_nh, s_nm;
+    const int n = T * k, j = threadIdx.x;
+    const bool valid = j < n;
+    const int e = valid ? ids[j] : -1;
+    const int t = valid ? j / k : 0;
+    const float wt = valid ? w[j] : 0.f;
+    const int sl = valid ? slot_of[e] : -1;
+    if (valid && counts) atomicAdd(&counts[e], 1u);
+    s_e[j] = e;
+    s_sl[j] = sl;
+    s_mask[j] = 0;
+    __syncthreads();
+    // is this pair its expert's first hit?
+    bool first = valid && sl >= 0;
+    for (int q = 0; first && q < j; ++q) first = s_e[q] != e;
+    s_first[j] = first;
+    s_miss[j] = valid && sl < 0;
+    __syncthreads();
+    // exclusive prefix sums (n <= 128: one warp walks it)
+    if (j < 32) {
+        int fh = 0, fm = 0;
+        for (int b = 0; b < kMaxRouted; b += 32) {
+            const int q = b + j;
+            const int vf = s_first[q], vm = s_miss[q];
+            const unsigned bf = __ballot_sync(0xffffffff, vf), bm = __ballot_sync(0xffffffff, vm);
+            const unsigned lt = (1u << j) - 1;
+            s_first[q] = fh + __popc(bf & lt);   // the entry a first pair creates
+            s_miss[q] = fm + __popc(bm & lt);
+            fh += __popc(bf);
+            fm += __popc(bm);
         }
-        if (lane == 0) {
-            hits->n = nh;
-            hits->n_miss = nm;
-            msg->n_miss = nm;
-            msg->T = T;
-            n_hit_s = nh;
-            n_miss_s = nm;
+        if (j == 0) {
+            s_nh = fh;
+            s_nm = fm;
         }
     }
     __syncthreads();
-    if (n_miss_s > 0) {
+    // every hit pair finds its expert's entry (the first pair's), and sets its token's bit and weight
+    if (valid && sl >= 0) {
+        int q = 0;
+        while (s_e[q] != e || s_sl[q] < 0) ++q;   // the first pair of this expert
+        const int ent = s_first[q];
+        atomicOr(&s_mask[ent], 1u << t);
+        hits->e[ent].w[t] = wt;
+        if (q == j) {
+            hits->e[ent].expert = e;
+            hits->e[ent].slot = sl;
+        }
+    }
+    if (valid && sl < 0) {
+        const int pos = s_miss[j];
+        msg->miss_t[pos] = t;
+        msg->miss_e[pos] = e;
+        msg->miss_w[pos] = wt;
+    }
+    __syncthreads();
+    if (j < s_nh) hits->e[j].mask = s_mask[j];
+    if (j == 0) {
+        hits->n = s_nh;
+        hits->n_miss = s_nm;
+        msg->n_miss = s_nm;
+        msg->T = T;
+    }
+    if (s_nm > 0) {
         float4 * mx = (float4 *) msg->x();
         const float4 * xs = (const float4 *) x;
-        for (int i = threadIdx.x; i < T * E / 4; i += blockDim.x) mx[i] = xs[i];
+        for (int i = j; i < T * E / 4; i += blockDim.x) mx[i] = xs[i];
         __threadfence_system();
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (j == 0) {
         msg->seq_req = *seq;
         g_moe_ts[g_moe_layer & 63][0] = gtimer();
     }
@@ -97,7 +109,8 @@ __global__ void moe_plan_k(const int32_t * ids, const float * w, int T, int k, c
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
               const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st) {
-    moe_plan_k<<<1, 256, 0, st>>>(ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq, counts_layer);
+    if (T * k > kMaxRouted) { fprintf(stderr, "moe_plan: %d pairs exceed %d\n", T * k, kMaxRouted); abort(); }
+    moe_plan_k<<<1, kMaxRouted, 0, st>>>(ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq, counts_layer);
 }
 
 // ------------------------------------------------------------------------------------------- hits

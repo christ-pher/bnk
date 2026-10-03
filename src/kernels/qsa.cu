@@ -154,15 +154,36 @@ __global__ void qsa_topk_k(const float * scores, int max_blocks, int32_t * sel, 
             if ((v & mask) == prefix) atomicAdd(&hist[(v >> shift) & 255], 1u);
         }
         __syncthreads();
-        if (threadIdx.x == 0) {
-            unsigned acc = 0;
-            int d = 255;
-            for (; d > 0; --d) {
-                if (acc + hist[d] >= want) break;
-                acc += hist[d];
+        // the digit d whose bin holds the want-th largest: warp 0, each lane summing 8 bins from the top, then
+        // a suffix scan across lanes (the same d and remainder the serial walk from 255 down finds)
+        if (threadIdx.x < 32) {
+            const int lane = threadIdx.x;
+            const int hi = 255 - 8 * lane;   // this lane's bins: hi, hi-1, ..., hi-7
+            unsigned own = 0;
+            for (int i = 0; i < 8; ++i) own += hist[hi - i];
+            unsigned incl = own;   // sum over lanes 0..lane (bins from 255 down to hi-7)
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned v = __shfl_up_sync(0xffffffff, incl, o);
+                if (lane >= o) incl += v;
             }
-            prefix_s = prefix | ((unsigned) d << shift);
-            want_s = want - acc;
+            const unsigned before = incl - own;
+            const bool here = before < want && incl >= want;
+            const unsigned who = __ballot_sync(0xffffffff, here);
+            if (who) {
+                if (lane == __ffs(who) - 1) {
+                    unsigned acc = before;
+                    int d = hi;
+                    for (int i = 0; i < 8 && d > 0; ++i, --d) {
+                        if (acc + hist[d] >= want) break;
+                        acc += hist[d];
+                    }
+                    prefix_s = prefix | ((unsigned) d << shift);
+                    want_s = want - acc;
+                }
+            } else if (lane == 31) {   // fewer than want in all: the serial walk stops at d = 0
+                prefix_s = prefix;
+                want_s = want - (incl - hist[0]);
+            }
         }
         __syncthreads();
         prefix = prefix_s;
@@ -184,15 +205,31 @@ __global__ void qsa_topk_k(const float * scores, int max_blocks, int32_t * sel, 
     sa[threadIdx.x] = na;
     se[threadIdx.x] = ne;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int ca = 0, ce = 0;
-        for (int i = 0; i < (int) blockDim.x; ++i) {
-            const int a = sa[i], e = se[i];
-            sa[i] = ca;
-            se[i] = ce;
-            ca += a;
-            ce += e;
+    {   // exclusive block scans of (sa, se): warps scan with shuffles, then the warp totals
+        __shared__ int wa[32], we[32];
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        int a = sa[threadIdx.x], e = se[threadIdx.x];
+        for (int o = 1; o < 32; o <<= 1) {
+            const int va = __shfl_up_sync(0xffffffff, a, o), ve = __shfl_up_sync(0xffffffff, e, o);
+            if (lane >= o) { a += va; e += ve; }
         }
+        if (lane == 31) { wa[wid] = a; we[wid] = e; }
+        __syncthreads();
+        if (wid == 0) {
+            const int nw = blockDim.x >> 5;
+            int x = lane < nw ? wa[lane] : 0, y = lane < nw ? we[lane] : 0;
+            for (int o = 1; o < 32; o <<= 1) {
+                const int vx = __shfl_up_sync(0xffffffff, x, o), vy = __shfl_up_sync(0xffffffff, y, o);
+                if (lane >= o) { x += vx; y += vy; }
+            }
+            if (lane < nw) { wa[lane] = x; we[lane] = y; }
+        }
+        __syncthreads();
+        const int ba = wid ? wa[wid - 1] : 0, be = wid ? we[wid - 1] : 0;
+        const int ia = a - sa[threadIdx.x], ie = e - se[threadIdx.x];   // exclusive within the warp
+        __syncthreads();
+        sa[threadIdx.x] = ba + ia;
+        se[threadIdx.x] = be + ie;
     }
     __syncthreads();
     // slot of a pick = (#above before it) + min(#equal before it, want): block order, equal ones past `want` dropped
@@ -269,13 +306,82 @@ __global__ void __launch_bounds__(256) qsa_score_tiled_k(const float * __restric
     }
 }
 
+// A decode window (TT <= 8 rows, 4 indexer heads): each thread owns one pooled key and reads it once, 32 dims at a
+// time, accumulating every row x head of the window in registers; the queries sit in shared memory (broadcast).
+// Summation order per (row, head) is the per-row kernel's, so scores are bit-identical to it.
+template <int TT>
+__global__ void __launch_bounds__(256) qsa_score_win_k(const float * __restrict__ q, const float * __restrict__ pooled,
+                                                       float * __restrict__ scores, int max_blocks, int id, int r,
+                                                       int dense_cells, const int * pos0p, int t_off) {
+    constexpr int IH = 4;
+    extern __shared__ float qs[];   // [TT][IH][id]
+    const int pos0 = *pos0p + t_off;
+    const int nb = (pos0 + TT) / r;  // the last row's complete blocks
+    if ((int) (blockIdx.x * blockDim.x) >= nb) return;
+    for (int i = threadIdx.x; i < TT * IH * id; i += blockDim.x) qs[i] = q[i];
+    __syncthreads();
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb) return;
+    float acc[TT][IH];
+#pragma unroll
+    for (int t = 0; t < TT; ++t)
+#pragma unroll
+        for (int h = 0; h < IH; ++h) acc[t][h] = 0.f;
+    const float4 * kp = (const float4 *) (pooled + (size_t) b * id);
+    for (int c = 0; c < id / 4; c += 8) {
+        float4 kv[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) kv[u] = __ldg(kp + c + u);
+#pragma unroll
+        for (int t = 0; t < TT; ++t)
+#pragma unroll
+            for (int h = 0; h < IH; ++h) {
+                const float4 * qq = (const float4 *) (qs + ((size_t) t * IH + h) * id) + c;
+                float a = acc[t][h];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float4 qv = qq[u];
+                    a += qv.x * kv[u].x + qv.y * kv[u].y + qv.z * kv[u].z + qv.w * kv[u].w;
+                }
+                acc[t][h] = a;
+            }
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        const int qpos = pos0 + t;
+        if (qpos + 1 <= dense_cells || b >= (qpos + 1) / r) continue;
+        float sc = 0.f;
+#pragma unroll
+        for (int h = 0; h < IH; ++h) sc += fmaxf(acc[t][h], 0.f);
+        scores[(size_t) t * max_blocks + b] = sc;
+    }
+}
+
+template <int TT>
+static void score_win(const float * q, const float * pooled, float * scores, int max_blocks, const QsaShape & sh,
+                      const int * pos0, int t_off, cudaStream_t s) {
+    qsa_score_win_k<TT><<<(max_blocks + 255) / 256, 256, TT * 4 * sh.id * sizeof(float), s>>>(
+        q, pooled, scores, max_blocks, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
+}
+
 void qsa_select(const float * q, const float * pooled, float * scores, int max_blocks, int32_t * sel, int32_t * n_sel,
                 int T, const QsaShape & sh, const int * pos0, int t_off, cudaStream_t s) {
     static const bool old = getenv("BNK_QSA_OLD") != nullptr;
     if (T > 8 && sh.id % 32 == 0 && !old)  // prompt rows: tiled
         qsa_score_tiled_k<<<dim3((max_blocks + 63) / 64, (T + 63) / 64), 256, 0, s>>>(
             q, pooled, scores, T, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
-    else  // a decode window: one pass per query over the blocks
+    else if (!old && !getenv("BNK_QSA_NOWIN") && sh.ih == 4 && sh.id % 32 == 0 && T <= 8) {   // a decode window
+        switch (T) {
+            case 1: score_win<1>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 2: score_win<2>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 3: score_win<3>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 4: score_win<4>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 5: score_win<5>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 6: score_win<6>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            case 7: score_win<7>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+            default: score_win<8>(q, pooled, scores, max_blocks, sh, pos0, t_off, s); break;
+        }
+    } else
         qsa_score_k<<<dim3((max_blocks + 255) / 256, T), 256, sh.ih * sh.id * sizeof(float), s>>>(
             q, pooled, scores, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
     qsa_topk_k<<<T, 1024, 0, s>>>(scores, max_blocks, sel, n_sel, sh.top_blocks, sh.ratio, sh.dense_cells(), pos0,

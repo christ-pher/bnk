@@ -89,6 +89,7 @@ public:
     // (the expert cache gives the bytes up), and rebalance() hands spare bytes back to the cache.
     void ensure_ctx(int cells);
     void rebalance();
+    double last_rebalance_ms = 0;
     size_t vram_budget() const { return budget_.limit(); }
     size_t kv_bytes_mapped() const;
     // One batched prompt pass over N tokens (commits; logits of the last token in row 0).
@@ -230,6 +231,9 @@ private:
     std::vector<ElasticBuf> kv_k_, kv_v_, kv_raw_, kv_pool_;
     int ctx_mapped_ = 0;   // cells of context whose KV is mapped
     void prefill_layout(int N);
+    void predict_stats(int il, int T);
+    DevBuf<float> pred_logits_, pred_w_;
+    DevBuf<int32_t> pred_ids_;
     size_t prefill_arena_bytes(int N);
     size_t prefill_carve(int N, bool dry_only);
     void map_ctx(int cells);

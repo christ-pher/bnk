@@ -55,9 +55,16 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     const double t0 = now_ms();
     const size_t cp = checkpoint_at < 0 ? prompt.size() : (size_t) checkpoint_at;
     if (cp > keep && cp < prompt.size()) {
+        static const bool prof = getenv("BNK_START_PROF") != nullptr;
+        const double a = now_ms();
         eng_.prefill(std::vector<int32_t>(prompt.begin() + keep, prompt.begin() + cp));
+        const double b = now_ms();
         eng_.checkpoint();
+        const double c = now_ms();
         eng_.prefill(std::vector<int32_t>(prompt.begin() + cp, prompt.end()));
+        if (prof)
+            fprintf(stderr, "start: %zu new tokens %.0f ms (rebalance %.0f ms), snapshot %.0f ms, last %zu tokens %.0f ms\n",
+                    cp - keep, b - a, eng_.last_rebalance_ms, c - b, prompt.size() - cp, now_ms() - c);
     } else {
         eng_.prefill(std::vector<int32_t>(prompt.begin() + keep, prompt.end()));
         if (cp >= prompt.size()) eng_.checkpoint();
