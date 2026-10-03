@@ -40,6 +40,7 @@ class State:
         self.active = None                               # the request being served
         self.waiting = 0
         self.lock = threading.Lock()
+        self.im_start = self.tok.id_of("<|im_start|>")
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})
@@ -128,7 +129,14 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     def stream(ids: list[int], allow_guard: bool) -> str:
         """One engine request; returns 'stop' (a stop string), 'loop' (the guard), or the engine's reason."""
         nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail
-        gen = S.engine.generate(ids, {**params, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids})
+        extra = {}
+        # snapshot the engine state where the prompt's last turn begins: the next request in this conversation
+        # shares everything before it (even when the client re-renders this turn's answer differently)
+        if S.im_start is not None and allow_guard:
+            last = len(ids) - 1 - ids[::-1].index(S.im_start) if S.im_start in ids else -1
+            if last > 0:
+                extra["checkpoint"] = last
+        gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids})
         wrap_pending, wrap_deadline, outcome = False, 0, None
         for ev in gen:
             rid = ev.get("_rid")

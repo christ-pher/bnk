@@ -29,7 +29,9 @@ public:
 
     // Starts a request: reuses the engine state when its history is a prefix of `prompt` (only the rest is
     // processed), otherwise starts over. Returns the first generated token.
-    int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp);
+    // `checkpoint_at`: where to snapshot the state for later requests to resume from (the start of the prompt's
+    // last turn, which the next request will share); -1 = the end of the prompt.
+    int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at = -1);
     // Emits the next tokens: 1 + accepted drafts.
     std::vector<int32_t> next();
     // Back-compat for the CLI: start with greedy sampling on a fresh state.

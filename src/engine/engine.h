@@ -97,6 +97,13 @@ public:
     const float * logits_dev() const { return logits_; }
 
     int pos() const { return (int) history_.size(); }
+    // Snapshots of the per-position-independent state (DeltaNet recurrences, conv and n-gram histories, the
+    // drafter's last residual) so a later prompt that shares only part of the history can resume from the last
+    // snapshot inside the shared part instead of starting over. The KV cache needs none: it is per position.
+    void checkpoint();
+    // Restores the latest snapshot at or before max_pos; returns its position (the history is cut there), or -1.
+    int rollback(int max_pos);
+    int checkpoints() const;
     const std::vector<int32_t> & history() const { return history_; }
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_.threads(); }
@@ -153,6 +160,11 @@ private:
     EngineOptions opt_;
     cudaStream_t st_ = nullptr;
     std::vector<int32_t> history_;
+    struct Checkpoint { int pos = -1, mtp_cell = -1; uint64_t age = 0; float * host = nullptr; };
+    std::vector<Checkpoint> ckpts_;
+    uint64_t ckpt_age_ = 0;
+    static constexpr int kMaxCheckpoints = 6;
+    template <typename F> void each_state(F && f);   // f(device ptr, floats) over every saved buffer
     uint32_t seq_ = 0;
     int64_t fwd_count_ = 0;
     cudaGraphExec_t graphs_[2][kMaxWindow + 1] = {};   // [commit_all][T]

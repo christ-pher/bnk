@@ -33,6 +33,8 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
 }
 
 Engine::~Engine() {
+    for (auto & k : ckpts_)
+        if (k.host) cudaFreeHost(k.host);
     for (auto & gm : graphs_) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     for (auto & g : commit_graphs_) if (g) cudaGraphExecDestroy(g);
     if (counts_.p) save_counts();
@@ -277,9 +279,74 @@ void Engine::rebalance() {
     }
 }
 
+template <typename F> void Engine::each_state(F && f) {
+    const Config & c = model_.cfg;
+    for (int il = 0; il < c.n_layer; ++il)
+        if (!c.is_attn(il)) {
+            f(conv_buf_[il].p, conv_buf_[il].n);
+            f(ssm_state_[il].p, ssm_state_[il].n);
+        }
+    if (ple_hist_.p) f(ple_hist_.p, ple_hist_.n);
+    if (mtp_R_) f(mtp_R_, (size_t) c.hc_dim());
+}
+
+int Engine::checkpoints() const {
+    int n = 0;
+    for (const auto & k : ckpts_) n += k.pos >= 0;
+    return n;
+}
+
+void Engine::checkpoint() {
+    const int p = pos();
+    if (p == 0) return;
+    for (auto & k : ckpts_)
+        if (k.pos == p) { k.age = ++ckpt_age_; return; }
+    size_t floats = 0;
+    each_state([&](float *, size_t n) { floats += n; });
+    Checkpoint * slot = nullptr;
+    for (auto & k : ckpts_)
+        if (k.pos < 0) { slot = &k; break; }
+    if (!slot && (int) ckpts_.size() < kMaxCheckpoints) {
+        ckpts_.emplace_back();
+        slot = &ckpts_.back();
+        CUDA_CHECK(cudaHostAlloc((void **) &slot->host, floats * 4, 0));
+    }
+    if (!slot)  // the least recently used one goes
+        slot = &*std::min_element(ckpts_.begin(), ckpts_.end(), [](const Checkpoint & a, const Checkpoint & b) { return a.age < b.age; });
+    size_t off = 0;
+    each_state([&](float * d, size_t n) {
+        CUDA_CHECK(cudaMemcpyAsync(slot->host + off, d, n * 4, cudaMemcpyDeviceToHost, st_));
+        off += n;
+    });
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    slot->pos = p;
+    slot->mtp_cell = mtp_cell_;
+    slot->age = ++ckpt_age_;
+}
+
+int Engine::rollback(int max_pos) {
+    Checkpoint * best = nullptr;
+    for (auto & k : ckpts_)
+        if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
+    if (!best) return -1;
+    size_t off = 0;
+    each_state([&](float * d, size_t n) {
+        CUDA_CHECK(cudaMemcpyAsync(d, best->host + off, n * 4, cudaMemcpyHostToDevice, st_));
+        off += n;
+    });
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    history_.resize(best->pos);
+    mtp_cell_ = best->mtp_cell;
+    best->age = ++ckpt_age_;
+    for (auto & k : ckpts_)  // snapshots past the cut describe a history that is gone
+        if (k.pos > best->pos) k.pos = -1;
+    return best->pos;
+}
+
 void Engine::reset() {
     const Config & c = model_.cfg;
     history_.clear();
+    for (auto & k : ckpts_) k.pos = -1;
     mtp_cell_ = -1;
     for (int il = 0; il < c.n_layer; ++il) {
         if (!c.is_attn(il)) {

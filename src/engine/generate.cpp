@@ -34,19 +34,34 @@ void Generator::draft_from(const float * R_row, int32_t tok, int cell) {
     stats.draft_ms += now_ms() - t0;
 }
 
-int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingParams & sp) {
+int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at) {
     sp_ = sp;
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
     drafts_.clear();
-    // reuse the processed prefix when the prompt extends it
+    // reuse what is already processed: all of it when the prompt extends the history, else rewind to the last
+    // snapshot inside the shared prefix (a chat client re-renders earlier turns, e.g. without their reasoning)
     const auto & h = eng_.history();
+    size_t common = 0;
+    while (common < h.size() && common < prompt.size() && h[common] == prompt[common]) ++common;
     size_t keep = 0;
-    if (!h.empty() && h.size() < prompt.size() && std::equal(h.begin(), h.end(), prompt.begin())) keep = h.size();
+    if (!h.empty() && common == h.size() && h.size() < prompt.size()) {
+        keep = h.size();
+    } else if (common > 0) {
+        const int r = eng_.rollback((int) std::min(common, prompt.size() - 1));
+        if (r > 0) keep = (size_t) r;
+    }
     if (keep == 0) eng_.reset();
-    const std::vector<int32_t> rest(prompt.begin() + keep, prompt.end());
     const double t0 = now_ms();
-    eng_.prefill(rest);
+    const size_t cp = checkpoint_at < 0 ? prompt.size() : (size_t) checkpoint_at;
+    if (cp > keep && cp < prompt.size()) {
+        eng_.prefill(std::vector<int32_t>(prompt.begin() + keep, prompt.begin() + cp));
+        eng_.checkpoint();
+        eng_.prefill(std::vector<int32_t>(prompt.begin() + cp, prompt.end()));
+    } else {
+        eng_.prefill(std::vector<int32_t>(prompt.begin() + keep, prompt.end()));
+        if (cp >= prompt.size()) eng_.checkpoint();
+    }
     stats.prefill_ms += now_ms() - t0;
     stats.prompt_tokens += (int64_t) prompt.size();
     stats.reused_tokens += (int64_t) keep;

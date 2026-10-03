@@ -2,7 +2,7 @@
 //
 //   in : {"op":"generate","id":..,"prompt":[ids],"max_tokens":N,"temperature":..,"top_p":..,"top_k":..,
 //         "min_p":..,"presence_penalty":..,"repetition_penalty":..,"seed":..,"stop_ids":[ids],"draft":n,
-//         "draft_min_p":p}  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
+//         "draft_min_p":p,"checkpoint":pos}  (checkpoint: where to snapshot state for the next request to resume)  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
 //        {"op":"cancel","id":..}   {"op":"stats"}   {"op":"reset"}   {"op":"quit"}
 //   out: {"type":"ready",..}  {"type":"prefill","id":..}  {"type":"tokens","id":..,"ids":[..]}
 //        {"type":"done","id":..,"reason":"stop|length|cancel|context"} {"type":"error",..}
@@ -299,7 +299,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             const double t0 = now_ms();
             cur.t_start = t0;
             telemetry(true);
-            int32_t tok = gen.start(prompt, sp);
+            int32_t tok = gen.start(prompt, sp, req.has("checkpoint") ? (int) req["checkpoint"].num() : -1);
             const double t1 = now_ms();
             const int64_t fresh = gen.stats.prompt_tokens - gen.stats.reused_tokens;
             cur.reused = gen.stats.reused_tokens;
