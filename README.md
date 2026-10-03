@@ -42,6 +42,18 @@ client sees.
 | 120K tokens | 1,165 tok/s (1.7 min) |
 | 228K tokens | 1,094 tok/s (3.5 min) |
 
+**Long conversations** — the workload that matters most in practice. Logs of real use show agent-style sessions:
+a median context of 56–66K tokens (a quarter of requests above 100K), ~97% of each prompt shared with the previous
+turn, and five to six times more time spent generating than processing prompts. Measured on an 80K-token coding
+conversation with Orca, ten turns each:
+
+| | Orca IQ4_XS at ~80K tokens of context |
+|---|---|
+| Decode, greedy | 63 tok/s |
+| Decode, served (temperature 0.6) | 53–55 tok/s |
+| Expert misses (served by the CPU) | 8–10% |
+| Starting a follow-up turn | 0.5 s for a short message, ~4 s for a 1K-token tool result |
+
 For reference, the engine bnk replaces reached ~57 tok/s for decoding and 400–700 tok/s for prompt processing
 on the same machine.
 
