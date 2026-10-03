@@ -52,7 +52,7 @@ export function PerformancePage({ range }: { range: Range }) {
           <CardDescription>1 + accepted drafts per full-model pass</CardDescription>
         </CardHeader>
         <CardContent>
-          <TimeChart rows={rows} kind="line" series={[{ key: "tpr", label: "Tokens / round", color: "var(--chart-3)", value: (r) => r.tokens_per_round, missing: "connect" }]} digits={2} />
+          <TimeChart rows={rows} kind="line" series={[{ key: "tpr", label: "Tokens / round", color: "var(--chart-3)", value: (r) => r.tokens_per_round }]} digits={2} />
         </CardContent>
       </Card>
       <Card>
@@ -61,7 +61,7 @@ export function PerformancePage({ range }: { range: Range }) {
           <CardDescription>Share of MTP drafts the full model confirmed</CardDescription>
         </CardHeader>
         <CardContent>
-          <TimeChart rows={rows} kind="line" series={[{ key: "acc", label: "Accepted", color: "var(--chart-3)", value: (r) => (r.accept == null ? null : r.accept * 100), missing: "connect" }]} unit="%" domain={[0, 100]} />
+          <TimeChart rows={rows} kind="line" series={[{ key: "acc", label: "Accepted", color: "var(--chart-3)", value: (r) => (r.accept == null ? null : r.accept * 100) }]} unit="%" domain={[0, 100]} />
         </CardContent>
       </Card>
 

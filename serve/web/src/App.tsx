@@ -171,7 +171,7 @@ function AppSidebar({ page }: { page: PageId }) {
       </SidebarContent>
       <SidebarFooter className="group-data-[collapsible=icon]:hidden">
         <div className="grid gap-1 rounded-lg border p-3 text-xs text-muted-foreground">
-          <div className="flex justify-between"><span>Context</span><span className="tabular text-foreground">{fmt.compact(live?.n_ctx)}</span></div>
+          <div className="flex justify-between"><span>Context</span><span className="tabular text-foreground">{fmt.ctx(live?.n_ctx)}</span></div>
           <div className="flex justify-between"><span>Speculation</span><span className="text-foreground">{live?.mtp ? "MTP" : "off"}</span></div>
           <div className="flex justify-between"><span>Uptime</span><span className="tabular text-foreground">{uptime != null ? fmt.duration(uptime) : "—"}</span></div>
         </div>

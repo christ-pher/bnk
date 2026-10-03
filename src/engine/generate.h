@@ -38,6 +38,7 @@ public:
         return start(prompt, SamplingParams{});
     }
     void set_draft(int n) { opt_.max_draft = n; }
+    void set_draft_min_p(float p) { opt_.min_p = p; }
     GenStats stats;
 
 private:

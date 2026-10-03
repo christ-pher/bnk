@@ -1,7 +1,8 @@
 // `bnk serve`: the engine behind a line protocol on stdin/stdout (one JSON object per line).
 //
 //   in : {"op":"generate","id":..,"prompt":[ids],"max_tokens":N,"temperature":..,"top_p":..,"top_k":..,
-//         "min_p":..,"presence_penalty":..,"repetition_penalty":..,"seed":..,"stop_ids":[ids],"draft":n}
+//         "min_p":..,"presence_penalty":..,"repetition_penalty":..,"seed":..,"stop_ids":[ids],"draft":n,
+//         "draft_min_p":p}  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
 //        {"op":"cancel","id":..}   {"op":"stats"}   {"op":"reset"}   {"op":"quit"}
 //   out: {"type":"ready",..}  {"type":"prefill","id":..}  {"type":"tokens","id":..,"ids":[..]}
 //        {"type":"done","id":..,"reason":"stop|length|cancel|context"} {"type":"error",..}
@@ -282,6 +283,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             sp.seed = (uint64_t) req["seed"].num(0);
             const int max_tokens = (int) req["max_tokens"].num(1024);
             gen.set_draft(req.has("draft") ? (int) req["draft"].num() : gopt.max_draft);
+            gen.set_draft_min_p(req.has("draft_min_p") ? (float) req["draft_min_p"].num() : gopt.min_p);
             {
                 std::lock_guard<std::mutex> lk(cur_mu);
                 current_id = id;

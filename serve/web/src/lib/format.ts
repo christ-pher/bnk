@@ -11,6 +11,13 @@ export const fmt = {
     if (v == null || Number.isNaN(v)) return "—"
     return Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(v)
   },
+  // context sizes in tokens, binary thousands as models quote them (262144 -> "256K")
+  ctx(v: number | null | undefined) {
+    if (v == null || Number.isNaN(v)) return "—"
+    if (v < 1024) return String(v)
+    const k = v / 1024
+    return `${k >= 100 || Number.isInteger(k) ? Math.round(k) : k.toFixed(1)}K`
+  },
   gib(mb: number | null | undefined, digits = 1) {
     if (mb == null) return "—"
     return `${(mb / 1024).toFixed(digits)} GiB`

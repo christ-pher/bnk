@@ -43,9 +43,20 @@ class State:
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})
+        # sampling defaults: the model file's recommendation, then the model config (configs/<model>.json);
+        # a request's own fields always win
         samp = self.tok.sampling
+        self.config = json.loads(Path(args.config).read_text()) if args.config else {}
         self.defaults = {"temperature": float(samp.get("temp", 1.0)), "top_k": int(samp.get("top_k", 20)),
-                         "top_p": float(samp.get("top_p", 0.95))}
+                         "top_p": float(samp.get("top_p", 0.95)), "min_p": 0.0, "presence_penalty": 0.0}
+        self.defaults.update(self.config.get("sampling", {}))
+        spec = self.config.get("speculation", {})
+        self.draft_defaults = {k: spec[k] for k in ("draft", "draft_min_p") if k in spec}
+        # the guard: --no-think-guard, else BNK_THINK_GUARD, else the model config, else on
+        if args.think_guard is None and os.environ.get("BNK_THINK_GUARD"):
+            args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
+        if args.think_guard is None:
+            args.think_guard = bool(self.config.get("thinking_loop_guard", True))
         eargs = ["--model", args.model, "--ctx", str(args.ctx)]
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
@@ -55,6 +66,7 @@ class State:
             eargs += ["--profile", args.profile]
         if args.counts:
             eargs += ["--counts", args.counts]
+        eargs += self.config.get("engine_args", [])
         eargs += args.engine_args
         self.telemetry = Telemetry()
         self.console = Console(self.telemetry.bus, args.log_level)
@@ -76,12 +88,16 @@ def sampling_from(body: dict) -> dict:
         "temperature": float(body.get("temperature", d["temperature"])),
         "top_k": int(body.get("top_k", d["top_k"])),
         "top_p": float(body.get("top_p", d["top_p"])),
-        "min_p": float(body.get("min_p", 0.0)),
-        "presence_penalty": float(body.get("presence_penalty", 0.0)),
+        "min_p": float(body.get("min_p", d["min_p"])),
+        "presence_penalty": float(body.get("presence_penalty", d["presence_penalty"])),
         "repetition_penalty": float(body.get("repetition_penalty", 1.0)),
     }
     if body.get("seed") is not None:
         p["seed"] = int(body["seed"])
+    for k in ("draft", "draft_min_p"):   # speculative decoding knobs (the model config sets their defaults)
+        v = body.get(k, S.draft_defaults.get(k))
+        if v is not None:
+            p[k] = v
     return p
 
 
@@ -591,8 +607,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=os.environ.get("BNK_API_KEY", ""))
     ap.add_argument("--max-tokens", type=int, default=8192, help="default completion budget")
-    ap.add_argument("--no-think-guard", dest="think_guard", action="store_false",
-                    default=os.environ.get("BNK_THINK_GUARD", "1") != "0",
+    ap.add_argument("--config", default="", help="model config JSON (configs/*.json): sampling, speculation, guard")
+    ap.add_argument("--no-think-guard", dest="think_guard", action="store_false", default=None,
                     help="disable the thinking-loop guard (it closes reasoning that keeps repeating itself)")
     ap.add_argument("--model-id", default="")
     ap.add_argument("--cache-dir", default="~/.cache/bnk")
@@ -616,6 +632,10 @@ def main():
     info = S.engine.info
     print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}"
           f" | thinking-loop guard {'on' if args.think_guard else 'off'}", flush=True)
+    d = S.defaults
+    print(f"bnk: defaults - temperature {d['temperature']} · top_p {d['top_p']} · top_k {d['top_k']}"
+          + (f" · draft {S.draft_defaults.get('draft')} (cutoff {S.draft_defaults.get('draft_min_p')})" if S.draft_defaults else "")
+          + (f" · config {Path(args.config).name}" if args.config else ""), flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"bnk: listening on http://{args.host}:{args.port}  (UI at /, OpenAI API at /v1)", flush=True)

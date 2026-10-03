@@ -1,0 +1,6 @@
+{
+  "notes": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S (ISTA DASLab). Sampling is the model file's own recommendation. Speculation tuned on this machine (5 prompts x 2-3 runs, sampled): draft 4 / cutoff 0.8 decodes ~58 tok/s vs ~50 with the engine defaults (3 / 0.5); at temperature 1.0 low-confidence drafts are mostly rejected, so a higher cutoff saves verify work.",
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "speculation": { "draft": 4, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true
+}

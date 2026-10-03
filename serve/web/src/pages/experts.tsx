@@ -163,7 +163,7 @@ export function ExpertsPage({ range }: { range: Range }) {
           <CardDescription>Expert uses served from VRAM, per second</CardDescription>
         </CardHeader>
         <CardContent>
-          <TimeChart rows={rows} kind="line" series={[{ key: "hit", label: "Hit rate", color: "var(--chart-1)", value: (r) => (r.miss_rate == null ? null : 100 * (1 - r.miss_rate)), missing: "connect" }]} unit="%" digits={1} domain={[0, 100]} />
+          <TimeChart rows={rows} kind="line" series={[{ key: "hit", label: "Hit rate", color: "var(--chart-1)", value: (r) => (r.miss_rate == null ? null : 100 * (1 - r.miss_rate)) }]} unit="%" digits={1} domain={[0, 100]} />
         </CardContent>
       </Card>
     </div>

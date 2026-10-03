@@ -8,10 +8,7 @@ export interface Series {
   key: string
   label: string
   color: string // a --chart-n token
-  value: (row: any) => number | null | undefined
-  // what a missing reading means: "zero" for rates (the engine did none of that work), "connect" for ratios
-  // (acceptance, hit rate: undefined while idle, so the line bridges the gap rather than diving to 0)
-  missing?: "zero" | "connect"
+  value: (row: any) => number | null | undefined // a missing reading (no work of that kind that second) plots as 0
 }
 
 export function TimeChart({
@@ -32,21 +29,20 @@ export function TimeChart({
   height?: number | string // a number of px, or "100%" to fill a sized parent
 }) {
   const config: ChartConfig = Object.fromEntries(series.map((s) => [s.key, { label: s.label, color: s.color }]))
+  if (rows.length < 2)
+    return (
+      <div className="flex w-full items-center justify-center text-sm text-muted-foreground" style={{ height }}>
+        Collecting samples…
+      </div>
+    )
   const data = rows.map((r) => {
     const o: Record<string, number | null> = { t: r.t }
     for (const s of series) {
       const v = s.value(r)
-      o[s.key] = v == null || Number.isNaN(v) ? ((s.missing ?? "zero") === "zero" ? 0 : null) : Number(v.toFixed(digits))
+      o[s.key] = v == null || Number.isNaN(v) ? 0 : Number(v.toFixed(digits))
     }
     return o
   })
-  // a sample with no neighbours (a sub-second burst between idle gaps) gets a dot, since a line can't show it
-  const lone = (key: string) => (props: { cx?: number; cy?: number; index?: number }) => {
-    const i = props.index ?? 0
-    const isLone = data[i]?.[key] != null && data[i - 1]?.[key] == null && data[i + 1]?.[key] == null
-    if (!isLone || props.cx == null || props.cy == null) return <g key={`d-${key}-${i}`} />
-    return <circle key={`d-${key}-${i}`} cx={props.cx} cy={props.cy} r={3} fill={`var(--color-${key})`} stroke="var(--card)" strokeWidth={2} />
-  }
   const tooltip = (
     <ChartTooltip
       cursor={{ stroke: "var(--border)", strokeWidth: 1 }}
@@ -109,8 +105,7 @@ export function TimeChart({
               strokeWidth={2}
               fill={`url(#fill-${s.key})`}
               isAnimationActive={false}
-              connectNulls={s.missing === "connect"}
-              dot={lone(s.key)}
+              dot={false}
               activeDot={{ r: 4, strokeWidth: 2, stroke: "var(--card)" }}
             />
           ))}
@@ -126,8 +121,7 @@ export function TimeChart({
               stroke={`var(--color-${s.key})`}
               strokeWidth={2}
               isAnimationActive={false}
-              connectNulls={s.missing === "connect"}
-              dot={lone(s.key)}
+              dot={false}
               activeDot={{ r: 4, strokeWidth: 2, stroke: "var(--card)" }}
             />
           ))}
@@ -138,8 +132,8 @@ export function TimeChart({
 }
 
 // A bare trend line for stat tiles: no axes, no tooltip (the tile's number is the reading).
-export function Sparkline({ values, color = "var(--chart-1)", height = 36, missing = "zero" }: { values: (number | null)[]; color?: string; height?: number; missing?: "zero" | "connect" }) {
-  const data = values.map((v, i) => ({ i, v: v == null && missing === "zero" ? 0 : v }))
+export function Sparkline({ values, color = "var(--chart-1)", height = 36 }: { values: (number | null)[]; color?: string; height?: number }) {
+  const data = values.map((v, i) => ({ i, v: v == null || Number.isNaN(v) ? 0 : v }))
   return (
     <ChartContainer config={{ v: { label: "", color } }} className="aspect-auto w-full" style={{ height }}>
       <AreaChart data={data} margin={{ top: 2, bottom: 0, left: 0, right: 0 }}>
@@ -157,7 +151,6 @@ export function Sparkline({ values, color = "var(--chart-1)", height = 36, missi
           strokeWidth={1.5}
           fill={`url(#spark-${color.replace(/[^a-z0-9]/gi, "")})`}
           isAnimationActive={false}
-          connectNulls
           dot={false}
         />
       </AreaChart>

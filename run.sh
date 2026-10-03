@@ -40,7 +40,7 @@ if [[ ! -x "$HERE/build/bnk" ]]; then
 fi
 if [[ ! -x "$HERE/.venv/bin/python" ]]; then
   python3 -m venv "$HERE/.venv"
-  "$HERE/.venv/bin/pip" install -q regex jinja2 numpy
+  "$HERE/.venv/bin/pip" install -q -r "$HERE/requirements.txt"
 fi
 
 # the dashboard (serve/web): built once, and again whenever its sources change
@@ -67,6 +67,8 @@ fi
 
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --ctx "$CTX" --port "$PORT" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
+# per-model tuning: sampling defaults, speculation, the thinking-loop guard (configs/<name>.json)
+[[ -f "$HERE/configs/$NAME.json" ]] && ARGS+=(--config "$HERE/configs/$NAME.json")
 [[ -n "$MTP" ]] && ARGS+=(--mtp "$MTP")
 [[ -n "$MTP" && -n "$DRAFT_VOCAB" && -f "$DRAFT_VOCAB" ]] && ARGS+=(--draft-vocab "$DRAFT_VOCAB")
 # the learned routing counts (written as the server runs) rank the initial VRAM cache; on a model's first run the

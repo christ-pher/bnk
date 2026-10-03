@@ -1,0 +1,9 @@
+# the server (serve/): tokenizer, chat templates, telemetry
+regex>=2024.0
+jinja2>=3.1
+numpy>=1.26
+# tools/build_mtp.py: GGUF writing (llama.cpp's gguf-py; its Q2_0 type is newer than the PyPI release)
+pyyaml>=6.0
+gguf @ git+https://github.com/ggml-org/llama.cpp#subdirectory=gguf-py
+# the dashboard build (serve/web) when no system Node.js is installed
+nodejs-wheel>=20
