@@ -2,6 +2,7 @@ import { Cpu, Gauge, LayoutDashboard, ListOrdered, MessageSquare, Moon, ScrollTe
 import { useEffect, useState } from "react"
 
 import { ChatSheet, type ChatSettings, type Msg } from "@/components/chat/chat-sheet"
+import { CopyRow } from "@/components/dash/copy-row"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
@@ -22,7 +23,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { fmt } from "@/lib/format"
-import { RANGES, useTelemetry, type Range } from "@/lib/telemetry"
+import { RANGES, useTelemetry, useUptime, type Range } from "@/lib/telemetry"
 import { ExpertsPage } from "@/pages/experts"
 import { LogsPage } from "@/pages/logs"
 import { OverviewPage } from "@/pages/overview"
@@ -131,7 +132,8 @@ export default function App() {
 function AppSidebar({ page }: { page: PageId }) {
   const model = useTelemetry((s) => s.overview?.model)
   const live = useTelemetry((s) => s.live)
-  const uptime = useTelemetry((s) => s.overview?.uptime)
+  const uptime = useUptime()
+  const origin = window.location.origin
   return (
     <Sidebar collapsible="icon">
       <SidebarHeader>
@@ -142,10 +144,7 @@ function AppSidebar({ page }: { page: PageId }) {
                 <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
                   <Zap className="size-4" />
                 </div>
-                <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-semibold">bnk</span>
-                  <span className="truncate text-xs text-muted-foreground">{model ?? "inference engine"}</span>
-                </div>
+                <span className="truncate text-base font-semibold">bnk</span>
               </a>
             </SidebarMenuButton>
           </SidebarMenuItem>
@@ -170,6 +169,12 @@ function AppSidebar({ page }: { page: PageId }) {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="group-data-[collapsible=icon]:hidden">
+        {/* what a client needs to connect: the two API bases and the model id the API serves */}
+        <div className="grid min-w-0 grid-cols-1 gap-2 rounded-lg border p-3 text-xs text-muted-foreground">
+          <CopyRow label="OpenAI API" value={`${origin}/v1`} />
+          <CopyRow label="Claude API" value={origin} />
+          <CopyRow label="Model" value={model} />
+        </div>
         <div className="grid gap-1 rounded-lg border p-3 text-xs text-muted-foreground">
           <div className="flex justify-between"><span>Context</span><span className="tabular text-foreground">{fmt.ctx(live?.n_ctx)}</span></div>
           <div className="flex justify-between"><span>Speculation</span><span className="text-foreground">{live?.mtp ? "MTP" : "off"}</span></div>

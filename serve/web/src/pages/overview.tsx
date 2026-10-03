@@ -9,13 +9,14 @@ import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
 import { fmt } from "@/lib/format"
 import { headline } from "@/lib/metrics"
-import { useTelemetry, windowed, type Range } from "@/lib/telemetry"
+import { useTelemetry, useUptime, windowed, type Range } from "@/lib/telemetry"
 
 export function OverviewPage({ range }: { range: Range }) {
   const live = useTelemetry((s) => s.live)
   const history = useTelemetry((s) => s.history)
   const recent = useTelemetry((s) => s.recent)
   const overview = useTelemetry((s) => s.overview)
+  const uptime = useUptime()
   const h = headline(live, history, recent)
   const spark = history.slice(-300)
   const rows = windowed(history, range)
@@ -73,7 +74,7 @@ export function OverviewPage({ range }: { range: Range }) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Layers className="size-4 text-muted-foreground" />Totals</CardTitle>
-            <CardDescription>Up {fmt.duration(overview?.uptime ?? 0)}</CardDescription>
+            <CardDescription>Up {fmt.duration(uptime ?? 0)}</CardDescription>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm">
             <Total label="Requests" value={fmt.n(live?.life.requests)} />

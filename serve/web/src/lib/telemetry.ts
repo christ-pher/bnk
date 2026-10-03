@@ -153,12 +153,13 @@ export interface State {
   recent: RequestRecord[]
   log: { t: number; line: string }[]
   lastEvent: number
+  overviewAt: number // Date.now() when `overview` arrived (uptime counts on from there)
 }
 
 const MAX_HISTORY = 3600
 const MAX_LOG = 1000
 
-let state: State = { conn: "connecting", overview: null, live: null, history: [], recent: [], log: [], lastEvent: 0 }
+let state: State = { conn: "connecting", overview: null, live: null, history: [], recent: [], log: [], lastEvent: 0, overviewAt: 0 }
 const listeners = new Set<() => void>()
 let es: EventSource | null = null
 let retry: number | undefined
@@ -176,6 +177,7 @@ function connect() {
     set({
       conn: "open",
       overview: o,
+      overviewAt: Date.now(),
       live: o.live && "phase" in o.live ? o.live : state.live,
       history: o.history.slice(-MAX_HISTORY),
       recent: o.recent,
@@ -259,4 +261,16 @@ export function smooth(values: (number | null | undefined)[], alpha = 0.35): num
     v = v == null ? x : alpha * x + (1 - alpha) * v
   }
   return v
+}
+
+// The server's uptime in seconds, ticking every second (counted on from when the dashboard last heard it).
+export function useUptime(): number | null {
+  const base = useTelemetry((s) => s.overview?.uptime)
+  const at = useTelemetry((s) => s.overviewAt)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  return base == null ? null : base + Math.max(0, now - at) / 1000
 }
