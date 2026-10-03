@@ -20,6 +20,7 @@ from pathlib import Path
 from .chat import ChatTemplate, OutputParser
 from .console import LEVELS, Console
 from .engine import Engine, EngineError
+from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary
 from .telemetry import Telemetry
 from .tokenizer import StreamDecoder, Tokenizer
 
@@ -86,54 +87,100 @@ def sampling_from(body: dict) -> dict:
 
 def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], thinking: bool, emit):
     """Drives one engine request. `emit(kind, text)` receives reasoning/content pieces as they decode.
-    Returns (content, reasoning, tool_calls, finish_reason, usage, timings)."""
+    Returns (content, reasoning, tool_calls, finish_reason, usage, timings).
+
+    Thinking-loop guard: while the model reasons, its tokens go through a ThinkingLoopGuard. When it reports a
+    loop, generation runs on to the end of the line or sentence, the engine request is cancelled, and a second one
+    continues from everything generated so far plus a short wrap-up that closes the reasoning, so the model writes
+    its answer in the output budget left. The engine reuses its state (the new prompt extends what it has seen),
+    so the hand-over costs one short prefill however long the conversation."""
     dec = StreamDecoder(S.tok)
     parser = OutputParser(thinking)
+    guard = ThinkingLoopGuard() if (thinking and S.args.think_guard) else None
+    force_at = int(os.environ.get("BNK_THINK_GUARD_TEST", "0"))   # testing: report a loop after N thinking tokens
     text_so_far = ""
+    reasoning_tail = ""
     finish = "length"
     done_msg = {}
     rid = None
     t0 = time.time()
     counted = True
-    with S.lock:
-        S.waiting += 1
-    try:
-        gen = S.engine.generate(prompt_ids, {**params, "max_tokens": max_tokens, "stop_ids": S.stop_ids})
-        stopped = False
+    generated: list[int] = []
+    interventions = 0
+    stopped = False
+
+    def stream(ids: list[int], allow_guard: bool) -> str:
+        """One engine request; returns 'stop' (a stop string), 'loop' (the guard), or the engine's reason."""
+        nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail
+        gen = S.engine.generate(ids, {**params, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids})
+        wrap_pending, wrap_deadline, outcome = False, 0, None
         for ev in gen:
             rid = ev.get("_rid")
             t = ev.get("type")
             if t == "prefill":
                 with S.lock:
-                    S.waiting -= 1
-                    counted = False
-                    S.active = {"id": rid, "started": t0, "prompt_tokens": ev.get("prompt_tokens"),
-                                "reused": ev.get("reused"), "prefill_ms": ev.get("ms"), "gen_tokens": 0}
+                    if counted:
+                        S.waiting -= 1
+                        counted = False
+                    if S.active is None:
+                        S.active = {"id": rid, "started": t0, "prompt_tokens": ev.get("prompt_tokens"),
+                                    "reused": ev.get("reused"), "prefill_ms": ev.get("ms"), "gen_tokens": 0}
             elif t == "tokens":
                 if stopped:
                     continue
+                generated.extend(ev["ids"])
                 piece = dec.feed(ev["ids"])
                 with S.lock:
                     if S.active:
                         S.active["gen_tokens"] += len(ev["ids"])
                 if stops:
                     text_so_far += piece
-                    hit = min((text_so_far.find(s) for s in stops if s and s in text_so_far), default=-1)
+                    hit = min((text_so_far.find(x) for x in stops if x and x in text_so_far), default=-1)
                     if hit >= 0:
                         cut = len(text_so_far) - hit
                         piece = piece[:max(0, len(piece) - cut)]
                         stopped = True
-                        finish = "stop"
+                        outcome = "stop"
                         S.engine.cancel(rid)
+                in_thinking = parser.mode == "reasoning"
                 for kind, txt in parser.feed(piece):
                     emit(kind, txt)
+                if allow_guard and guard and in_thinking and parser.mode == "reasoning" and outcome is None:
+                    reasoning_tail = (reasoning_tail + piece)[-200:]
+                    if not wrap_pending and (guard.push(ev["ids"]) or (force_at and guard.count >= force_at)):
+                        wrap_pending, wrap_deadline = True, len(generated) + 48
+                    if wrap_pending and (at_clean_boundary(reasoning_tail) or len(generated) >= wrap_deadline):
+                        outcome = "loop"
+                        S.engine.cancel(rid)
             elif t == "done":
                 done_msg = ev
-                if not stopped:
-                    finish = {"stop": "stop", "length": "length", "cancel": "stop", "context": "length"}.get(
-                        ev.get("reason"), "stop")
+                if outcome is None:
+                    outcome = ev.get("reason", "stop")
             elif t == "error":
                 raise EngineError(ev.get("message", "engine error"))
+        return outcome
+
+    with S.lock:
+        S.waiting += 1
+    try:
+        outcome = stream(prompt_ids, True)
+        if outcome == "loop":
+            interventions += 1
+            room = max_tokens - len(generated)
+            S.console.line(S.console._c("33", "↻ ") + f"thinking loop after {guard.count:,} thinking tokens "
+                           f"({guard.last_ratio:.0%} repeated): closing the reasoning, {room:,} tokens left to answer")
+            S.telemetry.bus.publish("log", {"t": time.time(), "line": f"thinking loop guard: intervened after "
+                                                                       f"{guard.count} thinking tokens"})
+            for kind, txt in parser.feed(dec.flush() + WRAP_UP):
+                emit(kind, txt)
+            if room > 0:
+                outcome = stream(prompt_ids + generated + S.tok.encode(WRAP_UP), False)
+            else:
+                outcome = "length"
+        if outcome == "stop" and stopped:
+            finish = "stop"
+        else:
+            finish = {"stop": "stop", "length": "length", "cancel": "stop", "context": "length"}.get(outcome, "stop")
     except BaseException:
         if rid:
             S.engine.cancel(rid)
@@ -151,14 +198,16 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         emit(kind, txt)
     if calls:
         finish = "tool_calls"
-    usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": done_msg.get("gen_tokens", 0),
-             "total_tokens": len(prompt_ids) + done_msg.get("gen_tokens", 0)}
+    usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": len(generated),
+             "total_tokens": len(prompt_ids) + len(generated)}
     timings = {k: done_msg.get(k) for k in ("prefill_ms", "prefill_tps", "gen_ms", "tps", "reused", "rounds",
                                              "tokens_per_round", "accepted", "drafted", "expert_miss_rate",
                                              "verify_ms", "draft_ms", "cpu_expert_ms")}
+    if interventions:
+        timings["thinking_loop_guard"] = interventions
     rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
            "gen_tokens": usage["completion_tokens"], "finish": finish, "temperature": params.get("temperature"),
-           "max_tokens": max_tokens, "thinking": thinking, **timings}
+           "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, **timings}
     S.recent.append(rec)
     S.telemetry.bus.publish("request", rec)
     return content, parser.reasoning_all, calls, finish, usage, timings
@@ -542,6 +591,9 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=os.environ.get("BNK_API_KEY", ""))
     ap.add_argument("--max-tokens", type=int, default=8192, help="default completion budget")
+    ap.add_argument("--no-think-guard", dest="think_guard", action="store_false",
+                    default=os.environ.get("BNK_THINK_GUARD", "1") != "0",
+                    help="disable the thinking-loop guard (it closes reasoning that keeps repeating itself)")
     ap.add_argument("--model-id", default="")
     ap.add_argument("--cache-dir", default="~/.cache/bnk")
     ap.add_argument("--log", default="", help="engine log file")
@@ -562,8 +614,8 @@ def main():
         S.engine.on_log = on_log
     S.engine.start()
     info = S.engine.info
-    print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}",
-          flush=True)
+    print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}"
+          f" | thinking-loop guard {'on' if args.think_guard else 'off'}", flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"bnk: listening on http://{args.host}:{args.port}  (UI at /, OpenAI API at /v1)", flush=True)

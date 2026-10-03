@@ -1,7 +1,10 @@
+import { RefreshCcw } from "lucide-react"
+
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { fmt } from "@/lib/format"
 import { useTelemetry } from "@/lib/telemetry"
 
@@ -54,8 +57,19 @@ export function RequestsPage() {
                   <TableCell className="text-right">{r.drafted ? fmt.pct((r.accepted ?? 0) / r.drafted) : "—"}</TableCell>
                   <TableCell className="text-right">{fmt.pct(r.expert_miss_rate, 1)}</TableCell>
                   <TableCell className="text-right text-muted-foreground">{fmt.n(r.temperature, 1)}</TableCell>
-                  <TableCell>
+                  <TableCell className="flex items-center gap-1.5">
                     <Badge variant={r.finish === "stop" ? "secondary" : "outline"}>{r.finish}</Badge>
+                    {r.loop_guard ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Badge variant="outline" className="gap-1 border-warning/60">
+                            <RefreshCcw className="size-3" />
+                            loop
+                          </Badge>
+                        </TooltipTrigger>
+                        <TooltipContent>The reasoning kept repeating itself; the thinking-loop guard closed it so the model could answer</TooltipContent>
+                      </Tooltip>
+                    ) : null}
                   </TableCell>
                 </TableRow>
               ))}

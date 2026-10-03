@@ -112,6 +112,7 @@ export interface RequestRecord {
   temperature?: number
   max_tokens?: number
   thinking?: boolean
+  loop_guard?: number // times the thinking-loop guard closed a looping reasoning
   prefill_ms?: number
   prefill_tps?: number
   gen_ms?: number

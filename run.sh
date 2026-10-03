@@ -2,6 +2,7 @@
 # Start the bnk server.
 #   ./run.sh [iq3_s|orca|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
 #   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
+#   BNK_THINK_GUARD=0  turn off the thinking-loop guard (on by default; serve/loop_guard.py)
 #   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
