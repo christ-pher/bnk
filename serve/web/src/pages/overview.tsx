@@ -135,7 +135,7 @@ export function OverviewPage({ range }: { range: Range }) {
         <Card>
           <CardHeader>
             <CardTitle>Prompt processing</CardTitle>
-            <CardDescription>New prompt tokens per second while reading a prompt</CardDescription>
+            <CardDescription>New prompt tokens per second during prompt processing</CardDescription>
           </CardHeader>
           <CardContent className="relative min-h-[130px] flex-1">
             <TimeChart
@@ -188,7 +188,7 @@ export function NowCard() {
         <CardTitle className="flex items-center gap-2"><Activity className="size-4 text-muted-foreground" />Now</CardTitle>
         <CardDescription>{live ? `Context ${fmt.ctx(live.pos)} / ${fmt.ctx(live.n_ctx)}` : "Connecting…"}</CardDescription>
         <CardAction>
-          {live?.phase === "prefill" && <Badge className="gap-1.5"><Spinner className="size-3" />Reading prompt</Badge>}
+          {live?.phase === "prefill" && <Badge className="gap-1.5"><Spinner className="size-3" />Processing prompt</Badge>}
           {live?.phase === "decode" && <Badge className="gap-1.5"><Zap className="size-3" />Generating</Badge>}
           {live?.phase === "idle" && <Badge variant="secondary">Idle</Badge>}
         </CardAction>

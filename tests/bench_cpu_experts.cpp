@@ -56,6 +56,25 @@ int main(int argc, char ** argv) {
     CpuExpertPool pool;
     pool.init(m, st, threads);
     std::vector<float> out(8 * E);
+    // cold: what a decode step sees - a different layer each call, random experts whose weights come from DRAM
+    {
+        std::mt19937 r2(7);
+        for (int nexp : {1, 2, 4, 8}) {
+            const int reps = 480;
+            double tot = 0;
+            for (int k = 0; k < reps; ++k) {
+                const int il = k % c.n_layer;
+                std::vector<ExpertTask> tasks;
+                for (int j = 0; j < nexp; ++j) tasks.push_back({j % 4, j, (int) (r2() % c.n_expert), 0.1f});
+                const double t0 = now_ms();
+                pool.run(il, 4, x.data(), tasks, out.data());
+                tot += now_ms() - t0;
+            }
+            printf("cold pool %2d threads: %d expert-token pairs over a 4-token window: %.1f us/layer\n", threads, nexp,
+                   tot / reps * 1000);
+        }
+    }
+    if (getenv("BNK_COLD_ONLY")) return 0;
     for (int nexp : {1, 2, 4, 10}) {
         for (int il : {0, 1, 17}) {
             std::vector<ExpertTask> tasks;

@@ -73,7 +73,7 @@ class Console:
             done, total = r.get("prefill_done", 0), r.get("prefill_total", 0)
             ms = r.get("prefill_ms", 0) or 0
             rate = f" · {done / (ms / 1000):,.0f} tok/s" if ms > 200 and done else ""
-            self.status(self._c("33", "◐ reading prompt ") + f"{done:,}/{total:,} tokens{rate}")
+            self.status(self._c("33", "◐ processing prompt ") + f"{done:,}/{total:,} tokens{rate}")
         elif phase == "decode":
             if rid and rid not in self.seen_decode:
                 self.seen_decode.add(rid)
@@ -81,7 +81,7 @@ class Console:
                 tps = (r.get("prefill_total", 0) / (r["prefill_ms"] / 1000)) if r.get("prefill_ms") else 0
                 self.line(self._c("36", "▶ ") + f"{rid[:6]}  prompt {r.get('prompt_tokens', 0):,} tokens"
                           + (f" ({reused:,} reused)" if reused else "")
-                          + f" read in {r.get('prefill_ms', 0) / 1000:.2f} s" + (f" · {tps:,.0f} tok/s" if tps else ""))
+                          + f" processed in {r.get('prefill_ms', 0) / 1000:.2f} s" + (f" · {tps:,.0f} tok/s" if tps else ""))
             n, ms = r.get("gen_tokens", 0), r.get("gen_ms", 0) or 0
             tps = f"{(n - 1) / (ms / 1000):5.1f} tok/s" if ms > 400 and n > 1 else "  —  tok/s"
             acc = f" · {r['accepted'] / r['drafted']:.0%} accepted" if r.get("drafted") else ""

@@ -244,7 +244,7 @@ function AssistantMsg({ m }: { m: Msg }) {
         </Collapsible>
       ) : null}
       {m.pending && !m.content && !m.reasoning && (
-        <div className="flex items-center gap-2 text-muted-foreground"><Spinner className="size-3.5" />Reading the prompt…</div>
+        <div className="flex items-center gap-2 text-muted-foreground"><Spinner className="size-3.5" />Processing the prompt…</div>
       )}
       {m.content && (
         <div className="prose-chat leading-relaxed">

@@ -116,18 +116,29 @@ void Engine::prefill_alloc(int N) {
 }
 
 // Sized after the cache: the largest number of non-resident experts in any layer, twice (double buffer).
-// Two stages for the next layers' non-resident experts, sized for the cache as it is now (a shrinking cache leaves
-// more experts outside, so this may take a few rounds to settle).
-void Engine::prefill_staging_ensure() {
+// Two stages for the next layers' non-resident experts. `full`: room for every non-resident expert of a layer
+// (sized for the cache as it is now; a shrinking cache leaves more experts outside, so this may take a few rounds
+// to settle), as streaming a whole layer ahead needs; otherwise the small stage kept between prompts, and the
+// prompt path's cost model sends the experts that do not fit to the CPU.
+void Engine::prefill_staging_ensure(bool full) {
     const Config & c = model_.cfg;
+    const size_t small = vmem_round((size_t) opt_.stage_small_mib << 20);
     for (int round = 0; round < 4; ++round) {
         size_t need = 0;
         for (int il = 0; il < c.n_layer; ++il)
             need = std::max(need, (size_t) (c.n_expert - cache_.resident(il)) * store_.blob_bytes(il));
+        if (!full) need = std::min(need, small);
         if (need <= pf_.stage_bytes && pf_stage_b_[0].mapped() >= need) break;
         for (int i = 0; i < 2; ++i) pf_stage_b_[i].ensure(need);
-        pf_.stage_bytes = need;
+        pf_.stage_bytes = std::max(pf_.stage_bytes, need);
     }
+}
+
+void Engine::prefill_staging_shrink() {
+    const size_t small = vmem_round((size_t) opt_.stage_small_mib << 20);
+    if (pf_stage_b_[0].mapped() <= small) return;
+    for (int i = 0; i < 2; ++i) pf_stage_b_[i].shrink_to(small);
+    pf_.stage_bytes = std::min(pf_.stage_bytes, pf_stage_b_[0].mapped());
 }
 
 void Engine::prefill_staging_alloc() {
@@ -139,7 +150,7 @@ void Engine::prefill_staging_alloc() {
         pf_.stage[i] = pf_stage_b_[i].as<uint8_t>();
     }
     pf_.stage_bytes = 0;
-    prefill_staging_ensure();
+    prefill_staging_ensure(false);
     pf_.stage_idx.assign(c.n_layer, std::vector<int>(c.n_expert, -1));
 }
 
@@ -163,6 +174,9 @@ void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
     const size_t blob = store_.blob_bytes(il);
     std::vector<int> & idx = p.stage_idx[il];
     int n = 0;
+    if (experts.size() * blob > p.stage_bytes)
+        throw std::runtime_error("expert staging too small: " + std::to_string(experts.size()) + " experts of layer " +
+                                 std::to_string(il) + " need " + std::to_string((experts.size() * blob) >> 20) + " MiB");
     for (int e : experts) {
         idx[e] = n;
         CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) n * blob, store_.blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
@@ -349,7 +363,7 @@ void Engine::pf_moe(int il, int N) {
         for (int e : nr) cpu_total += cnt[e] * t_tok;
         size_t n_pcie = 0;
         double pcie_total = 0;
-        while (n_pcie < nr.size() && n_pcie * blob < p.stage_bytes) {
+        while (n_pcie < nr.size() && (n_pcie + 1) * blob <= p.stage_bytes) {   // the whole expert must fit
             const double cpu_after = cpu_total - cnt[nr[n_pcie]] * t_tok;
             if (std::max(pcie_total + t_pcie, cpu_after) >= std::max(pcie_total, cpu_total)) break;
             pcie_total += t_pcie;

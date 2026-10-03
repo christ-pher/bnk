@@ -3,6 +3,8 @@
 //   bnk check --model M.gguf --tokens-file F --ref PREFIX   (per-layer residual + logits vs llama_ref)
 #include <cmath>
 #include <cstdio>
+
+#include <cuda_profiler_api.h>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -70,6 +72,9 @@ int main(int argc, char ** argv) {
         else if (a == "--mtp") opt.mtp = next();
         else if (a == "--draft-vocab") opt.draft_vocab = next();
         else if (a == "--prefill-chunk-max") opt.prefill_chunk_max = std::stoi(next());
+        else if (a == "--prefill-small") opt.prefill_small = std::stoi(next());
+        else if (a == "--stage-small-mib") opt.stage_small_mib = std::stoi(next());
+        else if (a == "--stage-full-min") opt.stage_full_min = std::stoi(next());
         else if (a == "--draft") gopt.max_draft = std::stoi(next());
         else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();
@@ -190,6 +195,9 @@ int main(int argc, char ** argv) {
     const double t1 = now_ms();
     std::vector<int> out{tok};
     eng.times = StageTimes{};
+    // BNK_PROFILE_DECODE: limit a profiler's capture to the decode phase (nsys --capture-range=cudaProfilerApi)
+    static const bool prof = getenv("BNK_PROFILE_DECODE") != nullptr;
+    if (prof) cudaProfilerStart();
     const double t2 = now_ms();
     while ((int) out.size() < max_new && out.back() != c.eos_token) {
         for (int t : gen.next()) {
@@ -198,6 +206,7 @@ int main(int argc, char ** argv) {
         }
     }
     const double t3 = now_ms();
+    if (prof) cudaProfilerStop();
     printf("output:");
     for (int t : out) printf(" %d", t);
     printf("\nprefill %zu tokens in %.1f ms (%.1f tok/s)\n", prompt.size(), t1 - t0, prompt.size() / ((t1 - t0) / 1000));

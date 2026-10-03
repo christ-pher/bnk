@@ -37,6 +37,13 @@ struct EngineOptions {
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     int prefill_chunk_max = 8192;    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile)
+    // Between prompts the prompt path keeps a layout for prefill_small tokens and up to stage_small_mib of PCIe
+    // staging; more is borrowed from the expert cache for bigger reads. Smaller values give decoding a bigger cache
+    // but slow down each turn: on an 80K-token agent conversation with Orca, 512 / 256 MiB gave +1.6% decode speed
+    // (miss rate 7.9% -> 7.5%) for 1.2 s more per turn, so the defaults keep everything mapped.
+    int prefill_small = 2048;        // layout kept between prompts
+    int stage_small_mib = 1 << 20;   // staging kept between prompts (capped at a whole layer's outside experts)
+    int stage_full_min = 512;        // reads this long borrow a stage for a whole layer's outside experts
     std::string draft_vocab;         // int32 token ids the drafter may propose (empty = the whole vocabulary)
     int prefill_chunk = 2048;        // tokens per batched prompt pass (0 = decode windows only)
     int prefill_min = 24;            // fewer tokens than this go through decode windows
@@ -226,10 +233,11 @@ private:
     size_t prefill_arena_bytes(int N);
     size_t prefill_carve(int N, bool dry_only);
     void map_ctx(int cells);
-    int pf_base_ = 0, pf_big_ = 0;   // chunk sizes: normal, and for long prompts
+    int pf_small_ = 0, pf_base_ = 0, pf_big_ = 0;   // chunk layouts: between prompts, normal, long prompts
     bool cache_ready_ = false;
     static constexpr int kCtxStep = 8192, kCtxBaseline = 16384;
-    void prefill_staging_ensure();
+    void prefill_staging_ensure(bool full);
+    void prefill_staging_shrink();
     struct {
         DevBuf<float> res, xn, lo, gpre, mixed, inj, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, rlog, w, sg, su,
             sh, sgate, shared, moe, ple_emb, ple_key, ple_val, ple_gated, ple_hist, x;

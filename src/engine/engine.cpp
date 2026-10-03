@@ -163,6 +163,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
 
     if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_);
     pf_base_ = opt.prefill_chunk;
+    pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
     pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
     if (opt.prefill_chunk > 0) {
         prefill_alloc(pf_big_);
@@ -178,7 +179,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
     budget_.reclaim = [this](size_t need) { return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0; };
     ensure_ctx(std::min(opt.max_ctx, kCtxBaseline));
-    if (opt.prefill_chunk > 0) prefill_layout(pf_base_);
+    if (opt.prefill_chunk > 0) prefill_layout(pf_small_);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
     if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
     if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
@@ -186,12 +187,15 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     size_t budget = avail;
     if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
     if (opt.prefill_chunk > 0) {
+        // the expert stage kept between prompts (two of them) depends on how many experts each layer leaves
+        // outside the cache: iterate to a fixed point
+        const size_t small = (size_t) opt.stage_small_mib << 20;
         for (int it = 0; it < 6; ++it) {
             const auto slots = ExpertCache::plan(model_, store_, budget, rank);
             size_t need = 0;
             for (int il = 0; il < c.n_layer; ++il)
                 need = std::max(need, (size_t) (c.n_expert - slots[il]) * store_.blob_bytes(il));
-            need = vmem_round(need);
+            need = vmem_round(std::min(need, small));
             const size_t want = avail > 2 * need ? avail - 2 * need : 0;
             const size_t nb = opt.expert_cache_gib >= 0 ? std::min(want, (size_t) (opt.expert_cache_gib * 1073741824.0)) : want;
             if (nb == budget) break;
@@ -203,8 +207,9 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     if (opt.prefill_chunk > 0) {
         prefill_staging_alloc();
         if (opt.verbose)
-            fprintf(stderr, "bnk: prompt path: chunks of %d tokens (%d for long prompts), 2 x %.2f GiB of expert staging\n",
-                    pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
+            fprintf(stderr, "bnk: prompt path: chunks of %d / %d / %d tokens (short turns / prompts / long prompts), "
+                            "2 x %.2f GiB of expert staging between prompts (more borrowed for long ones)\n",
+                    pf_small_, pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
     }
     reset();
 }
@@ -269,14 +274,14 @@ void Engine::map_ctx(int cells) {
 // After a prompt: the prompt buffers go back to their baseline, the context keeps what it uses (plus a step),
 // and the expert tier takes the free bytes back.
 void Engine::rebalance() {
-    if (pf_base_ > 0) prefill_layout(pf_base_);
+    if (pf_base_ > 0) {
+        prefill_layout(pf_small_);
+        prefill_staging_shrink();
+    }
     const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kCtxStep) / kCtxStep * kCtxStep));
     if (keep < ctx_mapped_) map_ctx(keep);
     const size_t slack = 64ull << 20;
-    if (budget_.free() > slack) {
-        cache_.grow(budget_.free() - slack, st_);
-        if (pf_base_ > 0) prefill_staging_ensure();
-    }
+    if (budget_.free() > slack) cache_.grow(budget_.free() - slack, st_);
 }
 
 template <typename F> void Engine::each_state(F && f) {
@@ -695,9 +700,14 @@ size_t Engine::kv_bytes_mapped() const {
 void Engine::prefill(const std::vector<int32_t> & tokens) {
     size_t i = 0;
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
-    // a long prompt reads in big chunks, the prompt buffers borrowing VRAM from the expert cache meanwhile
-    if (pf_big_ > pf_base_ && (int) tokens.size() >= 2 * pf_base_) prefill_layout(pf_big_);
-    if (pf_base_ > 0) prefill_staging_ensure();
+    // the chunk layout for this read, borrowing VRAM from the expert cache meanwhile: a short turn keeps the
+    // small layout and stage; longer reads get bigger chunks and a stage that holds a whole layer's outside experts
+    const int n = (int) tokens.size();
+    if (pf_base_ > 0) {
+        const int lay = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
+        prefill_layout(lay);
+        prefill_staging_ensure(n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min);
+    }
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();

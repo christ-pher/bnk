@@ -40,7 +40,7 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Prompt processing</CardTitle>
-          <CardDescription>New tokens per second while reading a prompt</CardDescription>
+          <CardDescription>New tokens per second during prompt processing</CardDescription>
         </CardHeader>
         <CardContent>
           <TimeChart rows={rows} series={[{ key: "pf", label: "Prefill", color: "var(--chart-2)", value: (r) => r.prefill_tps }]} unit="tok/s" />
