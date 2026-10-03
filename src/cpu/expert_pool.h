@@ -76,6 +76,7 @@ private:
     std::vector<uint8_t> hq_;      // per task: h quantized for the down product
     std::unique_ptr<std::atomic<int>[]> rows_done_;
     std::vector<std::vector<int>> groups_;   // tasks of the same expert
+    int chunks_per_thread_ = 1;
     int rows_done_n_ = 0;
 };
 

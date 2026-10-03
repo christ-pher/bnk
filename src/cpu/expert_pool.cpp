@@ -127,7 +127,11 @@ void SpinPool::run(const std::function<void(int, int)> & fn) {
 void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads) {
     m_ = &m;
     st_ = &st;
-    pool_ = std::make_unique<SpinPool>(n_threads - 1, -1);
+    // BNK_CPU_PIN=1: worker i on core i + 1 (the calling thread stays free: threads it creates later would
+    // inherit a single-core mask); BNK_CPU_CHUNKS=n: n work ranges per thread, claimed dynamically
+    const bool pin = env_int("BNK_CPU_PIN", 0) != 0;
+    chunks_per_thread_ = std::max(1, env_int("BNK_CPU_CHUNKS", 1));
+    pool_ = std::make_unique<SpinPool>(n_threads - 1, pin ? 1 : -1);
 }
 
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
@@ -186,9 +190,14 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
 
     // phase 1: the gate/up rows of every expert group, split evenly
     const int R = ng * 2 * F;
+    // work is cut into chunks_per_thread x threads ranges claimed from a counter (1: one fixed slice each)
+    const int nchunk1 = std::max(1, std::min(R, chunks_per_thread_ * pool_->size()));
+    std::atomic<int> next1{0};
     pool_->run([&](int part, int nparts) {
+      for (int c = chunks_per_thread_ > 1 ? next1.fetch_add(1) : part; c < (chunks_per_thread_ > 1 ? nchunk1 : nparts);
+           c = chunks_per_thread_ > 1 ? next1.fetch_add(1) : nparts) {
         int b, e;
-        split(R, part, nparts, b, e);
+        split(R, c, chunks_per_thread_ > 1 ? nchunk1 : nparts, b, e);
         thread_local std::vector<const void *> ysv;
         thread_local std::vector<float> valsv;
         ysv.resize(nt);
@@ -223,13 +232,18 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 }
             }
         }
+      }
     });
 
     // phase 2: output rows, split evenly; each row decodes every group's down row once, then each token sums its
     // experts in task order (the same order a one-token window uses, so speculation reproduces plain decoding)
+    const int nchunk2 = std::max(1, std::min(E, chunks_per_thread_ * pool_->size()));
+    std::atomic<int> next2{0};
     pool_->run([&](int part, int nparts) {
+      for (int c = chunks_per_thread_ > 1 ? next2.fetch_add(1) : part; c < (chunks_per_thread_ > 1 ? nchunk2 : nparts);
+           c = chunks_per_thread_ > 1 ? next2.fetch_add(1) : nparts) {
         int b, e;
-        split(E, part, nparts, b, e);
+        split(E, c, chunks_per_thread_ > 1 ? nchunk2 : nparts, b, e);
         thread_local std::vector<const void *> hsv;
         thread_local std::vector<float> valsv, tvv;
         hsv.resize(nt);
@@ -256,6 +270,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             for (int t = 0; t < T; ++t) out[(size_t) t * E + r] = 0.f;
             for (int i = 0; i < nt; ++i) out[(size_t) tasks[i].t * E + r] += tasks[i].w * tv[i];
         }
+      }
     });
     last_ms = now_ms() - t0;
 }
