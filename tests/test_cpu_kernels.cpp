@@ -126,10 +126,12 @@ void bench_mdot(const char * path) {
             return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a).count() / 20 / rows * 1000;
         };
         float out[4], acc = 0;
-        const double g1 = time([&] { for (int r = 0; r < rows; ++r) { tr->vec_dot(n, out, 0, t.data + r * rb, 0, yp[0], 0, 1); acc += out[0]; } });
-        const double m1 = time([&] { for (int r = 0; r < rows; ++r) { mdot(t.type, n, t.data + r * rb, yp.data(), 1, out); acc += out[0]; } });
-        const double g4 = time([&] { for (int r = 0; r < rows; ++r) for (int k = 0; k < 4; ++k) { tr->vec_dot(n, out, 0, t.data + r * rb, 0, yp[k], 0, 1); acc += out[0]; } });
-        const double m4 = time([&] { for (int r = 0; r < rows; ++r) { mdot(t.type, n, t.data + r * rb, yp.data(), 4, out); acc += out[0]; } });
-        printf("%-8s n=%d ns/row: ggml T1 %.0f  mdot T1 %.0f | ggml T4 %.0f  mdot T4 %.0f (%g)\n", ggml_type_name(t.type), n, g1, m1, g4, m4, acc * 0);
+        printf("%-8s n=%d ns/row (ggml per token / mdot):", ggml_type_name(t.type), n);
+        for (int T = 1; T <= 4; ++T) {
+            const double gt = time([&] { for (int r = 0; r < rows; ++r) for (int k = 0; k < T; ++k) { tr->vec_dot(n, out, 0, t.data + r * rb, 0, yp[k], 0, 1); acc += out[0]; } });
+            const double mt = time([&] { for (int r = 0; r < rows; ++r) { mdot(t.type, n, t.data + r * rb, yp.data(), T, out); acc += out[0]; } });
+            printf("  T%d %.0f / %.0f", T, gt, mt);
+        }
+        printf(" (%g)\n", acc * 0);
     }
 }
