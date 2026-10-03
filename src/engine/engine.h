@@ -36,6 +36,7 @@ struct EngineOptions {
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
+    std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
     int prefill_chunk_max = 8192;    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile)
     // Between prompts the prompt path keeps a layout for prefill_small tokens and up to stage_small_mib of PCIe
     // staging; more is borrowed from the expert cache for bigger reads. Smaller values give decoding a bigger cache

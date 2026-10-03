@@ -139,11 +139,39 @@ stay under 5% repetition, well below the 55% trigger.
 
 Any GGUF of the `qwen4exp` architecture (Qwen3.8-Flash-Next and fine-tunes): 48 layers (36 gated DeltaNet + 12
 QSA full-attention), 512 routed experts (top 10) plus a shared expert, hyper-connections (4 streams), the
-per-layer n-gram embedding. Expert formats: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K, Q6_K, Q8_0.
+per-layer n-gram embedding. Expert formats: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K, Q5_K, Q6_K, Q8_0. Files that
+also carry an MTP block (`nextn_predict_layers`) load their trunk.
 Tested with:
 
 * **IQ3_S** — `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (ISTA DASLab), 2 shards
 * **Orca IQ4_XS** — `Qwen3.8-Flash-Next-Uncensored-IQ4_XS`, 3 shards
+* **CYBER-FROST-3.8** — Blackfrost-AI's fine-tune, as `peasantsmith/CYBER-FROST-3.8-PS-GUFF` (Q5_K_M: Q5_K
+  gate/up and IQ4_NL down experts with an importance matrix, 78 GB of experts), stored without its PLE table
+  (see below)
+
+**CYBER-FROST-3.8.** Of the published quantizations of this fine-tune, PS-GUFF has the most precise experts that fit
+this machine's RAM and needs no new kernels (the other GGUFs use Q5_0/Q5_1/Q3_K/MXFP4 experts, or need more than
+the 128 GB of RAM). Three things about the file:
+
+* Its 28.8 GB PLE table is byte-identical to Orca's (checked with a SHA-256 of the whole tensor), so it is
+  downloaded without it (`tools/fetch_gguf.py`, 83.7 GB instead of 112.5 GB) and the engine reads the table from
+  the Orca file (`--ple-gguf`; `run.sh cyber-frost` passes it).
+* It declares its MTP block (`block_count` 49, `nextn_predict_layers` 1); the engine runs the 48-layer trunk and
+  drafts with `--mtp` as usual. That MTP head is byte-identical to the official Qwen one, so the stock draft
+  layer from `tools/build_mtp.py` is the model's own.
+* Its `compress_ratios` are all 0, which would mean dense attention, although the attention layers carry their
+  QSA indexers and the checkpoint's config says `indexer_compress_ratio` 4; the engine restores the ratio
+  (`BNK_NO_QSA=1` runs dense attention).
+
+Its chat template adds Blackfrost's own system prompt and a reasoning-effort line (`xhigh` by default; pass
+`chat_template_kwargs: {"reasoning_effort": "medium"|"low"}`), and always thinks.
+
+```bash
+.venv/bin/python tools/fetch_gguf.py --repo peasantsmith/CYBER-FROST-3.8-PS-GUFF \
+    --file CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf --drop per_layer_token_embd.weight \
+    --out /opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf
+./run.sh cyber-frost      # BNK_CYBER_FROST / BNK_PLE_GGUF override the two paths
+```
 
 Other quantizations of the same architecture (for example Unsloth's UD-IQ4_XS) use the same formats and should
 load as-is; add a `configs/<name>.json` to set their sampling defaults.
@@ -151,12 +179,13 @@ load as-is; add a `configs/<name>.json` to set their sampling defaults.
 ## Setup
 
 **Requirements:** Linux, an sm_70 GPU (V100) with CUDA 12.8, CMake ≥ 3.24, g++ ≥ 12 (C++20), Python ≥ 3.10,
-Ninja (recommended), and enough RAM to page-lock every expert (47 GB for IQ3_S, 61 GB for Orca) plus ~10 GB.
+Ninja (recommended), and enough RAM to page-lock every expert (47 GB for IQ3_S, 61 GB for Orca, 78 GB for
+CYBER-FROST) plus ~10 GB.
 
 ```bash
 git clone https://github.com/christ-pher/bnk.git && cd bnk
 ./setup.sh --mtp --models /path/to/your/models
-./run.sh iq3_s            # or: ./run.sh orca, or ./run.sh /path/to/model-00001-of-0000N.gguf
+./run.sh iq3_s            # or: ./run.sh orca, ./run.sh cyber-frost, or ./run.sh /path/to/model-00001-of-0000N.gguf
 ```
 
 `setup.sh` does everything in one pass:
@@ -179,7 +208,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 Then open `http://<host>:8080` for the dashboard. `run.sh` looks for models under `$BNK_MODELS` (set by
-`setup.sh --models`); the `iq3_s` and `orca` presets at the top of `run.sh` name the files it expects there.
+`setup.sh --models`); the `iq3_s` and `orca` presets at the top of `run.sh` name the files it expects there (`cyber-frost` looks
+in `/opt/models/cyber-frost` and takes the PLE table from the Orca file).
 
 First start takes about a minute: the experts are copied into page-locked RAM and the VRAM cache is filled.
 The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>.bnkc` and used next time.
@@ -256,7 +286,7 @@ src/server/    the engine's JSON-lines protocol (bnk serve)
 serve/         HTTP server: APIs, chat templates, tokenizer, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
 configs/       per-model defaults
-tools/         CLI, MTP builder, draft-vocabulary builder, agent benchmark, llama.cpp reference dumper
+tools/         CLI, MTP builder, draft-vocabulary builder, GGUF fetcher, agent benchmark, llama.cpp reference dumper
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 ```

@@ -50,7 +50,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     ggml_cpu_init();
     CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
-    model_.load(path, opt.verbose);
+    model_.load(path, opt.verbose, opt.ple_gguf);
     layer_routed.assign(model_.cfg.n_layer, 0);
     layer_misses.assign(model_.cfg.n_layer, 0);
     store_.build(model_, std::min(opt.cpu_threads, 16), opt.verbose);

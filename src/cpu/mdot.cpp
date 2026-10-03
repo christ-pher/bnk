@@ -233,6 +233,61 @@ void iq4_xs_rows(const block_iq4_xs * x, int nb, const block_q8_K * const * y, f
     for (int t = 0; t < NT; ++t) s[t] = hsum8(acc[t]);
 }
 
+// ---------------------------------------------------------------------------------------------- Q5_K x Q8_K
+// Same integer and float operations as ggml_vec_dot_q5_K_q8_K (AVX2), per token, so results are bit-identical.
+template <int NT>
+void q5_k_rows(const block_q5_K * x, int nb, const block_q8_K * const * y, float * s) {
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m128i mzero = _mm_setzero_si128();
+    __m256 acc[NT];
+    float summs[NT];
+    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); summs[t] = 0.f; }
+    uint32_t utmp[4];
+    for (int i = 0; i < nb; ++i) {
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & 0x0f0f0f0f) | (((utmp[1] >> 6) & 0x03030303) << 4);
+        const uint32_t uaux = utmp[1] & 0x3f3f3f3f;
+        utmp[1] = (utmp[2] & 0x0f0f0f0f) | (((utmp[0] >> 6) & 0x03030303) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= 0x3f3f3f3f;
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+        const uint8_t * sc8 = (const uint8_t *) utmp;  // the 8 sub-block scales
+        // decode the 256 weights (8 x 32 unsigned 5-bit values) once
+        const __m256i hbits = _mm256_loadu_si256((const __m256i *) x[i].qh);
+        __m256i q5[8];
+        for (int j = 0; j < 4; ++j) {
+            const __m256i q5bits = _mm256_loadu_si256((const __m256i *) (x[i].qs + 32 * j));
+            const __m256i h0 = _mm256_and_si256(hbits, _mm256_set1_epi8((char) (1 << (2 * j))));
+            const __m256i h1 = _mm256_and_si256(hbits, _mm256_set1_epi8((char) (1 << (2 * j + 1))));
+            q5[2 * j] = _mm256_add_epi8(_mm256_and_si256(q5bits, m4), _mm256_slli_epi16(_mm256_srli_epi16(h0, 2 * j), 4));
+            q5[2 * j + 1] = _mm256_add_epi8(_mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4),
+                                            _mm256_slli_epi16(_mm256_srli_epi16(h1, 2 * j + 1), 4));
+        }
+        const float dx = fp16(x[i].data.data.d), mx = fp16(x[i].data.data.dmin);
+        for (int t = 0; t < NT; ++t) {
+            const block_q8_K & b = y[t][i];
+            const float d = b.d * dx;
+            const float dmin = -b.d * mx;
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i *) b.bsums);
+            const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+            const __m128i prod = _mm_madd_epi16(mins, q8s);
+            const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+            summs[t] += dmin * _mm_extract_epi32(hsum, 0);
+            __m256i sumi = _mm256_setzero_si256();
+            for (int j = 0; j < 4; ++j) {
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i *) (b.qs + 64 * j));
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) (b.qs + 64 * j + 32));
+                const __m256i p0 = _mm256_madd_epi16(_mm256_set1_epi16(sc8[2 * j]), _mm256_maddubs_epi16(q5[2 * j], q8_0));
+                const __m256i p1 = _mm256_madd_epi16(_mm256_set1_epi16(sc8[2 * j + 1]), _mm256_maddubs_epi16(q5[2 * j + 1], q8_1));
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p1));
+            }
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) s[t] = hsum8(acc[t]) + summs[t];
+}
+
 // ---------------------------------------------------------------------------------------------- IQ4_NL x Q8_0
 template <int NT>
 void iq4_nl_rows(const block_iq4_nl * x, int nb, const block_q8_0 * const * y, float * s) {
@@ -278,7 +333,7 @@ void dispatch(const void * row, int nb, const void * const * y, int T, float * s
 
 bool mdot_supported(int type) {
     return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
-           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL;
+           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q5_K;
 }
 
 void mdot(int type, int n, const void * row, const void * const * y, int T, float * s) {
@@ -297,6 +352,9 @@ void mdot(int type, int n, const void * row, const void * const * y, int T, floa
             break;
         case GGML_TYPE_IQ4_NL:
             dispatch<block_iq4_nl, block_q8_0, iq4_nl_rows<1>, iq4_nl_rows<2>, iq4_nl_rows<3>, iq4_nl_rows<4>>(row, n / QK4_NL, y, T, s);
+            break;
+        case GGML_TYPE_Q5_K:
+            dispatch<block_q5_K, block_q8_K, q5_k_rows<1>, q5_k_rows<2>, q5_k_rows<3>, q5_k_rows<4>>(row, n / QK_K, y, T, s);
             break;
         default: break;
     }

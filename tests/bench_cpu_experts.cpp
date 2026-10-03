@@ -1,5 +1,5 @@
 // CPU expert kernels on this machine: ggml vec_dot speed per format and the pool's latency for a few experts.
-//   bench_cpu_experts MODEL.gguf [threads]
+//   bench_cpu_experts MODEL.gguf [threads]   (BNK_PLE_GGUF=FILE for a model stored without its PLE table)
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -13,7 +13,7 @@ using namespace bnk;
 int main(int argc, char ** argv) {
     ggml_cpu_init();
     Model m;
-    m.load(argv[1], true);
+    m.load(argv[1], true, getenv("BNK_PLE_GGUF") ? getenv("BNK_PLE_GGUF") : "");
     const int threads = argc > 2 ? atoi(argv[2]) : 24;
     const Config & c = m.cfg;
     const int E = c.n_embd, F = c.n_ff_exp;

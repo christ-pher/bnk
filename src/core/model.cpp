@@ -17,7 +17,11 @@ Config load_config(const GgufModel & g) {
     if (arch != "qwen4exp") throw std::runtime_error("unsupported architecture '" + arch + "' (expected qwen4exp)");
     auto k = [&](const char * s) { return arch + "." + s; };
     Config c;
-    c.n_layer = (int) g.get_u64(k("block_count"));
+    // block_count includes the MTP ("nextn") prediction blocks some files carry after the trunk (e.g.
+    // CYBER-FROST-3.8: 49 = 48 + 1); the trunk is what runs here, the draft layer comes from --mtp
+    const int nextn = (int) g.get_u64(k("nextn_predict_layers"), 0);
+    c.n_layer = (int) g.get_u64(k("block_count")) - nextn;
+    if (c.n_layer <= 0) throw std::runtime_error("block_count does not exceed nextn_predict_layers");
     c.n_embd = (int) g.get_u64(k("embedding_length"));
     c.n_head = (int) g.get_u64(k("attention.head_count"));
     c.n_head_kv = (int) g.get_u64(k("attention.head_count_kv"));
@@ -43,6 +47,21 @@ Config load_config(const GgufModel & g) {
     c.idx_top_k = (int) g.get_u64(k("attention.indexer.top_k"));
     for (auto v : g.get_int_arr(k("attention.compress_ratios"))) c.compress_ratio.push_back((int) v);
     c.compress_ratio.resize(c.n_layer, 0);
+    // Some conversions (CYBER-FROST-3.8 PS-GUFF) write compress_ratios as all zeros although the attention layers
+    // carry their QSA indexers; the checkpoint's config says indexer_compress_ratio 4, like the base model. Zeros
+    // would mean dense attention (llama.cpp's reading), which matches the trained model only within the indexer's
+    // budget, so restore the architecture's ratio. BNK_NO_QSA=1 still runs dense attention.
+    bool any_ratio = false, indexers = false;
+    for (int il = 0; il < c.n_layer; ++il) {
+        any_ratio |= c.compress_ratio[il] > 0;
+        indexers |= c.is_attn(il) && g.find("blk." + std::to_string(il) + ".indexer.k_proj.weight") != nullptr;
+    }
+    if (!any_ratio && indexers) {
+        constexpr int kQsaRatio = 4;
+        for (int il = 0; il < c.n_layer; ++il) if (c.is_attn(il)) c.compress_ratio[il] = kQsaRatio;
+        fprintf(stderr, "bnk: compress_ratios are all 0 but the attention layers have QSA indexers: using ratio %d\n",
+                kQsaRatio);
+    }
 
     auto ple_layers = g.get_int_arr(k("ple.layers"));
     if (!ple_layers.empty()) {
@@ -109,7 +128,7 @@ Model::~Model() {
     for (void * p : device_allocs_) cudaFree(p);
 }
 
-void Model::load(const std::string & path, bool verbose) {
+void Model::load(const std::string & path, bool verbose, const std::string & ple_path) {
     gguf.open(path);
     cfg = load_config(gguf);
     const Config & c = cfg;
@@ -184,7 +203,22 @@ void Model::load(const std::string & path, bool verbose) {
     hc_head = hcw("output_hc", false);
     output = upload("output.weight");
     tok_embd = upload("token_embd.weight");
-    if (c.ple_layer >= 0) ple_table = &gguf.get("per_layer_token_embd.weight");
+    if (c.ple_layer >= 0) {
+        // the PLE table may live in another GGUF (--ple-gguf): a fine-tune that left it untouched can share the
+        // base quant's copy instead of storing another 28.8 GB. The model's own table wins when it has one.
+        ple_table = gguf.find("per_layer_token_embd.weight");
+        if (!ple_table) {
+            if (ple_path.empty())
+                throw std::runtime_error("per_layer_token_embd.weight is not in the model; pass --ple-gguf FILE");
+            ple_gguf.open(ple_path);
+            ple_table = &ple_gguf.get("per_layer_token_embd.weight");
+            const uint64_t rows = c.ple_offset[c.ple_heads() - 1] + c.ple_vocab[c.ple_heads() - 1];
+            if (ple_table->ne[0] != c.ple_dim || (uint64_t) ple_table->ne[1] < rows)
+                throw std::runtime_error("the PLE table in " + ple_path + " does not match the model's PLE metadata");
+            if (verbose) fprintf(stderr, "bnk: PLE table (%.2f GiB, %s) from %s\n", ple_table->nbytes / 1073741824.0,
+                                 ggml_type_name(ple_table->type), ple_path.c_str());
+        }
+    }
     if (verbose) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
 }
 

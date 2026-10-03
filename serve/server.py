@@ -59,6 +59,8 @@ class State:
         if args.think_guard is None:
             args.think_guard = bool(self.config.get("thinking_loop_guard", True))
         eargs = ["--model", args.model, "--ctx", str(args.ctx)]
+        if args.ple_gguf:
+            eargs += ["--ple-gguf", args.ple_gguf]
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
             if args.draft_vocab:
@@ -605,6 +607,7 @@ def main():
     ap = argparse.ArgumentParser(description="bnk inference server")
     ap.add_argument("--model", required=True, help="first GGUF shard of the model")
     ap.add_argument("--mtp", default="", help="MTP draft layer GGUF (speculative decoding)")
+    ap.add_argument("--ple-gguf", default="", help="GGUF holding the PLE table when the model file has none")
     ap.add_argument("--draft", type=int, default=3)
     ap.add_argument("--draft-vocab", default="", help="int32 token ids the drafter may propose (faster drafts)")
     ap.add_argument("--ctx", type=int, default=32768)

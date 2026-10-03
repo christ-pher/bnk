@@ -69,10 +69,12 @@ struct Model {
     std::vector<LayerWeights> layers;
     HcWeights hc_head;
     QMat output, tok_embd;
+    GgufModel ple_gguf;                                    // --ple-gguf: holds the PLE table when the model has none
     const TensorRef * ple_table = nullptr;                 // host (mmap), [ple_dim, rows]
     size_t vram_dense_bytes = 0;
 
-    void load(const std::string & path, bool verbose = true);  // dense weights to VRAM
+    // dense weights to VRAM; ple_path supplies per_layer_token_embd.weight when the model file has none
+    void load(const std::string & path, bool verbose = true, const std::string & ple_path = "");
     ~Model();
 
     bool repack_ = true;  // R layouts for dense quant matrices

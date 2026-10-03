@@ -152,7 +152,7 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
         idx_k_norm_ = dev_f32(plus_one(g.get(L + "self_attn.indexer.k_layernorm.weight")));
         int r = 0;
         for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
-        qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
+        qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, r ? c.idx_top_k / r : 0, c.n_rot,
                         c.rope_base, c.rms_eps};
         sparse_ = r > 0;
     }
