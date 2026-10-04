@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start the bnk server.
-#   ./run.sh [iq3_s|orca|cyber-frost|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
+#   ./run.sh [iq3_s|orca|cyber-frost|abliterated|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
 #   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
 #   BNK_THINK_GUARD=0  turn off the thinking-loop guard (on by default; serve/loop_guard.py)
 #   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
@@ -26,13 +26,16 @@ PLE="${BNK_PLE_GGUF:-}"
 case "$choice" in
   iq3_s|IQ3_S) MODEL="$MODELS/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"; NAME=iq3_s ;;
   orca|orca-iq4_xs|iq4_xs) MODEL="$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf"; NAME=orca-iq4_xs ;;
+  # SC117's GSQ-RCO IQ3_S with Orca's abliterated tensors transplanted (huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)
+  abliterated|iq3_s-abliterated|sc117)
+    MODEL="${BNK_ABLITERATED:-/opt/models/gsq-rco-abliterated/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf}"; NAME=iq3_s-abliterated ;;
   # CYBER-FROST-3.8 PS-GUFF (Q5_K_M), fetched without its PLE table (tools/fetch_gguf.py, see README): that table
   # is byte-identical to Orca's, so it is read from the Orca file
   cyber-frost|cyberfrost|frost)
     MODEL="${BNK_CYBER_FROST:-/opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf}"; NAME=cyber-frost
     PLE="${BNK_PLE_GGUF:-$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf}" ;;
   *.gguf) MODEL="$choice"; NAME="$(basename "$choice" .gguf)" ;;
-  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, or a .gguf path)"; exit 1 ;;
+  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, or a .gguf path)"; exit 1 ;;
 esac
 
 # --port, --ctx and every other server option pass through (defaults: 8080, 262144); a model's persistent server

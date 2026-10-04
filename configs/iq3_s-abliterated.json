@@ -1,0 +1,7 @@
+{
+  "notes": "SC117 GSQ-RCO-abliterated IQ3_S: the ISTA DASLab IQ3_S with 144 residual-writing tensors replaced by Orca's (orcarouter) abliterated ones; everything else, shard 2 included, is byte-identical. Starting from Orca's settings because it carries Orca's ablation: temperature 0.6 (Orca looped in thinking at higher settings), draft 4 / cutoff 0.8, thinking-loop guard on. Not yet tuned on this model.",
+  "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "speculation": { "draft": 4, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true,
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S", "--max-tokens", "32768"]
+}

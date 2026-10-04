@@ -194,6 +194,15 @@ Its chat template adds Blackfrost's own system prompt and a reasoning-effort lin
 ./run.sh cyber-frost      # BNK_CYBER_FROST / BNK_PLE_GGUF override the two paths
 ```
 
+**GSQ-RCO-abliterated IQ3_S** ([SC117](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)): the
+IQ3_S above with 144 residual-writing tensors swapped for Orca's abliterated ones (mostly Q8_0 now); shard 2 and the
+MTP head are the stock ones. It starts from Orca's settings (temperature 0.6, guard on); not tuned yet.
+
+```bash
+hf download SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF --include "IQ3_S/*" --local-dir /opt/models/gsq-rco-abliterated
+./run.sh abliterated      # BNK_ABLITERATED overrides the path
+```
+
 Other quantizations of the same architecture (for example Unsloth's UD-IQ4_XS) use the same formats and should
 load as-is; add a `configs/<name>.json` to set their sampling defaults.
 
