@@ -610,7 +610,7 @@ def main():
     ap.add_argument("--ple-gguf", default="", help="GGUF holding the PLE table when the model file has none")
     ap.add_argument("--draft", type=int, default=3)
     ap.add_argument("--draft-vocab", default="", help="int32 token ids the drafter may propose (faster drafts)")
-    ap.add_argument("--ctx", type=int, default=32768)
+    ap.add_argument("--ctx", type=int, default=262144, help="maximum context (the model's native 256K by default)")
     ap.add_argument("--profile", default="", help="expert ranking for the initial VRAM cache")
     ap.add_argument("--counts", default="", help="file to learn expert routing counts in")
     ap.add_argument("--engine", default=str(ROOT.parent / "build" / "bnk"))
@@ -618,7 +618,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=os.environ.get("BNK_API_KEY", ""))
     ap.add_argument("--max-tokens", type=int, default=8192, help="default completion budget")
-    ap.add_argument("--config", default="", help="model config JSON (configs/*.json): sampling, speculation, guard")
+    ap.add_argument("--config", default="",
+                    help="model config JSON (configs/*.json): sampling, speculation, guard, engine_args, server_args")
     ap.add_argument("--no-think-guard", dest="think_guard", action="store_false", default=None,
                     help="disable the thinking-loop guard (it closes reasoning that keeps repeating itself)")
     ap.add_argument("--model-id", default="")
@@ -628,7 +629,16 @@ def main():
     ap.add_argument("--log-level", choices=LEVELS, default=os.environ.get("BNK_LOG_LEVEL", "info"),
                     help="terminal output: quiet, info (requests + live status), debug (+ telemetry, engine log)")
     ap.add_argument("engine_args", nargs="*", help="extra engine arguments (after --)")
-    args = ap.parse_args()
+    # the config's "server_args" are read as if typed before the command line, so the command line still wins
+    known, _ = ap.parse_known_args()
+    server_args = []
+    if known.config:
+        server_args = json.loads(Path(known.config).read_text()).get("server_args", [])
+        if not isinstance(server_args, list) or not all(isinstance(a, str) for a in server_args):
+            ap.error(f"{known.config}: server_args must be a list of strings")
+        if any(a.split("=")[0] in ("--config", "--model") for a in server_args):
+            ap.error(f"{known.config}: server_args cannot set --config or --model")
+    args = ap.parse_args(server_args + sys.argv[1:])
     S = State(args)
     print(f"bnk: starting the engine for {S.model_id} ...", flush=True)
     if args.log_level != "quiet":

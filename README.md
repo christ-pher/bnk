@@ -244,7 +244,7 @@ The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>
 | `--port 8080` | HTTP port |
 | `--ctx 262144` | maximum context (256K is the model's native length; memory is only used as needed) |
 | `--no-mtp` | no speculative decoding |
-| anything else | passed to the server (see `python -m serve.server --help`) |
+| anything else | passed to the server (see `python -m serve.server --help`); to keep an option, put it in the model's `server_args` |
 
 | Environment | |
 |---|---|
@@ -260,11 +260,17 @@ The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>
 {
   "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
-  "thinking_loop_guard": true
+  "thinking_loop_guard": true,
+  "server_args": ["--model-id", "orca", "--max-tokens", "32768"],
+  "engine_args": ["--threads", "24"]
 }
 ```
 
-Sampling values are defaults; a request's own fields take precedence. The shipped speculation settings come from
+This is where a model's persistent settings go; `run.sh <preset>` loads `configs/<preset>.json` (the file named
+after the model for a `.gguf` path). `server_args` are any server options (`python -m serve.server --help`: port,
+context, model id, completion budget, API key ...) and are read as if typed before the command line, so options
+given to `run.sh` still win. `engine_args` go to the engine (`--threads`, `--cache-gib`, ...; see
+`tools/bnk_main.cpp`). Sampling values are defaults; a request's own fields take precedence. The shipped speculation settings come from
 sweeps on this machine: drafting up to 4 tokens with a 0.8 confidence cutoff was 13–18% faster than the engine's
 defaults (3 tokens, 0.5 cutoff) for both models.
 

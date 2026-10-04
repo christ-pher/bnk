@@ -35,11 +35,11 @@ case "$choice" in
   *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, or a .gguf path)"; exit 1 ;;
 esac
 
-PORT=8080; CTX=262144; MTP="$MTP_DEFAULT"; EXTRA=()
+# --port, --ctx and every other server option pass through (defaults: 8080, 262144); a model's persistent server
+# options live in configs/<name>.json under "server_args"
+MTP="$MTP_DEFAULT"; EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port) PORT="$2"; shift 2 ;;
-    --ctx) CTX="$2"; shift 2 ;;
     --no-mtp) MTP=""; shift ;;
     *) EXTRA+=("$1"); shift ;;
   esac
@@ -78,7 +78,7 @@ if [[ -n "$MTP" && -n "$DRAFT_VOCAB" && ! -f "$DRAFT_VOCAB" ]]; then
 fi
 
 COUNTS="$CACHE/counts-$NAME.bnkc"
-ARGS=(--model "$MODEL" --ctx "$CTX" --port "$PORT" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
+ARGS=(--model "$MODEL" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 # per-model tuning: sampling defaults, speculation, the thinking-loop guard (configs/<name>.json)
 [[ -f "$HERE/configs/$NAME.json" ]] && ARGS+=(--config "$HERE/configs/$NAME.json")
 [[ -n "$MTP" ]] && ARGS+=(--mtp "$MTP")
