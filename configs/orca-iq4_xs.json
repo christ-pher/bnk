@@ -2,5 +2,6 @@
   "notes": "Qwen3.8 Flash Next Abliterated (Orca) IQ4_XS. Temperature 0.6 (Qwen's recommendation for thinking; this model fell into thinking loops at higher settings and greedy decoding). Speculation tuned on this machine (5 prompts x 2 runs at temperature 0.6): draft 4 / cutoff 0.8 decodes ~61 tok/s vs ~54 with the engine defaults (3 / 0.5). The thinking-loop guard stays on.",
   "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
-  "thinking_loop_guard": true
+  "thinking_loop_guard": true,
+  "server_args": ["--max-tokens", "32768"]
 }
