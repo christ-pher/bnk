@@ -91,6 +91,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     mail_stride_ = MoeMsg::bytes(E);
     CUDA_CHECK(cudaHostAlloc((void **) &mail_, mail_stride_ * c.n_layer, cudaHostAllocMapped));
     memset(mail_, 0, mail_stride_ * c.n_layer);
+    prefetch_.init(model_, store_, opt.prefetch, opt.verbose);   // before the cache takes the free VRAM
+    if (prefetch_.on()) pred_logits_.alloc((size_t) W * c.n_expert);
 
     CUDA_CHECK(cudaHostAlloc((void **) &h_par_, sizeof(WinParams), cudaHostAllocMapped));
     CUDA_CHECK(cudaMalloc(&d_par_, sizeof(WinParams)));
@@ -536,54 +538,80 @@ void Engine::attn(int il, int T) {
     gemv_auto(L.wo, attn_o_, H * D, T, out_, E, false, act_, st_);
 }
 
-// Measurement only (BNK_PREDICT_STATS, eager mode): how well would layer il+1's router, run on layer il's MoE
-// input, predict layer il+1's experts? Counted against the misses (non-resident experts) the CPU would compute.
+// Measurement only (BNK_PREDICT_STATS, eager mode): how much CPU expert work would a budgeted PCIe prefetch remove?
+// Layer il + D's router runs on layer il's MoE input (D = 1, 2); the target layer's non-resident experts are
+// ranked by their routing probability summed over the window's tokens and the best B would be fetched. Counted
+// against the target layer's misses: missed (token, expert) pairs, distinct missed experts (what the CPU streams
+// from RAM), and layers whose misses would all be covered (the GPU would not wait on the CPU at all).
 void Engine::predict_stats(int il, int T) {
     const Config & c = model_.cfg;
-    const int k = c.n_expert_used, P = 16;
-    static std::vector<int32_t> prev;   // [T][P] predicted for this layer (from the previous one)
-    static int prev_T = 0, prev_layer = -1;
-    static int64_t miss = 0, hit10 = 0, hit16 = 0, extra10 = 0, extra16 = 0, layers = 0;
+    const int k = c.n_expert_used, NE = c.n_expert;
+    static const int Bs[] = {1, 2, 3, 4, 6, 8, 12};
+    constexpr int NB = 7, ND = 2;
+    struct Acc { int64_t pairs = 0, uniq = 0, full = 0, fetched = 0; };
+    static Acc acc[ND][NB];
+    static std::vector<std::vector<float>> score[ND];   // [d][target layer]: prediction made d + 1 layers earlier
+    static std::vector<int> score_T[ND];                // its window size, 0 = none this forward
+    static int64_t steps = 0, miss_pairs = 0, miss_uniq = 0, miss_layers = 0;
+    for (int d = 0; d < ND; ++d) {
+        if (score[d].empty()) { score[d].resize(c.n_layer); score_T[d].assign(c.n_layer, 0); }
+        if (il == 0) std::fill(score_T[d].begin(), score_T[d].end(), 0);
+    }
     std::vector<int32_t> ids((size_t) T * k);
     CUDA_CHECK(cudaMemcpy(ids.data(), rids_.p, ids.size() * 4, cudaMemcpyDeviceToHost));
-    if (prev_layer == il && prev_T == T) {
-        for (int Pn : {10, 16}) {
-            std::vector<char> pred(c.n_expert, 0);   // the union over the window's tokens
-            for (int t = 0; t < T; ++t)
-                for (int j = 0; j < Pn; ++j) pred[prev[(size_t) t * P + j]] = 1;
-            std::vector<char> needed(c.n_expert, 0);
-            for (int i = 0; i < T * k; ++i) {
-                const int e = ids[i];
-                if (cache_.slot_of(il, e) >= 0) continue;
-                if (Pn == 10) ++miss;
-                needed[e] = 1;
-                (Pn == 10 ? hit10 : hit16) += pred[e];
-            }
-            for (int e = 0; e < c.n_expert; ++e)   // fetched for nothing: predicted, non-resident, not used
-                if (pred[e] && !needed[e] && cache_.slot_of(il, e) < 0) (Pn == 10 ? extra10 : extra16)++;
+    std::vector<int> need(NE, 0);     // missed pairs per expert
+    int u = 0, pairs = 0;
+    for (int i = 0; i < T * k; ++i)
+        if (cache_.slot_of(il, ids[i]) < 0) { u += need[ids[i]]++ == 0; ++pairs; }
+    ++steps;
+    miss_pairs += pairs; miss_uniq += u; miss_layers += u > 0;
+    for (int d = 0; d < ND; ++d) {
+        if (score_T[d][il] != T) continue;
+        std::vector<int> cand;
+        for (int e = 0; e < NE; ++e) if (cache_.slot_of(il, e) < 0) cand.push_back(e);
+        std::partial_sort(cand.begin(), cand.begin() + std::min<size_t>(12, cand.size()), cand.end(),
+                          [&](int x, int y) { return score[d][il][x] > score[d][il][y]; });
+        for (int bi = 0; bi < NB; ++bi) {
+            int cp = 0, cu = 0;
+            const int B = std::min<int>(Bs[bi], cand.size());
+            for (int j = 0; j < B; ++j) if (need[cand[j]]) { cp += need[cand[j]]; ++cu; }
+            acc[d][bi].pairs += cp; acc[d][bi].uniq += cu; acc[d][bi].fetched += B;
+            acc[d][bi].full += u > 0 && cu == u;
         }
-        ++layers;
     }
-    prev_layer = -1;
-    if (il + 1 < c.n_layer) {
-        if (!pred_logits_.p) {
-            pred_logits_.alloc((size_t) kMaxWindow * c.n_expert);
-            pred_ids_.alloc((size_t) kMaxWindow * 32);
-            pred_w_.alloc((size_t) kMaxWindow * 32);
-        }
-        gemv_q(model_.layers[il + 1].router, mixact_, mixed_, c.n_embd, T, pred_logits_, c.n_expert, st_);
-        route_topk(pred_logits_, T, c.n_expert, P, pred_ids_, pred_w_, 1.f, st_);
-        prev.resize((size_t) T * P);
-        CUDA_CHECK(cudaMemcpyAsync(prev.data(), pred_ids_.p, prev.size() * 4, cudaMemcpyDeviceToHost, st_));
+    // predictions from this layer's MoE input for layers il + 1 .. il + ND
+    if (!pred_logits_.p) pred_logits_.alloc((size_t) kMaxWindow * NE);
+    std::vector<float> lg((size_t) T * NE);
+    for (int d = 0; d < ND; ++d) {
+        const int tl = il + 1 + d;
+        if (tl >= c.n_layer) break;
+        gemv_q(model_.layers[tl].router, mixact_, mixed_, c.n_embd, T, pred_logits_, NE, st_);
+        CUDA_CHECK(cudaMemcpyAsync(lg.data(), pred_logits_.p, lg.size() * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
-        prev_T = T;
-        prev_layer = il + 1;
+        std::vector<float> sc(NE, 0.f);
+        for (int t = 0; t < T; ++t) {
+            const float * l = lg.data() + (size_t) t * NE;
+            const float mx = *std::max_element(l, l + NE);
+            double z = 0;
+            for (int e = 0; e < NE; ++e) z += expf(l[e] - mx);
+            for (int e = 0; e < NE; ++e) sc[e] += (float) (expf(l[e] - mx) / z);
+        }
+        score[d][tl] = std::move(sc); score_T[d][tl] = T;
     }
-    if (layers && layers % 2000 == 0)
-        fprintf(stderr, "predict: %lld layer steps, %lld misses; next-layer router on this layer's input covers "
-                        "%.1f%% (top-10 per token, %.1f extra experts fetched/layer) or %.1f%% (top-16, %.1f extra)\n",
-                (long long) layers, (long long) miss, 100.0 * hit10 / std::max<int64_t>(1, miss),
-                (double) extra10 / layers, 100.0 * hit16 / std::max<int64_t>(1, miss), (double) extra16 / layers);
+    if (steps % 4000 == 0) {
+        fprintf(stderr, "predict: %lld layer steps (T=%d), misses/layer %.2f pairs %.2f experts, %.1f%% of layers "
+                        "miss; CPU %.1f us per missed expert\n", (long long) steps, T, (double) miss_pairs / steps,
+                (double) miss_uniq / steps, 100.0 * miss_layers / steps, 1e3 * pstat_cpu_ms_ / std::max<int64_t>(1, pstat_cpu_n_));
+        for (int d = 0; d < ND; ++d)
+            for (int bi = 0; bi < NB; ++bi)
+                fprintf(stderr, "predict:   %d ahead, best %2d: covers %5.1f%% pairs %5.1f%% experts, %5.1f%% of "
+                                "missing layers fully; %.2f fetched/layer, %.2f wasted\n", d + 1, Bs[bi],
+                        100.0 * acc[d][bi].pairs / std::max<int64_t>(1, miss_pairs),
+                        100.0 * acc[d][bi].uniq / std::max<int64_t>(1, miss_uniq),
+                        100.0 * acc[d][bi].full / std::max<int64_t>(1, miss_layers),
+                        (double) acc[d][bi].fetched / steps, (double) (acc[d][bi].fetched - acc[d][bi].uniq) / steps);
+    }
+    pstat_uniq_ = u;
 }
 
 void Engine::moe(int il, int T) {
@@ -594,15 +622,24 @@ void Engine::moe(int il, int T) {
     quantize_act(mixed_, E, T, E, mixact_, st_);
     gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
     route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
-    moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
+    static const bool pstats = getenv("BNK_PREDICT_STATS") != nullptr;
+    const bool pf = prefetch_.on() && !pstats && !dump_all;
+    static const bool pf_nouse = getenv("BNK_PF_NOUSE") != nullptr;   // diagnostics: copies never used
+    moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert,
+             pf && !pf_nouse ? prefetch_.table(il) : nullptr, st_);
+    if (pf && il + 1 < c.n_layer) {   // the next layer's likely misses, for the prefetch thread
+        gemv_q(model_.layers[il + 1].router, mixact_, mixed_, E, T, pred_logits_, c.n_expert, st_);
+        moe_predict(pred_logits_, T, c.n_expert, cache_.desc(il + 1).slot_of, prefetch_.per_layer(),
+                    prefetch_.msg(il), &d_par_->seq, st_);
+    }
     if (!opt_.use_graphs || dump_all) {  // eager mode: answer the CPU part right here
         CUDA_CHECK(cudaStreamSynchronize(st_));
-        static const bool pstats = getenv("BNK_PREDICT_STATS") != nullptr;
         if (pstats) predict_stats(il, T);
         MoeMsg * m = msg(il);
         tasks_.clear();
         for (int i = 0; i < m->n_miss; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
         if (!tasks_.empty()) cpu_.run(il, T, m->x(), tasks_, m->out(E));
+        if (pstats && !tasks_.empty()) { pstat_cpu_ms_ += cpu_.last_ms; pstat_cpu_n_ += pstat_uniq_; }
         times.misses += m->n_miss;
         times.routed += (int64_t) T * k;
         layer_misses[il] += m->n_miss;
@@ -700,6 +737,7 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     history_.insert(history_.end(), tokens, tokens + T);
     memcpy(h_tok_, tokens, T * 4);
     *h_par_ = WinParams{pos0, T, ++seq_, 0};
+    prefetch_.begin(seq_);
     ple_gather(T);
     if (opt_.use_graphs && !dump_all) {
         cudaGraphExec_t & ge = graphs_[commit_all ? 1 : 0][T];
@@ -728,6 +766,12 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
     if (!commit_all) pending_T_ = T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
+    static const bool pf_log = getenv("BNK_PF_LOG") != nullptr;
+    if (pf_log && prefetch_.on() && times.calls % 1000 == 999)
+        fprintf(stderr, "prefetch: %lld experts copied, %lld used (%.1f%%); misses %.2f%% of routed\n",
+                (long long) prefetch_.issued(), (long long) prefetch_.used(),
+                100.0 * prefetch_.used() / std::max<int64_t>(1, prefetch_.issued()),
+                100.0 * times.misses / std::max<int64_t>(1, times.routed));
     times.total_ms += now_ms() - t0;
     times.calls++;
 }

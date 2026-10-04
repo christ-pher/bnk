@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include "kernels/moe.h"
@@ -25,9 +26,10 @@ void bump_seq(uint32_t * seq, cudaStream_t st) { bump_seq_k<<<1, 1, 0, st>>>(seq
 // in pair order, as before: a hit entry is created by the first pair of its expert, misses keep their pair order
 // (the CPU sums a token's experts in that order, so results do not depend on this kernel's scheduling).
 __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, const float * w, int T, int k,
-                                                         const int32_t * slot_of, HitList * hits, MoeMsg * msg,
+                                                         const int32_t * slot_of, const uint8_t * base,
+                                                         size_t blob, HitList * hits, MoeMsg * msg,
                                                          const float * x, int E, const uint32_t * seq,
-                                                         uint32_t * counts) {
+                                                         uint32_t * counts, PfLayer * pf) {
     __shared__ int s_e[kMaxRouted], s_sl[kMaxRouted];
     __shared__ int s_first[kMaxRouted], s_miss[kMaxRouted];
     __shared__ unsigned s_mask[kMaxRouted];
@@ -37,7 +39,20 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
     const int e = valid ? ids[j] : -1;
     const int t = valid ? j / k : 0;
     const float wt = valid ? w[j] : 0.f;
-    const int sl = valid ? slot_of[e] : -1;
+    int sl = valid ? slot_of[e] : -1;
+    const uint8_t * bp = sl >= 0 ? base + (size_t) sl * blob : nullptr;
+    if (valid && sl < 0 && pf) {   // prefetched for this forward? (seq first: it is written last)
+        const uint32_t cur = *seq;
+        for (int q = 0; q < kMaxPrefetch; ++q) {
+            if (((volatile uint32_t *) pf->seq)[q] != cur) continue;
+            __threadfence();
+            if (((volatile int32_t *) pf->expert)[q] == e) {
+                sl = 1 << 30;      // any non-negative value: the pair is a hit
+                bp = pf->blob[q];
+                break;
+            }
+        }
+    }
     if (valid && counts) atomicAdd(&counts[e], 1u);
     s_e[j] = e;
     s_sl[j] = sl;
@@ -77,7 +92,8 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
         hits->e[ent].w[t] = wt;
         if (q == j) {
             hits->e[ent].expert = e;
-            hits->e[ent].slot = sl;
+            hits->e[ent].blob = bp;
+            if (pf && sl == 1 << 30) atomicAdd(&pf->used, 1u);
         }
     }
     if (valid && sl < 0) {
@@ -108,9 +124,86 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
 }
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
-              const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st) {
+              const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, PfLayer * pf, cudaStream_t st) {
     if (T * k > kMaxRouted) { fprintf(stderr, "moe_plan: %d pairs exceed %d\n", T * k, kMaxRouted); abort(); }
-    moe_plan_k<<<1, kMaxRouted, 0, st>>>(ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq, counts_layer);
+    moe_plan_k<<<1, kMaxRouted, 0, st>>>(ids, w, T, k, d.slot_of, d.base, d.blob, s.hits, msg, x, E, seq,
+                                         counts_layer, pf);
+}
+
+// ------------------------------------------------------------------------------------------- prefetch
+// One block, a thread per expert (n_exp <= 1024): score = routing probability summed over the window's tokens,
+// resident experts excluded, then the best B by repeated block argmax.
+__global__ void __launch_bounds__(1024) moe_predict_k(const float * logits, int T, int n_exp,
+                                                      const int32_t * slot_of, int B, PfMsg * msg,
+                                                      const uint32_t * seq) {
+    __shared__ float s_v[32];
+    __shared__ int s_i[32];
+    const int e = threadIdx.x, lane = e & 31, wid = e >> 5, nw = blockDim.x >> 5;
+    const bool valid = e < n_exp;
+    auto block_max = [&](float v, int i, int & arg) {
+        for (int o = 16; o; o >>= 1) {
+            const float v2 = __shfl_xor_sync(0xffffffff, v, o);
+            const int i2 = __shfl_xor_sync(0xffffffff, i, o);
+            if (v2 > v || (v2 == v && i2 < i)) { v = v2; i = i2; }
+        }
+        __syncthreads();
+        if (lane == 0) { s_v[wid] = v; s_i[wid] = i; }
+        __syncthreads();
+        v = s_v[0]; i = s_i[0];
+        for (int q = 1; q < nw; ++q)
+            if (s_v[q] > v || (s_v[q] == v && s_i[q] < i)) { v = s_v[q]; i = s_i[q]; }
+        arg = i;
+        return v;
+    };
+    auto block_sum = [&](float v) {
+        for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+        __syncthreads();
+        if (lane == 0) s_v[wid] = v;
+        __syncthreads();
+        float r = 0.f;
+        for (int q = 0; q < nw; ++q) r += s_v[q];
+        return r;
+    };
+    float score = 0.f;
+    int dummy;
+    for (int t = 0; t < T; ++t) {
+        const float l = valid ? logits[(size_t) t * n_exp + e] : -INFINITY;
+        const float mx = block_max(l, e, dummy);
+        const float p = valid ? __expf(l - mx) : 0.f;
+        score += p / block_sum(p);
+    }
+    if (!valid || slot_of[e] >= 0) score = -1.f;
+    int n = 0;
+    for (int b = 0; b < B; ++b) {
+        int arg;
+        const float v = block_max(score, e, arg);
+        if (v <= 0.f) break;
+        if (e == 0) msg->expert[n] = arg;
+        ++n;
+        if (e == arg) score = -1.f;
+    }
+    if (e == 0) {
+        msg->n = n;
+        __threadfence_system();
+        msg->seq = *seq;
+    }
+}
+
+void moe_predict(const float * logits, int T, int n_exp, const int32_t * slot_of_next, int B, PfMsg * msg,
+                 const uint32_t * seq, cudaStream_t st) {
+    if (n_exp > 1024) { fprintf(stderr, "moe_predict: %d experts exceed 1024\n", n_exp); abort(); }
+    moe_predict_k<<<1, (n_exp + 31) / 32 * 32, 0, st>>>(logits, T, n_exp, slot_of_next, std::min(B, kMaxPrefetch),
+                                                        msg, seq);
+}
+
+__global__ void moe_pf_mark_k(PfLayer * pf, PfMark m, uint32_t seq) {
+    for (int j = 0; j < m.n; ++j) ((volatile int32_t *) pf->expert)[j] = m.expert[j];
+    __threadfence();
+    for (int j = 0; j < m.n; ++j) ((volatile uint32_t *) pf->seq)[j] = seq;
+}
+
+void moe_pf_mark(PfLayer * pf, const PfMark & m, uint32_t seq, cudaStream_t st) {
+    if (m.n > 0) moe_pf_mark_k<<<1, 1, 0, st>>>(pf, m, seq);
 }
 
 // ------------------------------------------------------------------------------------------- hits
@@ -127,7 +220,7 @@ __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hit
     if (r >= 2 * F) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
+    const uint8_t * row = h.blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
     const int nsb = E / 32;
     const int64_t nb = cols_pad / 32;
     float acc[NT];
@@ -183,7 +276,7 @@ __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ h
     if (r >= E) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
+    const uint8_t * row = h.blob + down_off + (size_t) r * drow;
     const int nsb = F / 32;
     float acc[NT];
 #pragma unroll
@@ -239,7 +332,7 @@ __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ h
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
     if (ok) {
-        const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
+        const uint8_t * row = h.blob + (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
         for (int sb = sub; sb < nb; sb += LPR) {
             Unpacked u;
             RT<FMT>::unpack(row, o, sb, u);
@@ -293,7 +386,7 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
     if (ok) {
-        const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
+        const uint8_t * row = h.blob + down_off + (size_t) r * drow;
         for (int sb = sub; sb < nb; sb += LPR) {
             Unpacked u;
             RT<FMT>::unpack(row, o, sb, u);

@@ -377,7 +377,7 @@ void MtpLayer::enqueue(int n, bool draft) {
     // MoE: every expert resident
     gemv_auto(router_, mixed_, E, 1, rlog_, c.n_expert, false, act_, st_);
     route_topk(rlog_, 1, c.n_expert, c.n_expert_used, ids_, rw_, c.expert_weights_scale, st_);
-    moe_plan(ids_, rw_, 1, c.n_expert_used, moe_, moes_, msg_, mixed_, E, seq_dev_, nullptr, st_);
+    moe_plan(ids_, rw_, 1, c.n_expert_used, moe_, moes_, msg_, mixed_, E, seq_dev_, nullptr, nullptr, st_);
     quantize_act(mixed_, E, 1, E, act_, st_);
     moe_hits(moe_, moes_, act_, 1, c.n_expert_used, E, c.n_ff_exp, st_);
     gemv_auto(sh_gate_, mixed_, E, 1, sg_, c.n_ff_shexp, false, act_, st_);

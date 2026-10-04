@@ -31,7 +31,8 @@ struct alignas(64) MoeMsg {
 
 // The hit list the plan kernel builds on the device.
 struct HitEntry {
-    int32_t expert, slot;
+    int32_t expert, pad_;
+    const uint8_t * blob;     // the expert's R-layout blob on the device (cache slot or prefetch slot)
     uint32_t mask;            // tokens of the window routed to this expert
     float w[kMaxWindow];      // their routing weights
 };
@@ -66,9 +67,38 @@ struct MoeScratch {
     uint32_t * counts = nullptr;  // [n_layer][n_expert] routing frequency (device)
 };
 
-// Builds the hit list and the CPU request (mailbox `msg`, host-mapped), then signals seq.
+// ---- decode-time expert prefetch (engine/prefetch.h): the next layer's likely misses, copied over PCIe meanwhile
+constexpr int kMaxPrefetch = 8;
+// One layer's prefetch slots (device). Slot j holds `expert[j]` for the forward whose seq equals `seq[j]`; the
+// copy stream writes the expert first and the seq last, so a reader that sees the forward's seq sees the blob.
+struct PfLayer {
+    int32_t expert[kMaxPrefetch];
+    uint32_t seq[kMaxPrefetch];
+    const uint8_t * blob[kMaxPrefetch];
+    uint32_t used;            // prefetched experts the plan kernel took (statistics)
+};
+// The next layer's predicted misses, posted to the prefetch thread (host-mapped, one per layer).
+struct alignas(64) PfMsg {
+    volatile uint32_t seq;
+    int32_t n;
+    int32_t expert[kMaxPrefetch];
+};
+struct PfMark {
+    int32_t n;
+    int32_t expert[kMaxPrefetch];
+};
+// Ranks the next layer's non-resident experts by routing probability summed over the window (logits: that
+// layer's router on this layer's MoE input, [T][n_exp]) and posts the best B to msg, then signals seq.
+void moe_predict(const float * logits, int T, int n_exp, const int32_t * slot_of_next, int B, PfMsg * msg,
+                 const uint32_t * seq, cudaStream_t st);
+// Marks slots [0, m.n) of pf as holding m.expert for forward seq (after their blobs were written on st).
+void moe_pf_mark(PfLayer * pf, const PfMark & m, uint32_t seq, cudaStream_t st);
+
+// Builds the hit list and the CPU request (mailbox `msg`, host-mapped), then signals seq. Misses that `pf` (may be
+// null) holds for this forward become hits.
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s,
-              MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);
+              MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, PfLayer * pf,
+              cudaStream_t st);
 // Hit experts on the GPU: writes s.part.
 void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st);
 // Waits for the CPU's answer when the layer had misses.

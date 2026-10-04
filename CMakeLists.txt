@@ -57,6 +57,7 @@ add_library(bnk_core STATIC
   src/engine/sampler.cpp
   src/server/serve.cpp
   src/engine/prefill.cpp
+  src/engine/prefetch.cpp
   src/kernels/gemm.cu
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)

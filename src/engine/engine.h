@@ -19,6 +19,7 @@
 #include "core/util.h"
 #include "cpu/expert_pool.h"
 #include "engine/mtp.h"
+#include "engine/prefetch.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
@@ -54,6 +55,7 @@ struct EngineOptions {
     int gemm_min_tokens = 32;        // prompt-path experts with fewer tokens run on their quantized weights
     int adapt_every = 4;             // forwards between adaptive cache updates (0 = static cache)
     int adapt_swaps = 16;            // max expert swaps started per update
+    int prefetch = 0;                // decode: experts per layer copied one layer ahead (engine/prefetch.h; 0 = off)
 };
 
 struct StageTimes {
@@ -166,6 +168,7 @@ private:
     ExpertCache cache_;
     MtpLayer mtp_;
     CpuExpertPool cpu_;
+    ExpertPrefetch prefetch_;   // after store_: its thread copies from the store
     EngineOptions opt_;
     cudaStream_t st_ = nullptr;
     std::vector<int32_t> history_;
@@ -233,8 +236,10 @@ private:
     int ctx_mapped_ = 0;   // cells of context whose KV is mapped
     void prefill_layout(int N);
     void predict_stats(int il, int T);
-    DevBuf<float> pred_logits_, pred_w_;
-    DevBuf<int32_t> pred_ids_;
+    DevBuf<float> pred_logits_;
+    int pstat_uniq_ = 0;            // distinct missed experts of the current layer
+    int64_t pstat_cpu_n_ = 0;       // and their sum, with the CPU time they took
+    double pstat_cpu_ms_ = 0;
     size_t prefill_arena_bytes(int N);
     size_t prefill_carve(int N, bool dry_only);
     void map_ctx(int cells);
