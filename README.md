@@ -307,7 +307,8 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 **Dashboard** — live analytics built with [shadcn/ui](https://ui.shadcn.com/): decode and prompt-processing speeds,
-speculation, expert-cache hit rates per layer, GPU / PCIe / CPU / memory, requests, the engine log, and a chat
+speculation, expert-cache hit rates per layer, GPU / PCIe / CPU / memory, conversations (several agents sharing
+the engine: who runs, who waits, which are parked in RAM, each one's turns), requests, the engine log, and a chat
 panel for testing. The sidebar lists the OpenAI and Claude API base URLs and the served model id, each with a copy
 button. Data arrives over server-sent events (`GET /api/stream`); `GET /api/stats` returns a snapshot.
 
