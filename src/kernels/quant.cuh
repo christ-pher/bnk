@@ -130,6 +130,47 @@ template <> struct QTraits<QT_Q6_K> {
 };
 
 // ---------------------------------------------------------------------------------------- i-quants
+template <> struct QTraits<QT_IQ2_XXS> {
+    static constexpr int QK = 256, BYTES = 66;
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * b, int ib, Unpacked & u) {
+        const float d = h2f(ld16(b));
+        const uint8_t * q = b + 2 + 8 * ib;
+        const uint32_t a = ld32a2(q);          // 4 grid indices
+        const uint32_t aux = ld32a2(q + 4);    // 4x7-bit signs + 4-bit scale (top nibble)
+        u.d0 = u.d1 = d * (0.5f + (aux >> 28)) * 0.25f;
+        u.m0 = u.m1 = 0.f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint2 g = *(const uint2 *) (iq2xxs_grid + ((a >> (8 * il)) & 0xff));
+            const uint32_t sg = ksigns_iq2xs[(aux >> (7 * il)) & 127];
+            u.w[2 * il + 0] = apply_signs4(g.x, sg & 0xF);
+            u.w[2 * il + 1] = apply_signs4(g.y, sg >> 4);
+        }
+    }
+};
+
+template <> struct QTraits<QT_IQ2_XS> {
+    static constexpr int QK = 256, BYTES = 74;
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * b, int ib, Unpacked & u) {
+        const float d = h2f(ld16(b));
+        const uint8_t * qb = b + 2 + 8 * ib;   // 4 uint16: 9-bit grid idx + 7-bit sign idx
+        const uint8_t sc = b[2 + 64 + ib];
+        u.d0 = d * (0.5f + (sc & 0xf)) * 0.25f;
+        u.d1 = d * (0.5f + (sc >> 4)) * 0.25f;
+        u.m0 = u.m1 = 0.f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint32_t q16 = ld16(qb + 2 * il);
+            const uint2 g = *(const uint2 *) (iq2xs_grid + (q16 & 511));
+            const uint32_t sg = ksigns_iq2xs[q16 >> 9];
+            u.w[2 * il + 0] = apply_signs4(g.x, sg & 0xF);
+            u.w[2 * il + 1] = apply_signs4(g.y, sg >> 4);
+        }
+    }
+};
+
 template <> struct QTraits<QT_IQ2_S> {
     static constexpr int QK = 256, BYTES = 82;
     static constexpr bool HAS_MIN = false;
@@ -263,7 +304,8 @@ __device__ __forceinline__ void unpack_sub(const uint8_t * row, int sb, Unpacked
 
 // The formats the dp4a family handles; float formats (F32/F16/BF16) take the float GEMV path.
 __host__ __device__ constexpr bool is_dp4a_format(int t) {
-    return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ3_XXS ||
+    return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ2_XXS ||
+           t == QT_IQ2_XS || t == QT_IQ3_XXS ||
            t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0;
 }
 __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
@@ -275,6 +317,8 @@ __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t
         case QT_Q5_K: F.template operator()<QT_Q5_K>(); break;       \
         case QT_Q6_K: F.template operator()<QT_Q6_K>(); break;       \
         case QT_IQ2_S: F.template operator()<QT_IQ2_S>(); break;     \
+        case QT_IQ2_XXS: F.template operator()<QT_IQ2_XXS>(); break; \
+        case QT_IQ2_XS: F.template operator()<QT_IQ2_XS>(); break;   \
         case QT_IQ3_XXS: F.template operator()<QT_IQ3_XXS>(); break; \
         case QT_IQ3_S: F.template operator()<QT_IQ3_S>(); break;     \
         case QT_IQ4_NL: F.template operator()<QT_IQ4_NL>(); break;   \
