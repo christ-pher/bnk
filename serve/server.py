@@ -49,7 +49,8 @@ class State:
         samp = self.tok.sampling
         self.config = json.loads(Path(args.config).read_text()) if args.config else {}
         self.defaults = {"temperature": float(samp.get("temp", 1.0)), "top_k": int(samp.get("top_k", 20)),
-                         "top_p": float(samp.get("top_p", 0.95)), "min_p": 0.0, "presence_penalty": 0.0}
+                         "top_p": float(samp.get("top_p", 0.95)), "min_p": 0.0, "presence_penalty": 0.0,
+                         "repetition_penalty": 1.0}
         self.defaults.update(self.config.get("sampling", {}))
         spec = self.config.get("speculation", {})
         self.draft_defaults = {k: spec[k] for k in ("draft", "draft_min_p") if k in spec}
@@ -93,7 +94,7 @@ def sampling_from(body: dict) -> dict:
         "top_p": float(body.get("top_p", d["top_p"])),
         "min_p": float(body.get("min_p", d["min_p"])),
         "presence_penalty": float(body.get("presence_penalty", d["presence_penalty"])),
-        "repetition_penalty": float(body.get("repetition_penalty", 1.0)),
+        "repetition_penalty": float(body.get("repetition_penalty", d["repetition_penalty"])),
     }
     if body.get("seed") is not None:
         p["seed"] = int(body["seed"])

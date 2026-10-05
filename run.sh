@@ -29,13 +29,17 @@ case "$choice" in
   # SC117's GSQ-RCO IQ3_S with Orca's abliterated tensors transplanted (huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)
   abliterated|iq3_s-abliterated|sc117)
     MODEL="${BNK_ABLITERATED:-/opt/models/gsq-rco-abliterated/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf}"; NAME=iq3_s-abliterated ;;
+  # ukisai Swift 1.5 GSQ-RCO IQ3_XXS (huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), highest tier offered.
+  # NOTE: does not load yet - its IQ2_XS/IQ2_XXS expert tensors have no R-layout kernel (see configs/swift.json).
+  swift|swift-iq3_xxs|iq3_xxs)
+    MODEL="${BNK_SWIFT:-/opt/models/swift-gsq-rco/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"; NAME=swift ;;
   # CYBER-FROST-3.8 PS-GUFF (Q5_K_M), fetched without its PLE table (tools/fetch_gguf.py, see README): that table
   # is byte-identical to Orca's, so it is read from the Orca file
   cyber-frost|cyberfrost|frost)
     MODEL="${BNK_CYBER_FROST:-/opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf}"; NAME=cyber-frost
     PLE="${BNK_PLE_GGUF:-$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf}" ;;
   *.gguf) MODEL="$choice"; NAME="$(basename "$choice" .gguf)" ;;
-  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, or a .gguf path)"; exit 1 ;;
+  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, swift, or a .gguf path)"; exit 1 ;;
 esac
 
 # --port, --ctx and every other server option pass through (defaults: 8080, 262144); a model's persistent server
