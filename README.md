@@ -203,6 +203,16 @@ hf download SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF --include "IQ3_S/*
 ./run.sh abliterated      # BNK_ABLITERATED overrides the path
 ```
 
+**Swift 1.5 GSQ-RCO-abliterated IQ3_XXS** ([SC117](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)):
+the same transplant applied to ukisai's Swift 1.5 IQ3_XXS (`./run.sh swift`): 144 residual-writing tensors replaced
+(IQ4_XS / IQ4_NL / Q2_0), the other 1080 byte-identical. Swift's shard 2 holds layers 13-47, so both shards are
+needed. Card sampling (temperature 1.0); not tuned yet.
+
+```bash
+hf download SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF --include "IQ3_XXS/*" --local-dir /opt/models/swift-gsq-rco-abliterated
+./run.sh swift-abliterated   # BNK_SWIFT_ABLITERATED overrides the path
+```
+
 Other quantizations of the same architecture (for example Unsloth's UD-IQ4_XS) use the same formats and should
 load as-is; add a `configs/<name>.json` to set their sampling defaults.
 

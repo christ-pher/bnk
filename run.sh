@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start the bnk server.
 #   ./run.sh                     # no model arg on a terminal: pick from a dropdown of the available models
-#   ./run.sh [iq3_s|orca|cyber-frost|abliterated|swift|<full-model-id>|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
+#   ./run.sh [iq3_s|orca|cyber-frost|abliterated|swift|swift-abliterated|<full-model-id>|PATH-to-first-shard.gguf] [--port 8080] [--ctx 262144] [--no-mtp] [server options...]
 #   BNK_DRAFT_VOCAB= (empty) drafts over the whole vocabulary, e.g. for non-English chats
 #   BNK_THINK_GUARD=0  turn off the thinking-loop guard (on by default; serve/loop_guard.py)
 #   BNK_LOG_LEVEL=quiet|info|debug  terminal output (default info: a line per request, live status while generating)
@@ -56,13 +56,16 @@ case "$choice" in
   # ukisai Swift 1.5 GSQ-RCO IQ3_XXS (huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), highest tier offered
   swift|swift-iq3_xxs|iq3_xxs|Swift-1.5-GSQ-RCO-IQ3_XXS)
     MODEL="${BNK_SWIFT:-/opt/models/swift-gsq-rco/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"; NAME=Swift-1.5-GSQ-RCO-IQ3_XXS ;;
+  # SC117's Swift 1.5 IQ3_XXS with Orca's abliterated tensors transplanted (huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)
+  swift-abliterated|swift-abl|Swift-1.5-GSQ-RCO-abliterated-IQ3_XXS)
+    MODEL="${BNK_SWIFT_ABLITERATED:-/opt/models/swift-gsq-rco-abliterated/IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf}"; NAME=Swift-1.5-GSQ-RCO-abliterated-IQ3_XXS ;;
   # CYBER-FROST-3.8 PS-GUFF (Q5_K_M), fetched without its PLE table (tools/fetch_gguf.py, see README): that table
   # is byte-identical to Orca's, so it is read from the Orca file
   cyber-frost|cyberfrost|frost|CYBER-FROST-3.8-PS-Q5_K_M)
     MODEL="${BNK_CYBER_FROST:-/opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf}"; NAME=CYBER-FROST-3.8-PS-Q5_K_M
     PLE="${BNK_PLE_GGUF:-$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf}" ;;
   *.gguf) MODEL="$choice"; NAME="$(basename "$choice" .gguf)" ;;
-  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, swift, or a .gguf path)"; exit 1 ;;
+  *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, swift, swift-abliterated, or a .gguf path)"; exit 1 ;;
 esac
 
 # --port, --ctx and every other server option pass through (defaults: 8080, 262144); a model's persistent server
