@@ -61,6 +61,7 @@ command -v git >/dev/null || need+=(git)
 command -v curl >/dev/null || need+=(curl)
 command -v python3 >/dev/null || need+=(python3)
 python3 -c "import venv, ensurepip" 2>/dev/null || need+=(python3-venv)
+command -v whiptail >/dev/null || need+=(whiptail)   # run.sh's no-arg model picker
 if [[ ${#need[@]} -gt 0 ]]; then
   if [[ $SYSTEM == 1 ]] && command -v apt-get >/dev/null && ask "install ${need[*]} with apt (needs sudo)?"; then
     sudo apt-get update -qq && sudo apt-get install -y -qq "${need[@]}"

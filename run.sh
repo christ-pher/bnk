@@ -30,13 +30,7 @@ pick_model() {
   if command -v whiptail >/dev/null 2>&1; then
     local -a menu=(); local id
     for id in "${ids[@]}"; do menu+=("$id" ""); done
-    # dark theme (default newt palette is a bright blue/gray); scoped to this call via the env assignment
-    # black backdrop, a dark-gray dialog panel on top of it (so the box stands out), cyan accents + selection bar
-    local dark='root=white,black shadow=black,black window=white,gray border=brightcyan,gray title=brightcyan,gray
-textbox=white,gray label=white,gray listbox=white,gray sellistbox=white,gray actlistbox=black,brightcyan
-actsellistbox=black,brightcyan entry=black,lightgray compactbutton=white,gray button=black,lightgray
-actbutton=black,brightcyan helpline=gray,black roottext=gray,black'
-    NEWT_COLORS="$dark" whiptail --title "bnk — select a model" \
+    whiptail --title "bnk — select a model" \
       --menu "Choose a model to serve (Esc to cancel):" 18 90 "${#ids[@]}" "${menu[@]}" 3>&1 1>&2 2>&3
   else
     local id PS3="Select a model by number (Ctrl-C to cancel): "
