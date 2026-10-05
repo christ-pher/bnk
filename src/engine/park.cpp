@@ -59,16 +59,65 @@ size_t Engine::parked_bytes() const {
     return b;
 }
 
+uint8_t * Engine::pinned_take(size_t bytes, size_t * cap) {
+    size_t best = spare_.size();
+    for (size_t i = 0; i < spare_.size(); ++i)   // the smallest that fits
+        if (spare_[i].cap >= bytes && (best == spare_.size() || spare_[i].cap < spare_[best].cap)) best = i;
+    if (best < spare_.size()) {
+        uint8_t * p = spare_[best].p;
+        *cap = spare_[best].cap;
+        spare_.erase(spare_.begin() + (long) best);
+        return p;
+    }
+    // room for the conversation to grow before the buffer stops fitting it
+    const size_t step = 256ull << 20;
+    *cap = (bytes + bytes / 4 + step - 1) / step * step;
+    uint8_t * p = nullptr;
+    while (cudaHostAlloc((void **) &p, *cap, 0) != cudaSuccess) {
+        cudaGetLastError();
+        if (spare_.empty()) return nullptr;
+        CUDA_CHECK(cudaFreeHost(spare_.back().p));   // too little RAM to pin: give the spares back first
+        spare_.pop_back();
+    }
+    return p;
+}
+
+void Engine::pinned_give(uint8_t * p, size_t cap) {
+    spare_.push_back({p, cap});
+    if (spare_.size() > 2) {   // keep the two biggest
+        auto it = std::min_element(spare_.begin(), spare_.end(), [](const Pinned & a, const Pinned & b) { return a.cap < b.cap; });
+        CUDA_CHECK(cudaFreeHost(it->p));
+        spare_.erase(it);
+    }
+}
+
+float * Engine::ck_take() {
+    if (!ck_spare_.empty()) {
+        float * p = ck_spare_.back();
+        ck_spare_.pop_back();
+        return p;
+    }
+    float * p = nullptr;
+    CUDA_CHECK(cudaHostAlloc((void **) &p, state_floats() * 4, 0));
+    return p;
+}
+
+void Engine::ck_give(float * p) {
+    if (!p) return;
+    if (ck_spare_.size() < (size_t) kMaxCheckpoints) ck_spare_.push_back(p);
+    else CUDA_CHECK(cudaFreeHost(p));
+}
+
 void Engine::drop_parked(size_t i) {
     Parked & p = parked_[i];
-    for (auto & k : p.ckpts) CUDA_CHECK(cudaFreeHost(k.host));
-    CUDA_CHECK(cudaFreeHost(p.host));
+    for (auto & k : p.ckpts) ck_give(k.host);
+    pinned_give(p.host, p.cap);
     parked_.erase(parked_.begin() + (long) i);
 }
 
 // Copies the live conversation into host RAM (the live state is left as it is). Never drops the entry stamped
 // `keep` (one about to be restored).
-void Engine::park(uint64_t keep) {
+void Engine::park(uint64_t keep, bool move_ckpts) {
     const double t0 = now_ms();
     const int n = pos();
     // one entry per conversation: an older copy whose history this one extends is superseded
@@ -93,8 +142,8 @@ void Engine::park(uint64_t keep) {
         park_stats.evictions++;
     }
     Parked p;
-    if (cudaHostAlloc((void **) &p.host, bytes, 0) != cudaSuccess) {
-        cudaGetLastError();
+    p.host = pinned_take(bytes, &p.cap);
+    if (!p.host) {
         if (opt_.verbose) fprintf(stderr, "bnk: could not pin %.2f GiB to park a conversation\n", bytes / 1073741824.0);
         return;
     }
@@ -107,11 +156,16 @@ void Engine::park(uint64_t keep) {
         CUDA_CHECK(cudaMemcpyAsync(p.host + off, d, f * 4, cudaMemcpyDeviceToHost, st_));
         off += f * 4;
     });
-    for (const auto & k : ckpts_) {   // the snapshots, copied host to host meanwhile
+    for (auto & k : ckpts_) {   // the snapshots: moved, or copied host to host meanwhile
         if (k.pos < 0) continue;
         Checkpoint c = k;
-        CUDA_CHECK(cudaHostAlloc((void **) &c.host, sfloats * 4, 0));
-        memcpy(c.host, k.host, sfloats * 4);
+        if (move_ckpts) {
+            k.host = ck_take();
+            k.pos = -1;
+        } else {
+            c.host = ck_take();
+            memcpy(c.host, k.host, sfloats * 4);
+        }
         p.ckpts.push_back(c);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -154,7 +208,7 @@ void Engine::restore(size_t i) {
         if (!slot && (int) ckpts_.size() < kMaxCheckpoints) {
             ckpts_.emplace_back();
             slot = &ckpts_.back();
-            CUDA_CHECK(cudaHostAlloc((void **) &slot->host, state_floats() * 4, 0));
+            slot->host = ck_take();
         }
         if (!slot) break;
         std::swap(slot->host, c.host);   // the parked entry frees the old buffer
@@ -183,7 +237,7 @@ void Engine::select_conversation(const std::vector<int32_t> & prompt) {
     const int lost = pos() - (best < 0 ? live : 0);
     if (lost > 0 && lost >= opt_.park_min) {
         const uint64_t keep = best >= 0 ? parked_[best].used : 0;
-        park(keep);
+        park(keep, best >= 0);
         for (size_t i = 0; i < parked_.size() && best >= 0; ++i)   // park() may have dropped others: find it again
             if (parked_[i].used == keep) best = (int) i;
     }

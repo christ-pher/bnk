@@ -122,6 +122,7 @@ public:
     // conversation first when it would lose at least park_min tokens). No-op unless park_gib > 0.
     void select_conversation(const std::vector<int32_t> & prompt);
     int parked() const { return (int) parked_.size(); }
+    void drop_parked_all() { while (!parked_.empty()) drop_parked(parked_.size() - 1); }
     size_t parked_bytes() const;
     struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; } park_stats;
     const std::vector<int32_t> & history() const { return history_; }
@@ -194,12 +195,23 @@ private:
         int mtp_cell = -1;
         std::vector<Checkpoint> ckpts;   // own pinned buffers
         uint8_t * host = nullptr;        // pinned: the context ranges, then the recurrent state
+        size_t cap = 0;                  // host's size (from the pool, with room to grow)
         size_t bytes = 0;
         uint64_t used = 0;
     };
     std::vector<Parked> parked_;
     uint64_t park_age_ = 0;
-    void park(uint64_t keep = 0);
+    // Pinned buffers are kept for reuse: pinning costs ~0.3 s per GiB, and conversations taking turns hand the
+    // same few buffers around (a restore frees what the next park needs).
+    struct Pinned { uint8_t * p; size_t cap; };
+    std::vector<Pinned> spare_;          // conversation buffers
+    std::vector<float *> ck_spare_;      // snapshot buffers (all state_floats() long)
+    uint8_t * pinned_take(size_t bytes, size_t * cap);
+    void pinned_give(uint8_t * p, size_t cap);
+    float * ck_take();
+    void ck_give(float * p);
+    // move_ckpts: the live snapshots go along instead of being copied (the live state is replaced next)
+    void park(uint64_t keep = 0, bool move_ckpts = false);
     void restore(size_t i);
     void drop_parked(size_t i);
     uint32_t seq_ = 0;

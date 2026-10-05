@@ -264,8 +264,9 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         const std::string op = req["op"].str();
         const std::string id = req["id"].str();
         try {
-            if (op == "reset") {
+            if (op == "reset") {   // a clean slate: parked conversations go too
                 eng.reset();
+                eng.drop_parked_all();
                 emit(JsonOut().kv("type", "reset").kv("id", id).done());
                 continue;
             }
