@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .chat import ChatTemplate, OutputParser
 from .console import LEVELS, Console
+from .conversations import Conversations
 from .engine import Engine, EngineError
 from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary
 from .telemetry import Telemetry
@@ -76,6 +77,7 @@ class State:
         self.console = Console(self.telemetry.bus, args.log_level)
         self.engine = Engine(args.engine, eargs, log_path=args.log, on_telemetry=self.telemetry.on_engine,
                              on_log=lambda line: self.telemetry.bus.publish("log", {"t": time.time(), "line": line}))
+        self.convs = Conversations(self.tok, self.im_start, self.telemetry.bus.publish, parking=args.park_gib > 0)
 
 
 S: State | None = None
@@ -150,13 +152,15 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
             last = len(ids) - 1 - ids[::-1].index(S.im_start) if S.im_start in ids else -1
             if last > 0:
                 extra["checkpoint"] = last
-        gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids})
+        gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids},
+                                on_start=lambda r: S.convs.status(cid, "reading", r))
         wrap_pending, wrap_deadline, outcome = False, 0, None
         slice_t0 = time.time()
         for ev in gen:
             rid = ev.get("_rid")
             t = ev.get("type")
             if t == "prefill":
+                S.convs.status(cid, "generating", rid)
                 first_prefill = first_prefill or ev
                 slice_t0 = time.time()
                 with S.lock:
@@ -207,6 +211,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                 raise EngineError(ev.get("message", "engine error"))
         return outcome
 
+    cid = S.convs.begin(prompt_ids)
     with S.lock:
         S.waiting += 1
     try:
@@ -215,6 +220,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
             outcome = stream(prompt_ids + tail, allow_guard)
             if outcome == "yield" and len(generated) < max_tokens:
                 slices += 1
+                S.convs.status(cid, "queued")
                 with S.lock:
                     if S.active and S.active["id"] == rid:
                         S.active = None
@@ -252,6 +258,8 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                 S.waiting -= 1
             if S.active and S.active["id"] == rid:
                 S.active = None
+        if sys.exc_info()[0] is not None:   # failed or cancelled: the conversation is free again
+            S.convs.status(cid, "idle")
     for kind, txt in parser.feed(dec.flush()):
         emit(kind, txt)
     rest, content, calls = parser.finish()
@@ -276,9 +284,11 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         timings["thinking_loop_guard"] = interventions
     rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
            "gen_tokens": usage["completion_tokens"], "finish": finish, "temperature": params.get("temperature"),
-           "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, **timings}
+           "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, "conversation": cid,
+           "wall_s": time.time() - t0, **timings}
     S.recent.append(rec)
     S.telemetry.bus.publish("request", rec)
+    S.convs.end(cid, tail, rec)
     return content, parser.reasoning_all, calls, finish, usage, timings
 
 
@@ -386,6 +396,7 @@ class Handler(BaseHTTPRequestHandler):
                            "name": info.get("model"), "args": S.engine.args},
                 "gpu": S.telemetry.gpu.static, "live": S.telemetry.live(),
                 "history": list(S.telemetry.history), "recent": list(S.recent),
+                "conversations": S.convs.snapshot(),
                 "log": list(S.engine.log_tail)[-200:]}
 
     def _stream(self):

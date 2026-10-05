@@ -119,14 +119,17 @@ class Engine:
         """Requests waiting for the engine."""
         return len(self._line)
 
-    def generate(self, prompt: list[int], params: dict):
-        """Yields engine events for one request: prefill, tokens..., done (or error)."""
+    def generate(self, prompt: list[int], params: dict, on_start=None):
+        """Yields engine events for one request: prefill, tokens..., done (or error). `on_start(rid)` is called
+        when the request gets the engine (after waiting its turn)."""
         rid = uuid.uuid4().hex[:12]
         q = queue.Queue()
         with self.qlock:
             self.queues[rid] = q
         self._acquire()
         try:
+            if on_start:
+                on_start(rid)
             self._send({"op": "generate", "id": rid, "prompt": prompt, **params})
             while True:
                 msg = q.get()

@@ -31,6 +31,7 @@ export function RequestsPage() {
               <TableRow>
                 <TableHead>Time</TableHead>
                 <TableHead>Source</TableHead>
+                <TableHead>Conv.</TableHead>
                 <TableHead className="text-right">Prompt</TableHead>
                 <TableHead className="text-right">Reused</TableHead>
                 <TableHead className="text-right">Prefill</TableHead>
@@ -48,6 +49,7 @@ export function RequestsPage() {
                 <TableRow key={r.id ?? i}>
                   <TableCell className="text-muted-foreground">{fmt.clock(r.time)}</TableCell>
                   <TableCell><Badge variant="outline">{r.api || "—"}</Badge></TableCell>
+                  <TableCell>{r.conversation != null ? <a href="#conversations" className="hover:underline">#{r.conversation}</a> : "—"}</TableCell>
                   <TableCell className="text-right">{fmt.n(r.prompt_tokens)}</TableCell>
                   <TableCell className="text-right text-muted-foreground">{fmt.n(r.reused)}</TableCell>
                   <TableCell className="text-right">{r.prefill_tps ? `${fmt.n(r.prefill_tps)} tok/s` : fmt.ms(r.prefill_ms)}</TableCell>

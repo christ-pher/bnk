@@ -1,7 +1,8 @@
 // The live telemetry store: one EventSource on /api/stream feeding every view.
 //
 // The server sends `init` (everything it has), then `live` (~4/s, the engine's latest snapshot), `sample`
-// (1/s, rates computed server-side from cumulative counters), `request` (a finished request) and `log`.
+// (1/s, rates computed server-side from cumulative counters), `request` (a finished request), `conversations`
+// (every tracked conversation, whenever one changes) and `log`.
 import { useEffect, useState, useSyncExternalStore } from "react"
 
 export type Phase = "idle" | "prefill" | "decode"
@@ -24,6 +25,8 @@ export interface Live {
   experts_total: number
   expert_cache_gb: number
   kv_gb: number // VRAM holding the context (grows with the conversation, given back on a new one)
+  parked?: number // conversations parked in host RAM
+  parked_gb?: number
   cpu_threads: number
   mtp: boolean
   req: {
@@ -58,6 +61,11 @@ export interface Live {
     routed: number
     misses: number
     swaps: number
+    parks?: number
+    restores?: number
+    park_evictions?: number
+    park_ms?: number
+    restore_ms?: number
   }
   layer_slots: number[]
   layer_routed: number[]
@@ -126,6 +134,40 @@ export interface RequestRecord {
   verify_ms?: number
   draft_ms?: number
   cpu_expert_ms?: number
+  conversation?: number
+  slices?: number // time slices the request ran in (it gave its turn up to waiting requests in between)
+  wall_s?: number
+}
+
+// One conversation (an agent or a chat): requests that continue each other's tokens.
+export type ConvStatus = "queued" | "reading" | "generating" | "idle"
+export interface ConvTurn {
+  id: string
+  time: number
+  prompt_tokens: number
+  reused?: number
+  prefill_ms?: number
+  gen_tokens: number
+  tps?: number
+  slices?: number
+  finish: string
+  wall_s?: number
+}
+export interface Conversation {
+  id: number
+  label: string
+  created: number
+  status: ConvStatus
+  since: number
+  rid: string | null // the engine request in flight (live.req.id while it runs)
+  context: number
+  prompt_tokens: number
+  where: "gpu" | "ram" | "none" // where its state is between turns
+  turns: ConvTurn[]
+  n_turns: number
+  gen_total: number
+  read_ms_total: number
+  last_active: number
 }
 
 export interface Overview {
@@ -140,6 +182,7 @@ export interface Overview {
   live: Live
   history: Sample[]
   recent: RequestRecord[]
+  conversations?: Conversation[]
   log: string[]
 }
 
@@ -151,6 +194,7 @@ export interface State {
   live: Live | null
   history: Sample[]
   recent: RequestRecord[]
+  conversations: Conversation[]
   log: { t: number; line: string }[]
   lastEvent: number
   overviewAt: number // Date.now() when `overview` arrived (uptime counts on from there)
@@ -159,7 +203,7 @@ export interface State {
 const MAX_HISTORY = 3600
 const MAX_LOG = 1000
 
-let state: State = { conn: "connecting", overview: null, live: null, history: [], recent: [], log: [], lastEvent: 0, overviewAt: 0 }
+let state: State = { conn: "connecting", overview: null, live: null, history: [], recent: [], conversations: [], log: [], lastEvent: 0, overviewAt: 0 }
 const listeners = new Set<() => void>()
 let es: EventSource | null = null
 let retry: number | undefined
@@ -181,6 +225,7 @@ function connect() {
       live: o.live && "phase" in o.live ? o.live : state.live,
       history: o.history.slice(-MAX_HISTORY),
       recent: o.recent,
+      conversations: o.conversations ?? [],
       log: o.log.map((line) => ({ t: 0, line })),
     })
   })
@@ -195,6 +240,7 @@ function connect() {
     const r = JSON.parse((e as MessageEvent).data) as RequestRecord
     set({ recent: [...state.recent.slice(-199), r] })
   })
+  es.addEventListener("conversations", (e) => set({ conversations: JSON.parse((e as MessageEvent).data) }))
   es.addEventListener("log", (e) => {
     const l = JSON.parse((e as MessageEvent).data) as { t: number; line: string }
     set({ log: [...state.log.slice(-(MAX_LOG - 1)), l] })
@@ -261,6 +307,16 @@ export function smooth(values: (number | null | undefined)[], alpha = 0.35): num
     v = v == null ? x : alpha * x + (1 - alpha) * v
   }
   return v
+}
+
+// The current time, ticking every second (for "waiting 12s" and "2m ago").
+export function useNow(): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+  return now
 }
 
 // The server's uptime in seconds, ticking every second (counted on from when the dashboard last heard it).

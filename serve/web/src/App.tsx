@@ -1,4 +1,4 @@
-import { Cpu, Gauge, LayoutDashboard, ListOrdered, MessageSquare, Moon, ScrollText, Sun, Zap } from "lucide-react"
+import { Cpu, Gauge, LayoutDashboard, ListOrdered, MessageSquare, MessagesSquare, Moon, ScrollText, Sun, Zap } from "lucide-react"
 import { useEffect, useState } from "react"
 
 import { ChatSheet, type ChatSettings, type Msg } from "@/components/chat/chat-sheet"
@@ -24,6 +24,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { fmt } from "@/lib/format"
 import { RANGES, useTelemetry, useUptime, type Range } from "@/lib/telemetry"
+import { ConversationsPage } from "@/pages/conversations"
 import { ExpertsPage } from "@/pages/experts"
 import { LogsPage } from "@/pages/logs"
 import { OverviewPage } from "@/pages/overview"
@@ -36,6 +37,7 @@ const PAGES = [
   { id: "performance", title: "Performance", icon: Zap, ranged: true },
   { id: "experts", title: "Experts", icon: Gauge, ranged: true },
   { id: "system", title: "System", icon: Cpu, ranged: true },
+  { id: "conversations", title: "Conversations", icon: MessagesSquare, ranged: false },
   { id: "requests", title: "Requests", icon: ListOrdered, ranged: false },
   { id: "logs", title: "Logs", icon: ScrollText, ranged: false },
 ] as const
@@ -119,6 +121,7 @@ export default function App() {
             {page === "performance" && <PerformancePage range={range} />}
             {page === "experts" && <ExpertsPage range={range} />}
             {page === "system" && <SystemPage range={range} />}
+            {page === "conversations" && <ConversationsPage />}
             {page === "requests" && <RequestsPage />}
             {page === "logs" && <LogsPage />}
           </main>
