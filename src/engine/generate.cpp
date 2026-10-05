@@ -39,6 +39,7 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
     drafts_.clear();
+    eng_.select_conversation(prompt);   // another conversation's request: swap its parked state in
     // reuse what is already processed: all of it when the prompt extends the history, else rewind to the last
     // snapshot inside the shared prefix (a chat client re-renders earlier turns, e.g. without their reasoning)
     const auto & h = eng_.history();

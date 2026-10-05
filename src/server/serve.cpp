@@ -123,7 +123,12 @@ std::string telemetry_json(Engine & eng, const Generator & gen, const Totals & t
         .kv("cpu_expert_ms", tot.cpu_expert_ms + (busy ? tm.cpu_experts_ms : 0.0))
         .kv("routed", routed)
         .kv("misses", misses)
-        .kv("swaps", (int64_t) eng.cache().swaps_done);
+        .kv("swaps", (int64_t) eng.cache().swaps_done)
+        .kv("parks", eng.park_stats.parks)
+        .kv("restores", eng.park_stats.restores)
+        .kv("park_evictions", eng.park_stats.evictions)
+        .kv("park_ms", eng.park_stats.park_ms)
+        .kv("restore_ms", eng.park_stats.restore_ms);
     std::vector<int> slots(c.n_layer);
     for (int il = 0; il < c.n_layer; ++il) slots[il] = eng.cache().slots(il);
     JsonOut o;
@@ -145,6 +150,8 @@ std::string telemetry_json(Engine & eng, const Generator & gen, const Totals & t
         .kv("experts_total", c.n_layer * c.n_expert)
         .kv("expert_cache_gb", (double) eng.cache().bytes() / 1073741824.0)
         .kv("kv_gb", (double) eng.kv_bytes_mapped() / 1073741824.0)
+        .kv("parked", eng.parked())
+        .kv("parked_gb", (double) eng.parked_bytes() / 1073741824.0)
         .kv("cpu_threads", eng.cpu_threads())
         .kv("mtp", eng.mtp() != nullptr)
         .raw("req", rq.done())

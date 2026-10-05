@@ -84,6 +84,8 @@ int main(int argc, char ** argv) {
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
+        else if (a == "--park-gib") opt.park_gib = std::stod(next());
+        else if (a == "--park-min") opt.park_min = std::stoi(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     if (mode == "serve") {

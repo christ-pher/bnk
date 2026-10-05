@@ -289,17 +289,6 @@ void Engine::rebalance() {
     if (room > 0) cache_.grow(room, st_);
 }
 
-template <typename F> void Engine::each_state(F && f) {
-    const Config & c = model_.cfg;
-    for (int il = 0; il < c.n_layer; ++il)
-        if (!c.is_attn(il)) {
-            f(conv_buf_[il].p, conv_buf_[il].n);
-            f(ssm_state_[il].p, ssm_state_[il].n);
-        }
-    if (ple_hist_.p) f(ple_hist_.p, ple_hist_.n);
-    if (mtp_R_) f(mtp_R_, (size_t) c.hc_dim());
-}
-
 int Engine::checkpoints() const {
     int n = 0;
     for (const auto & k : ckpts_) n += k.pos >= 0;

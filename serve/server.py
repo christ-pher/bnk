@@ -59,7 +59,7 @@ class State:
             args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
         if args.think_guard is None:
             args.think_guard = bool(self.config.get("thinking_loop_guard", True))
-        eargs = ["--model", args.model, "--ctx", str(args.ctx)]
+        eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib)]
         if args.ple_gguf:
             eargs += ["--ple-gguf", args.ple_gguf]
         if args.mtp:
@@ -113,7 +113,12 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     loop, generation runs on to the end of the line or sentence, the engine request is cancelled, and a second one
     continues from everything generated so far plus a short wrap-up that closes the reasoning, so the model writes
     its answer in the output budget left. The engine reuses its state (the new prompt extends what it has seen),
-    so the hand-over costs one short prefill however long the conversation."""
+    so the hand-over costs one short prefill however long the conversation.
+
+    Time slices: when other requests wait for the engine (several agents sharing it), a request that has generated
+    for --slice seconds gives its turn up the same way (cancel, queue again behind them, continue from everything
+    generated so far). The engine parks its conversation meanwhile, so coming back costs well under a second and
+    one long generation no longer holds every other agent up."""
     dec = StreamDecoder(S.tok)
     parser = OutputParser(thinking)
     guard = ThinkingLoopGuard() if (thinking and S.args.think_guard) else None
@@ -126,12 +131,18 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     t0 = time.time()
     counted = True
     generated: list[int] = []
+    tail: list[int] = []          # what follows the prompt in the engine's history: generated tokens, wrap-ups
     interventions = 0
+    slices = 0
     stopped = False
+    first_prefill: dict = {}
+    gen_ms = 0.0
+    slice_s = S.args.slice
 
     def stream(ids: list[int], allow_guard: bool) -> str:
-        """One engine request; returns 'stop' (a stop string), 'loop' (the guard), or the engine's reason."""
-        nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail
+        """One engine request; returns 'stop' (a stop string), 'loop' (the guard), 'yield' (its time slice is up
+        and others wait), or the engine's reason."""
+        nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail, first_prefill, gen_ms
         extra = {}
         # snapshot the engine state where the prompt's last turn begins: the next request in this conversation
         # shares everything before it (even when the client re-renders this turn's answer differently)
@@ -141,21 +152,25 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                 extra["checkpoint"] = last
         gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids})
         wrap_pending, wrap_deadline, outcome = False, 0, None
+        slice_t0 = time.time()
         for ev in gen:
             rid = ev.get("_rid")
             t = ev.get("type")
             if t == "prefill":
+                first_prefill = first_prefill or ev
+                slice_t0 = time.time()
                 with S.lock:
                     if counted:
                         S.waiting -= 1
                         counted = False
-                    if S.active is None:
-                        S.active = {"id": rid, "started": t0, "prompt_tokens": ev.get("prompt_tokens"),
-                                    "reused": ev.get("reused"), "prefill_ms": ev.get("ms"), "gen_tokens": 0}
+                    S.active = {"id": rid, "started": t0, "prompt_tokens": len(prompt_ids),
+                                "reused": first_prefill.get("reused"), "prefill_ms": first_prefill.get("ms"),
+                                "gen_tokens": len(generated)}
             elif t == "tokens":
                 if stopped:
                     continue
                 generated.extend(ev["ids"])
+                tail.extend(ev["ids"])
                 piece = dec.feed(ev["ids"])
                 with S.lock:
                     if S.active:
@@ -179,8 +194,13 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                     if wrap_pending and (at_clean_boundary(reasoning_tail) or len(generated) >= wrap_deadline):
                         outcome = "loop"
                         S.engine.cancel(rid)
+                if (outcome is None and slice_s > 0 and time.time() - slice_t0 >= slice_s
+                        and S.engine.waiters() > 0):
+                    outcome = "yield"
+                    S.engine.cancel(rid)
             elif t == "done":
                 done_msg = ev
+                gen_ms += ev.get("gen_ms") or 0
                 if outcome is None:
                     outcome = ev.get("reason", "stop")
             elif t == "error":
@@ -190,20 +210,34 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     with S.lock:
         S.waiting += 1
     try:
-        outcome = stream(prompt_ids, True)
-        if outcome == "loop":
-            interventions += 1
-            room = max_tokens - len(generated)
-            S.console.line(S.console._c("33", "↻ ") + f"thinking loop after {guard.count:,} thinking tokens "
-                           f"({guard.last_ratio:.0%} repeated): closing the reasoning, {room:,} tokens left to answer")
-            S.telemetry.bus.publish("log", {"t": time.time(), "line": f"thinking loop guard: intervened after "
-                                                                       f"{guard.count} thinking tokens"})
-            for kind, txt in parser.feed(dec.flush() + WRAP_UP):
-                emit(kind, txt)
-            if room > 0:
-                outcome = stream(prompt_ids + generated + S.tok.encode(WRAP_UP), False)
-            else:
+        allow_guard = True
+        while True:
+            outcome = stream(prompt_ids + tail, allow_guard)
+            if outcome == "yield" and len(generated) < max_tokens:
+                slices += 1
+                with S.lock:
+                    if S.active and S.active["id"] == rid:
+                        S.active = None
+                    S.waiting += 1
+                    counted = True
+                continue
+            if outcome == "loop":
+                interventions += 1
+                allow_guard = False
+                room = max_tokens - len(generated)
+                S.console.line(S.console._c("33", "↻ ") + f"thinking loop after {guard.count:,} thinking tokens "
+                               f"({guard.last_ratio:.0%} repeated): closing the reasoning, {room:,} tokens left to answer")
+                S.telemetry.bus.publish("log", {"t": time.time(), "line": f"thinking loop guard: intervened after "
+                                                                           f"{guard.count} thinking tokens"})
+                for kind, txt in parser.feed(dec.flush() + WRAP_UP):
+                    emit(kind, txt)
+                tail.extend(S.tok.encode(WRAP_UP))
+                if room > 0:
+                    continue
                 outcome = "length"
+            break
+        if outcome == "yield":
+            outcome = "length"
         if outcome == "stop" and stopped:
             finish = "stop"
         else:
@@ -216,9 +250,9 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         with S.lock:
             if counted:
                 S.waiting -= 1
-            S.active = None
-    tail = dec.flush()
-    for kind, txt in parser.feed(tail):
+            if S.active and S.active["id"] == rid:
+                S.active = None
+    for kind, txt in parser.feed(dec.flush()):
         emit(kind, txt)
     rest, content, calls = parser.finish()
     for kind, txt in rest:
@@ -230,6 +264,14 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     timings = {k: done_msg.get(k) for k in ("prefill_ms", "prefill_tps", "gen_ms", "tps", "reused", "rounds",
                                              "tokens_per_round", "accepted", "drafted", "expert_miss_rate",
                                              "verify_ms", "draft_ms", "cpu_expert_ms")}
+    if first_prefill:   # the prompt's own read, not a resumed slice's
+        ms = first_prefill.get("ms") or 0
+        fresh = len(prompt_ids) - (first_prefill.get("reused") or 0)
+        timings.update(prefill_ms=ms, reused=first_prefill.get("reused"), prefill_tps=fresh / (ms / 1000) if ms else 0)
+    if slices or interventions:
+        timings.update(gen_ms=gen_ms, tps=(len(generated) - 1) / (gen_ms / 1000) if gen_ms and generated else 0)
+    if slices:
+        timings["slices"] = slices + 1
     if interventions:
         timings["thinking_loop_guard"] = interventions
     rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
@@ -619,6 +661,10 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=os.environ.get("BNK_API_KEY", ""))
     ap.add_argument("--max-tokens", type=int, default=8192, help="default completion budget")
+    ap.add_argument("--slice", type=float, default=float(os.environ.get("BNK_SLICE_S", "10")),
+                    help="seconds a request generates before giving its turn to waiting ones (0 = never)")
+    ap.add_argument("--park-gib", type=float, default=float(os.environ.get("BNK_PARK_GIB", "24")),
+                    help="host RAM for parked conversations (several clients taking turns; 0 = off)")
     ap.add_argument("--config", default="",
                     help="model config JSON (configs/*.json): sampling, speculation, guard, engine_args, server_args")
     ap.add_argument("--no-think-guard", dest="think_guard", action="store_false", default=None,

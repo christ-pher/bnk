@@ -23,7 +23,11 @@ class Engine:
         self.ready = threading.Event()
         self.info = {}
         self.queues: dict[str, queue.Queue] = {}
-        self.lock = threading.Lock()          # one generation at a time
+        # one generation at a time, first come first served (a request that yields its turn queues behind the
+        # ones already waiting)
+        self._turn = threading.Condition()
+        self._line: collections.deque = collections.deque()
+        self._busy = False
         self.qlock = threading.Lock()
         self.started_at = None
         self.log_tail = collections.deque(maxlen=400)
@@ -97,22 +101,41 @@ class Engine:
         """The engine's last telemetry snapshot (it pushes one every 250 ms while working, 1 s while idle)."""
         return self.last_telemetry
 
+    def _acquire(self):
+        me = object()
+        with self._turn:
+            self._line.append(me)
+            while self._busy or self._line[0] is not me:
+                self._turn.wait()
+            self._line.popleft()
+            self._busy = True
+
+    def _release(self):
+        with self._turn:
+            self._busy = False
+            self._turn.notify_all()
+
+    def waiters(self) -> int:
+        """Requests waiting for the engine."""
+        return len(self._line)
+
     def generate(self, prompt: list[int], params: dict):
         """Yields engine events for one request: prefill, tokens..., done (or error)."""
         rid = uuid.uuid4().hex[:12]
         q = queue.Queue()
         with self.qlock:
             self.queues[rid] = q
+        self._acquire()
         try:
-            with self.lock:
-                self._send({"op": "generate", "id": rid, "prompt": prompt, **params})
-                while True:
-                    msg = q.get()
-                    msg["_rid"] = rid
-                    yield msg
-                    if msg.get("type") in ("done", "error"):
-                        break
+            self._send({"op": "generate", "id": rid, "prompt": prompt, **params})
+            while True:
+                msg = q.get()
+                msg["_rid"] = rid
+                yield msg
+                if msg.get("type") in ("done", "error"):
+                    break
         finally:
+            self._release()
             with self.qlock:
                 self.queues.pop(rid, None)
 

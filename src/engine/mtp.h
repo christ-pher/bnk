@@ -32,6 +32,15 @@ public:
     void ensure_ctx(int cells);
     void release_ctx(int cells);
     size_t ctx_bytes_needed(int cells) const;
+    // f(device ptr, bytes) over the buffers holding cells [0, cells) (for parking a conversation)
+    template <typename F> void each_ctx(int cells, F && f) {
+        f((void *) kc_.p, (size_t) cells * kv_cell_bytes_);
+        f((void *) vc_.p, (size_t) cells * kv_cell_bytes_);
+        if (sparse_) {
+            f((void *) kraw_.p, (size_t) cells * qsh_.id * sizeof(half));
+            f((void *) pooled_.p, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+        }
+    }
     bool loaded() const { return loaded_; }
     size_t vram_bytes() const { return vram_; }
 

@@ -54,6 +54,11 @@ struct EngineOptions {
     int gemm_min_tokens = 32;        // prompt-path experts with fewer tokens run on their quantized weights
     int adapt_every = 4;             // forwards between adaptive cache updates (0 = static cache)
     int adapt_swaps = 16;            // max expert swaps started per update
+    // Parked conversations: when a request belongs to another conversation, the live one's whole state goes to
+    // host RAM (up to park_gib, least recently used dropped first) and comes back when its next request arrives,
+    // instead of its prompt being read again. 0 = off (one conversation at a time, as before).
+    double park_gib = 0;
+    int park_min = 2048;             // conversations shorter than this are not worth parking
 };
 
 struct StageTimes {
@@ -113,6 +118,12 @@ public:
     // Restores the latest snapshot at or before max_pos; returns its position (the history is cut there), or -1.
     int rollback(int max_pos);
     int checkpoints() const;
+    // Makes the state that can reuse the most of `prompt` live: the live one, or a parked one (parking the live
+    // conversation first when it would lose at least park_min tokens). No-op unless park_gib > 0.
+    void select_conversation(const std::vector<int32_t> & prompt);
+    int parked() const { return (int) parked_.size(); }
+    size_t parked_bytes() const;
+    struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; } park_stats;
     const std::vector<int32_t> & history() const { return history_; }
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_.threads(); }
@@ -174,6 +185,23 @@ private:
     uint64_t ckpt_age_ = 0;
     static constexpr int kMaxCheckpoints = 6;
     template <typename F> void each_state(F && f);   // f(device ptr, floats) over every saved buffer
+    size_t state_floats();
+    // f(device ptr, bytes) over every buffer holding per-position state for cells [0, cells) (KV, indexer keys
+    // and their pooled blocks, the drafter's)
+    template <typename F> void each_ctx(int cells, F && f);
+    struct Parked {
+        std::vector<int32_t> history;
+        int mtp_cell = -1;
+        std::vector<Checkpoint> ckpts;   // own pinned buffers
+        uint8_t * host = nullptr;        // pinned: the context ranges, then the recurrent state
+        size_t bytes = 0;
+        uint64_t used = 0;
+    };
+    std::vector<Parked> parked_;
+    uint64_t park_age_ = 0;
+    void park(uint64_t keep = 0);
+    void restore(size_t i);
+    void drop_parked(size_t i);
     uint32_t seq_ = 0;
     int64_t fwd_count_ = 0;
     cudaGraphExec_t graphs_[2][kMaxWindow + 1] = {};   // [commit_all][T]
@@ -269,5 +297,17 @@ private:
         int max_items = 0;
     } pf_;
 };
+
+// (here so that park.cpp can use it as well)
+template <typename F> void Engine::each_state(F && f) {
+    const Config & c = model_.cfg;
+    for (int il = 0; il < c.n_layer; ++il)
+        if (!c.is_attn(il)) {
+            f(conv_buf_[il].p, conv_buf_[il].n);
+            f(ssm_state_[il].p, ssm_state_[il].n);
+        }
+    if (ple_hist_.p) f(ple_hist_.p, ple_hist_.n);
+    if (mtp_R_) f(mtp_R_, (size_t) c.hc_dim());
+}
 
 }  // namespace bnk
