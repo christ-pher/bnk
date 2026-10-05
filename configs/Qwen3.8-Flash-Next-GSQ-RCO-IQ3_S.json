@@ -3,5 +3,5 @@
   "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
-  "server_args": ["--max-tokens", "32768"]
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", "--max-tokens", "32768"]
 }

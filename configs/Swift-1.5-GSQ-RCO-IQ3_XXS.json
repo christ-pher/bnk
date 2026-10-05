@@ -1,0 +1,7 @@
+{
+  "notes": "ukisai Swift 1.5 GSQ-RCO IQ3_XXS (highest tier in the repo; others are 2-bit IQ2_XS/Q2_0). Its ffn_gate/up_exps are IQ2_XS/IQ2_XXS; bnk gained kernels for those 2026-10-05 (R-layout + dp4a + CPU mdot, validated bit-exact vs ggml). Base GSQ-RCO qwen4exp; bnk uses its shared MTP drafter. Sampling defaults to the Qwen recommendation; not tuned on this machine yet. Decodes ~42 tok/s in a smoke test.",
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "speculation": { "draft": 4, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true,
+  "server_args": ["--model-id", "Swift-1.5-GSQ-RCO-IQ3_XXS", "--max-tokens", "32768"]
+}

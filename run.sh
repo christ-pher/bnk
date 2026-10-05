@@ -24,19 +24,18 @@ choice="${1:-iq3_s}"
 PLE="${BNK_PLE_GGUF:-}"
 [[ $# -gt 0 ]] && shift
 case "$choice" in
-  iq3_s|IQ3_S) MODEL="$MODELS/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"; NAME=iq3_s ;;
-  orca|orca-iq4_xs|iq4_xs) MODEL="$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf"; NAME=orca-iq4_xs ;;
+  iq3_s|IQ3_S) MODEL="$MODELS/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"; NAME=Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S ;;
+  orca|orca-iq4_xs|iq4_xs) MODEL="$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf"; NAME=Qwen3.8-Flash-Next-Uncensored-IQ4_XS ;;
   # SC117's GSQ-RCO IQ3_S with Orca's abliterated tensors transplanted (huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)
   abliterated|iq3_s-abliterated|sc117)
-    MODEL="${BNK_ABLITERATED:-/opt/models/gsq-rco-abliterated/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf}"; NAME=iq3_s-abliterated ;;
-  # ukisai Swift 1.5 GSQ-RCO IQ3_XXS (huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), highest tier offered.
-  # NOTE: does not load yet - its IQ2_XS/IQ2_XXS expert tensors have no R-layout kernel (see configs/swift.json).
+    MODEL="${BNK_ABLITERATED:-/opt/models/gsq-rco-abliterated/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf}"; NAME=Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S ;;
+  # ukisai Swift 1.5 GSQ-RCO IQ3_XXS (huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), highest tier offered
   swift|swift-iq3_xxs|iq3_xxs)
-    MODEL="${BNK_SWIFT:-/opt/models/swift-gsq-rco/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"; NAME=swift ;;
+    MODEL="${BNK_SWIFT:-/opt/models/swift-gsq-rco/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"; NAME=Swift-1.5-GSQ-RCO-IQ3_XXS ;;
   # CYBER-FROST-3.8 PS-GUFF (Q5_K_M), fetched without its PLE table (tools/fetch_gguf.py, see README): that table
   # is byte-identical to Orca's, so it is read from the Orca file
   cyber-frost|cyberfrost|frost)
-    MODEL="${BNK_CYBER_FROST:-/opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf}"; NAME=cyber-frost
+    MODEL="${BNK_CYBER_FROST:-/opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf}"; NAME=CYBER-FROST-3.8-PS-Q5_K_M
     PLE="${BNK_PLE_GGUF:-$MODELS/orca-iq4_xs/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf}" ;;
   *.gguf) MODEL="$choice"; NAME="$(basename "$choice" .gguf)" ;;
   *) echo "unknown model '$choice' (iq3_s, orca, cyber-frost, abliterated, swift, or a .gguf path)"; exit 1 ;;

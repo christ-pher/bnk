@@ -3,5 +3,5 @@
   "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
-  "server_args": ["--max-tokens", "32768"]
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next-Uncensored-IQ4_XS", "--max-tokens", "32768"]
 }
