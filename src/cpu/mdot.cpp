@@ -192,6 +192,86 @@ void iq2_s_rows(const block_iq2_s * x, int nb, const block_q8_K * const * y, flo
     for (int t = 0; t < NT; ++t) s[t] = 0.125f * hsum8(acc[t]);
 }
 
+// ---------------------------------------------------------------------------------------------- IQ2_XXS
+// Mirrors ggml_vec_dot_iq2_xxs_q8_K (AVX2): grid from iq2xxs_grid, signs from keven_signs applied to the
+// activations, one 4-bit scale (2*ls+1) per 32-block; the per-32 weight decode is hoisted out of the token loop.
+template <int NT>
+void iq2_xxs_rows(const block_iq2_xxs * x, int nb, const block_q8_K * const * y, float * s) {
+    const uint64_t * signs64 = (const uint64_t *) keven_signs.v;
+    uint32_t aux32[4];
+    const uint8_t * aux8 = (const uint8_t *) aux32;
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float dw = fp16(x[i].d);
+        const uint16_t * q2 = x[i].qs;
+        __m256i sumi[NT];
+        for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            memcpy(aux32, q2, 4 * sizeof(uint32_t));
+            q2 += 8;
+            const __m256i q2_1 = _mm256_set_epi64x(iq2xxs_grid[aux8[3]], iq2xxs_grid[aux8[2]],
+                                                   iq2xxs_grid[aux8[1]], iq2xxs_grid[aux8[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(iq2xxs_grid[aux8[11]], iq2xxs_grid[aux8[10]],
+                                                   iq2xxs_grid[aux8[9]], iq2xxs_grid[aux8[8]]);
+            const __m256i s2_1 = _mm256_set_epi64x(signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
+                                                   signs64[(aux32[1] >> 7) & 127], signs64[(aux32[1] >> 0) & 127]);
+            const __m256i s2_2 = _mm256_set_epi64x(signs64[(aux32[3] >> 21) & 127], signs64[(aux32[3] >> 14) & 127],
+                                                   signs64[(aux32[3] >> 7) & 127], signs64[(aux32[3] >> 0) & 127]);
+            const __m256i sc1 = _mm256_set1_epi16(2 * (aux32[1] >> 28) + 1);
+            const __m256i sc2 = _mm256_set1_epi16(2 * (aux32[3] >> 28) + 1);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t * q8 = y[t][i].qs + ib32 * 32;
+                const __m256i a1 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) q8), s2_1);
+                const __m256i a2 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) (q8 + 32)), s2_2);
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, a1), sc1);
+                const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, a2), sc2);
+                sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(p1, p2));
+            }
+        }
+        for (int t = 0; t < NT; ++t)
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dw * y[t][i].d), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+    }
+    for (int t = 0; t < NT; ++t) s[t] = 0.125f * hsum8(acc[t]);
+}
+
+// ---------------------------------------------------------------------------------------------- IQ2_XS
+// Mirrors dequantize/vec_dot of iq2_xs: 9-bit grid index and 7-bit sign index packed per uint16, two 4-bit
+// per-16 scales per 32-block. Processed one 32-block at a time (grid+signs hoisted out of the token loop).
+template <int NT>
+void iq2_xs_rows(const block_iq2_xs * x, int nb, const block_q8_K * const * y, float * s) {
+    const uint64_t * signs64 = (const uint64_t *) keven_signs.v;
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float dw = fp16(x[i].d);
+        const uint16_t * q2 = x[i].qs;
+        __m256i sumi[NT];
+        for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const __m256i q2v = _mm256_set_epi64x(iq2xs_grid[q2[3] & 511], iq2xs_grid[q2[2] & 511],
+                                                  iq2xs_grid[q2[1] & 511], iq2xs_grid[q2[0] & 511]);
+            const __m256i s2 = _mm256_set_epi64x(signs64[q2[3] >> 9], signs64[q2[2] >> 9],
+                                                 signs64[q2[1] >> 9], signs64[q2[0] >> 9]);
+            q2 += 4;
+            const int slo = x[i].scales[ib32] & 0xf, shi = x[i].scales[ib32] >> 4;
+            const __m256i sc = _mm256_setr_epi16(2 * slo + 1, 2 * slo + 1, 2 * slo + 1, 2 * slo + 1,
+                                                 2 * slo + 1, 2 * slo + 1, 2 * slo + 1, 2 * slo + 1,
+                                                 2 * shi + 1, 2 * shi + 1, 2 * shi + 1, 2 * shi + 1,
+                                                 2 * shi + 1, 2 * shi + 1, 2 * shi + 1, 2 * shi + 1);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t * q8 = y[t][i].qs + ib32 * 32;
+                const __m256i a = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) q8), s2);
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(q2v, a), sc);
+                sumi[t] = _mm256_add_epi32(sumi[t], p);
+            }
+        }
+        for (int t = 0; t < NT; ++t)
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dw * y[t][i].d), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+    }
+    for (int t = 0; t < NT; ++t) s[t] = 0.125f * hsum8(acc[t]);
+}
+
 // ---------------------------------------------------------------------------------------------- IQ4_XS
 template <int NT>
 void iq4_xs_rows(const block_iq4_xs * x, int nb, const block_q8_K * const * y, float * s) {
@@ -333,6 +413,7 @@ void dispatch(const void * row, int nb, const void * const * y, int T, float * s
 
 bool mdot_supported(int type) {
     return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
+           type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
            type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q5_K;
 }
 
@@ -346,6 +427,12 @@ void mdot(int type, int n, const void * row, const void * const * y, int T, floa
             break;
         case GGML_TYPE_IQ2_S:
             dispatch<block_iq2_s, block_q8_K, iq2_s_rows<1>, iq2_s_rows<2>, iq2_s_rows<3>, iq2_s_rows<4>>(row, n / QK_K, y, T, s);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            dispatch<block_iq2_xxs, block_q8_K, iq2_xxs_rows<1>, iq2_xxs_rows<2>, iq2_xxs_rows<3>, iq2_xxs_rows<4>>(row, n / QK_K, y, T, s);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            dispatch<block_iq2_xs, block_q8_K, iq2_xs_rows<1>, iq2_xs_rows<2>, iq2_xs_rows<3>, iq2_xs_rows<4>>(row, n / QK_K, y, T, s);
             break;
         case GGML_TYPE_IQ4_XS:
             dispatch<block_iq4_xs, block_q8_K, iq4_xs_rows<1>, iq4_xs_rows<2>, iq4_xs_rows<3>, iq4_xs_rows<4>>(row, n / QK_K, y, T, s);

@@ -14,8 +14,8 @@
 
 namespace bnk {
 
-enum : int { F_Q8_0 = 8, F_Q4_K = 12, F_Q5_K = 13, F_Q6_K = 14, F_IQ3_XXS = 18, F_IQ4_NL = 20, F_IQ3_S = 21,
-             F_IQ2_S = 22, F_IQ4_XS = 23, F_Q2_0 = 42 };
+enum : int { F_Q8_0 = 8, F_Q4_K = 12, F_Q5_K = 13, F_Q6_K = 14, F_IQ2_XXS = 16, F_IQ2_XS = 17, F_IQ3_XXS = 18,
+             F_IQ4_NL = 20, F_IQ3_S = 21, F_IQ2_S = 22, F_IQ4_XS = 23, F_Q2_0 = 42 };
 
 BNK_HD static inline void rfmt_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
@@ -120,6 +120,24 @@ BNK_HD static inline void rfmt_repack_row(const RLayout & L, const uint8_t * s, 
                 const int ib = sb % 8;
                 memcpy(A + 8 * sb, blk + 2 + 8 * ib, 8);
                 memcpy(B + 4 * sb, blk + 2 + 64 + 4 * ib, 4);
+                if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
+            }
+            break;
+        case F_IQ2_XXS:   // block 66 bytes: d, qs[32] uint16 (8 bytes per 32-block: 4 grid idx + aux signs/scale)
+            for (int sb = 0; sb < n; ++sb) {
+                const uint8_t * blk = s + (sb / 8) * 66;
+                const int ib = sb % 8;
+                memcpy(A + 4 * sb, blk + 2 + 8 * ib, 4);
+                memcpy(B + 4 * sb, blk + 2 + 8 * ib + 4, 4);
+                if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
+            }
+            break;
+        case F_IQ2_XS:    // block 74 bytes: d, qs[32] uint16 (4 per 32-block), scales[8]
+            for (int sb = 0; sb < n; ++sb) {
+                const uint8_t * blk = s + (sb / 8) * 74;
+                const int ib = sb % 8;
+                memcpy(A + 8 * sb, blk + 2 + 8 * ib, 8);
+                B[sb] = blk[2 + 64 + ib];
                 if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
             }
             break;
@@ -232,6 +250,24 @@ BNK_HD static inline void rfmt_repack_sb(const RLayout & L, const uint8_t * s, u
                 const int ib = sb % 8;
                 memcpy(A + 8 * sb, blk + 2 + 8 * ib, 8);
                 memcpy(B + 4 * sb, blk + 2 + 64 + 4 * ib, 4);
+                if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
+            }
+            break;
+        case F_IQ2_XXS:
+            {
+                const uint8_t * blk = s + (sb / 8) * 66;
+                const int ib = sb % 8;
+                memcpy(A + 4 * sb, blk + 2 + 8 * ib, 4);
+                memcpy(B + 4 * sb, blk + 2 + 8 * ib + 4, 4);
+                if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
+            }
+            break;
+        case F_IQ2_XS:
+            {
+                const uint8_t * blk = s + (sb / 8) * 74;
+                const int ib = sb % 8;
+                memcpy(A + 8 * sb, blk + 2 + 8 * ib, 8);
+                B[sb] = blk[2 + 64 + ib];
                 if (ib == 0) memcpy(C + 2 * (sb / 8), blk, 2);
             }
             break;

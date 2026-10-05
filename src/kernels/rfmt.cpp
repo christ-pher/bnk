@@ -10,7 +10,7 @@ namespace bnk {
 bool r_supported(int fmt) {
     switch (fmt) {
         case F_Q8_0: case F_Q4_K: case F_Q5_K: case F_Q6_K: case F_IQ3_XXS: case F_IQ4_NL: case F_IQ3_S:
-        case F_IQ2_S: case F_IQ4_XS: case F_Q2_0: return true;
+        case F_IQ2_S: case F_IQ4_XS: case F_Q2_0: case F_IQ2_XXS: case F_IQ2_XS: return true;
         default: return false;
     }
 }
@@ -33,6 +33,8 @@ RLayout r_layout(int fmt, int64_t cols) {
         case F_IQ4_XS: sz[0] = 16 * n; sz[1] = n; sz[2] = 2 * nb; break;
         case F_IQ2_S: sz[0] = 4 * n; sz[1] = 4 * n; sz[2] = n; sz[3] = n; sz[4] = 2 * nb; break;
         case F_IQ3_XXS: sz[0] = 8 * n; sz[1] = 4 * n; sz[2] = 2 * nb; break;
+        case F_IQ2_XXS: sz[0] = 4 * n; sz[1] = 4 * n; sz[2] = 2 * nb; break;
+        case F_IQ2_XS: sz[0] = 8 * n; sz[1] = n; sz[2] = 2 * nb; break;
         case F_IQ3_S: sz[0] = 8 * n; sz[1] = 4 * n; sz[2] = n; sz[3] = n; sz[4] = 2 * nb; break;
         case F_Q2_0: sz[0] = 8 * n; sz[1] = 2 * (cols / 64); break;
         default: throw std::runtime_error("R layout: unsupported format");

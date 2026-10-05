@@ -146,6 +146,44 @@ template <> struct RT<QT_IQ2_S> {
     }
 };
 
+template <> struct RT<QT_IQ2_XXS> {
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+        const uint32_t a = *(const uint32_t *) (row + o.a + 4 * sb);   // 4 grid indices
+        const uint32_t b = *(const uint32_t *) (row + o.b + 4 * sb);   // 4x7-bit signs + 4-bit scale (top nibble)
+        const float d = h2f(*(const uint16_t *) (row + o.c + 2 * (sb >> 3)));
+        u.d0 = u.d1 = d * (0.5f + (b >> 28)) * 0.25f;
+        u.m0 = u.m1 = 0.f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint2 gr = *(const uint2 *) (iq2xxs_grid + ((a >> (8 * il)) & 0xff));
+            const uint32_t s8 = ksigns_iq2xs[(b >> (7 * il)) & 127];
+            u.w[2 * il + 0] = apply_signs4(gr.x, s8 & 0xF);
+            u.w[2 * il + 1] = apply_signs4(gr.y, s8 >> 4);
+        }
+    }
+};
+
+template <> struct RT<QT_IQ2_XS> {
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+        const uint2 q = *(const uint2 *) (row + o.a + 8 * sb);   // 4 uint16: 9-bit grid idx + 7-bit sign idx
+        const uint32_t sc = row[o.b + sb];
+        const float d = h2f(*(const uint16_t *) (row + o.c + 2 * (sb >> 3)));
+        u.d0 = d * (0.5f + (sc & 0xf)) * 0.25f;   // first 16 weights (il 0,1)
+        u.d1 = d * (0.5f + (sc >> 4)) * 0.25f;    // last 16 weights (il 2,3)
+        u.m0 = u.m1 = 0.f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint32_t q16 = ((il < 2 ? q.x : q.y) >> (16 * (il & 1))) & 0xffff;
+            const uint2 gr = *(const uint2 *) (iq2xs_grid + (q16 & 511));
+            const uint32_t s8 = ksigns_iq2xs[q16 >> 9];
+            u.w[2 * il + 0] = apply_signs4(gr.x, s8 & 0xF);
+            u.w[2 * il + 1] = apply_signs4(gr.y, s8 >> 4);
+        }
+    }
+};
+
 template <> struct RT<QT_IQ3_XXS> {
     static constexpr bool HAS_MIN = false;
     __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
@@ -207,6 +245,8 @@ template <> struct RT<QT_Q2_0> {
         case QT_Q5_K: F.template operator()<QT_Q5_K>(); break;       \
         case QT_Q6_K: F.template operator()<QT_Q6_K>(); break;       \
         case QT_IQ2_S: F.template operator()<QT_IQ2_S>(); break;     \
+        case QT_IQ2_XXS: F.template operator()<QT_IQ2_XXS>(); break; \
+        case QT_IQ2_XS: F.template operator()<QT_IQ2_XS>(); break;   \
         case QT_IQ3_XXS: F.template operator()<QT_IQ3_XXS>(); break; \
         case QT_IQ3_S: F.template operator()<QT_IQ3_S>(); break;     \
         case QT_IQ4_NL: F.template operator()<QT_IQ4_NL>(); break;   \
