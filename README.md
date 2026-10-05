@@ -271,6 +271,7 @@ The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | where models and the MTP layer live |
+| `BNK_PARK_GIB=24`, `BNK_SLICE_S=10` | several clients taking turns (see below); `0` turns either off |
 | `BNK_CPU_PIN=1`, `BNK_CPU_CHUNKS=3` | pin the CPU expert workers to cores / split their work dynamically (Strata's scheme; no measurable gain on this machine, so off by default) |
 
 **Per-model configs** — `configs/<name>.json`:
@@ -308,6 +309,16 @@ speculation, expert-cache hit rates per layer, GPU / PCIe / CPU / memory, reques
 panel for testing. The sidebar lists the OpenAI and Claude API base URLs and the served model id, each with a copy
 button. Data arrives over server-sent events (`GET /api/stream`); `GET /api/stats` returns a snapshot.
 
+**Several agents at once** — requests run one at a time, first come first served, but each conversation keeps
+its state. When a request belongs to another conversation, the engine parks the live one in pinned host RAM
+(history, KV cache, indexer keys, recurrent state, snapshots and the drafter's KV: 28 KiB per token) and brings
+the requested one back, so a turn reads only its new tokens instead of the whole conversation (`--park-gib`, 24 GiB
+by default, least recently used dropped first). A request that has generated for `--slice` seconds (10) while
+others wait gives its turn up and continues from where it was, so one long answer does not hold the other agents
+up. With 3 agents at ~45-50K tokens each (`tools/multi_agent_bench.py`): turn reads 41 s -> 2.0 s (a swap is ~0.15 s
+out + ~0.12 s in), the whole run 721 s -> 256 s. `tools/park_check.py` checks that a resumed conversation produces
+exactly the tokens it would have without the interruption.
+
 **Engine CLI** — `build/bnk` also runs on its own:
 
 ```bash
@@ -339,7 +350,7 @@ third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 
 ## Limitations
 
-* One request at a time (requests queue); the engine is tuned for a single interactive user.
+* One request at a time (requests queue and take turns; see "Several agents at once"): no batched decoding.
 * Decoding slows as the context fills: the KV cache takes VRAM from the expert cache (up to 7 GiB at 256K).
 * The thinking-loop guard catches exact repetition, not paraphrased loops.
 * Only sm_70 is built and tested; other GPUs would need their own tuning (and CUDA 13 no longer targets V100).
