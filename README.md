@@ -128,9 +128,11 @@ so the output distribution is the model's own. The drafter scores only a ~145K-t
 
 **Long context.** The full-attention layers use the model's QSA sparse attention: a learned indexer scores
 compressed 4-token blocks and each query attends to its top 2,048 tokens. bnk computes the block scores as a tiled
-fp32 product over 64 queries at a time and runs the attention on tensor cores, one block per KV head serving all
-twelve query heads that share it, so prompt processing does not slow down as the context fills: it is bound by
-streaming experts over PCIe, not by attention, from the first token to the 256Kth.
+fp32 product over 64 queries at a time; the attention then runs on tensor cores in one launch over the whole
+chunk, one block per (row, KV head) serving the twelve query heads that share it, with the next tile's gathered
+keys and values loaded while the current one computes. Every query sees a fixed number of keys, so prompt
+processing does not slow down as the context fills; streaming experts over PCIe dominates it, with attention
+about 10% of the GPU time of an 80K-token read (`tests/bench_qsa_attn.cu` times the kernels on real selections).
 
 **Elastic VRAM.** The KV cache, the indexer keys, the drafter's KV and the prompt-processing buffers each reserve
 address space for their maximum and map physical memory in 2 MiB pages only as needed. All of them draw on one

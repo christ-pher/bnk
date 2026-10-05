@@ -42,5 +42,14 @@ void qsa_attention(const float * q, const half * kc, const half * vc, const floa
 void qsa_attention_prefill(const float * q, const half * kc, const half * vc, const float * qfull_gate,
                            const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1,
                            const QsaShape & sh, int pos0, float scale, cudaStream_t s);
+// R = `rows` neighbouring rows per block over the union of their selections (1, 2 or 4); every row in [t0, t1)
+// must be sparse. Returns false when the shape is not supported (nothing launched).
+bool qsa_attention_prefill_multi(int rows, const float * q, const half * kc, const half * vc,
+                                 const float * qfull_gate, const int32_t * sel, const int32_t * n_sel, float * out,
+                                 int t0, int t1, const QsaShape & sh, int pos0, float scale, cudaStream_t s);
+// the one-warp-per-(row, head) kernel on its own (the reference for tests)
+void qsa_attention_prefill_ref(const float * q, const half * kc, const half * vc, const float * qfull_gate,
+                               const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1,
+                               const QsaShape & sh, int pos0, float scale, cudaStream_t s);
 
 }  // namespace bnk

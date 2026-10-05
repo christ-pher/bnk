@@ -1,9 +1,12 @@
+#include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 
 #include <mma.h>
 
+#include "core/util.h"
 #include "kernels/qsa.h"
 
 namespace bnk {
@@ -685,6 +688,329 @@ __global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, co
     }
 }
 
+// Prompt rows on tensor cores, R neighbouring rows per block: neighbouring rows select mostly the same blocks
+// (4 rows: their union is ~1.9x one row's selection), so the block walks the union once and each gathered key/value
+// tile serves all R x G query rows; a per-key row mask keeps every row to its own selection and causal tail.
+// The R rows' G heads are the M = R * G rows of the wmma tiles (MT tiles of 16). Per tile of 32 keys: S = Q K^T,
+// masked online softmax, O += P V with O in accumulator fragments (rescaled through a per-warp scratch tile when a
+// row's maximum grows). Every row must be sparse (n_sel > 0); R * 4 <= 32 (the per-entry cell masks are 32 bits).
+template <int R, int MT>
+__global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q, const half * kc, const half * vc,
+                                                                const float * qfull, const int32_t * sel,
+                                                                const int32_t * n_sel, float * out, int t0, int t1,
+                                                                int H, int Hkv, int r, int K, int pos0, float scale) {
+    using namespace nvcuda;
+    constexpr int M = 16 * MT, NW = 8, KT = QA_KT, LDP = KT + 8;
+    constexpr int TILES = MT * (QA_D / 16), PER_WARP = (TILES + NW - 1) / NW;
+    // S tiles are split over the head dim so that every warp has one (M = 16: 2 tiles x 4 quarters)
+    constexpr int SPLIT = NW / (MT * 2) > 0 ? NW / (MT * 2) : 1;
+    extern __shared__ __align__(32) unsigned char smem[];
+    half * Qs = (half *) smem;                                   // [M][QA_LD]
+    half * KVs = Qs + M * QA_LD;                                 // [KT][QA_LD]
+    half * Ps = (half *) (KVs + KT * QA_LD);                     // [M][LDP]
+    int32_t * ent_blk = (int32_t *) (Ps + M * LDP);              // [R * K + 8]
+    uint32_t * ent_mask = (uint32_t *) (ent_blk + R * K + 8);    // [R * K + 8]: 4 cells x R row bits
+    // one region, three uses at different times: the selections (building the key list), the partial scores
+    // (S to softmax) and the warps' rescale tiles (P V, output)
+    float * Ss = (float *) (ent_mask + R * K + 8);               // [SPLIT][M][KT]
+    float * scr = Ss;                                            // [NW][256]
+    int32_t * sel_s = (int32_t *) Ss;                            // [R][K]
+    __shared__ float m_s[M], l_s[M], corr_s[M];
+    __shared__ int need_s[MT];
+    __shared__ int cells[2][KT];
+    __shared__ uint32_t cmask[2][KT];
+    __shared__ int qpos_s[R], ns_s[R], ts_s[R], nb_s[R];
+    __shared__ int wsum[NW], n_union_s, n_ent_s;
+
+    const int G = H / Hkv, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int tb = t0 + blockIdx.x * R, hk = blockIdx.y;
+    if (tid < R) {
+        const int t = tb + tid;
+        const bool ok = t < t1;
+        const int qp = pos0 + (ok ? t : tb);
+        qpos_s[tid] = ok ? qp : -1;
+        ns_s[tid] = ok ? n_sel[t - t0] : 0;
+        ts_s[tid] = (qp + 1) / r * r;
+        nb_s[tid] = (qp + 1) / r;
+    }
+    for (int i = tid; i < R * K; i += 256) {
+        const int rr = i / K, j = i % K, t = tb + rr;
+        sel_s[i] = (t < t1 && j < n_sel[t - t0]) ? sel[(int64_t) (t - t0) * K + j] : INT_MAX;
+    }
+    // queries of the R rows' head groups (scaled), zero rows past R * G
+    for (int i = tid; i < M * QA_D; i += 256) {
+        const int m = i / QA_D, d = i % QA_D, rr = m / G, g = m % G, t = tb + rr;
+        Qs[m * QA_LD + d] = __float2half(m < R * G && t < t1 ? q[((int64_t) t * H + hk * G + g) * QA_D + d] * scale : 0.f);
+    }
+    if (tid < M) {
+        m_s[tid] = -FLT_MAX;
+        l_s[tid] = 0.f;
+    }
+    __syncthreads();
+    int nb_min = INT_MAX, q_max = 0;
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr)
+        if (qpos_s[rr] >= 0) nb_min = min(nb_min, nb_s[rr]), q_max = max(q_max, qpos_s[rr]);
+    auto contains = [&](int rr, int b) {
+        const int32_t * s = sel_s + rr * K;
+        int lo = 0, hi = K;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (s[mid] < b) lo = mid + 1; else hi = mid;
+        }
+        return lo < K && s[lo] == b;
+    };
+    // the union of the selected blocks below nb_min: an entry is owned by the first row that selected it
+    constexpr int PER = R * 512 / 256;   // items per thread (K = 512)
+    unsigned own = 0;
+    int cnt = 0;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int i = tid * PER + j, rr = i / K;
+        const int b = sel_s[i];
+        bool o = b < nb_min;
+        for (int r2 = 0; r2 < rr && o; ++r2) o = !contains(r2, b);
+        own |= (unsigned) o << j;
+        cnt += o;
+    }
+    int x = cnt;   // exclusive scan of the counts over the block
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(0xffffffff, x, off);
+        if (lane >= off) x += y;
+    }
+    if (lane == 31) wsum[warp] = x;
+    __syncthreads();
+    int base = x - cnt;
+    for (int w = 0; w < warp; ++w) base += wsum[w];
+    if (tid == 255) n_union_s = base + cnt;
+#pragma unroll
+    for (int j = 0; j < PER; ++j)
+        if (own >> j & 1) {
+            const int b = sel_s[tid * PER + j];
+            unsigned rows = 0;
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) rows |= (unsigned) contains(rr, b) << rr;
+            ent_blk[base] = b;
+            ent_mask[base++] = rows | rows << R | rows << 2 * R | rows << 3 * R;
+        }
+    __syncthreads();
+    // the blocks from nb_min to the last row's tail, cell by cell (selected for some rows, the tail for others)
+    const int n_union = n_union_s, n_tail = q_max / r - nb_min + 1;
+    if (tid < n_tail) {
+        const int b = nb_min + tid;
+        uint32_t mk = 0;
+        for (int i = 0; i < r; ++i) {
+            const int c = b * r + i;
+            unsigned rows = 0;
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) {
+                const bool ok = qpos_s[rr] >= 0 && c <= qpos_s[rr] &&
+                                (c >= ts_s[rr] || (b < nb_s[rr] && contains(rr, b)));
+                rows |= (unsigned) ok << rr;
+            }
+            mk |= rows << (i * R);
+        }
+        ent_blk[n_union + tid] = b;
+        ent_mask[n_union + tid] = mk;
+    }
+    if (tid == 0) n_ent_s = n_union + n_tail;
+    __syncthreads();
+    const int n_keys = n_ent_s * r;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[PER_WARP];
+#pragma unroll
+    for (int j = 0; j < PER_WARP; ++j) wmma::fill_fragment(acc[j], 0.f);
+    const unsigned rmask = (1u << R) - 1;
+    // Software pipeline: the next tile's keys and values are fetched into registers while this tile computes, so
+    // the gathers' latency hides behind the tensor-core work (sm_70 has no asynchronous copies).
+    auto tile_cells = [&](int k0, int b) {
+        if (tid < KT) {
+            const int k = k0 + tid;
+            if (k < n_keys) {
+                const int e = k / r, i = k % r;
+                cells[b][tid] = ent_blk[e] * r + i;
+                cmask[b][tid] = ent_mask[e] >> (i * R) & rmask;
+            } else {
+                cells[b][tid] = -1;
+                cmask[b][tid] = 0;
+            }
+        }
+    };
+    constexpr int PIECES = KT * QA_D / 8 / 256;   // 16-byte pieces per thread per tile
+    uint4 kreg[PIECES], vreg[PIECES];
+    auto fetch = [&](const half * src, int b, uint4 * reg) {
+#pragma unroll
+        for (int j = 0; j < PIECES; ++j) {
+            const int i = tid + 256 * j, k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
+            const int c = cells[b][k];
+            reg[j] = c >= 0 ? *(const uint4 *) (src + ((int64_t) c * Hkv + hk) * QA_D + d8) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4 * reg) {
+#pragma unroll
+        for (int j = 0; j < PIECES; ++j) {
+            const int i = tid + 256 * j, k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
+            *(uint4 *) &KVs[k * QA_LD + d8] = reg[j];
+        }
+    };
+    const int n_tiles = (n_keys + KT - 1) / KT;
+    tile_cells(0, 0);
+    if (n_tiles > 1) tile_cells(KT, 1);
+    __syncthreads();
+    fetch(kc, 0, kreg);
+    fetch(vc, 0, vreg);
+    put(kreg);
+    __syncthreads();
+    for (int it = 0; it < n_tiles; ++it) {
+        const int cb = it & 1, nbuf = cb ^ 1;
+        const bool more = it + 1 < n_tiles;
+        if (more) fetch(kc, nbuf, kreg);   // the next keys, in flight during this tile
+        if (tid < MT) need_s[tid] = 0;
+        // S[M][32]: one 16 x 16 tile per warp
+        for (int tt = warp; tt < MT * 2 * SPLIT; tt += NW) {
+            const int sp = tt % SPLIT, mi = (tt / SPLIT) >> 1, ni = (tt / SPLIT) & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
+            wmma::fill_fragment(sf, 0.f);
+#pragma unroll 4
+            for (int kd = sp * (QA_D / SPLIT); kd < (sp + 1) * (QA_D / SPLIT); kd += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
+                wmma::load_matrix_sync(af, Qs + mi * 16 * QA_LD + kd, QA_LD);
+                wmma::load_matrix_sync(bf, KVs + ni * 16 * QA_LD + kd, QA_LD);
+                wmma::mma_sync(sf, af, bf, sf);
+            }
+            wmma::store_matrix_sync(Ss + (sp * M + mi * 16) * KT + ni * 16, sf, KT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        put(vreg);   // this tile's values (fetched during the previous one)
+        // the masked softmax update (4 threads per row, 8 keys each)
+        for (int row = tid >> 2; row < M; row += 64) {
+            const int sub = tid & 3, rr = row / G;
+            const bool live = row < R * G;
+            float sc[8], mx = -FLT_MAX;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int k = sub * 8 + j;
+                sc[j] = Ss[row * KT + k];
+#pragma unroll
+                for (int sp = 1; sp < SPLIT; ++sp) sc[j] += Ss[(sp * M + row) * KT + k];
+                if (live && (cmask[cb][k] >> rr & 1)) mx = fmaxf(mx, sc[j]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+            const float m_old = m_s[row], m_new = fmaxf(m_old, mx);
+            float ps = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int k = sub * 8 + j;
+                const float p = live && (cmask[cb][k] >> rr & 1) ? __expf(sc[j] - m_new) : 0.f;
+                Ps[row * LDP + k] = __float2half(p);
+                ps += p;
+            }
+            ps += __shfl_xor_sync(0xffffffff, ps, 1);
+            ps += __shfl_xor_sync(0xffffffff, ps, 2);
+            if (sub == 0) {
+                const float c = m_new > m_old ? __expf(m_old - m_new) : 1.f;
+                corr_s[row] = c;
+                l_s[row] = l_s[row] * c + ps;
+                m_s[row] = m_new;
+                if (c != 1.f) need_s[row / 16] = 1;
+            }
+        }
+        __syncthreads();
+        if (more) fetch(vc, nbuf, vreg);   // the next values, in flight during P V
+        // O += P V: this warp's output tiles (m tile, 16 dims)
+        float * sw = scr + warp * 256;
+#pragma unroll
+        for (int j = 0; j < PER_WARP; ++j) {
+            const int tt = warp + j * NW;
+            if (tt >= TILES) break;
+            const int mi = tt / (QA_D / 16), di = tt % (QA_D / 16);
+            if (need_s[mi]) {   // rows whose maximum grew: O *= corr
+                wmma::store_matrix_sync(sw, acc[j], 16, wmma::mem_row_major);
+                __syncwarp();
+#pragma unroll
+                for (int e = lane; e < 256; e += 32) sw[e] *= corr_s[mi * 16 + e / 16];
+                __syncwarp();
+                wmma::load_matrix_sync(acc[j], sw, 16, wmma::mem_row_major);
+            }
+#pragma unroll
+            for (int kk = 0; kk < KT / 16; ++kk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, Ps + mi * 16 * LDP + kk * 16, LDP);
+                wmma::load_matrix_sync(vf, KVs + kk * 16 * QA_LD + di * 16, QA_LD);
+                wmma::mma_sync(acc[j], pf, vf, acc[j]);
+            }
+        }
+        __syncthreads();
+        if (more) {
+            put(kreg);
+            if (it + 2 < n_tiles) tile_cells((it + 2) * KT, cb);
+        }
+        __syncthreads();
+    }
+    // out = O / l * sigmoid(gate)
+    float * sw = scr + warp * 256;
+#pragma unroll
+    for (int j = 0; j < PER_WARP; ++j) {
+        const int tt = warp + j * NW;
+        if (tt >= TILES) break;
+        const int mi = tt / (QA_D / 16), di = tt % (QA_D / 16);
+        wmma::store_matrix_sync(sw, acc[j], 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int m = mi * 16 + e / 16, d = di * 16 + e % 16, rr = m / G, g = m % G, t = tb + rr;
+            if (m >= R * G || t >= t1) continue;
+            const int h = hk * G + g;
+            const float gate = qfull[((int64_t) t * H + h) * 2 * QA_D + QA_D + d];
+            out[((int64_t) t * H + h) * QA_D + d] = sw[e] / l_s[m] * qsa_sigmoid(gate);
+        }
+        __syncwarp();
+    }
+}
+
+template <int R, int MT>
+static void launch_multi(const float * q, const half * kc, const half * vc, const float * qfull_gate,
+                         const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1, const QsaShape & sh,
+                         int pos0, float scale, cudaStream_t s) {
+    constexpr int M = 16 * MT;
+    constexpr int SPLIT = 8 / (MT * 2) > 0 ? 8 / (MT * 2) : 1;
+    const size_t region = std::max({(size_t) SPLIT * M * QA_KT * 4, (size_t) 8 * 256 * 4, (size_t) R * sh.top_blocks * 4});
+    const size_t bytes = (size_t) M * QA_LD * 2 + (size_t) QA_KT * QA_LD * 2 + (size_t) M * (QA_KT + 8) * 2 +
+                         (size_t) (R * sh.top_blocks + 8) * 8 + region;
+    static bool attr = false;
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_prefill_multi_k<R, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int) bytes));
+        attr = true;
+        if (getenv("BNK_QSA_INFO")) {
+            cudaFuncAttributes fa;
+            int nb = 0;
+            CUDA_CHECK(cudaFuncGetAttributes(&fa, qsa_attn_prefill_multi_k<R, MT>));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, qsa_attn_prefill_multi_k<R, MT>, 256, bytes));
+            fprintf(stderr, "qsa multi R=%d: %d registers, %zu + %zu bytes shared, %d blocks per SM\n", R, fa.numRegs,
+                    (size_t) fa.sharedSizeBytes, bytes, nb);
+        }
+    }
+    qsa_attn_prefill_multi_k<R, MT><<<dim3((t1 - t0 + R - 1) / R, sh.Hkv), 256, bytes, s>>>(
+        q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv, sh.ratio, sh.top_blocks, pos0, scale);
+}
+
+bool qsa_attention_prefill_multi(int rows, const float * q, const half * kc, const half * vc,
+                                 const float * qfull_gate, const int32_t * sel, const int32_t * n_sel, float * out,
+                                 int t0, int t1, const QsaShape & sh, int pos0, float scale, cudaStream_t s) {
+    const int G = sh.H / sh.Hkv;
+    if (sh.D != QA_D || sh.top_blocks != 512 || G > 16) return false;
+    switch (rows) {
+        case 1: launch_multi<1, 1>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s); return true;
+        case 2: if (2 * G > 32) return false; launch_multi<2, 2>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s); return true;
+        case 4: if (4 * G > 48) return false; launch_multi<4, 3>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s); return true;
+        default: return false;
+    }
+}
+
 void qsa_attention_prefill(const float * q, const half * kc, const half * vc, const float * qfull_gate,
                            const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1,
                            const QsaShape & sh, int pos0, float scale, cudaStream_t s) {
@@ -696,6 +1022,14 @@ void qsa_attention_prefill(const float * q, const half * kc, const half * vc, co
                                                                    sh.Hkv, sh.ratio, sh.top_blocks, pos0, scale);
         return;
     }
+    qsa_attention_prefill_ref(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s);
+}
+
+void qsa_attention_prefill_ref(const float * q, const half * kc, const half * vc, const float * qfull_gate,
+                               const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1,
+                               const QsaShape & sh, int pos0, float scale, cudaStream_t s) {
+    const int warps = (t1 - t0) * sh.H;
+    if (warps <= 0) return;
     qsa_attn_prefill_k<<<(warps + 7) / 8, 256, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv,
                                                        sh.D, sh.ratio, sh.top_blocks, pos0, scale);
 }

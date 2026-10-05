@@ -83,7 +83,8 @@ void Engine::prefill_alloc(int N) {
     const int E = c.n_embd, HC = c.hc_dim(), F = c.n_ff_exp, k = c.n_expert_used;
     auto & p = pf_;
     pf_cap_ = N;
-    if (qsa_on_) { p.scores.alloc((size_t) 64 * max_blocks_); p.sel.alloc((size_t) 64 * qsh_.top_blocks); p.nsel.alloc(64); }
+    // block selections for every row of a chunk (the attention runs once over the chunk); scores 64 rows at a time
+    if (qsa_on_) { p.scores.alloc((size_t) 64 * max_blocks_); p.sel.alloc((size_t) N * qsh_.top_blocks); p.nsel.alloc(std::max(N, 64)); }
     p.max_items = 2 * (N * k + c.n_expert);
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_items, (size_t) p.max_items * sizeof(PfItem), 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_x, (size_t) N * E * 4, 0));
@@ -287,23 +288,26 @@ void Engine::pf_attn(int il, int N) {
         qsa_store_keys(p.ik, kraw_[il], N, c.idx_dim, &d_par_->pos0, st_);
         qsa_queries(p.iq, F(L.idx_q_norm), N, qsh_, &d_par_->pos0, st_);
         qsa_pool(kraw_[il], F(L.idx_k_norm), pooled_[il], N, qsh_, &d_par_->pos0, st_);
-        // rows past the dense limit select blocks; 64 rows at a time bound the score scratch
-        for (int t0 = 0; t0 < N; t0 += 64) {
+        // Rows up to the dense limit attend to everything; the others select blocks (64 rows at a time bound the
+        // score scratch) and then attend in one launch, each block a row (BNK_QSA_PER64: per 64 rows, as before).
+        static const bool old = getenv("BNK_QSA_PER64") != nullptr;
+        const int ts = std::clamp(qsh_.dense_cells() - pos0, 0, N);   // the first sparse row
+        for (int t0 = 0; t0 < ts; t0 += 64) attention_prefill_rows(t0, std::min(ts, t0 + 64));
+        for (int t0 = ts; t0 < N; t0 += 64) {
             const int t1 = std::min(N, t0 + 64);
-            if (pos0 + t1 <= qsh_.dense_cells()) {
-                attention_prefill_rows(t0, t1);
-                continue;
-            }
-            qsa_select(p.iq.p + (size_t) t0 * c.idx_heads * c.idx_dim, pooled_[il], p.scores, max_blocks_, p.sel,
-                       p.nsel, t1 - t0, qsh_, &d_par_->pos0, t0, st_);
-            qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, t0, t1, qsh_, pos0,
-                                  1.f / sqrtf((float) D), st_);
+            int32_t * sel = old ? p.sel.p : p.sel.p + (size_t) (t0 - ts) * qsh_.top_blocks;
+            int32_t * nsel = old ? p.nsel.p : p.nsel.p + (t0 - ts);
+            qsa_select(p.iq.p + (size_t) t0 * c.idx_heads * c.idx_dim, pooled_[il], p.scores, max_blocks_, sel,
+                       nsel, t1 - t0, qsh_, &d_par_->pos0, t0, st_);
+            if (old)
+                qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, sel, nsel, p.ao, t0, t1, qsh_, pos0,
+                                      1.f / sqrtf((float) D), st_);
             static const char * dsel = getenv("BNK_DUMP_SEL");
             if (dsel && il == env_int("BNK_DUMP_SEL_LAYER", 3)) {
                 std::vector<int32_t> h((size_t) (t1 - t0) * qsh_.top_blocks), hn(t1 - t0);
                 CUDA_CHECK(cudaStreamSynchronize(st_));
-                CUDA_CHECK(cudaMemcpy(h.data(), p.sel.p, h.size() * 4, cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(hn.data(), p.nsel.p, hn.size() * 4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h.data(), sel, h.size() * 4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hn.data(), nsel, hn.size() * 4, cudaMemcpyDeviceToHost));
                 FILE * f = fopen(dsel, "ab");
                 for (int t = 0; t < t1 - t0; ++t) {
                     const int32_t row = pos0 + t0 + t;
@@ -314,6 +318,11 @@ void Engine::pf_attn(int il, int N) {
                 fclose(f);
             }
         }
+        if (!old && ts < N &&
+            !qsa_attention_prefill_multi(1, p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
+                                         1.f / sqrtf((float) D), st_))
+            qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
+                                  1.f / sqrtf((float) D), st_);
     } else {
         attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
     }

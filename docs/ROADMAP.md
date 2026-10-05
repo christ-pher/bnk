@@ -7,7 +7,7 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 | # | What | Why | Expected | Status |
 |---|---|---|---|---|
-| 1 | **Sparse prefill attention, multi-row tiles** (`qsa_attn_prefill_tc_k`, `src/kernels/qsa.cu`) | 15.6% of GPU time in a 78K-token read, at ~4.5 TFLOP/s; each block handles one query row, though neighbouring rows select mostly the same 4-token key blocks | 5-10% faster prompt reading *(estimate)*; may also help MTP verify windows | in progress |
+| 1 | ~~Sparse prefill attention~~ | done, see below | | done |
 | 2 | **Profile the real multi-agent workload** on the parking server | after parking (turn reads 41 s -> 2 s in `tools/multi_agent_bench.py`), measure the read vs generate split on real agent traffic | decides how much effort goes into 3 | |
 | 3 | **Batched decode of several conversations** ("level 3"), in stages: several conversations resident at once -> batched kernels with per-conversation positions -> scheduler | agents decode in the same step instead of taking turns | +20-50% total throughput with several agents *(estimate)*; each single stream gets slower | |
 
@@ -21,6 +21,15 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 * Older open items: HC fusion, int8 KV, GPU sampler, faster `moe_plan`, T=8 GEMV.
 
 ## Done
+
+* **Sparse prefill attention kernel** (2026-10-05): the attention kernel 88.8 -> 50.1 ms per 8K rows (1.77x,
+  `tests/bench_qsa_attn.cu` on real selections); a 78K-token read 63.3 -> 58.8 s (+7.1%, 1,237 -> 1,331 tok/s),
+  68.1 -> 63.5 s with MTP. What helped: one launch over the chunk instead of per 64 rows, 8 warps with the output
+  kept in accumulator fragments, and loading the next tile's keys/values during the current one. What did not:
+  sharing a block between 2-4 neighbouring rows over the union of their selections (the union is 1.9x one row's
+  for 4 rows, so loads halve, but the extra masked tensor-core work and lower occupancy made it slower; the
+  variant stays in the code, `qsa_attention_prefill_multi(rows=2|4)`, for a later look). `BNK_QSA_PER64=1`
+  restores the old per-64-row path.
 
 * **Parked conversations + time slices** (2026-10-05): several agents take turns without re-reading their
   prompts; 3 agents at ~45-50K tokens: turn reads 41 s -> 2.0 s, run 721 s -> 256 s.
