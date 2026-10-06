@@ -7,3 +7,5 @@ pyyaml>=6.0
 gguf @ git+https://github.com/ggml-org/llama.cpp#subdirectory=gguf-py
 # the dashboard build (serve/web) when no system Node.js is installed
 nodejs-wheel>=20
+# tools/fetch_models.py: downloading the models (and the hf command for logging in to gated ones)
+huggingface_hub>=0.34
