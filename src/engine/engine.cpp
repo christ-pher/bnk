@@ -161,6 +161,12 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
                 opt.max_ctx, kv_cell_bytes / 1024.0, (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
                 state_bytes / 1073741824.0, cpu_.threads());
 
+    if (const char * rl = getenv("BNK_ROUTE_LOG")) {
+        route_log_ = fopen(rl, "wb");
+        if (!route_log_) throw std::runtime_error(std::string("cannot open ") + rl);
+        route_dev_.alloc((size_t) c.n_layer * kMaxWindow * c.n_expert_used);
+        cpu_us_.assign(c.n_layer, 0.f);
+    }
     if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_);
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
@@ -583,6 +589,9 @@ void Engine::moe(int il, int T) {
     quantize_act(mixed_, E, T, E, mixact_, st_);
     gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
     route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
+    if (route_log_)
+        CUDA_CHECK(cudaMemcpyAsync(route_dev_.p + (size_t) il * kMaxWindow * k, rids_.p, (size_t) T * k * 4,
+                                   cudaMemcpyDeviceToDevice, st_));
     moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
     if (!opt_.use_graphs || dump_all) {  // eager mode: answer the CPU part right here
         CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -649,6 +658,34 @@ void Engine::enqueue_forward(int T) {
     head(T);
 }
 
+void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double t1) {
+    const Config & c = model_.cfg;
+    const int L = c.n_layer, k = c.n_expert_used;
+    std::vector<int32_t> ids((size_t) L * kMaxWindow * k);
+    CUDA_CHECK(cudaMemcpy(ids.data(), route_dev_.p, ids.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<uint64_t> ts((size_t) 64 * 3);
+    moe_debug_times((uint64_t (*)[3]) ts.data(), L);
+    // the conversation: a hash of its first tokens
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < std::min<size_t>(history_.size(), 256); ++i) h = (h ^ (uint32_t) history_[i]) * 16777619u;
+    const int32_t hdr[6] = {0x54554f52, T, pos0, commit_all ? 1 : 0, (int32_t) h, L};
+    const double tt[2] = {t0, t1};
+    fwrite(hdr, 4, 6, route_log_);
+    fwrite(tt, 8, 2, route_log_);
+    fwrite(ts.data(), 8, (size_t) L * 3, route_log_);
+    fwrite(cpu_us_.data(), 4, L, route_log_);
+    std::vector<int16_t> out((size_t) L * T * k);
+    for (int il = 0; il < L; ++il)
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < k; ++j) {
+                const int e = ids[((size_t) il * kMaxWindow + t) * k + j];
+                out[((size_t) il * T + t) * k + j] = (int16_t) (cache_.slot_of(il, e) >= 0 ? e : -(e + 1));
+            }
+    fwrite(out.data(), 2, out.size(), route_log_);
+    fflush(route_log_);
+    std::fill(cpu_us_.begin(), cpu_us_.end(), 0.f);
+}
+
 void Engine::service_cpu(uint32_t seq, int T) {
     const Config & c = model_.cfg;
     const int E = c.n_embd;
@@ -671,6 +708,7 @@ void Engine::service_cpu(uint32_t seq, int T) {
             m->seq_done = seq;
             const double t2 = now_ms();
             times.cpu_experts_ms += t2 - t1;
+            if (route_log_) cpu_us_[il] = (float) ((t2 - t1) * 1e3);
             static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
             if (prof) fprintf(stderr, "svc L%02d n=%d wait %.1f us  cpu %.1f us\n", il, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
         }
@@ -700,6 +738,7 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
             CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
             cudaGraphDestroy(g);
         }
+        if (route_log_) moe_debug_reset(st_);
         CUDA_CHECK(cudaGraphLaunch(ge, st_));
         service_cpu(seq_, T);
         static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
@@ -715,6 +754,7 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
         enqueue_forward(T);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (route_log_ && opt_.use_graphs && !dump_all) write_route_log(T, pos0, commit_all, t0, now_ms());
     if (!commit_all) pending_T_ = T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
     times.total_ms += now_ms() - t0;

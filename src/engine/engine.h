@@ -273,6 +273,12 @@ private:
     int ctx_mapped_ = 0;   // cells of context whose KV is mapped
     void prefill_layout(int N);
     void predict_stats(int il, int T);
+    // BNK_ROUTE_LOG=file: per decode forward, every row's routed experts per layer (negative: not resident), the
+    // per-layer GPU timestamps and CPU expert times (tools/batch_sim.py reads it)
+    FILE * route_log_ = nullptr;
+    DevBuf<int32_t> route_dev_;          // [n_layer][kMaxWindow * k]
+    std::vector<float> cpu_us_;          // this forward's CPU expert time per layer
+    void write_route_log(int T, int pos0, bool commit_all, double t0, double t1);
     DevBuf<float> pred_logits_, pred_w_;
     DevBuf<int32_t> pred_ids_;
     size_t prefill_arena_bytes(int N);

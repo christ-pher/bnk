@@ -77,6 +77,8 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
                 int k, int E, cudaStream_t st);
 void moe_debug_times(uint64_t (*out)[3], int n);
+// restarts the per-layer timestamps at layer 0 (on `st`, before a forward: the drafter's MoE calls advance them)
+void moe_debug_reset(cudaStream_t st);
 // ---- prompt path: experts with few tokens, straight on their quantized weights
 struct PfItem {
     const uint8_t * blob;     // the expert's blob on the device (cache slot or stage)

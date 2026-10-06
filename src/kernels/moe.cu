@@ -435,6 +435,11 @@ __global__ void moe_wait_k(const HitList * hits, MoeMsg * msg, const uint32_t * 
     g_moe_layer = L + 1;
 }
 
+void moe_debug_reset(cudaStream_t st) {
+    static const int zero = 0;
+    cudaMemcpyToSymbolAsync(g_moe_layer, &zero, 4, 0, cudaMemcpyHostToDevice, st);
+}
+
 void moe_debug_times(uint64_t (*out)[3], int n) {
     cudaMemcpyFromSymbol(out, g_moe_ts, sizeof(uint64_t) * 3 * n);
     int zero = 0;
