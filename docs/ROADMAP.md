@@ -30,6 +30,15 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done
 
+* **VRAM budget follows the driver** (2026-10-06, v0.1.3): an agent session with more conversations than slots
+  (~60 parks/resumes) failed requests with `CUDA VMM create: out of memory`. Cause: forward-graph LRU churn
+  (batched layouts vary; 32 kept) refunded each destroyed graph's measured ~18 MiB to the budget, but the driver
+  keeps destroyed-graph memory and instantiates the next graph in it (measured ~0): ~1.5 GiB of phantom free
+  VRAM, which the expert cache grew into. No refund on destroy; `VramBudget::sync()` re-derives the limit from
+  `cudaMemGetInfo` (used + driver free - reserve, below used when under the reserve) on every `make_room` and
+  before the cache grows back, reclaiming in up to 4 rounds; `ElasticBuf::ensure` unwinds a partial mapping on
+  OOM and retries once. Drift in the same workload: -1,486 MiB -> -134 MiB, no failed requests. Console and
+  dashboard show the combined decode rate of all requests in flight (`gen_tps_total`, wall time).
 * **Decode while a prompt is read** (2026-10-06, v0.1.2): `bnk serve` runs the other requests' rounds between a
   read's prompt chunks, for `BNK_READ_SHARE` (0.5) of each chunk's time, never after the last chunk (whose logits
   seed the first token). An agent decoding while another agent's 42K-token first turn is read stalled 36.1 s at

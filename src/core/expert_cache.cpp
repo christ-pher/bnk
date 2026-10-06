@@ -301,7 +301,7 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     resident_ = 0;
     for (int l = 0; l < n_layer_; ++l) {
         sb_[l] = slot_bytes(m, l);
-        layer_buf_[l].reserve((size_t) n_expert_ * sb_[l], vb, "expert cache");
+        layer_buf_[l].reserve((size_t) n_expert_ * sb_[l], vb, "expert cache", false);
         layer_buf_[l].ensure(slot_expert_[l].size() * sb_[l]);
         layer_base_[l] = layer_buf_[l].as<uint8_t>();
         std::vector<int> sl, ex;

@@ -9,6 +9,7 @@ export type Phase = "idle" | "prefill" | "decode"
 
 export interface Live {
   t: number
+  active?: number // requests in flight (reading or generating)
   model: string
   phase: Phase
   n_ctx: number
@@ -91,6 +92,8 @@ export interface Sample {
   t: number
   phase: Phase
   gen_tps: number | null // tokens per second of decoding time (null: no decoding in this second)
+  gen_tps_total?: number | null // all requests in flight together, per second of wall time
+  active?: number // requests in flight
   prefill_tps: number | null
   gen_tokens: number // tokens produced in this second
   prefill_tokens: number

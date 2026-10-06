@@ -31,10 +31,13 @@ export function PerformancePage({ range }: { range: Range }) {
       <Card>
         <CardHeader>
           <CardTitle>Decode speed</CardTitle>
-          <CardDescription>Tokens per second while generating</CardDescription>
+          <CardDescription>Per request while generating, and combined across requests decoded together</CardDescription>
         </CardHeader>
         <CardContent>
-          <TimeChart rows={rows} series={[{ key: "gen", label: "Decode", color: "var(--chart-1)", value: (r) => r.gen_tps }]} unit="tok/s" digits={1} />
+          <TimeChart rows={rows} series={[
+                { key: "gen", label: "Per request", color: "var(--chart-1)", value: (r) => r.gen_tps },
+                { key: "total", label: "Combined", color: "var(--chart-4)", value: (r) => r.gen_tps_total ?? null },
+              ]} unit="tok/s" digits={1} />
         </CardContent>
       </Card>
       <Card>

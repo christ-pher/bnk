@@ -29,7 +29,16 @@ export function OverviewPage({ range }: { range: Range }) {
           value={fmt.n(h.decode.value, 1)}
           unit="tok/s"
           action={<SourceBadge source={h.decode.source} />}
-          footer={<span>Generated tokens per second, speculation included</span>}
+          footer={
+            h.combined ? (
+              <span>
+                <span className="font-medium text-foreground tabular">{fmt.n(h.combined.value, 1)} tok/s</span> combined across{" "}
+                {h.combined.active} requests
+              </span>
+            ) : (
+              <span>Generated tokens per second, speculation included</span>
+            )
+          }
         >
           <Sparkline values={spark.map((s) => s.gen_tps)} color="var(--chart-1)" />
         </StatCard>
@@ -121,12 +130,15 @@ export function OverviewPage({ range }: { range: Range }) {
         <Card>
           <CardHeader>
             <CardTitle>Decode speed</CardTitle>
-            <CardDescription>Tokens per second while generating</CardDescription>
+            <CardDescription>Per request while generating, and combined across requests decoded together</CardDescription>
           </CardHeader>
           <CardContent className="relative min-h-[130px] flex-1">
             <TimeChart
               rows={rows}
-              series={[{ key: "gen", label: "Decode", color: "var(--chart-1)", value: (r) => r.gen_tps }]}
+              series={[
+                { key: "gen", label: "Per request", color: "var(--chart-1)", value: (r) => r.gen_tps },
+                { key: "total", label: "Combined", color: "var(--chart-4)", value: (r) => r.gen_tps_total ?? null },
+              ]}
               unit="tok/s"
               digits={1}
               height="100%"

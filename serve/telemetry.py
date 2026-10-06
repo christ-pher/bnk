@@ -170,6 +170,9 @@ class Telemetry:
         # so a 0.3 s prefill reads at its true rate rather than averaged over the whole second
         gms, pms = d("gen_ms"), d("prefill_ms")
         out = {"gen_tps": d("gen_tokens") / (gms / 1000) if gms > 50 else None,
+               # every request in flight together, per second of wall time (gen_tps is per request: requests
+               # decoded in one batch each count the whole step)
+               "gen_tps_total": d("gen_tokens") / dt if d("gen_tokens") > 0 else None,
                "prefill_tps": d("prefill_tokens") / (pms / 1000) if pms > 50 and d("prefill_tokens") > 0 else None,
                "gen_tokens": d("gen_tokens"), "prefill_tokens": d("prefill_tokens")}
         out["accept"] = d("accepted") / d("drafted") if d("drafted") > 0 else None
@@ -192,7 +195,8 @@ class Telemetry:
             self._prev = cur
             g = self.gpu.latest
             s = {"t": round(time.time(), 3), "phase": cur.get("phase"),
-                 "gen_tps": r.get("gen_tps"), "prefill_tps": r.get("prefill_tps"),
+                 "gen_tps": r.get("gen_tps"), "gen_tps_total": r.get("gen_tps_total"),
+                 "active": cur.get("active", 0), "prefill_tps": r.get("prefill_tps"),
                  "gen_tokens": r.get("gen_tokens", 0), "prefill_tokens": r.get("prefill_tokens", 0),
                  "accept": r.get("accept"), "tokens_per_round": r.get("tokens_per_round"),
                  "miss_rate": r.get("miss_rate"), "swaps": r.get("swaps", 0), "busy": r.get("busy", 0.0),

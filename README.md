@@ -52,6 +52,26 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### What v0.1.3 changed
+
+A fix for agent workloads with more conversations than slots, where v0.1.2 could fail requests after a while with
+`CUDA VMM create: out of memory`, then `not enough VRAM for a context of ...` or `prompt buffers: not enough VRAM`:
+
+| | v0.1.2 | v0.1.3 |
+|---|---|---|
+| VRAM the budget believed free but the driver did not have (one agent session, ~60 parks/resumes) | ~1.5 GiB, growing | ~0.1 GiB, corrected at once |
+| Requests failed for VRAM in that session | 3+ | 0 |
+
+Batched layouts change all the time, so the engine replaces cached forward graphs often (it keeps 32). It credited
+a destroyed graph's ~18 MiB back to the VRAM budget, but the driver keeps that memory for the next graph: each
+replacement made the budget think it had 18 MiB more than it did, the expert cache grew into it, and the next
+mapping failed. Destroyed graphs are no longer credited, and the budget now re-reads the driver's free memory
+whenever it hands out VRAM: anything taken outside it (graphs, workspaces, staging) comes back out of the expert
+cache, keeping the 0.75 GiB reserve. A failed mapping is unwound and retried once after reclaiming, and a VRAM
+error now says why (`budget used / limit, driver free, reserve, cache gave`). The terminal's live line and the
+dashboard's decode charts also show the **combined** speed of all requests decoding together (each request's own
+rate counts the whole shared step, so with 3 at once each shows ~20 tok/s while the server delivers ~60).
+
 ### What v0.1.2 changed
 
 | | v0.1.1 | v0.1.2 |
@@ -433,6 +453,7 @@ expert cache starts warm after the first session.
 | `BNK_READ_SHARE=0.5` | while a prompt is read, the other requests decode for this share of each chunk's time (`0`: reads block them) |
 | `BNK_DRAFT_BATCH=0` | draft for each conversation on its own instead of in one batched pass |
 | `BNK_LOG_LEVEL=quiet\|info\|debug` | terminal output: `info` prints a line per request and a live status line |
+| `BNK_VRAM_LOG=1`, `BNK_VMEM_LOG=1` | log to the engine log when the VRAM budget corrects itself against the driver / when the expert cache shrinks or grows |
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | where models and the MTP layer live (`setup.sh` saves them to `bnk.env`) |

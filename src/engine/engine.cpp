@@ -173,6 +173,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     const size_t reserve = (size_t) (opt.vram_reserve_gib * 1073741824.0);
     budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
+    budget_.set_reserve(reserve);
     budget_.reclaim = [this](size_t need) { return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0; };
     ensure_ctx(std::min(opt.max_ctx, kCtxBaseline));
     if (opt.prefill_chunk > 0) prefill_layout(pf_small_);
@@ -295,7 +296,8 @@ void Engine::map_ctx(int cells) {
             }
         }
         if (mtp_.loaded()) need += mtp_.ctx_bytes_needed(cells);
-        if (!budget_.make_room(need)) throw std::runtime_error("not enough VRAM for a context of " + std::to_string(cells));
+        if (!budget_.make_room(need))
+            throw std::runtime_error("not enough VRAM for a context of " + std::to_string(cells) + " (" + budget_.describe() + ")");
     }
     for (int il = 0; il < c.n_layer; ++il) {
         if (!cur_->kv_k[il].reserved()) continue;
@@ -336,6 +338,7 @@ void Engine::rebalance() {
     const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kCtxStep) / kCtxStep * kCtxStep));
     if (keep < cur_->ctx_mapped) map_ctx(keep);
     const size_t slack = 64ull << 20;
+    budget_.make_room(0);   // re-syncs with the driver; VRAM taken outside the budget since then leaves the cache
     size_t room = budget_.free() > slack ? budget_.free() - slack : 0;
     if (opt_.expert_cache_gib >= 0) {   // a configured cache size is a cap, also when growing back
         const size_t cap = (size_t) (opt_.expert_cache_gib * 1073741824.0);
@@ -882,9 +885,9 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
                 for (auto it = fwd_graphs_.begin(); it != fwd_graphs_.end(); ++it)
                     if (it->second.exec && (lru == fwd_graphs_.end() || it->second.used < lru->second.used)) lru = it;
                 if (lru == fwd_graphs_.end()) break;
+                // no refund: the driver keeps a destroyed graph's memory and builds the next graph in it (its
+                // measured size is then ~0), so what the graphs hold is the high-water mark charged so far
                 cudaGraphExecDestroy(lru->second.exec);
-                budget_.refund(lru->second.bytes);
-                graph_bytes_ -= std::min(graph_bytes_, lru->second.bytes);
                 fwd_graphs_.erase(lru);
             }
             // an instantiated graph holds device memory: the expert cache gives it up (charged to the budget,

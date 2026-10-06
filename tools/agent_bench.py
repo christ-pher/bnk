@@ -50,5 +50,6 @@ for i in range(turns + 1):
           f" {row['tpr']:.2f} tok/round, miss {row['miss']:.1%}, verify {row['verify']:.0f} ms (cpu {row['cpu_ms']:.0f} ms)/round", flush=True)
 dec = [r for r in out if r["turn"] > 0]
 gen = sum(r["gen"] for r in dec); secs = sum(r["gen"] / r["tps"] for r in dec if r["tps"])
-print(f"SUMMARY decode {gen / secs:.1f} tok/s over {gen} tokens; turn reads {sum(r['prefill_s'] for r in dec) / len(dec):.2f} s avg; "
-      f"miss {sum(r['miss'] for r in dec) / len(dec):.1%}")
+if dec and secs:   # turns=0 measures only the first read: no summary
+    print(f"SUMMARY decode {gen / secs:.1f} tok/s over {gen} tokens; turn reads {sum(r['prefill_s'] for r in dec) / len(dec):.2f} s avg; "
+          f"miss {sum(r['miss'] for r in dec) / len(dec):.1%}")

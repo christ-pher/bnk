@@ -8,11 +8,21 @@ export interface Headline {
   tokensPerRound: number | null
   hitRate: number | null // share of expert uses served from VRAM, last minute (lifetime when idle long)
   hitRateLifetime: number | null
+  combined: { value: number; active: number } | null // all requests in flight together (2 or more)
 }
 
 function mean(xs: (number | null | undefined)[]): number | null {
   const v = xs.filter((x): x is number => x != null && !Number.isNaN(x))
   return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null
+}
+
+// Several requests decoded together share each step, so each one's own rate understates the server: the tokens all
+// of them generated per second of wall time, over the last 5 s.
+function combinedRate(live: Live | null, history: Sample[]): Headline["combined"] {
+  const active = live?.active ?? 0
+  if (active < 2) return null
+  const v = mean(history.slice(-5).map((s) => s.gen_tps_total ?? null))
+  return v != null ? { value: v, active } : null
 }
 
 export function headline(live: Live | null, history: Sample[], recent: RequestRecord[]): Headline {
@@ -51,5 +61,6 @@ export function headline(live: Live | null, history: Sample[], recent: RequestRe
     tokensPerRound: tpr,
     hitRate: recentMiss != null ? 1 - recentMiss : lifeHit,
     hitRateLifetime: lifeHit,
+    combined: combinedRate(live, history),
   }
 }
