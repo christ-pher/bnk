@@ -85,6 +85,9 @@ public:
     // otherwise (a verify window) nothing is until commit(c) keeps its first c rows.
     void forward(const int32_t * tokens, int T, bool commit_all = true);
     void commit(int c);
+    // The commit (the DeltaNet recurrence over the kept rows) runs on its own stream, overlapping the drafter;
+    // everything that touches the recurrent state or the window buffers first joins it (on the main stream).
+    void join_commit();
     const float * residual_dev() const { return res_; }
     cudaStream_t stream() const { return st_; }
     // Processes a prompt (batched passes for long stretches, decode windows for short tails) and commits it;
@@ -183,6 +186,9 @@ private:
     CpuExpertPool cpu_;
     EngineOptions opt_;
     cudaStream_t st_ = nullptr;
+    cudaStream_t st_commit_ = nullptr;
+    cudaEvent_t ev_verified_ = nullptr, ev_committed_ = nullptr;
+    bool commit_inflight_ = false;
     std::vector<int32_t> history_;
     struct Checkpoint { int pos = -1, mtp_cell = -1; uint64_t age = 0; float * host = nullptr; };
     std::vector<Checkpoint> ckpts_;
@@ -255,6 +261,8 @@ private:
     std::vector<ExpertTask> tasks_;
     // per-layer recurrent state
     std::vector<DevBuf<float>> conv_buf_;   // [(K-1)+W][C] per GDN layer
+    DevBuf<float *> conv_ptrs_;             // the GDN layers' conv_buf_ pointers (one shift kernel at commit)
+    int n_gdn_ = 0;
     std::vector<DevBuf<float>> ssm_state_;  // [nv][S][S]
     std::vector<DevBuf<float>> gdn_co_, gdn_g_, gdn_b_;  // per GDN layer: the window's conv outputs, decay, beta
     std::vector<DevBuf<half>> kc_, vc_;     // [max_ctx][Hkv][D] per attention layer

@@ -12,7 +12,7 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 3a | ~~Batching feasibility~~ | done, see below: go | | done |
 | 3b | **Batched decode of several conversations** ("level 3"), in stages: several conversations resident at once -> batched kernels with per-conversation positions (windows past 8 rows) -> scheduler, with the MTP drafting batched too | generation is ~74% of busy time with several agents | 3 agents: +35-40% total throughput with per-conversation drafting, +63-66% with batched drafting (simulated, cache shrink included); each conversation at ~25-30 tok/s while batched | next |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
-| 3d | **Drafting cost** (single stream) | after 3c, the drafter (MTP layer run + up to 3 steps, each with its own MoE and draft head) is most of the 3.6 ms left between verify forwards, ~10% of a round | a few % *(estimate)* | |
+| 3d | ~~Drafting cost~~ | done, see below | | done |
 
 ## Other areas (from the 78K nsys profile, 2026-10-05)
 
@@ -24,6 +24,15 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 * Older open items: HC fusion, int8 KV, GPU sampler, faster `moe_plan`, T=8 GEMV.
 
 ## Done
+
+* **Drafting and commit overhead** (2026-10-06): an nsys trace grouped by graph launch showed the commit (the
+  DeltaNet recurrence replayed over the kept rows, ~0.8 ms of GPU time) hidden inside the drafter's timing, the
+  draft argmax on one block (84 us for 144K logits) and 37 small conv-shift launches per commit. Now the commit runs
+  on its own stream and overlaps the drafter (joined before anything touches the recurrent state), the argmax
+  uses many blocks, the shifts are one kernel, and the drafter no longer waits for the stream before its inputs.
+  Drafting + commit per round 2.97 -> 2.46 ms; decode at 78K 61.5 -> 62.3 tok/s (+1.3%, alternating A/B);
+  greedy MTP output still identical to plain decoding. `BNK_COMMIT_SAME_STREAM=1`, `BNK_ARGMAX_ONE=1` restore
+  the old behaviour.
 
 * **Sampling on the GPU** (2026-10-06): a sampled row cost 3.0 ms of host time (copying 248K logits and an
   nth_element over all of them for top-k 20), ~2 rows per round. `topk_rows` (radix select on order-preserving

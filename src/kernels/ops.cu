@@ -133,6 +133,16 @@ __global__ void shift_rows_k(float * buf, int64_t row_elems, int from, int n) {
     for (int64_t c = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; c < row_elems; c += (int64_t) gridDim.x * blockDim.x)
         for (int i = 0; i < n; ++i) buf[(int64_t) i * row_elems + c] = buf[(int64_t) (from + i) * row_elems + c];
 }
+__global__ void shift_rows_multi_k(float * const * bufs, int64_t row_elems, int from, int n) {
+    float * buf = bufs[blockIdx.y];
+    for (int64_t c = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; c < row_elems; c += (int64_t) gridDim.x * blockDim.x)
+        for (int i = 0; i < n; ++i) buf[(int64_t) i * row_elems + c] = buf[(int64_t) (from + i) * row_elems + c];
+}
+void shift_rows_multi(float * const * bufs, int nbuf, int64_t row_elems, int from, int n, cudaStream_t s) {
+    if (from == 0 || n <= 0 || nbuf <= 0) return;
+    shift_rows_multi_k<<<dim3(nblk(row_elems, 256), nbuf), 256, 0, s>>>(bufs, row_elems, from, n);
+}
+
 void shift_rows(float * buf, int64_t row_elems, int from, int n, cudaStream_t s) {
     if (from == 0 || n <= 0) return;
     shift_rows_k<<<nblk(row_elems, 256), 256, 0, s>>>(buf, row_elems, from, n);
@@ -705,8 +715,63 @@ __global__ void argmax_prob_k(const float * x, int n, int32_t * out, float * pro
         prob[0] = 1.f / s;
     }
 }
+// Many-block version: each block its local max (lowest index on ties) and sum of exp relative to it; one small
+// block combines them (sum_b s_b * exp(m_b - M)). Partials live in fixed device memory: graph-capture safe, and
+// only the drafter (one stream) calls this.
+constexpr int kAmaxBlocks = 96;
+__device__ float g_amax_m[kAmaxBlocks], g_amax_s[kAmaxBlocks];
+__device__ int g_amax_i[kAmaxBlocks];
+__global__ void argmax_prob_part_k(const float * x, int n) {
+    __shared__ float bv[32], sh[32];
+    __shared__ int bi[32];
+    float best = -FLT_MAX;
+    int idx = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (x[i] > best) { best = x[i]; idx = i; }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, best, o);
+        const int oi = __shfl_xor_sync(0xffffffff, idx, o);
+        if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { bv[wid] = best; bi[wid] = idx; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int q = 1; q < (int) (blockDim.x >> 5); ++q)
+            if (bv[q] > bv[0] || (bv[q] == bv[0] && bi[q] < bi[0])) { bv[0] = bv[q]; bi[0] = bi[q]; }
+    }
+    __syncthreads();
+    const float mx = bv[0];
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) s += __expf(x[i] - mx);
+    s = block_sum(s, sh);
+    if (threadIdx.x == 0) {
+        g_amax_m[blockIdx.x] = mx;
+        g_amax_i[blockIdx.x] = bi[0];
+        g_amax_s[blockIdx.x] = s;
+    }
+}
+__global__ void argmax_prob_fin_k(int nb, int32_t * out, float * prob) {
+    if (threadIdx.x != 0) return;
+    float M = g_amax_m[0];
+    int I = g_amax_i[0];
+    for (int b = 1; b < nb; ++b)
+        if (g_amax_m[b] > M || (g_amax_m[b] == M && g_amax_i[b] < I)) { M = g_amax_m[b]; I = g_amax_i[b]; }
+    float s = 0.f;
+    for (int b = 0; b < nb; ++b) s += g_amax_s[b] * __expf(g_amax_m[b] - M);
+    out[0] = I;
+    prob[0] = 1.f / s;
+}
 void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s) {
-    argmax_prob_k<<<1, 1024, 0, s>>>(logits, n, id, prob);
+    static const bool one = getenv("BNK_ARGMAX_ONE") != nullptr;
+    if (one) {
+        argmax_prob_k<<<1, 1024, 0, s>>>(logits, n, id, prob);
+        return;
+    }
+    const int nb = std::min(kAmaxBlocks, std::max(1, (n + 2047) / 2048));
+    argmax_prob_part_k<<<nb, 256, 0, s>>>(logits, n);
+    argmax_prob_fin_k<<<1, 32, 0, s>>>(nb, id, prob);
 }
 
 __global__ void add_bcast_k(float * R, const float * e, int hc, int E) {

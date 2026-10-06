@@ -26,6 +26,8 @@ void add_scaled(float * y, const float * x, const float * scale_per_token, int T
 void copy_f32(float * dst, const float * src, int64_t n, cudaStream_t s);
 // rows [0, n) of buf (row_elems floats each) = rows [from, from + n): an in-order shift, overlap allowed
 void shift_rows(float * buf, int64_t row_elems, int from, int n, cudaStream_t s);
+// shift_rows over several buffers of the same row size at once (bufs: a device array of nbuf pointers)
+void shift_rows_multi(float * const * bufs, int nbuf, int64_t row_elems, int from, int n, cudaStream_t s);
 
 // ---- gated delta net
 // conv_in [T+K-1][C]: the K-1 history rows then the new inputs; out = silu(conv) [T][C]

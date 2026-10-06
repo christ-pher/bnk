@@ -225,6 +225,9 @@ int main(int argc, char ** argv) {
     printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms\n",
            gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
            gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls));
+    printf("drafting: run %.2f ms per round, %.2f further steps per round at %.2f ms each\n",
+           gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
+           (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
     printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
            (long long) eng.cache().swaps_done);

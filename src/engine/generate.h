@@ -21,6 +21,8 @@ struct GenStats {
     int64_t rounds = 0, drafted = 0, accepted = 0, emitted = 0;
     int64_t prompt_tokens = 0, reused_tokens = 0;
     double prefill_ms = 0, verify_ms = 0, commit_ms = 0, draft_ms = 0, sample_ms = 0;
+    double draft_run_ms = 0;   // the drafter over the kept rows (and the first draft)
+    int64_t draft_steps = 0;   // further one-row draft steps
 };
 
 class Generator {

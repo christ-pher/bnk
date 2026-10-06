@@ -50,6 +50,9 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     ggml_cpu_init();
     CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&st_commit_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_verified_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_committed_, cudaEventDisableTiming));
     model_.load(path, opt.verbose, opt.ple_gguf);
     layer_routed.assign(model_.cfg.n_layer, 0);
     layer_misses.assign(model_.cfg.n_layer, 0);
@@ -302,6 +305,7 @@ int Engine::checkpoints() const {
 }
 
 void Engine::checkpoint() {
+    join_commit();
     const int p = pos();
     if (p == 0) return;
     for (auto & k : ckpts_)
@@ -330,6 +334,7 @@ void Engine::checkpoint() {
 }
 
 int Engine::rollback(int max_pos) {
+    join_commit();
     Checkpoint * best = nullptr;
     for (auto & k : ckpts_)
         if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
@@ -349,6 +354,7 @@ int Engine::rollback(int max_pos) {
 }
 
 void Engine::reset() {
+    join_commit();
     const Config & c = model_.cfg;
     history_.clear();
     for (auto & k : ckpts_) k.pos = -1;
@@ -479,17 +485,48 @@ void Engine::enqueue_commit(int cnt) {
     for (int il = 0; il < c.n_layer; ++il) {
         if (c.is_attn(il)) continue;
         gdn_recurrence(gdn_co_[il], C, gdn_g_[il], gdn_b_[il], ssm_state_[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
-        shift_rows(conv_buf_[il], C, cnt, K - 1, st_);
     }
+    shift_rows_multi(conv_ptrs_, n_gdn_, C, cnt, K - 1, st_);
     if (c.ple_layer >= 0) shift_rows(ple_hist_, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
 }
 
+void Engine::join_commit() {
+    if (!commit_inflight_) return;
+    CUDA_CHECK(cudaStreamWaitEvent(st_, ev_committed_, 0));
+    commit_inflight_ = false;
+}
+
 void Engine::commit(int cnt) {
+    if (!conv_ptrs_.p) {   // the GDN conv buffers never move: their pointer table once, before any capture
+        const Config & c = model_.cfg;
+        std::vector<float *> ptrs;
+        for (int il = 0; il < c.n_layer; ++il)
+            if (!c.is_attn(il)) ptrs.push_back(conv_buf_[il].p);
+        n_gdn_ = (int) ptrs.size();
+        conv_ptrs_.alloc(ptrs.size());
+        CUDA_CHECK(cudaMemcpy(conv_ptrs_.p, ptrs.data(), ptrs.size() * sizeof(float *), cudaMemcpyHostToDevice));
+    }
     if (pending_T_ == 0) throw std::runtime_error("commit: no verify window pending");
     if (cnt < 1 || cnt > pending_T_) throw std::runtime_error("commit: count out of range");
     history_.resize(history_.size() - (pending_T_ - cnt));
     pending_T_ = 0;
-    if (opt_.use_graphs) {
+    static const bool same_stream = getenv("BNK_COMMIT_SAME_STREAM") != nullptr;
+    if (opt_.use_graphs && !same_stream) {
+        if (!commit_graphs_[cnt]) {
+            cudaGraph_t g;
+            CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+            enqueue_commit(cnt);
+            CUDA_CHECK(cudaStreamEndCapture(st_, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&commit_graphs_[cnt], g, 0));
+            cudaGraphDestroy(g);
+        }
+        // on the commit stream, after the verify window: the drafter (main stream) runs meanwhile
+        CUDA_CHECK(cudaEventRecord(ev_verified_, st_));
+        CUDA_CHECK(cudaStreamWaitEvent(st_commit_, ev_verified_, 0));
+        CUDA_CHECK(cudaGraphLaunch(commit_graphs_[cnt], st_commit_));
+        CUDA_CHECK(cudaEventRecord(ev_committed_, st_commit_));
+        commit_inflight_ = true;
+    } else if (opt_.use_graphs) {
         if (!commit_graphs_[cnt]) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -716,6 +753,7 @@ void Engine::service_cpu(uint32_t seq, int T) {
 }
 
 void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
+    join_commit();
     if (T < 1 || T > kMaxWindow) throw std::runtime_error("forward: bad window");
     if (pending_T_) throw std::runtime_error("forward: the previous verify window was not committed");
     commit_all_ = commit_all;
@@ -784,6 +822,7 @@ size_t Engine::kv_bytes_mapped() const {
 }
 
 void Engine::prefill(const std::vector<int32_t> & tokens) {
+    join_commit();
     size_t i = 0;
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
     // the chunk layout for this read, borrowing VRAM from the expert cache meanwhile: a short turn keeps the

@@ -510,6 +510,7 @@ void Engine::pf_moe(int il, int N) {
 }
 
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
+    join_commit();
     if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
     if (pending_T_) throw std::runtime_error("prefill_chunk: a verify window is pending");
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");

@@ -118,6 +118,7 @@ void Engine::drop_parked(size_t i) {
 // Copies the live conversation into host RAM (the live state is left as it is). Never drops the entry stamped
 // `keep` (one about to be restored).
 void Engine::park(uint64_t keep, bool move_ckpts) {
+    join_commit();
     const double t0 = now_ms();
     const int n = pos();
     // one entry per conversation: an older copy whose history this one extends is superseded
@@ -183,6 +184,7 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
 
 // Makes parked conversation i the live one (the live state is overwritten: park it first to keep it).
 void Engine::restore(size_t i) {
+    join_commit();
     const double t0 = now_ms();
     Parked & p = parked_[i];
     const int n = (int) p.history.size();

@@ -289,7 +289,8 @@ void MtpLayer::hc_pre(const HcWeights & w, const float * res, int T, bool inject
 int MtpLayer::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
     if (n < 1 || n > kMaxWindow) throw std::runtime_error("mtp: bad row count");
     const int HC = main_->cfg.hc_dim();
-    CUDA_CHECK(cudaStreamSynchronize(st_));   // the pinned inputs below may still be read by a previous graph
+    // no stream sync here: the pinned inputs below are read only by this layer's graphs, and forward() waits for
+    // each of those; whatever else is queued (the main model's commit) runs first, in stream order
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_rows, (size_t) n * HC * 4, cudaMemcpyDeviceToDevice, st_));
     memcpy(h_io_ + 8, next_tokens, n * 4);
     return forward(n, cell0, draft, prob);

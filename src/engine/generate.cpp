@@ -178,6 +178,7 @@ std::vector<int32_t> Generator::next() {
         nxt.push_back(bonus);
         float pr = 0.f;
         int d = mtp_->run(eng_.residual_dev(), nxt.data(), a + 1, P, opt_.max_draft > 0, &pr);
+        stats.draft_run_ms += now_ms() - t0;
         eng_.set_mtp_pending(eng_.residual_dev() + (size_t) a * eng_.cfg().hc_dim(), P + a);
         if (opt_.max_draft > 0) {
             drafts_.push_back(d);
@@ -185,6 +186,7 @@ std::vector<int32_t> Generator::next() {
             while ((int) drafts_.size() < opt_.max_draft && pr >= opt_.min_p) {
                 d = mtp_->step(d, cell++, &pr);
                 drafts_.push_back(d);
+                stats.draft_steps++;
             }
         }
         stats.draft_ms += now_ms() - t0;
