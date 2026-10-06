@@ -26,11 +26,12 @@ ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
 ap.add_argument("--gen", type=int, default=48)
 ap.add_argument("--ctx-chars", type=int, default=12000)
+ap.add_argument("--slots", type=int, default=1, help="engine conversation slots (batched decoding when > 1)")
 a = ap.parse_args()
 
 tok = Tokenizer.from_gguf(a.model, cache_dir=str(Path("~/.cache/bnk").expanduser()))
 args = [a.engine, "serve", "--model", a.model, "--ctx", "32768", "--cache-gib", "0", "--adapt-every", "0",
-        "--park-gib", "8", "--park-min", "0"]
+        "--park-gib", "8", "--park-min", "0", "--slots", str(a.slots)]
 if a.mtp:
     args += ["--mtp", a.mtp]
     if a.draft_vocab:

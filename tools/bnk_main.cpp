@@ -15,6 +15,7 @@
 #include "engine/generate.h"
 #include "engine/mtp.h"
 #include "server/serve.h"
+#include <memory>
 
 using namespace bnk;
 
@@ -56,6 +57,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
+    bool solo = false, adapt_set = false;
     int max_new = 32;
     GenOptions gopt;
     EngineOptions opt;
@@ -82,11 +84,12 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
-        else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
-        else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
+        else if (a == "--adapt-every") opt.adapt_every = std::stoi(next()), adapt_set = true;
+        else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next()), adapt_set = true;
         else if (a == "--park-gib") opt.park_gib = std::stod(next());
         else if (a == "--park-min") opt.park_min = std::stoi(next());
         else if (a == "--slots") opt.slots = std::stoi(next());
+        else if (a == "--solo") solo = true;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     if (mode == "serve") {
@@ -94,7 +97,13 @@ int main(int argc, char ** argv) {
         eng.load(model, opt);
         return serve_main(eng, gopt, eng.model().gguf.get_str("general.name", "bnk"));
     }
-    auto prompt = read_tokens(tokfile);
+    // several conversations share the expert cache: it has to follow a mix of routings, so it adapts every forward
+    // and swaps more at a time (3 batched agents: 72-76 -> 84 tok/s; one conversation: no measurable change)
+    if (opt.slots > 1 && !adapt_set) {
+        opt.adapt_every = 1;
+        opt.adapt_swaps = 32;
+    }
+    auto prompt = mode == "multi" ? std::vector<int32_t>{} : read_tokens(tokfile);
     Engine eng;
     eng.load(model, opt);
     const Config & c = eng.cfg();
@@ -194,6 +203,94 @@ int main(int argc, char ** argv) {
         for (int il = 0; il < c.n_layer; ++il) printf("layer %2d  max rel rms vs llama.cpp %.3e\n", il, lerr[il]);
         printf("logits max rel rms %.3e, argmax agreement %d/%zu, KL(ref||bnk) mean %.4f max %.4f\n", logit_err, agree,
                prompt.size(), kl_sum / prompt.size(), kl_max);
+        return 0;
+    }
+
+    if (mode == "multi") {
+        // several prompts (comma-separated --tokens-file), each in its own slot, decoded together in batched rounds
+        // (the rows of a round shared out: kMaxWindow / active); --solo decodes them one after another instead
+        std::vector<std::vector<int32_t>> prompts;
+        for (size_t a = 0, b; a <= tokfile.size(); a = b + 1) {
+            b = tokfile.find(',', a);
+            if (b == std::string::npos) b = tokfile.size();
+            prompts.push_back(read_tokens(tokfile.substr(a, b - a)));
+        }
+        const int n = (int) prompts.size();
+        if (n > eng.slots()) {
+            fprintf(stderr, "multi: %d prompts but %d slots (--slots)\n", n, eng.slots());
+            return 1;
+        }
+        std::vector<std::unique_ptr<Generator>> gens;
+        std::vector<std::vector<int>> outs(n);
+        const double p0 = now_ms();
+        for (int i = 0; i < n; ++i) {
+            gens.push_back(std::make_unique<Generator>(eng, eng.mtp(), gopt, i));
+            outs[i].push_back(gens[i]->prefill(prompts[i]));
+        }
+        const double p1 = now_ms();
+        eng.times = StageTimes{};
+        auto done = [&](int i) { return (int) outs[i].size() >= max_new || outs[i].back() == c.eos_token; };
+        int64_t rounds = 0, forwards = 0;
+        double fwd_ms = 0, fin_ms = 0;
+        const double t2 = now_ms();
+        if (solo) {
+            for (int i = 0; i < n; ++i)
+                while (!done(i)) {
+                    for (int t : gens[i]->next()) {
+                        outs[i].push_back(t);
+                        if (t == c.eos_token) break;
+                    }
+                    ++forwards;
+                }
+        } else {
+            while (true) {
+                std::vector<int> act;
+                for (int i = 0; i < n; ++i)
+                    if (!done(i)) act.push_back(i);
+                if (act.empty()) break;
+                std::vector<Generator *> ga;
+                for (int i : act) ga.push_back(gens[i].get());
+                static const bool even = getenv("BNK_EVEN_ROWS") != nullptr;
+                std::vector<int> rows = Generator::share_rows(ga);
+                if (even) rows.assign(act.size(), std::max(1, kMaxWindow / (int) act.size()));
+                std::vector<Engine::BatchWin> wins;
+                for (size_t j = 0; j < act.size(); ++j) {
+                    const auto & w = gens[act[j]]->window(rows[j]);
+                    wins.push_back({act[j], w.data(), (int) w.size(), w.size() == 1});
+                }
+                const double f0 = now_ms();
+                eng.forward_batch(wins);
+                fwd_ms += now_ms() - f0;
+                ++forwards;
+                const double f1 = now_ms();
+                for (int i : act)
+                    for (int t : gens[i]->finish()) {
+                        outs[i].push_back(t);
+                        if (t == c.eos_token || (int) outs[i].size() >= max_new) break;
+                    }
+                fin_ms += now_ms() - f1;
+                ++rounds;
+            }
+        }
+        const double t3 = now_ms();
+        size_t total = 0;
+        for (int i = 0; i < n; ++i) {
+            printf("output[%d]:", i);
+            for (int t : outs[i]) printf(" %d", t);
+            printf("\n");
+            total += outs[i].size() - 1;
+        }
+        const auto & tm = eng.times;
+        printf("prefill %d prompts in %.1f ms\n", n, p1 - p0);
+        printf("decode %s: %zu tokens in %.1f ms (%.2f tok/s total, %.2f per conversation); %lld forwards; "
+               "expert misses %.2f%% (%.2f per forward)\n", solo ? "one after another" : "batched", total, t3 - t2,
+               total / ((t3 - t2) / 1000), total / ((t3 - t2) / 1000) / (solo ? 1 : n), (long long) forwards,
+               100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls));
+        if (!solo)
+            printf("per round: batched forward %.2f ms, verify + commit + drafting of every conversation %.2f ms\n",
+                   fwd_ms / std::max<int64_t>(1, rounds), fin_ms / std::max<int64_t>(1, rounds));
+        printf("forward graphs: %lld captured, %.1f MiB of device memory at capture\n", (long long) eng.graph_captures(),
+               eng.graph_bytes() / 1048576.0);
         return 0;
     }
 

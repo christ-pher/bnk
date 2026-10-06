@@ -11,7 +11,8 @@
 namespace bnk {
 
 MtpLayer::~MtpLayer() {
-    for (auto & g : graphs_) for (auto & x : g) if (x) cudaGraphExecDestroy(x);
+    for (auto & sl : slots_)
+        for (auto & g : sl.graphs) for (auto & x : g) if (x) cudaGraphExecDestroy(x);
     for (void * p : allocs_) cudaFree(p);
     if (msg_) cudaFreeHost(msg_);
     if (h_io_) cudaFreeHost(h_io_);
@@ -31,11 +32,11 @@ std::vector<float> plus_one(const TensorRef & t) {
 }  // namespace
 
 void MtpLayer::ensure_ctx(int cells) {
-    kv_k_.ensure((size_t) cells * kv_cell_bytes_);
-    kv_v_.ensure((size_t) cells * kv_cell_bytes_);
+    cur_->kv_k.ensure((size_t) cells * kv_cell_bytes_);
+    cur_->kv_v.ensure((size_t) cells * kv_cell_bytes_);
     if (sparse_) {
-        kv_raw_.ensure((size_t) cells * qsh_.id * sizeof(half));
-        kv_pool_.ensure((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+        cur_->kv_raw.ensure((size_t) cells * qsh_.id * sizeof(half));
+        cur_->kv_pool.ensure((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
     }
 }
 
@@ -44,24 +45,24 @@ size_t MtpLayer::ctx_bytes_needed(int cells) const {
         const size_t b = vmem_round(bytes);
         return e.reserved() && b > e.mapped() ? b - e.mapped() : 0;
     };
-    size_t n = more(kv_k_, (size_t) cells * kv_cell_bytes_) + more(kv_v_, (size_t) cells * kv_cell_bytes_);
+    size_t n = more(cur_->kv_k, (size_t) cells * kv_cell_bytes_) + more(cur_->kv_v, (size_t) cells * kv_cell_bytes_);
     if (sparse_)
-        n += more(kv_raw_, (size_t) cells * qsh_.id * sizeof(half)) +
-             more(kv_pool_, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+        n += more(cur_->kv_raw, (size_t) cells * qsh_.id * sizeof(half)) +
+             more(cur_->kv_pool, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
     return n;
 }
 
 void MtpLayer::release_ctx(int cells) {
-    kv_k_.shrink_to((size_t) cells * kv_cell_bytes_);
-    kv_v_.shrink_to((size_t) cells * kv_cell_bytes_);
+    cur_->kv_k.shrink_to((size_t) cells * kv_cell_bytes_);
+    cur_->kv_v.shrink_to((size_t) cells * kv_cell_bytes_);
     if (sparse_) {
-        kv_raw_.shrink_to((size_t) cells * qsh_.id * sizeof(half));
-        kv_pool_.shrink_to((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+        cur_->kv_raw.shrink_to((size_t) cells * qsh_.id * sizeof(half));
+        cur_->kv_pool.shrink_to((size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
     }
 }
 
 void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
-                    const std::string & draft_vocab, VramBudget * budget) {
+                    const std::string & draft_vocab, VramBudget * budget, int slots) {
     main_ = &main;
     st_ = st;
     max_ctx_ = max_ctx;
@@ -211,18 +212,24 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     tok_dev_.alloc(W); pos_dev_.alloc(4); out_dev_.alloc(2);
     actq_.alloc(W * 4 * HC); actd_.alloc(W * 4 * HC / 32);
     act_.q = actq_; act_.d = actd_;
-    // K/V cells: address space for the whole context, mapped as it grows (ensure_ctx)
+    // K/V cells per conversation slot: address space for the whole context, mapped as it grows (ensure_ctx)
     const size_t kv = (size_t) max_ctx * c.n_head_kv * c.head_dim;
-    kv_k_.reserve(kv * sizeof(half), budget, "MTP KV");
-    kv_v_.reserve(kv * sizeof(half), budget, "MTP KV");
-    kc_.view(kv_k_.as<half>(), kv);
-    vc_.view(kv_v_.as<half>(), kv);
+    slots_ = std::vector<Slot>(std::max(1, slots));
+    if (sparse_) max_blocks_ = max_ctx / qsh_.ratio + 1;
+    for (Slot & sl : slots_) {
+        sl.kv_k.reserve(kv * sizeof(half), budget, "MTP KV");
+        sl.kv_v.reserve(kv * sizeof(half), budget, "MTP KV");
+        sl.kc.view(sl.kv_k.as<half>(), kv);
+        sl.vc.view(sl.kv_v.as<half>(), kv);
+        if (sparse_) {
+            sl.kv_raw.reserve((size_t) max_ctx * c.idx_dim * sizeof(half), budget, "MTP indexer keys");
+            sl.kv_pool.reserve((size_t) max_blocks_ * c.idx_dim * sizeof(float), budget, "MTP indexer keys");
+            sl.kraw.view(sl.kv_raw.as<half>(), (size_t) max_ctx * c.idx_dim);
+            sl.pooled.view(sl.kv_pool.as<float>(), (size_t) max_blocks_ * c.idx_dim);
+        }
+    }
+    cur_ = &slots_[0];
     if (sparse_) {
-        max_blocks_ = max_ctx / qsh_.ratio + 1;
-        kv_raw_.reserve((size_t) max_ctx * c.idx_dim * sizeof(half), budget, "MTP indexer keys");
-        kv_pool_.reserve((size_t) max_blocks_ * c.idx_dim * sizeof(float), budget, "MTP indexer keys");
-        kraw_.view(kv_raw_.as<half>(), (size_t) max_ctx * c.idx_dim);
-        pooled_.view(kv_pool_.as<float>(), (size_t) max_blocks_ * c.idx_dim);
         ik_.alloc((size_t) W * c.idx_dim);
         iq_.alloc((size_t) W * c.idx_heads * c.idx_dim);
         scores_.alloc((size_t) max_blocks_);
@@ -308,7 +315,7 @@ int MtpLayer::forward(int n, int cell0, bool draft, float * prob) {
     if (cell0 + n > max_ctx_) throw std::runtime_error("mtp: context full");
     h_io_[16] = cell0;
     h_io_[17] = cell0 + n - 1;
-    cudaGraphExec_t & g = graphs_[n][draft ? 1 : 0];
+    cudaGraphExec_t & g = cur_->graphs[n][draft ? 1 : 0];
     if (!g) {
         cudaGraph_t gr;
         CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -349,12 +356,12 @@ void MtpLayer::enqueue(int n, bool draft) {
     gemv_auto(wq_, mixed_, E, n, qfull_, H * D * 2, false, act_, st_);
     gemv_auto(wk_, mixed_, E, n, k_, Hkv * D, false, act_, st_);
     gemv_auto(wv_, mixed_, E, n, v_, Hkv * D, false, act_, st_);
-    attn_prep(qfull_, k_, v_, q_norm_, k_norm_, q_, kc_, vc_, n, H, Hkv, D, c.n_rot, c.rope_base, pos_dev_.p,
+    attn_prep(qfull_, k_, v_, q_norm_, k_norm_, q_, cur_->kc, cur_->vc, n, H, Hkv, D, c.n_rot, c.rope_base, pos_dev_.p,
               c.rms_eps, st_);
     if (sparse_) {  // index keys of every row (pooled blocks that end in the window), the draft row's query
         gemv_auto(idx_k_, mixed_, E, n, ik_, c.idx_dim, false, act_, st_);
-        qsa_store_keys(ik_, kraw_, n, c.idx_dim, pos_dev_.p, st_);
-        qsa_pool(kraw_, idx_k_norm_, pooled_, n, qsh_, pos_dev_.p, st_);
+        qsa_store_keys(ik_, cur_->kraw, n, c.idx_dim, pos_dev_.p, st_);
+        qsa_pool(cur_->kraw, idx_k_norm_, cur_->pooled, n, qsh_, pos_dev_.p, st_);
     }
     if (!draft) return;
     // the rest of the layer on the last row
@@ -365,11 +372,11 @@ void MtpLayer::enqueue(int n, bool draft) {
         const float * mL = mixed_.p + (size_t) L * E;
         gemv_auto(idx_q_, mL, E, 1, iq_, c.idx_heads * c.idx_dim, false, act_, st_);
         qsa_queries(iq_, idx_q_norm_, 1, qsh_, pos_dev_.p + 1, st_);
-        qsa_select(iq_, pooled_, scores_, max_blocks_, sel_, nsel_, 1, qsh_, pos_dev_.p + 1, 0, st_);
-        qsa_attention(q_.p + (size_t) L * H * D, kc_, vc_, qfull_.p + (size_t) L * H * D * 2, sel_, nsel_, attn_o_, 1,
+        qsa_select(iq_, cur_->pooled, scores_, max_blocks_, sel_, nsel_, 1, qsh_, pos_dev_.p + 1, 0, st_);
+        qsa_attention(q_.p + (size_t) L * H * D, cur_->kc, cur_->vc, qfull_.p + (size_t) L * H * D * 2, sel_, nsel_, attn_o_, 1,
                       qsh_, pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
     } else {
-        attention(q_.p + (size_t) L * H * D, kc_, vc_, qfull_.p + (size_t) L * H * D * 2, attn_o_, 1, H, Hkv, D,
+        attention(q_.p + (size_t) L * H * D, cur_->kc, cur_->vc, qfull_.p + (size_t) L * H * D * 2, attn_o_, 1, H, Hkv, D,
                   pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
     }
     gemv_auto(wo_, attn_o_, H * D, 1, bo_, E, false, act_, st_);

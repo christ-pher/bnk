@@ -60,7 +60,8 @@ class State:
             args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
         if args.think_guard is None:
             args.think_guard = bool(self.config.get("thinking_loop_guard", True))
-        eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib)]
+        eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib),
+                 "--slots", str(args.slots)]
         if args.ple_gguf:
             eargs += ["--ple-gguf", args.ple_gguf]
         if args.mtp:
@@ -674,6 +675,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=8192, help="default completion budget")
     ap.add_argument("--slice", type=float, default=float(os.environ.get("BNK_SLICE_S", "10")),
                     help="seconds a request generates before giving its turn to waiting ones (0 = never)")
+    ap.add_argument("--slots", type=int, default=int(os.environ.get("BNK_SLOTS", "3")),
+                    help="conversations decoded at once, batched (several agents); 1 = one at a time")
     ap.add_argument("--park-gib", type=float, default=float(os.environ.get("BNK_PARK_GIB", "24")),
                     help="host RAM for parked conversations (several clients taking turns; 0 = off)")
     ap.add_argument("--config", default="",
@@ -708,6 +711,7 @@ def main():
             publish(line)
         S.engine.on_log = on_log
     S.engine.start()
+    S.convs.slots = S.engine.slots()
     info = S.engine.info
     print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}"
           f" | thinking-loop guard {'on' if args.think_guard else 'off'}", flush=True)

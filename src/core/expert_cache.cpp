@@ -137,8 +137,14 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
     const size_t NN = (size_t) n_layer_ * n_expert_;
     if (!copy_) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
+        // the staging for swaps in flight is allocated outside the VRAM budget: with little free memory take
+        // fewer of them rather than fail (64 did not fit next to three conversations' context)
         swap_n_ = std::max(max_swaps, 1);
-        CUDA_CHECK(cudaMalloc(&swap_stage_, stage_bytes_ * swap_n_));
+        while (cudaMalloc(&swap_stage_, stage_bytes_ * swap_n_) != cudaSuccess) {
+            cudaGetLastError();
+            if (swap_n_ == 1) throw std::runtime_error("expert cache: no VRAM for swap staging");
+            swap_n_ = std::max(1, swap_n_ / 2);
+        }
         CUDA_CHECK(cudaMalloc(&swap_ptrs_, sizeof(uint8_t *) * swap_n_));
         last_counts_.assign(NN, 0);
         score_.assign(NN, 0.f);

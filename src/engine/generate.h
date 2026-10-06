@@ -27,7 +27,9 @@ struct GenStats {
 
 class Generator {
 public:
-    Generator(Engine & eng, MtpLayer * mtp, GenOptions opt = {}) : eng_(eng), mtp_(mtp), opt_(opt) {}
+    // slot: the engine's conversation slot this generator decodes in (-1: whichever is current)
+    Generator(Engine & eng, MtpLayer * mtp, GenOptions opt = {}, int slot = -1)
+        : eng_(eng), mtp_(mtp), opt_(opt), slot_(slot) {}
 
     // Starts a request: reuses the engine state when its history is a prefix of `prompt` (only the rest is
     // processed), otherwise starts over. Returns the first generated token.
@@ -36,8 +38,19 @@ public:
     int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at = -1);
     // Emits the next tokens: 1 + accepted drafts.
     std::vector<int32_t> next();
+    // The same round in two halves around Engine::forward_batch (several generators in one forward):
+    // window() is this round's tokens (the pending one plus up to max_rows-1 drafts), finish() verifies them from
+    // this slot's rows of the forward, commits, drafts the next ones and returns the emitted tokens.
+    const std::vector<int32_t> & window(int max_rows = kMaxWindow);
+    std::vector<int32_t> finish();
+    int slot() const { return slot_; }
+    int drafts() const { return (int) drafts_.size(); }
+    // The rows of one batched forward shared out among generators: one each for the pending token, then the
+    // drafts, one at a time round-robin, while rows are left (a generator gets no more rows than it has drafts).
+    static std::vector<int> share_rows(const std::vector<Generator *> & gens, int total = kMaxWindow);
     // Back-compat for the CLI: start with greedy sampling on a fresh state.
     int32_t prefill(const std::vector<int32_t> & prompt) {
+        use_slot();
         eng_.reset();
         return start(prompt, SamplingParams{});
     }
@@ -53,6 +66,9 @@ private:
     Engine & eng_;
     MtpLayer * mtp_;
     GenOptions opt_;
+    int slot_ = -1;
+    std::vector<int32_t> win_;   // this round's window
+    void use_slot() { if (slot_ >= 0) eng_.select(slot_); }
     SamplingParams sp_;
     Sampler sampler_;
     int32_t pending_ = -1;              // emitted, not yet processed by the main model

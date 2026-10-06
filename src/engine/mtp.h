@@ -27,18 +27,21 @@ public:
     ~MtpLayer();
     // Loads the MTP GGUF (tools/build_mtp.py: the checkpoint's mtp.* tensors) for the given main model.
     void load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
-              const std::string & draft_vocab = "", VramBudget * budget = nullptr);
+              const std::string & draft_vocab = "", VramBudget * budget = nullptr, int slots = 1);
+    // conversation slots: the drafter's own K/V per slot (load() makes `slots` of them); select() picks the one
+    // run / step / ensure_ctx work on
+    void select(int slot) { cur_ = &slots_.at(slot); }
     // K/V cells [0, cells) backed by VRAM (the address space covers the whole context)
     void ensure_ctx(int cells);
     void release_ctx(int cells);
     size_t ctx_bytes_needed(int cells) const;
     // f(device ptr, bytes) over the buffers holding cells [0, cells) (for parking a conversation)
     template <typename F> void each_ctx(int cells, F && f) {
-        f((void *) kc_.p, (size_t) cells * kv_cell_bytes_);
-        f((void *) vc_.p, (size_t) cells * kv_cell_bytes_);
+        f((void *) cur_->kc.p, (size_t) cells * kv_cell_bytes_);
+        f((void *) cur_->vc.p, (size_t) cells * kv_cell_bytes_);
         if (sparse_) {
-            f((void *) kraw_.p, (size_t) cells * qsh_.id * sizeof(half));
-            f((void *) pooled_.p, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+            f((void *) cur_->kraw.p, (size_t) cells * qsh_.id * sizeof(half));
+            f((void *) cur_->pooled.p, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
         }
     }
     bool loaded() const { return loaded_; }
@@ -79,18 +82,23 @@ private:
     DevBuf<int8_t> actq_;
     DevBuf<float> actd_;
     ActQ8 act_;
-    ElasticBuf kv_k_, kv_v_, kv_raw_, kv_pool_;
+    struct Slot {
+        ElasticBuf kv_k, kv_v, kv_raw, kv_pool;
+        DevBuf<half> kc, vc, kraw;
+        DevBuf<float> pooled;
+        cudaGraphExec_t graphs[kMaxWindow + 1][2] = {};
+    };
+    std::vector<Slot> slots_;
+    Slot * cur_ = nullptr;
     // sparse attention (the layer's own indexer, as the main model's full-attention layers)
     bool sparse_ = false;
     QsaShape qsh_{};
     int max_blocks_ = 0;
     QMat idx_q_, idx_k_;
     float * idx_q_norm_ = nullptr, * idx_k_norm_ = nullptr;
-    DevBuf<half> kraw_;
-    DevBuf<float> pooled_, ik_, iq_, scores_;
+    DevBuf<float> ik_, iq_, scores_;
     DevBuf<int32_t> sel_, nsel_;
     size_t kv_cell_bytes_ = 0;
-    DevBuf<half> kc_, vc_;
     MoeScratch moes_;
     DevBuf<uint8_t> hits_buf_;
     DevBuf<float> gu_buf_, hd_buf_, part_buf_;
@@ -103,7 +111,6 @@ private:
     QMat dhead_;
     int32_t * dvocab_ = nullptr;
     int n_dvocab_ = 0;
-    cudaGraphExec_t graphs_[kMaxWindow + 1][2] = {};
 };
 
 }  // namespace bnk

@@ -49,11 +49,11 @@ class Conversation:
         self.read_ms_total = 0.0
         self.last_active = self.created
 
-    def view(self, live_conv: int | None, park_min: int, parking: bool) -> dict:
+    def view(self, on_gpu, park_min: int, parking: bool) -> dict:
         n = len(self.tokens) // 4
         if self.status in ("reading", "generating"):
             where = "gpu"
-        elif live_conv == self.id:
+        elif self.id in on_gpu:
             where = "gpu"
         elif parking and n >= park_min and self.n_turns:
             where = "ram"
@@ -72,7 +72,8 @@ class Conversations:
         self.items: collections.OrderedDict[int, Conversation] = collections.OrderedDict()
         self.lock = threading.Lock()
         self.next_id = 1
-        self.live_conv: int | None = None   # whose state the engine holds now
+        self.slots = 1
+        self.on_gpu: collections.deque = collections.deque(maxlen=1)   # whose states the engine's slots hold
 
     def _label(self, ids: list[int]) -> str:
         """The start of the first user message (an agent's task), else of the prompt."""
@@ -116,7 +117,11 @@ class Conversations:
         c.rid = rid
         c.last_active = c.since
         if status in ("reading", "generating"):
-            self.live_conv = c.id
+            if self.on_gpu.maxlen != self.slots:
+                self.on_gpu = collections.deque(self.on_gpu, maxlen=self.slots)
+            if c.id in self.on_gpu:
+                self.on_gpu.remove(c.id)
+            self.on_gpu.append(c.id)
 
     def status(self, cid: int, status: str, rid: str | None = None):
         with self.lock:
@@ -142,7 +147,7 @@ class Conversations:
 
     def snapshot(self) -> list[dict]:
         with self.lock:
-            return [c.view(self.live_conv, self.park_min, self.parking) for c in reversed(self.items.values())]
+            return [c.view(set(self.on_gpu), self.park_min, self.parking) for c in reversed(self.items.values())]
 
     def _push(self):
         self.publish("conversations", self.snapshot())

@@ -41,6 +41,7 @@ void Generator::draft_from(const float * R_row, int32_t tok, int cell) {
 }
 
 int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at) {
+    use_slot();
     sp_ = sp;
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
@@ -102,19 +103,55 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
 }
 
 std::vector<int32_t> Generator::next() {
-    std::vector<int32_t> win;
-    win.push_back(pending_);
-    for (int d : drafts_) win.push_back(d);
-    if (eng_.pos() + (int) win.size() > eng_.max_ctx()) win.resize(1);
+    window(kMaxWindow);
+    const int T = (int) win_.size();
+    use_slot();
+    const double t0 = now_ms();
+    eng_.forward_batch({Engine::BatchWin{eng_.current_slot(), win_.data(), T, T == 1}});
+    stats.verify_ms += now_ms() - t0;
+    return finish();
+}
+
+const std::vector<int32_t> & Generator::window(int max_rows) {
+    use_slot();
+    win_.clear();
+    win_.push_back(pending_);
+    for (int d : drafts_) {
+        if ((int) win_.size() >= max_rows) break;
+        win_.push_back(d);
+    }
+    if (eng_.pos() + (int) win_.size() > eng_.max_ctx()) win_.resize(1);
+    return win_;
+}
+
+std::vector<int> Generator::share_rows(const std::vector<Generator *> & gens, int total) {
+    const int n = (int) gens.size();
+    std::vector<int> rows(n, 1);
+    int left = total - n;
+    for (bool more = true; left > 0 && more;) {
+        more = false;
+        for (int i = 0; i < n && left > 0; ++i)
+            if (rows[i] - 1 < gens[i]->drafts()) {
+                ++rows[i];
+                --left;
+                more = true;
+            }
+    }
+    return rows;
+}
+
+std::vector<int32_t> Generator::finish() {
+    use_slot();
+    const std::vector<int32_t> & win = win_;
     const int T = (int) win.size();
-    const int P = eng_.pos();
+    const int P = eng_.pos() - T;          // the window's first position
+    const int r0 = eng_.row0_of(eng_.current_slot());
     double t0 = now_ms();
-    eng_.forward(win.data(), T, T == 1);
     int a = 0;
     int32_t bonus;
     if (sp_.greedy()) {
         argmax_buf_.resize(T);
-        eng_.argmax_all(T, argmax_buf_.data());
+        eng_.argmax_all(T, argmax_buf_.data(), r0);
         while (a < T - 1 && argmax_buf_[a] == win[a + 1]) ++a;
         bonus = argmax_buf_[a];
         stats.verify_ms += now_ms() - t0;
@@ -127,10 +164,10 @@ std::vector<int32_t> Generator::next() {
         if (gpu) {
             topk_ids_.resize((size_t) T * sp_.top_k);
             topk_vals_.resize((size_t) T * sp_.top_k);
-            eng_.topk_rows_host(0, T, sp_.top_k, topk_ids_.data(), topk_vals_.data());
+            eng_.topk_rows_host(r0, T, sp_.top_k, topk_ids_.data(), topk_vals_.data());
         } else {
             logits_host_.resize((size_t) T * V);
-            eng_.logits_rows_host(T, logits_host_.data());
+            eng_.logits_rows_host(T, logits_host_.data(), r0);
         }
         bonus = -1;
         for (int i = 0; i < T; ++i) {
@@ -177,9 +214,10 @@ std::vector<int32_t> Generator::next() {
         std::vector<int32_t> nxt(win.begin() + 1, win.begin() + 1 + a);
         nxt.push_back(bonus);
         float pr = 0.f;
-        int d = mtp_->run(eng_.residual_dev(), nxt.data(), a + 1, P, opt_.max_draft > 0, &pr);
+        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.cfg().hc_dim();
+        int d = mtp_->run(R, nxt.data(), a + 1, P, opt_.max_draft > 0, &pr);
         stats.draft_run_ms += now_ms() - t0;
-        eng_.set_mtp_pending(eng_.residual_dev() + (size_t) a * eng_.cfg().hc_dim(), P + a);
+        eng_.set_mtp_pending(R + (size_t) a * eng_.cfg().hc_dim(), P + a);
         if (opt_.max_draft > 0) {
             drafts_.push_back(d);
             int cell = P + a + 1;

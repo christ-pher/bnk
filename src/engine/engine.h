@@ -6,6 +6,7 @@
 // which the calling thread services while the graph runs.
 #pragma once
 
+#include <map>
 #include <memory>
 #include <functional>
 #include <string>
@@ -85,6 +86,15 @@ public:
     // and the final residual of every row in residual_dev(). With commit_all the window is committed;
     // otherwise (a verify window) nothing is until commit(c) keeps its first c rows.
     void forward(const int32_t * tokens, int T, bool commit_all = true);
+    // One forward over several slots' windows at once (batched decoding): their rows are concatenated in the
+    // given order (at most kMaxWindow in all); the row-wise work (norms, GEMVs, MoE, head) runs once over all of
+    // them, attention / DeltaNet / PLE per slot on its own state. row0(i) is where window i's rows start (logits,
+    // residuals); a slot's commit() afterwards keeps rows of its own window.
+    struct BatchWin { int slot; const int32_t * tokens; int T; bool commit_all; };
+    int64_t graph_captures() const { return graph_captures_; }
+    size_t graph_bytes() const { return graph_bytes_; }
+    void forward_batch(const std::vector<BatchWin> & wins);
+    int row0_of(int slot) const;   // where that slot's rows started in the last forward
     void commit(int c);
     // The commit (the DeltaNet recurrence over the kept rows) runs on its own stream, overlapping the drafter;
     // everything that touches the recurrent state or the window buffers first joins it (on the main stream).
@@ -110,7 +120,7 @@ public:
     const float * mtp_pending_R() const { return cur_->mtp_R; }
     int mtp_pending_cell() const { return cur_->mtp_cell; }
     int argmax(int t);
-    void argmax_all(int T, int32_t * out);  // argmax of every row of the last window
+    void argmax_all(int T, int32_t * out, int row0 = 0);  // argmax of rows row0..row0+T-1 of the last forward
     std::vector<float> logits_host(int t);
     const float * logits_dev() const { return logits_; }
 
@@ -129,6 +139,8 @@ public:
     // Makes the state that can reuse the most of `prompt` live: the live one, or a parked one (parking the live
     // conversation first when it would lose at least park_min tokens). No-op unless park_gib > 0.
     void select_conversation(const std::vector<int32_t> & prompt);
+    // tokens of `prompt` the current slot's state can keep (its history, or its last snapshot inside the prefix)
+    int reusable(const std::vector<int32_t> & prompt) const;
     int parked() const { return (int) parked_.size(); }
     void drop_parked_all() { while (!parked_.empty()) drop_parked(parked_.size() - 1); }
     size_t parked_bytes() const;
@@ -136,7 +148,7 @@ public:
     const std::vector<int32_t> & history() const { return cur_->history; }
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_.threads(); }
-    void logits_rows_host(int T, float * out);   // rows 0..T-1 of the last window's logits
+    void logits_rows_host(int T, float * out, int row0 = 0);   // rows row0..row0+T-1 of the last forward's logits
     // the K largest logits of rows row0..row0+T-1 of the last window, selected on the GPU: ids/vals [T][K] (host)
     static constexpr int kTopkMax = 1024;
     void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals);
@@ -163,7 +175,7 @@ private:
     void enqueue_forward(int T);
     void layer_forward(int il, int T);
     void hc_pre(const HcWeights & w, int T, bool want_inject);
-    void ple_gather(int T);
+    void ple_gather();
     void ple(int il, int T);
     void gdn(int il, int T);
     void attn(int il, int T);
@@ -215,13 +227,27 @@ private:
         std::vector<ElasticBuf> kv_k, kv_v, kv_raw, kv_pool;
         int ctx_mapped = 0;   // cells of context whose KV is mapped
         DevBuf<float> ple_hist;
-        cudaGraphExec_t graphs[2][kMaxWindow + 1] = {};   // [commit_all][T]
-        cudaGraphExec_t commit_graphs[kMaxWindow + 1] = {};
+        cudaGraphExec_t commit_graphs[kMaxWindow][kMaxWindow + 1] = {};   // [first row in the window][kept rows]
+        int last_r0 = 0;     // where its rows were in the last forward (for its commit)
         bool used = false;   // ever held a conversation (an unused slot maps no context)
     };
     std::vector<std::unique_ptr<Seq>> seqs_;
     Seq * cur_ = nullptr;
+    // the forward in flight: each window's slot, first row, rows, position and whether it commits at once
+    struct Win { Seq * q; int r0, T, pos0; bool commit; };
+    std::vector<Win> wins_;
+    // per window layout (slot, T, commit ... in slot order); least recently used ones are dropped beyond
+    // kMaxFwdGraphs: every instantiated graph holds device memory, and batched layouts vary round to round
+    struct FwdGraph { cudaGraphExec_t exec = nullptr; uint64_t used = 0; size_t bytes = 0; };
+    std::map<std::vector<int>, FwdGraph> fwd_graphs_;
+    uint64_t fwd_graph_age_ = 0;
+    int64_t graph_captures_ = 0;
+    size_t graph_bytes_ = 0;   // device memory the instantiated graphs took (measured at capture)
+    static constexpr int kMaxFwdGraphs = 32;
+    static constexpr size_t kGraphBytesEst = 24ull << 20;   // ~18 MiB measured per instantiated forward graph
+    static constexpr int kMaxSlots = 8;
     void alloc_seq(Seq & q);
+    void use(Seq * q);   // cur_ = q, and the drafter's slot with it
     template <typename F> void each_state(F && f);   // f(device ptr, floats) over every saved buffer
     size_t state_floats();
     // f(device ptr, bytes) over every buffer holding per-position state for cells [0, cells) (KV, indexer keys
@@ -253,7 +279,6 @@ private:
     void drop_parked(size_t i);
     uint32_t seq_ = 0;
     int64_t fwd_count_ = 0;
-    bool commit_all_ = true;
 
     // window inputs (pinned host) and their device copy
     WinParams * h_par_ = nullptr;

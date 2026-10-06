@@ -10,7 +10,10 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 1 | ~~Sparse prefill attention~~ | done, see below | | done |
 | 2 | ~~Profile the real multi-agent workload~~ | done, see below | | done |
 | 3a | ~~Batching feasibility~~ | done, see below: go | | done |
-| 3b | **Batched decode of several conversations** ("level 3"), in stages: several conversations resident at once -> batched kernels with per-conversation positions (windows past 8 rows) -> scheduler, with the MTP drafting batched too | generation is ~74% of busy time with several agents | 3 agents: +35-40% total throughput with per-conversation drafting, +63-66% with batched drafting (simulated, cache shrink included); each conversation at ~25-30 tok/s while batched | next |
+| 3b | ~~Batched decode of several conversations~~ | done, see below | | done |
+| 4 | **Decode while a prompt is read**: run the other conversations' rounds between prefill chunks | an admitted turn's read (1-3 s, a first turn 40 s+) pauses every other agent's decoding | smoother multi-agent latency; part of the gap between the server (+14-17%) and the engine-level batch (+24%) | next |
+| 5 | **Batched drafting**: the drafter for every conversation of a round in one pass | per-conversation drafting is ~8 ms of a ~75 ms batched round | +5-10% batched *(estimate)* | |
+| 6 | **More rows per batched forward** (kMaxWindow 8 -> 16: GEMV / MoE kernels) | with 3 conversations each gets ~2.7 rows, so fewer drafts are verified | more tokens per round *(estimate)* | |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
 
@@ -24,6 +27,19 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 * Older open items: HC fusion, int8 KV, GPU sampler, faster `moe_plan`, T=8 GEMV.
 
 ## Done
+
+* **Batched decoding of several conversations** (2026-10-06): the engine holds `--slots` conversations (default 3
+  in the server) with their own KV, DeltaNet / PLE state, snapshots and drafter KV; one forward runs every active
+  conversation's window (rows concatenated, <= 8): norms, GEMVs, MoE and head once over all rows, attention /
+  DeltaNet / PLE per conversation on its own state. `bnk serve` admits up to `slots` requests and decodes them
+  together; the rows of a round go first to each pending token, then to drafts round-robin. Exact: each
+  conversation's greedy tokens decoded in batched rounds equal its tokens decoded alone (plain and MTP; parking
+  checked with 1 and 3 slots). Findings: three conversations mixed in one expert cache miss more (21% vs 14.6%
+  one at a time), so with slots > 1 the cache adapts every forward and swaps up to 32 experts (3 conversations:
+  72-76 -> 84 tok/s; one conversation: no change); each batched layout is its own CUDA graph (~18 MiB of VRAM:
+  slot-ordered layouts, an LRU of 32, charged to the VRAM budget). Measured: engine-level 3 conversations at
+  ~40K, 65-68 -> 84 tok/s total (+24%); through the server, 3 agents x 3 turns of up to 1,500 tokens: 31.2 ->
+  35.7 tok/s overall (+14%, the same 117 s of first reads in both), ~54 -> ~63 tok/s while decoding (+17%).
 
 * **Drafting and commit overhead** (2026-10-06): an nsys trace grouped by graph launch showed the commit (the
   DeltaNet recurrence replayed over the kept rows, ~0.8 ms of GPU time) hidden inside the drafter's timing, the

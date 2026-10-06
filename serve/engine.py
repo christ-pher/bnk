@@ -23,11 +23,11 @@ class Engine:
         self.ready = threading.Event()
         self.info = {}
         self.queues: dict[str, queue.Queue] = {}
-        # one generation at a time, first come first served (a request that yields its turn queues behind the
-        # ones already waiting)
+        # up to slots() generations at once (the engine batches them), first come first served (a request that
+        # yields its turn queues behind the ones already waiting)
         self._turn = threading.Condition()
         self._line: collections.deque = collections.deque()
-        self._busy = False
+        self._running = 0     # requests the engine is serving now (up to its conversation slots, batched)
         self.qlock = threading.Lock()
         self.started_at = None
         self.log_tail = collections.deque(maxlen=400)
@@ -101,18 +101,22 @@ class Engine:
         """The engine's last telemetry snapshot (it pushes one every 250 ms while working, 1 s while idle)."""
         return self.last_telemetry
 
+    def slots(self) -> int:
+        """Requests the engine serves at once (its conversation slots; decoded together in batched rounds)."""
+        return max(1, int(self.info.get("slots", 1) or 1))
+
     def _acquire(self):
         me = object()
         with self._turn:
             self._line.append(me)
-            while self._busy or self._line[0] is not me:
+            while self._running >= self.slots() or self._line[0] is not me:
                 self._turn.wait()
             self._line.popleft()
-            self._busy = True
+            self._running += 1
 
     def _release(self):
         with self._turn:
-            self._busy = False
+            self._running -= 1
             self._turn.notify_all()
 
     def waiters(self) -> int:

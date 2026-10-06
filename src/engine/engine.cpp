@@ -36,9 +36,9 @@ Engine::~Engine() {
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts)
             if (k.host) cudaFreeHost(k.host);
-        for (auto & gm : q->graphs) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
-        for (auto & g : q->commit_graphs) if (g) cudaGraphExecDestroy(g);
+        for (auto & gm : q->commit_graphs) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     }
+    for (auto & kv : fwd_graphs_) cudaGraphExecDestroy(kv.second.exec);
     if (counts_.p) save_counts();
     if (mail_) cudaFreeHost(mail_);
     if (h_par_) cudaFreeHost(h_par_);
@@ -97,8 +97,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaHostAlloc((void **) &mail_, mail_stride_ * c.n_layer, cudaHostAllocMapped));
     memset(mail_, 0, mail_stride_ * c.n_layer);
 
-    CUDA_CHECK(cudaHostAlloc((void **) &h_par_, sizeof(WinParams), cudaHostAllocMapped));
-    CUDA_CHECK(cudaMalloc(&d_par_, sizeof(WinParams)));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_par_, kMaxSlots * sizeof(WinParams), cudaHostAllocMapped));
+    CUDA_CHECK(cudaMalloc(&d_par_, kMaxSlots * sizeof(WinParams)));
     CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocMapped));
 
     if (c.ple_layer >= 0) {
@@ -156,7 +156,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         route_dev_.alloc((size_t) c.n_layer * kMaxWindow * c.n_expert_used);
         cpu_us_.assign(c.n_layer, 0.f);
     }
-    if (!opt.mtp.empty()) mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_);
+    if (!opt.mtp.empty())
+        mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
     pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
@@ -246,6 +247,12 @@ void Engine::alloc_seq(Seq & q) {
     if (c.ple_layer >= 0) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
 }
 
+void Engine::use(Seq * q) {
+    cur_ = q;
+    for (size_t i = 0; i < seqs_.size(); ++i)
+        if (seqs_[i].get() == q && mtp_.loaded()) mtp_.select((int) i);
+}
+
 int Engine::current_slot() const {
     for (size_t i = 0; i < seqs_.size(); ++i)
         if (seqs_[i].get() == cur_) return (int) i;
@@ -254,8 +261,8 @@ int Engine::current_slot() const {
 
 void Engine::select(int slot) {
     if (slot < 0 || slot >= (int) seqs_.size()) throw std::runtime_error("select: no slot " + std::to_string(slot));
-    join_commit();
-    cur_ = seqs_[slot].get();
+    // no join: switching touches nothing on the GPU, and whatever does (forward, prefill, snapshots ...) joins
+    use(seqs_[slot].get());
     if (!cur_->used) {   // first use: an empty conversation with the baseline context
         cur_->used = true;
         reset();
@@ -441,22 +448,23 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
 }
 
 // host side: the n-gram hash rows of the window, gathered into pinned memory the graph reads
-void Engine::ple_gather(int T) {
+void Engine::ple_gather() {
     const Config & c = model_.cfg;
     if (c.ple_layer < 0) return;
     const double t0 = now_ms();
     const int ph = c.ple_heads();
     const TensorRef & tab = *model_.ple_table;
     const size_t rb = tab.row_bytes();
-    const int pos0 = pos() - T;
-    for (int t = 0; t < T; ++t) {
-        const int p = pos0 + t;
+    for (const Win & w : wins_)
+    for (int tw = 0; tw < w.T; ++tw) {
+        const int p = w.pos0 + tw, t = w.r0 + tw;
+        const std::vector<int32_t> & hist = w.q->history;
         int64_t ctx[8];
-        ctx[0] = cur_->history[p];
+        ctx[0] = hist[p];
         bool cut = false;
         for (int s = 1; s < c.ple_ngram; ++s) {
             const int q = p - s;
-            const int64_t tok = (cut || q < 0) ? -1 : cur_->history[q];
+            const int64_t tok = (cut || q < 0) ? -1 : hist[q];
             cut = cut || tok < 0 || tok == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tok;
         }
@@ -485,45 +493,63 @@ void Engine::ple(int il, int T) {
     gemv_q(L.ple_key, act_, ple_emb_, D, T, ple_key_, HC, st_);
     gemv_q(L.ple_value, act_, ple_emb_, D, T, ple_val_, E, st_);
     const int hist = (c.ple_conv - 1) * c.ple_ngram;
-    ple_gate(ple_key_, res_, ple_val_, F(L.ple_norm_key), F(L.ple_norm_query), F(L.ple_norm_conv), ple_gated_,
-             cur_->ple_hist.p + (size_t) hist * HC, T, c.hc, E, c.rms_eps, st_);
-    ple_conv_add(res_, ple_gated_, cur_->ple_hist, (const half *) L.ple_conv1d.data, T, HC, c.ple_conv, c.ple_ngram, st_);
-    if (commit_all_) shift_rows(cur_->ple_hist, HC, T, hist, st_);
+    for (const Win & w : wins_) {
+        const size_t o = (size_t) w.r0 * HC;
+        ple_gate(ple_key_.p + o, res_.p + o, ple_val_.p + (size_t) w.r0 * E, F(L.ple_norm_key), F(L.ple_norm_query),
+                 F(L.ple_norm_conv), ple_gated_.p + o, w.q->ple_hist.p + (size_t) hist * HC, w.T, c.hc, E, c.rms_eps,
+                 st_);
+        ple_conv_add(res_.p + o, ple_gated_.p + o, w.q->ple_hist, (const half *) L.ple_conv1d.data, w.T, HC,
+                     c.ple_conv, c.ple_ngram, st_);
+        if (w.commit) shift_rows(w.q->ple_hist, HC, w.T, hist, st_);
+    }
 }
 
 void Engine::gdn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
-    float * cb = cur_->conv_buf[il];
     quantize_act(mixed_, E, T, E, mixact_, st_);
-    gemv_q(L.wqkv, mixact_, mixed_, E, T, cb + (size_t) (K - 1) * C, C, st_);
+    // the new conv inputs go behind each window's own K-1 history rows (one window: straight there)
+    const bool one = wins_.size() == 1;
+    float * qkv = one ? wins_[0].q->conv_buf[il].p + (size_t) (K - 1) * C : conv_out_.p;
+    gemv_q(L.wqkv, mixact_, mixed_, E, T, qkv, C, st_);
+    if (!one)
+        for (const Win & w : wins_)
+            CUDA_CHECK(cudaMemcpyAsync(w.q->conv_buf[il].p + (size_t) (K - 1) * C, conv_out_.p + (size_t) w.r0 * C,
+                                       (size_t) w.T * C * 4, cudaMemcpyDeviceToDevice, st_));
     gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, st_);
     float * co = gdn_co_[il], * gg = gdn_g_[il], * gb = gdn_b_[il];
     gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, st_);
     gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, st_);
     dbg(st_, il, "hc_mixed_attn", mixed_, (size_t) T * E);
-    dbg(st_, il, "linear_attn_qkv_mixed", cb + (size_t) (K - 1) * C, (size_t) T * C);
+    dbg(st_, il, "linear_attn_qkv_mixed", qkv, (size_t) T * C);
     dbg(st_, il, "z", z_, (size_t) T * nv * S);
-    gdn_conv(cb, F(L.ssm_conv1d), co, T, C, K, st_);
+    for (const Win & w : wins_) {
+        float * cw = co + (size_t) w.r0 * C, * gw = gg + (size_t) w.r0 * nv, * bw = gb + (size_t) w.r0 * nv;
+        gdn_conv(w.q->conv_buf[il], F(L.ssm_conv1d), cw, w.T, C, K, st_);
+        gdn_prep(cw, w.T, C, c.ssm_groups, nv, S, gw, bw, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
+        gdn_recurrence(cw, C, gw, bw, w.q->ssm_state[il], gdn_o_.p + (size_t) w.r0 * nv * S, w.T, c.ssm_groups, nv,
+                       S, w.commit ? w.T : 0, st_);
+    }
     dbg(st_, il, "conv_output_silu", co, (size_t) T * C);
-    gdn_prep(co, T, C, c.ssm_groups, nv, S, gg, gb, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-    gdn_recurrence(co, C, gg, gb, cur_->ssm_state[il], gdn_o_, T, c.ssm_groups, nv, S, commit_all_ ? T : 0, st_);
     gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
     dbg(st_, il, "attn_output", gdn_o_, (size_t) T * nv * S);
     dbg(st_, il, "final_output", gdn_n_, (size_t) T * nv * S);
     gemv_auto(L.ssm_out, gdn_n_, nv * S, T, out_, E, false, act_, st_);
     dbg(st_, il, "linear_attn_out", out_, (size_t) T * E);
-    if (commit_all_) shift_rows(cb, C, T, K - 1, st_);
+    for (const Win & w : wins_)
+        if (w.commit) shift_rows(w.q->conv_buf[il], C, w.T, K - 1, st_);
 }
 
 // Keep the first c rows of the last verify window: replay the delta rule over them and shift the histories.
 void Engine::enqueue_commit(int cnt) {
     const Config & c = model_.cfg;
     const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    const size_t r0 = (size_t) cur_->last_r0;
     for (int il = 0; il < c.n_layer; ++il) {
         if (c.is_attn(il)) continue;
-        gdn_recurrence(gdn_co_[il], C, gdn_g_[il], gdn_b_[il], cur_->ssm_state[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+        gdn_recurrence(gdn_co_[il].p + r0 * C, C, gdn_g_[il].p + r0 * nv, gdn_b_[il].p + r0 * nv, cur_->ssm_state[il],
+                       nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
     shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
     if (c.ple_layer >= 0) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
@@ -551,30 +577,32 @@ void Engine::commit(int cnt) {
     cur_->pending_T = 0;
     static const bool same_stream = getenv("BNK_COMMIT_SAME_STREAM") != nullptr;
     if (opt_.use_graphs && !same_stream) {
-        if (!cur_->commit_graphs[cnt]) {
+        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_r0][cnt];
+        if (!cg) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             enqueue_commit(cnt);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&cur_->commit_graphs[cnt], g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&cg, g, 0));
             cudaGraphDestroy(g);
         }
         // on the commit stream, after the verify window: the drafter (main stream) runs meanwhile
         CUDA_CHECK(cudaEventRecord(ev_verified_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(st_commit_, ev_verified_, 0));
-        CUDA_CHECK(cudaGraphLaunch(cur_->commit_graphs[cnt], st_commit_));
+        CUDA_CHECK(cudaGraphLaunch(cg, st_commit_));
         CUDA_CHECK(cudaEventRecord(ev_committed_, st_commit_));
         commit_inflight_ = true;
     } else if (opt_.use_graphs) {
-        if (!cur_->commit_graphs[cnt]) {
+        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_r0][cnt];
+        if (!cg) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             enqueue_commit(cnt);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&cur_->commit_graphs[cnt], g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&cg, g, 0));
             cudaGraphDestroy(g);
         }
-        CUDA_CHECK(cudaGraphLaunch(cur_->commit_graphs[cnt], st_));
+        CUDA_CHECK(cudaGraphLaunch(cg, st_));
     } else {
         enqueue_commit(cnt);
     }
@@ -588,21 +616,31 @@ void Engine::attn(int il, int T) {
     gemv_q(L.wq, mixact_, mixed_, E, T, qfull_, H * D * 2, st_);
     gemv_q(L.wk, mixact_, mixed_, E, T, k_, Hkv * D, st_);
     gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
-    attn_prep(qfull_, k_, v_, F(L.q_norm), F(L.k_norm), q_, cur_->kc[il], cur_->vc[il], T, H, Hkv, D, c.n_rot, c.rope_base,
-              &d_par_->pos0, c.rms_eps, st_);
-    if (cur_->kraw[il].p) {
-        // QSA: indexer keys and queries, pooled blocks, the per-query block selection, sparse attention
+    const bool qsa = wins_[0].q->kraw[il].p != nullptr;
+    if (qsa) {
         gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, st_);
-        qsa_store_keys(ik_, cur_->kraw[il], T, c.idx_dim, &d_par_->pos0, st_);
         gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, st_);
-        qsa_queries(iq_, F(L.idx_q_norm), T, qsh_, &d_par_->pos0, st_);
-        qsa_pool(cur_->kraw[il], F(L.idx_k_norm), cur_->pooled[il], T, qsh_, &d_par_->pos0, st_);
-        qsa_select(iq_, cur_->pooled[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, T, qsh_, &d_par_->pos0, 0, st_);
-        qsa_attention(q_, cur_->kc[il], cur_->vc[il], qfull_, qsa_sel_, qsa_nsel_, attn_o_, T, qsh_, &d_par_->pos0,
-                      1.f / sqrtf((float) D), attn_scratch_, st_);
-    } else {
-        attention(q_, cur_->kc[il], cur_->vc[il], qfull_, attn_o_, T, H, Hkv, D, &d_par_->pos0, 1.f / sqrtf((float) D),
-                  attn_scratch_, st_);
+    }
+    for (size_t wi = 0; wi < wins_.size(); ++wi) {
+        const Win & w = wins_[wi];
+        const int * pos0 = &d_par_[wi].pos0;
+        const size_t r = (size_t) w.r0;
+        float * qw = q_.p + r * H * D, * qf = qfull_.p + r * H * D * 2, * ao = attn_o_.p + r * H * D;
+        attn_prep(qf, k_.p + r * Hkv * D, v_.p + r * Hkv * D, F(L.q_norm), F(L.k_norm), qw, w.q->kc[il], w.q->vc[il],
+                  w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_);
+        if (qsa) {
+            // QSA: indexer keys and queries, pooled blocks, the per-query block selection, sparse attention
+            float * iqw = iq_.p + r * c.idx_heads * c.idx_dim;
+            qsa_store_keys(ik_.p + r * c.idx_dim, w.q->kraw[il], w.T, c.idx_dim, pos0, st_);
+            qsa_queries(iqw, F(L.idx_q_norm), w.T, qsh_, pos0, st_);
+            qsa_pool(w.q->kraw[il], F(L.idx_k_norm), w.q->pooled[il], w.T, qsh_, pos0, st_);
+            qsa_select(iqw, w.q->pooled[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, w.T, qsh_, pos0, 0, st_);
+            qsa_attention(qw, w.q->kc[il], w.q->vc[il], qf, qsa_sel_, qsa_nsel_, ao, w.T, qsh_, pos0,
+                          1.f / sqrtf((float) D), attn_scratch_, st_);
+        } else {
+            attention(qw, w.q->kc[il], w.q->vc[il], qf, ao, w.T, H, Hkv, D, pos0, 1.f / sqrtf((float) D),
+                      attn_scratch_, st_);
+        }
     }
     gemv_auto(L.wo, attn_o_, H * D, T, out_, E, false, act_, st_);
 }
@@ -727,7 +765,7 @@ void Engine::layer_forward(int il, int T) {
 
 void Engine::enqueue_forward(int T) {
     const Config & c = model_.cfg;
-    CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     dequant_gather(model_.tok_embd, h_tok_, T, x_, st_);
     hc_init(x_, res_, T, c.hc, c.n_embd, st_);
     for (int il = 0; il < c.n_layer; ++il) layer_forward(il, T);
@@ -792,32 +830,85 @@ void Engine::service_cpu(uint32_t seq, int T) {
 }
 
 void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
+    forward_batch({BatchWin{current_slot(), tokens, T, commit_all}});
+}
+
+int Engine::row0_of(int slot) const {
+    return seqs_.at(slot)->last_r0;
+}
+
+void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
     join_commit();
-    if (T < 1 || T > kMaxWindow) throw std::runtime_error("forward: bad window");
-    if (cur_->pending_T) throw std::runtime_error("forward: the previous verify window was not committed");
-    commit_all_ = commit_all;
-    if (pos() + T > opt_.max_ctx) throw std::runtime_error("context full");
-    ensure_ctx(pos() + T + kMaxWindow);
+    // windows in slot order, whatever order the caller lists them in: one graph per layout, not per permutation
+    std::vector<BatchWin> batch = batch_in;
+    std::sort(batch.begin(), batch.end(), [](const BatchWin & a, const BatchWin & b) { return a.slot < b.slot; });
+    if (batch.empty() || batch.size() > (size_t) kMaxSlots) throw std::runtime_error("forward: bad batch");
+    Seq * keep = cur_;
+    int R = 0;
+    for (const auto & b : batch) {
+        if (b.T < 1) throw std::runtime_error("forward: bad window");
+        R += b.T;
+    }
+    if (R > kMaxWindow) throw std::runtime_error("forward: more than kMaxWindow rows");
     const double t0 = now_ms();
-    last_T = T;
-    const int pos0 = pos();
-    cur_->history.insert(cur_->history.end(), tokens, tokens + T);
-    memcpy(h_tok_, tokens, T * 4);
-    *h_par_ = WinParams{pos0, T, ++seq_, 0};
-    ple_gather(T);
+    wins_.clear();
+    ++seq_;
+    std::vector<int> key{(int) batch.size()};
+    for (const auto & b : batch) {
+        Seq * q = seqs_.at(b.slot).get();
+        if (q->pending_T) throw std::runtime_error("forward: the previous verify window was not committed");
+        for (const Win & w : wins_)
+            if (w.q == q) throw std::runtime_error("forward: a slot twice in one batch");
+        use(q);
+        if (!q->used) { q->used = true; reset(); }
+        if (pos() + b.T > opt_.max_ctx) { use(keep); throw std::runtime_error("context full"); }
+        ensure_ctx(pos() + b.T + kMaxWindow);
+        const int r0 = wins_.empty() ? 0 : wins_.back().r0 + wins_.back().T;
+        wins_.push_back(Win{q, r0, b.T, pos(), b.commit_all});
+        q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
+        q->last_r0 = r0;
+        memcpy(h_tok_ + r0, b.tokens, b.T * 4);
+        h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
+        key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
+    }
+    use(keep);
+    last_T = R;
+    ple_gather();
     if (opt_.use_graphs && !dump_all) {
-        cudaGraphExec_t & ge = cur_->graphs[commit_all ? 1 : 0][T];
-        if (!ge) {
+        FwdGraph & fg = fwd_graphs_[key];
+        if (!fg.exec) {
+            while ((int) fwd_graphs_.size() > kMaxFwdGraphs) {   // the least recently used layout goes
+                auto lru = fwd_graphs_.end();
+                for (auto it = fwd_graphs_.begin(); it != fwd_graphs_.end(); ++it)
+                    if (it->second.exec && (lru == fwd_graphs_.end() || it->second.used < lru->second.used)) lru = it;
+                if (lru == fwd_graphs_.end()) break;
+                cudaGraphExecDestroy(lru->second.exec);
+                budget_.refund(lru->second.bytes);
+                graph_bytes_ -= std::min(graph_bytes_, lru->second.bytes);
+                fwd_graphs_.erase(lru);
+            }
+            // an instantiated graph holds device memory: the expert cache gives it up (charged to the budget,
+            // at the measured size), so the reserve for cuBLAS and the other graphs stays intact
+            budget_.make_room(kGraphBytesEst);
+            size_t f0 = 0, f1 = 0, tot = 0;
+            cudaMemGetInfo(&f0, &tot);
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
-            enqueue_forward(T);
+            enqueue_forward(R);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&fg.exec, g, 0));
             cudaGraphDestroy(g);
+            cudaMemGetInfo(&f1, &tot);
+            fg.bytes = f0 > f1 ? f0 - f1 : 0;
+            budget_.charge(fg.bytes);
+            graph_bytes_ += fg.bytes;
+            ++graph_captures_;
         }
+        fg.used = ++fwd_graph_age_;
+        cudaGraphExec_t ge = fg.exec;
         if (route_log_) moe_debug_reset(st_);
         CUDA_CHECK(cudaGraphLaunch(ge, st_));
-        service_cpu(seq_, T);
+        service_cpu(seq_, R);
         static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
         if (prof) {
             CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -828,11 +919,11 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
                         (ts[il][2] - ts[il][1]) / 1e3);
         }
     } else {
-        enqueue_forward(T);
+        enqueue_forward(R);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    if (route_log_ && opt_.use_graphs && !dump_all) write_route_log(T, pos0, commit_all, t0, now_ms());
-    if (!commit_all) cur_->pending_T = T;
+    if (route_log_ && opt_.use_graphs && !dump_all) write_route_log(R, wins_[0].pos0, wins_[0].commit, t0, now_ms());
+    for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
     times.total_ms += now_ms() - t0;
     times.calls++;
@@ -901,8 +992,8 @@ int Engine::argmax(int t) {
     return r;
 }
 
-void Engine::argmax_all(int T, int32_t * out) {
-    argmax_rows(logits_.p, T, model_.cfg.n_vocab, argmax_dev_, st_);
+void Engine::argmax_all(int T, int32_t * out, int row0) {
+    argmax_rows(logits_.p + (size_t) row0 * model_.cfg.n_vocab, T, model_.cfg.n_vocab, argmax_dev_, st_);
     CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
@@ -920,8 +1011,9 @@ void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals)
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
-void Engine::logits_rows_host(int T, float * out) {
-    CUDA_CHECK(cudaMemcpy(out, logits_.p, (size_t) T * model_.cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
+void Engine::logits_rows_host(int T, float * out, int row0) {
+    CUDA_CHECK(cudaMemcpy(out, logits_.p + (size_t) row0 * model_.cfg.n_vocab, (size_t) T * model_.cfg.n_vocab * 4,
+                          cudaMemcpyDeviceToHost));
 }
 
 void Engine::set_mtp_pending(const float * R_row_dev, int cell) {

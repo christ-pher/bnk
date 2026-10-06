@@ -226,6 +226,10 @@ void Engine::restore(size_t i) {
                 parked_.size());
 }
 
+int Engine::reusable(const std::vector<int32_t> & prompt) const {
+    return reuse_of(cur_->history, cur_->ckpts, prompt);
+}
+
 void Engine::select_conversation(const std::vector<int32_t> & prompt) {
     if (opt_.park_gib <= 0 || prompt.empty()) return;
     const int live = reuse_of(cur_->history, cur_->ckpts, prompt);
