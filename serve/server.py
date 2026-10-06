@@ -308,6 +308,14 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
 
 
 # ------------------------------------------------------------------------------------------- HTTP
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        """A client that drops its connection (a closed tab, an idle keep-alive) is not an error worth a traceback."""
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "bnk"
@@ -726,7 +734,7 @@ def main():
     print(f"bnk: defaults - temperature {d['temperature']} · top_p {d['top_p']} · top_k {d['top_k']}"
           + (f" · draft {S.draft_defaults.get('draft')} (cutoff {S.draft_defaults.get('draft_min_p')})" if S.draft_defaults else "")
           + (f" · config {Path(args.config).name}" if args.config else ""), flush=True)
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv = Server((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"bnk: listening on http://{args.host}:{args.port}  (UI at /, OpenAI API at /v1)", flush=True)
     try:
