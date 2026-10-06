@@ -14,6 +14,9 @@ MtpLayer::~MtpLayer() {
     for (auto & sl : slots_)
         for (auto & g : sl.graphs) for (auto & x : g) if (x) cudaGraphExecDestroy(x);
     for (void * p : allocs_) cudaFree(p);
+    for (auto & kv : mgraphs_) if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
+    if (h_multi_) cudaFreeHost(h_multi_);
+    if (h_mprob_) cudaFreeHost(h_mprob_);
     if (msg_) cudaFreeHost(msg_);
     if (h_io_) cudaFreeHost(h_io_);
     if (h_prob_) cudaFreeHost(h_prob_);
@@ -405,6 +408,191 @@ void MtpLayer::enqueue(int n, bool draft) {
     if (n_dvocab_) map_id(out_dev_, dvocab_, st_);
     CUDA_CHECK(cudaMemcpyAsync(h_io_, out_dev_.p, 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_prob_, prob_.p, 4, cudaMemcpyDeviceToHost, st_));
+}
+
+// ---------------------------------------------------------------------------------------------- batched drafting
+// Several conversations' drafter passes in one forward. Each item contributes n rows (K/V for all of them in its own
+// slot); its last row is its draft row. The draft rows (one per item) then run the rest of the layer, the MoE and the
+// head together. Rows are at most kMaxWindow in all (the main model's batched window bounds them).
+
+// buffers for up to kMaxWindow draft rows, allocated once (before any capture and before the inputs are staged)
+void MtpLayer::ensure_multi() {
+    if (h_multi_) return;
+    const Config & c = main_->cfg;
+    const int E = c.n_embd, HC = c.hc_dim(), W = kMaxWindow;
+    const int V = n_dvocab_ ? n_dvocab_ : c.n_vocab;
+    Dres_.alloc(W * HC); dmix_.alloc(W * E); dinj_.alloc(W * c.hc); dinj2_.alloc(W * c.hc);
+    dattn_.alloc(W * c.n_head * c.head_dim); dbo_.alloc(W * E); drlog_.alloc(W * c.n_expert);
+    drw_.alloc(W * c.n_expert_used); dids_.alloc(W * c.n_expert_used); dsg_.alloc(W * c.n_ff_shexp);
+    dsu_.alloc(W * c.n_ff_shexp); dsh_.alloc(W * c.n_ff_shexp); dsgate_.alloc(W); dshared_.alloc(W * E);
+    dy_.alloc(W * E); dsample_.alloc(W * E); dlogits_.alloc((size_t) W * V); dprob_.alloc(W); dout_.alloc(W);
+    mpos_.alloc(2 * W);
+    if (sparse_) diq_.alloc((size_t) W * c.idx_heads * c.idx_dim);
+    CUDA_CHECK(cudaHostAlloc((void **) &h_multi_, 32 * 4, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_mprob_, 8 * 4, cudaHostAllocMapped));
+}
+
+void MtpLayer::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) {
+    ensure_multi();
+    const int HC = main_->cfg.hc_dim();
+    std::vector<MItem> mi;
+    int r = 0;
+    for (const auto & it : items) {
+        CUDA_CHECK(cudaMemcpyAsync(Rin_.p + (size_t) r * HC, it.R_rows, (size_t) it.n * HC * 4, cudaMemcpyDeviceToDevice, st_));
+        memcpy(h_multi_ + r, it.tokens, it.n * 4);
+        mi.push_back({it.slot, it.n, it.cell0});
+        r += it.n;
+    }
+    if (r > kMaxWindow) throw std::runtime_error("mtp: more than kMaxWindow rows");
+    forward_multi(mi, tok_out, prob_out);
+}
+
+void MtpLayer::step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) {
+    ensure_multi();
+    const int HC = main_->cfg.hc_dim();
+    std::vector<MItem> mi;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const StepItem & it = items[i];
+        // the item's draft residual from the previous call (its row in Dres_) is this step's hidden input
+        CUDA_CHECK(cudaMemcpyAsync(Rin_.p + i * HC, Dres_.p + (size_t) it.prev * HC, (size_t) HC * 4,
+                                   cudaMemcpyDeviceToDevice, st_));
+        h_multi_[i] = it.tok;
+        mi.push_back({multi_slots_.at(it.prev), 1, it.cell});
+    }
+    forward_multi(mi, tok_out, prob_out);
+}
+
+void MtpLayer::forward_multi(const std::vector<MItem> & items, int32_t * tok_out, float * prob_out) {
+    const double t0 = now_ms();
+    const int S = (int) items.size();
+    if (S < 1 || S > kMaxWindow) throw std::runtime_error("mtp: bad batch");
+    std::vector<int> key;
+    for (int i = 0; i < S; ++i) {
+        const MItem & it = items[i];
+        if (it.cell0 + it.n > max_ctx_) throw std::runtime_error("mtp: context full");
+        h_multi_[8 + 2 * i] = it.cell0;
+        h_multi_[8 + 2 * i + 1] = it.cell0 + it.n - 1;
+        key.push_back(it.slot);
+        key.push_back(it.n);
+    }
+    MGraph & g = mgraphs_[key];
+    if (!g.exec) {
+        while (mgraphs_.size() > 48) {   // least recently used layouts go (each graph holds device memory)
+            auto lru = mgraphs_.end();
+            for (auto it = mgraphs_.begin(); it != mgraphs_.end(); ++it)
+                if (it->second.exec && (lru == mgraphs_.end() || it->second.used < lru->second.used)) lru = it;
+            if (lru == mgraphs_.end()) break;
+            cudaGraphExecDestroy(lru->second.exec);
+            mgraphs_.erase(lru);
+        }
+        cudaGraph_t gr;
+        CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+        enqueue_multi(items);
+        CUDA_CHECK(cudaStreamEndCapture(st_, &gr));
+        CUDA_CHECK(cudaGraphInstantiate(&g.exec, gr, 0));
+        cudaGraphDestroy(gr);
+    }
+    g.used = ++mgraph_age_;
+    CUDA_CHECK(cudaGraphLaunch(g.exec, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    multi_slots_.clear();
+    for (const auto & it : items) multi_slots_.push_back(it.slot);
+    for (int i = 0; i < S; ++i) {
+        tok_out[i] = h_multi_[24 + i];
+        prob_out[i] = h_mprob_[i];
+    }
+    ms += now_ms() - t0;
+    calls += S;
+}
+
+void MtpLayer::enqueue_multi(const std::vector<MItem> & items) {
+    const Config & c = main_->cfg;
+    const int E = c.n_embd, HC = c.hc_dim(), H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
+    const int S = (int) items.size();
+    int N = 0;
+    std::vector<int> r0(S), last(S);
+    for (int i = 0; i < S; ++i) {
+        r0[i] = N;
+        N += items[i].n;
+        last[i] = N - 1;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mpos_.p, h_multi_ + 8, 2 * S * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_multi_, N * 4, cudaMemcpyHostToDevice, st_));
+
+    // the two input branches, every row
+    dequant_gather(main_->tok_embd, tok_dev_, N, emb_, st_);
+    rmsnorm_rows(emb_, w_emb_, en_, N, E, E, E, c.rms_eps, st_);
+    gemv_auto(fc_emb_, en_, E, N, e2_, E, false, act_, st_);
+    rmsnorm_rows(Rin_, w_hid_, hn_, N, HC, HC, HC, c.rms_eps, st_);
+    for (int q0 = 0; q0 < N * c.hc; q0 += kMaxWindow) {
+        const int rr = std::min(kMaxWindow, N * c.hc - q0);
+        gemv_auto(fc_hid_, hn_.p + (size_t) q0 * E, E, rr, h2_.p + (size_t) q0 * E, E, false, act_, st_);
+    }
+    copy_f32(R_, h2_, (int64_t) N * HC, st_);
+    add_bcast_streams(R_, e2_, N, c.hc, E, st_);
+    // attention hyper-connection and K/V for every row, into each item's own slot
+    hc_pre(hc_attn_, R_, N, true, mixed_, inj_);
+    gemv_auto(wq_, mixed_, E, N, qfull_, H * D * 2, false, act_, st_);
+    gemv_auto(wk_, mixed_, E, N, k_, Hkv * D, false, act_, st_);
+    gemv_auto(wv_, mixed_, E, N, v_, Hkv * D, false, act_, st_);
+    if (sparse_) gemv_auto(idx_k_, mixed_, E, N, ik_, c.idx_dim, false, act_, st_);
+    for (int i = 0; i < S; ++i) {
+        Slot & sl = slots_.at(items[i].slot);
+        const size_t r = (size_t) r0[i];
+        attn_prep(qfull_.p + r * H * D * 2, k_.p + r * Hkv * D, v_.p + r * Hkv * D, q_norm_, k_norm_,
+                  q_.p + r * H * D, sl.kc, sl.vc, items[i].n, H, Hkv, D, c.n_rot, c.rope_base, mpos_.p + 2 * i,
+                  c.rms_eps, st_);
+        if (sparse_) {
+            qsa_store_keys(ik_.p + r * c.idx_dim, sl.kraw, items[i].n, c.idx_dim, mpos_.p + 2 * i, st_);
+            qsa_pool(sl.kraw, idx_k_norm_, sl.pooled, items[i].n, qsh_, mpos_.p + 2 * i, st_);
+        }
+    }
+    // the draft rows (each item's last) gathered: residual, mixed input, injection
+    for (int i = 0; i < S; ++i) {
+        copy_f32(Dres_.p + (size_t) i * HC, R_.p + (size_t) last[i] * HC, HC, st_);
+        copy_f32(dmix_.p + (size_t) i * E, mixed_.p + (size_t) last[i] * E, E, st_);
+        copy_f32(dinj_.p + (size_t) i * c.hc, inj_.p + (size_t) last[i] * c.hc, c.hc, st_);
+    }
+    if (sparse_) gemv_auto(idx_q_, dmix_, E, S, diq_, c.idx_heads * c.idx_dim, false, act_, st_);
+    for (int i = 0; i < S; ++i) {
+        Slot & sl = slots_.at(items[i].slot);
+        const size_t L = (size_t) last[i];
+        float * ao = dattn_.p + (size_t) i * H * D;
+        if (sparse_) {
+            float * iq = diq_.p + (size_t) i * c.idx_heads * c.idx_dim;
+            qsa_queries(iq, idx_q_norm_, 1, qsh_, mpos_.p + 2 * i + 1, st_);
+            qsa_select(iq, sl.pooled, scores_, max_blocks_, sel_, nsel_, 1, qsh_, mpos_.p + 2 * i + 1, 0, st_);
+            qsa_attention(q_.p + L * H * D, sl.kc, sl.vc, qfull_.p + L * H * D * 2, sel_, nsel_, ao, 1, qsh_,
+                          mpos_.p + 2 * i + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+        } else {
+            attention(q_.p + L * H * D, sl.kc, sl.vc, qfull_.p + L * H * D * 2, ao, 1, H, Hkv, D, mpos_.p + 2 * i + 1,
+                      1.f / sqrtf((float) D), attn_scratch_, st_);
+        }
+    }
+    // the rest of the layer on the draft rows together
+    gemv_auto(wo_, dattn_, H * D, S, dbo_, E, false, act_, st_);
+    hc_combine(Dres_, dbo_, dinj_, S, c.hc, E, st_);
+    hc_pre(hc_mlp_, Dres_, S, true, dmix_, dinj2_);
+    gemv_auto(router_, dmix_, E, S, drlog_, c.n_expert, false, act_, st_);
+    route_topk(drlog_, S, c.n_expert, c.n_expert_used, dids_, drw_, c.expert_weights_scale, st_);
+    moe_plan(dids_, drw_, S, c.n_expert_used, moe_, moes_, msg_, dmix_, E, seq_dev_, nullptr, st_);
+    quantize_act(dmix_, E, S, E, act_, st_);
+    moe_hits(moe_, moes_, act_, S, c.n_expert_used, E, c.n_ff_exp, st_);
+    gemv_auto(sh_gate_, dmix_, E, S, dsg_, c.n_ff_shexp, false, act_, st_);
+    gemv_auto(sh_up_, dmix_, E, S, dsu_, c.n_ff_shexp, false, act_, st_);
+    silu_mul(dsg_, dsu_, dsh_, (int64_t) S * c.n_ff_shexp, st_);
+    gemv_auto(sh_down_, dsh_, c.n_ff_shexp, S, dshared_, E, false, act_, st_);
+    gemv_auto(sh_gate_inp_, dmix_, E, S, dsgate_, 1, false, act_, st_);
+    sigmoid_inplace(dsgate_, S, st_);
+    moe_reduce(moes_, msg_, dshared_, dsgate_, dy_, S, c.n_expert_used, E, st_);
+    hc_combine(Dres_, dy_, dinj2_, S, c.hc, E, st_);
+    hc_pre(hc_mix_, Dres_, S, false, dsample_, nullptr);
+    const QMat & head = n_dvocab_ ? dhead_ : main_->output;
+    gemv_auto(head, dsample_, E, S, dlogits_, (int) head.rows, false, act_, st_);
+    argmax_prob_rows(dlogits_, (int) head.rows, S, dout_, dprob_, st_);
+    if (n_dvocab_) map_ids(dout_, dvocab_, S, st_);
+    CUDA_CHECK(cudaMemcpyAsync(h_multi_ + 24, dout_.p, S * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(h_mprob_, dprob_.p, S * 4, cudaMemcpyDeviceToHost, st_));
 }
 
 }  // namespace bnk

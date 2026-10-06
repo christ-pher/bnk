@@ -511,6 +511,9 @@ void Engine::pf_moe(int il, int N) {
 
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
     join_commit();
+    // the expert cache may have changed since the read began (other conversations decode between its chunks:
+    // their cache adaptation and growing KV leave more experts outside VRAM), so the staging is checked again
+    prefill_staging_ensure(pf_full_);
     if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
     if (cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");

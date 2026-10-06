@@ -961,7 +961,8 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     if (pf_base_ > 0) {
         const int lay = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
         prefill_layout(lay);
-        prefill_staging_ensure(n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min);
+        pf_full_ = n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min;
+        prefill_staging_ensure(pf_full_);
     }
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;

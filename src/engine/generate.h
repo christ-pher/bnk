@@ -42,7 +42,10 @@ public:
     // window() is this round's tokens (the pending one plus up to max_rows-1 drafts), finish() verifies them from
     // this slot's rows of the forward, commits, drafts the next ones and returns the emitted tokens.
     const std::vector<int32_t> & window(int max_rows = kMaxWindow);
-    std::vector<int32_t> finish();
+    // draft = false: verify and commit only; the next drafts come from draft_batch() (several generators' drafter
+    // passes in one forward)
+    std::vector<int32_t> finish(bool draft = true);
+    static void draft_batch(const std::vector<Generator *> & gens);
     int slot() const { return slot_; }
     int drafts() const { return (int) drafts_.size(); }
     // The rows of one batched forward shared out among generators: one each for the pending token, then the
@@ -68,6 +71,9 @@ private:
     GenOptions opt_;
     int slot_ = -1;
     std::vector<int32_t> win_;   // this round's window
+    // the drafter's job after a round, left for draft_batch(): the kept rows' residuals, their next tokens, cells
+    struct DraftJob { bool pending = false; const float * R = nullptr; std::vector<int32_t> next; int cell0 = 0; };
+    DraftJob job_;
     void use_slot() { if (slot_ >= 0) eng_.select(slot_); }
     SamplingParams sp_;
     Sampler sampler_;

@@ -8,6 +8,7 @@
 // Drafts only steer speculation: the verify window decides every emitted token.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -53,11 +54,33 @@ public:
     int run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob);
     // One more draft from the last residual, pairing it with `tok` at `cell`.
     int step(int32_t tok, int cell, float * prob);
+
+    // Batched drafting: several conversations' drafter passes in one forward (their slots' K/V each; the draft
+    // rows share the rest of the layer, the MoE and the head). run_multi is run() for every item; step_multi is
+    // step() for the items given by index into the last run_multi/step_multi (which chains their residuals).
+    struct RunItem { int slot; const float * R_rows; const int32_t * tokens; int n; int cell0; };
+    struct StepItem { int prev; int32_t tok; int cell; };   // prev: the item's index in the previous call
+    void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out);
+    void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out);
     double ms = 0;
     int64_t calls = 0;
 
 private:
     int forward(int n, int cell0, bool draft, float * prob);
+    // batched drafting
+    struct MItem { int slot, n, cell0; };
+    void forward_multi(const std::vector<MItem> & items, int32_t * tok_out, float * prob_out);
+    void enqueue_multi(const std::vector<MItem> & items);
+    void ensure_multi();
+    std::vector<int> multi_slots_;   // the slot of each item of the last batched call (for step_multi)
+    struct MGraph { cudaGraphExec_t exec = nullptr; uint64_t used = 0; };
+    std::map<std::vector<int>, MGraph> mgraphs_;
+    uint64_t mgraph_age_ = 0;
+    DevBuf<float> Dres_, dmix_, dinj_, dinj2_, dattn_, dbo_, drlog_, drw_, dsg_, dsu_, dsh_, dsgate_, dshared_, dy_,
+        dsample_, dlogits_, dprob_, diq_;
+    DevBuf<int32_t> dids_, dout_, mpos_;
+    int32_t * h_multi_ = nullptr;   // pinned: [0, 8) tokens in, [8, 24) cells (first, last) per item, [24, 32) out
+    float * h_mprob_ = nullptr;     // pinned: [8] draft probabilities
     void enqueue(int n, bool draft);
     void hc_pre(const HcWeights & w, const float * res, int T, bool inject, float * mixed, float * inj);
 

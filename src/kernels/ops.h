@@ -80,6 +80,10 @@ void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t
 void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals, cudaStream_t s);
 // one row: argmax and its softmax probability
 void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s);
+// the same for each of T rows (T <= 8): id[t], prob[t]
+void argmax_prob_rows(const float * logits, int n, int T, int32_t * id, float * prob, cudaStream_t s);
+// ids[t] = map[ids[t]] for t < T (a draft head over a token subset: row -> token id)
+void map_ids(int32_t * ids, const int32_t * map, int T, cudaStream_t s);
 // R[t][s][:] += e[t][:]
 void add_bcast_streams(float * R, const float * e, int T, int hc, int E, cudaStream_t s);
 

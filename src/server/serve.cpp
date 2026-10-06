@@ -5,7 +5,8 @@
 //         "draft_min_p":p,"checkpoint":pos}  (checkpoint: where to snapshot state for the next request to resume)  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
 //        {"op":"cancel","id":..}   {"op":"stats"}   {"op":"reset"}   {"op":"quit"}
 //   Up to `slots` generate requests run at once (each in a conversation slot of its own; --slots): one is admitted
-//   (its prompt read) while the others wait, then all of them decode together, one batched forward per round.
+//   (its prompt read) while the others keep decoding between its prompt chunks (BNK_READ_SHARE of each chunk's
+//   time, 0.5 by default), then all of them decode together, one batched forward per round.
 //   out: {"type":"ready",..}  {"type":"prefill","id":..}  {"type":"tokens","id":..,"ids":[..]}
 //        {"type":"done","id":..,"reason":"stop|length|cancel|context"} {"type":"error",..}
 //        {"type":"telemetry",..}: every 250 ms while working and every second while idle (also the answer to
@@ -22,6 +23,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <set>
 #include <iostream>
@@ -190,6 +192,7 @@ struct Active {
     bool stop = false;
     int64_t fresh = 0;
     double t0 = 0, t1 = 0, tg0 = 0;
+    double interleave_ms = 0;   // the others' decoding run between this request's prompt chunks
     Current cur;
 };
 
@@ -246,12 +249,14 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         emit(o.done());
     }
     telemetry(true);
+    std::function<void(size_t, size_t)> between_chunks;   // set below, once the round exists
     eng.on_prefill_progress = [&](size_t done, size_t total) {
         if (shown) {
             shown->cur.prefill_done = (int64_t) done;
             shown->cur.prefill_total = (int64_t) total;
         }
         telemetry(false);
+        if (between_chunks) between_chunks(done, total);
     };
 
     std::thread reader([&]() {
@@ -389,7 +394,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             shown = a.get();
             telemetry(true);
             const int32_t tok = a->gen->start(a->prompt, sp, req.has("checkpoint") ? (int) req["checkpoint"].num() : -1);
-            a->t1 = now_ms();
+            a->t1 = now_ms() - a->interleave_ms;
             const auto & gs = a->gen->stats;
             a->fresh = gs.prompt_tokens - gs.reused_tokens;
             a->cur.reused = gs.reused_tokens;
@@ -421,6 +426,60 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         }
     };
 
+    // one round for every request in flight: their windows in one batched forward; finished requests leave
+    auto run_round = [&]() {
+        try {
+            std::vector<Generator *> gens;
+            for (auto & a : active) gens.push_back(a->gen.get());
+            const std::vector<int> rows = Generator::share_rows(gens);
+            std::vector<Engine::BatchWin> wins;
+            for (size_t i = 0; i < active.size(); ++i) {
+                const auto & w = active[i]->gen->window(rows[i]);
+                wins.push_back({active[i]->slot, w.data(), (int) w.size(), w.size() == 1});
+            }
+            const double f0 = now_ms();
+            eng.forward_batch(wins);
+            const double f1 = now_ms();
+            // verify and commit every request, then all their drafts in one drafter pass (BNK_DRAFT_BATCH=0:
+            // each request drafts on its own)
+            static const bool draft_batch = !getenv("BNK_DRAFT_BATCH") || atoi(getenv("BNK_DRAFT_BATCH")) != 0;
+            for (auto & a : active) {
+                a->gen->stats.verify_ms += f1 - f0;
+                a->out = a->gen->finish(!draft_batch);
+            }
+            if (draft_batch) Generator::draft_batch(gens);
+            for (auto & a : active) deliver(*a);
+        } catch (const std::exception & e) {
+            for (auto & a : active) {
+                emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
+                try { eng.select(a->slot); eng.reset(); } catch (...) {}
+            }
+            active.clear();
+        }
+        for (size_t i = 0; i < active.size();) {
+            if (active[i]->stop) {
+                finish_request(*active[i]);
+                active.erase(active.begin() + (long) i);
+            } else {
+                ++i;
+            }
+        }
+    };
+    // While a request's prompt is read, the others keep decoding between its chunks: after each chunk but the last
+    // (the last one leaves the first token's logits in the decode buffers), rounds for share x that chunk's time.
+    static const double read_share = getenv("BNK_READ_SHARE") ? atof(getenv("BNK_READ_SHARE")) : 0.5;
+    double chunk_t0 = 0;
+    between_chunks = [&](size_t done, size_t total) {
+        if (!shown || done >= total || active.empty() || read_share <= 0) {
+            chunk_t0 = now_ms();
+            return;
+        }
+        const double t0 = now_ms(), budget = read_share * (t0 - (chunk_t0 > shown->t0 ? chunk_t0 : shown->t0));
+        while (!active.empty() && now_ms() - t0 < budget) run_round();
+        eng.select(shown->slot);   // back to the prompt being read
+        shown->interleave_ms += now_ms() - t0;
+        chunk_t0 = now_ms();
+    };
     static double last_save = now_ms();
     while (!quit) {
         // 1. admit waiting requests while slots are free (each prompt read in turn)
@@ -468,38 +527,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         }
         if (active.empty()) continue;
         // 2. one round for every request in flight: their windows in one batched forward
-        try {
-            std::vector<Generator *> gens;
-            for (auto & a : active) gens.push_back(a->gen.get());
-            const std::vector<int> rows = Generator::share_rows(gens);
-            std::vector<Engine::BatchWin> wins;
-            for (size_t i = 0; i < active.size(); ++i) {
-                const auto & w = active[i]->gen->window(rows[i]);
-                wins.push_back({active[i]->slot, w.data(), (int) w.size(), w.size() == 1});
-            }
-            const double f0 = now_ms();
-            eng.forward_batch(wins);
-            const double f1 = now_ms();
-            for (auto & a : active) {
-                a->gen->stats.verify_ms += f1 - f0;
-                a->out = a->gen->finish();
-                deliver(*a);
-            }
-        } catch (const std::exception & e) {
-            for (auto & a : active) {
-                emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
-                try { eng.select(a->slot); eng.reset(); } catch (...) {}
-            }
-            active.clear();
-        }
-        for (size_t i = 0; i < active.size();) {
-            if (active[i]->stop) {
-                finish_request(*active[i]);
-                active.erase(active.begin() + (long) i);
-            } else {
-                ++i;
-            }
-        }
+        run_round();
         if (active.empty()) eng.times = StageTimes{};
         telemetry(false);
         // keep the learned routing counts on disk (the process may be killed rather than quit)

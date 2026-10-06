@@ -342,6 +342,7 @@ private:
     bool cache_ready_ = false;
     static constexpr int kCtxStep = 8192, kCtxBaseline = 16384;
     void prefill_staging_ensure(bool full);
+    bool pf_full_ = false;   // this read stages whole layers (checked again before every chunk)
     void prefill_staging_shrink();
     struct {
         DevBuf<float> res, xn, lo, gpre, mixed, inj, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, rlog, w, sg, su,

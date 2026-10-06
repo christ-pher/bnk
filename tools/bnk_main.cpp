@@ -263,10 +263,14 @@ int main(int argc, char ** argv) {
                 fwd_ms += now_ms() - f0;
                 ++forwards;
                 const double f1 = now_ms();
-                for (int i : act)
-                    for (int t : gens[i]->finish()) {
-                        outs[i].push_back(t);
-                        if (t == c.eos_token || (int) outs[i].size() >= max_new) break;
+                static const bool draft_batch = !getenv("BNK_DRAFT_BATCH") || atoi(getenv("BNK_DRAFT_BATCH")) != 0;
+                std::vector<std::vector<int32_t>> got(act.size());
+                for (size_t j = 0; j < act.size(); ++j) got[j] = gens[act[j]]->finish(!draft_batch);
+                if (draft_batch) Generator::draft_batch(ga);
+                for (size_t j = 0; j < act.size(); ++j)
+                    for (int t : got[j]) {
+                        outs[act[j]].push_back(t);
+                        if (t == c.eos_token || (int) outs[act[j]].size() >= max_new) break;
                     }
                 fin_ms += now_ms() - f1;
                 ++rounds;

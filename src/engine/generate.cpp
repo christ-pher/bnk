@@ -140,7 +140,7 @@ std::vector<int> Generator::share_rows(const std::vector<Generator *> & gens, in
     return rows;
 }
 
-std::vector<int32_t> Generator::finish() {
+std::vector<int32_t> Generator::finish(bool draft) {
     use_slot();
     const std::vector<int32_t> & win = win_;
     const int T = (int) win.size();
@@ -208,6 +208,15 @@ std::vector<int32_t> Generator::finish() {
     stats.emitted += (int64_t) out.size();
     pending_ = bonus;
     drafts_.clear();
+    job_.pending = false;
+    if (mtp_ && !draft) {   // left for draft_batch(): the residual rows stay valid until the next forward
+        std::vector<int32_t> nxt(win.begin() + 1, win.begin() + 1 + a);
+        nxt.push_back(bonus);
+        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.cfg().hc_dim();
+        eng_.set_mtp_pending(R + (size_t) a * eng_.cfg().hc_dim(), P + a);
+        job_ = DraftJob{opt_.max_draft > 0, R, nxt, P};
+        return out;
+    }
     if (mtp_) {
         t0 = now_ms();
         // cells P..P+a: each kept row's main residual with the token that follows it
@@ -230,6 +239,60 @@ std::vector<int32_t> Generator::finish() {
         stats.draft_ms += now_ms() - t0;
     }
     return out;
+}
+
+// Every generator's drafter pass in one forward, then further steps together for those still confident. Each
+// generator's drafts are what its own run()/step() sequence would give (the rows are computed independently).
+void Generator::draft_batch(const std::vector<Generator *> & gens) {
+    std::vector<Generator *> g;
+    for (Generator * x : gens)
+        if (x->job_.pending && x->mtp_) g.push_back(x);
+    if (g.empty()) return;
+    MtpLayer * mtp = g[0]->mtp_;
+    const double t0 = now_ms();
+    std::vector<MtpLayer::RunItem> items;
+    for (Generator * x : g)
+        items.push_back({x->slot_, x->job_.R, x->job_.next.data(), (int) x->job_.next.size(), x->job_.cell0});
+    std::vector<int32_t> tok(g.size());
+    std::vector<float> pr(g.size());
+    mtp->run_multi(items, tok.data(), pr.data());
+    const double t1 = now_ms();
+    std::vector<int> cell(g.size()), idx(g.size());   // idx: each generator's item index in the last call
+    for (size_t i = 0; i < g.size(); ++i) {
+        g[i]->drafts_.push_back(tok[i]);
+        cell[i] = g[i]->job_.cell0 + (int) g[i]->job_.next.size();
+        idx[i] = (int) i;
+        g[i]->stats.draft_run_ms += (t1 - t0) / g.size();
+    }
+    while (true) {
+        std::vector<MtpLayer::StepItem> st;
+        std::vector<size_t> who;
+        for (size_t i = 0; i < g.size(); ++i) {
+            Generator * x = g[i];
+            if (idx[i] >= 0 && (int) x->drafts_.size() < x->opt_.max_draft && pr[i] >= x->opt_.min_p) {
+                st.push_back({idx[i], x->drafts_.back(), cell[i]++});
+                who.push_back(i);
+            } else {
+                idx[i] = -1;   // done drafting
+            }
+        }
+        if (st.empty()) break;
+        std::vector<int32_t> t2(st.size());
+        std::vector<float> p2(st.size());
+        mtp->step_multi(st, t2.data(), p2.data());
+        for (size_t j = 0; j < who.size(); ++j) {
+            Generator * x = g[who[j]];
+            x->drafts_.push_back(t2[j]);
+            pr[who[j]] = p2[j];
+            idx[who[j]] = (int) j;
+            x->stats.draft_steps++;
+        }
+    }
+    const double t2 = now_ms();
+    for (Generator * x : g) {
+        x->stats.draft_ms += (t2 - t0) / g.size();
+        x->job_.pending = false;
+    }
 }
 
 }  // namespace bnk

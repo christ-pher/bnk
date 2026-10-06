@@ -1,4 +1,5 @@
 #include <cfloat>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -763,6 +764,67 @@ __global__ void argmax_prob_fin_k(int nb, int32_t * out, float * prob) {
     out[0] = I;
     prob[0] = 1.f / s;
 }
+// T rows at once: partials [row][block] in fixed device memory (the drafter's batched rounds; one stream)
+constexpr int kAmaxRows = 8;
+__device__ float g_amr_m[kAmaxRows][kAmaxBlocks], g_amr_s[kAmaxRows][kAmaxBlocks];
+__device__ int g_amr_i[kAmaxRows][kAmaxBlocks];
+__global__ void argmax_prob_rows_part_k(const float * logits, int n) {
+    __shared__ float bv[32], sh[32];
+    __shared__ int bi[32];
+    const int row = blockIdx.y;
+    const float * x = logits + (int64_t) row * n;
+    float best = -FLT_MAX;
+    int idx = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (x[i] > best) { best = x[i]; idx = i; }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffff, best, o);
+        const int oi = __shfl_xor_sync(0xffffffff, idx, o);
+        if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { bv[wid] = best; bi[wid] = idx; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int q = 1; q < (int) (blockDim.x >> 5); ++q)
+            if (bv[q] > bv[0] || (bv[q] == bv[0] && bi[q] < bi[0])) { bv[0] = bv[q]; bi[0] = bi[q]; }
+    }
+    __syncthreads();
+    const float mx = bv[0];
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) s += __expf(x[i] - mx);
+    s = block_sum(s, sh);
+    if (threadIdx.x == 0) {
+        g_amr_m[row][blockIdx.x] = mx;
+        g_amr_i[row][blockIdx.x] = bi[0];
+        g_amr_s[row][blockIdx.x] = s;
+    }
+}
+__global__ void argmax_prob_rows_fin_k(int nb, int T, int32_t * out, float * prob) {
+    const int row = threadIdx.x;
+    if (row >= T) return;
+    float M = g_amr_m[row][0];
+    int I = g_amr_i[row][0];
+    for (int b = 1; b < nb; ++b)
+        if (g_amr_m[row][b] > M || (g_amr_m[row][b] == M && g_amr_i[row][b] < I)) { M = g_amr_m[row][b]; I = g_amr_i[row][b]; }
+    float s = 0.f;
+    for (int b = 0; b < nb; ++b) s += g_amr_s[row][b] * __expf(g_amr_m[row][b] - M);
+    out[row] = I;
+    prob[row] = 1.f / s;
+}
+void argmax_prob_rows(const float * logits, int n, int T, int32_t * id, float * prob, cudaStream_t s) {
+    if (T < 1 || T > kAmaxRows) throw std::runtime_error("argmax_prob_rows: 1..8 rows");
+    const int nb = std::min(kAmaxBlocks, std::max(1, (n + 2047) / 2048));
+    argmax_prob_rows_part_k<<<dim3(nb, T), 256, 0, s>>>(logits, n);
+    argmax_prob_rows_fin_k<<<1, 32, 0, s>>>(nb, T, id, prob);
+}
+
+__global__ void map_ids_k(int32_t * ids, const int32_t * map, int T) {
+    if ((int) threadIdx.x < T) ids[threadIdx.x] = map[ids[threadIdx.x]];
+}
+void map_ids(int32_t * ids, const int32_t * map, int T, cudaStream_t s) { map_ids_k<<<1, 32, 0, s>>>(ids, map, T); }
+
 void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s) {
     static const bool one = getenv("BNK_ARGMAX_ONE") != nullptr;
     if (one) {
