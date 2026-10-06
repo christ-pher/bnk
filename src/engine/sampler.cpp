@@ -36,13 +36,31 @@ void Sampler::distribution(const float * logits, int n_vocab, const SamplingPara
             if ((l[i] - mx) / temp > -30.f) idx_[w++] = i;
         idx_.resize(w);
     }
-    std::sort(idx_.begin(), idx_.end(), [&](int a, int b) { return l[a] > l[b]; });
-    const float mx = l[idx_[0]];
+    cand_.clear();
+    for (int32_t i : idx_) cand_.emplace_back(i, l[i]);
+    finish(sp, out);
+}
+
+void Sampler::distribution_topk(const int32_t * ids, const float * logits, int k, const SamplingParams & sp,
+                                std::vector<std::pair<int32_t, float>> & out) {
+    out.clear();
+    cand_.clear();
+    for (int i = 0; i < k; ++i) cand_.emplace_back(ids[i], logits[i]);
+    finish(sp, out);
+}
+
+void Sampler::finish(const SamplingParams & sp, std::vector<std::pair<int32_t, float>> & out) {
+    const float temp = std::max(sp.temperature, 1e-4f);
+    // most likely first (ties: lower token id first, so both candidate paths agree)
+    std::sort(cand_.begin(), cand_.end(), [](const auto & a, const auto & b) {
+        return a.second > b.second || (a.second == b.second && a.first < b.first);
+    });
+    const float mx = cand_[0].second;
     double z = 0;
-    out.reserve(idx_.size());
-    for (int32_t i : idx_) {
-        const float p = std::exp((l[i] - mx) / temp);
-        out.emplace_back(i, p);
+    out.reserve(cand_.size());
+    for (const auto & c : cand_) {
+        const float p = std::exp((c.second - mx) / temp);
+        out.emplace_back(c.first, p);
         z += p;
     }
     for (auto & c : out) c.second = (float) (c.second / z);

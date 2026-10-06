@@ -11,7 +11,8 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 2 | ~~Profile the real multi-agent workload~~ | done, see below | | done |
 | 3a | ~~Batching feasibility~~ | done, see below: go | | done |
 | 3b | **Batched decode of several conversations** ("level 3"), in stages: several conversations resident at once -> batched kernels with per-conversation positions (windows past 8 rows) -> scheduler, with the MTP drafting batched too | generation is ~74% of busy time with several agents | 3 agents: +35-40% total throughput with per-conversation drafting, +63-66% with batched drafting (simulated, cache shrink included); each conversation at ~25-30 tok/s while batched | next |
-| 3c | **Drafting cost** (single stream) | between two verify forwards the drafter, commit and sampling take a median 6.9 ms, ~19% of a decode round | up to ~15% faster decoding *(estimate)* even for one agent | |
+| 3c | ~~Sampling on the GPU~~ | done, see below | | done |
+| 3d | **Drafting cost** (single stream) | after 3c, the drafter (MTP layer run + up to 3 steps, each with its own MoE and draft head) is most of the 3.6 ms left between verify forwards, ~10% of a round | a few % *(estimate)* | |
 
 ## Other areas (from the 78K nsys profile, 2026-10-05)
 
@@ -23,6 +24,15 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 * Older open items: HC fusion, int8 KV, GPU sampler, faster `moe_plan`, T=8 GEMV.
 
 ## Done
+
+* **Sampling on the GPU** (2026-10-06): a sampled row cost 3.0 ms of host time (copying 248K logits and an
+  nth_element over all of them for top-k 20), ~2 rows per round. `topk_rows` (radix select on order-preserving
+  keys, ties to the lowest index, checked against a host reference in `tests/test_topk.cu`) picks each row's
+  top-k on the GPU: 0.64 ms for 4 rows, and only k (id, logit) pairs cross PCIe. The host keeps temperature,
+  min-p, top-p and the draft acceptance over the k candidates (same code for both paths). 3 agents at ~45-50K:
+  time between verify forwards 7.15 -> 3.57 ms (median), decode 54.0 -> 61.9 tok/s (+15%). Used when top_k is
+  1..1024 and there are no repetition/presence penalties (those change which tokens are the top k); otherwise,
+  or with `BNK_HOST_SAMPLER=1`, the host path as before. Known slow case: top_k 0 on the host (27 ms per row).
 
 * **Batching feasibility** (2026-10-06, `BNK_ROUTE_LOG` + `tools/batch_sim.py`): 3 agents at ~45-50K tokens,
   3,430 verify forwards logged with every row's routing, residency, per-layer GPU timestamps and CPU expert times.

@@ -578,6 +578,99 @@ __global__ void argmax_k(const float * lg, int n, int32_t * out) {
         out[blockIdx.x] = bi[0];
     }
 }
+// float -> unsigned with the same order (negative values flipped entirely, positive ones get the top bit)
+__device__ __forceinline__ unsigned order_key(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// One block (1024 threads) per row: radix select of the K-th largest key (8 bits at a time from the top), then
+// everything above it and the lowest-index equal ones (each thread scans a contiguous range; block scans place
+// the picks). The same selection as qsa_topk_k, on order-preserving keys.
+__global__ void __launch_bounds__(1024) topk_rows_k(const float * x, int n, int K, int32_t * ids, float * vals) {
+    __shared__ unsigned hist[256];
+    __shared__ unsigned prefix_s, want_s;
+    const int t = blockIdx.x;
+    const float * row = x + (int64_t) t * n;
+    int32_t * oid = ids + (int64_t) t * K;
+    float * ov = vals + (int64_t) t * K;
+    unsigned prefix = 0, mask = 0, want = K;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const unsigned v = order_key(row[i]);
+            if ((v & mask) == prefix) atomicAdd(&hist[(v >> shift) & 255], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {   // the digit whose bin holds the want-th largest (256 bins: serial is fine)
+            unsigned acc = 0;
+            int d = 255;
+            for (; d > 0; --d) {
+                if (acc + hist[d] >= want) break;
+                acc += hist[d];
+            }
+            prefix_s = prefix | ((unsigned) d << shift);
+            want_s = want - acc;
+        }
+        __syncthreads();
+        prefix = prefix_s;
+        want = want_s;
+        mask |= 255u << shift;
+        __syncthreads();
+    }
+    __shared__ int sa[1024], se[1024];
+    __shared__ int wa[32], we[32];
+    const int per = (n + blockDim.x - 1) / blockDim.x;
+    const int b0 = threadIdx.x * per, b1 = min(n, b0 + per);
+    int na = 0, ne = 0;
+    for (int b = b0; b < b1; ++b) {
+        const unsigned v = order_key(row[b]);
+        na += v > prefix;
+        ne += v == prefix;
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    int a = na, e = ne;
+    for (int o = 1; o < 32; o <<= 1) {
+        const int va = __shfl_up_sync(0xffffffff, a, o), ve = __shfl_up_sync(0xffffffff, e, o);
+        if (lane >= o) { a += va; e += ve; }
+    }
+    if (lane == 31) { wa[wid] = a; we[wid] = e; }
+    __syncthreads();
+    if (wid == 0) {
+        const int nw = blockDim.x >> 5;
+        int p = lane < nw ? wa[lane] : 0, q = lane < nw ? we[lane] : 0;
+        for (int o = 1; o < 32; o <<= 1) {
+            const int vp = __shfl_up_sync(0xffffffff, p, o), vq = __shfl_up_sync(0xffffffff, q, o);
+            if (lane >= o) { p += vp; q += vq; }
+        }
+        if (lane < nw) { wa[lane] = p; we[lane] = q; }
+    }
+    __syncthreads();
+    int ia = (wid ? wa[wid - 1] : 0) + a - na, ie = (wid ? we[wid - 1] : 0) + e - ne;
+    for (int b = b0; b < b1; ++b) {
+        const float f = row[b];
+        const unsigned v = order_key(f);
+        if (v > prefix) {
+            const int slot = ia + min(ie, (int) want);
+            oid[slot] = b;
+            ov[slot] = f;
+            ++ia;
+        } else if (v == prefix) {
+            if (ie < (int) want) {
+                oid[ia + ie] = b;
+                ov[ia + ie] = f;
+            }
+            ++ie;
+        }
+    }
+}
+
+void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals, cudaStream_t s) {
+    if (T <= 0 || K <= 0) return;
+    topk_rows_k<<<T, 1024, 0, s>>>(x, n, K, ids, vals);
+}
+
 void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t s) {
     argmax_k<<<T, 1024, 0, s>>>(logits, n, out);
 }

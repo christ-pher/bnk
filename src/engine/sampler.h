@@ -25,6 +25,13 @@ public:
     // The truncated, renormalized distribution of one logits row: (token, prob), most likely first.
     void distribution(const float * logits, int n_vocab, const SamplingParams & sp, const std::vector<int32_t> & recent,
                       std::vector<std::pair<int32_t, float>> & out);
+    // The same from a row's top-k candidates (token, logit) chosen elsewhere (on the GPU): only valid without
+    // penalties (they change which tokens are the top k) and with top_k > 0.
+    void distribution_topk(const int32_t * ids, const float * logits, int k, const SamplingParams & sp,
+                           std::vector<std::pair<int32_t, float>> & out);
+    static bool topk_ok(const SamplingParams & sp, int max_k) {
+        return sp.top_k > 0 && sp.top_k <= max_k && sp.repetition_penalty == 1.f && sp.presence_penalty == 0.f;
+    }
     int32_t draw(const std::vector<std::pair<int32_t, float>> & dist, int32_t exclude = -1);
     float uniform() { return std::uniform_real_distribution<float>(0.f, 1.f)(rng_); }
 
@@ -32,6 +39,9 @@ private:
     std::mt19937_64 rng_{std::random_device{}()};  // per process; a request's "seed" makes it reproducible
     std::vector<float> scratch_;
     std::vector<int32_t> idx_;
+    std::vector<std::pair<int32_t, float>> cand_;
+    // candidates (token, logit) in cand_ -> the distribution (temperature, min-p, top-p)
+    void finish(const SamplingParams & sp, std::vector<std::pair<int32_t, float>> & out);
 };
 
 }  // namespace bnk

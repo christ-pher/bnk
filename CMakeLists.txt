@@ -89,3 +89,8 @@ target_compile_options(bench_qsa_attn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_C
 add_executable(bench_gemv tests/bench_gemv.cu)
 target_link_libraries(bench_gemv PRIVATE bnk_core)
 target_compile_options(bench_gemv PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(bench_sampler tests/bench_sampler.cpp)
+target_link_libraries(bench_sampler PRIVATE bnk_core)
+add_executable(test_topk tests/test_topk.cu)
+target_link_libraries(test_topk PRIVATE bnk_core)
+target_compile_options(test_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)

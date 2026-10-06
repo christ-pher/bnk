@@ -57,6 +57,10 @@ private:
     std::vector<int32_t> drafts_;       // drafts for the next window
     std::vector<int32_t> argmax_buf_;
     std::vector<float> logits_host_;
+    std::vector<int32_t> topk_ids_;
+    std::vector<float> topk_vals_;
+    // row `row`'s distribution: top-k on the GPU when the parameters allow it, else the whole row on the host
+    void row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist);
     std::vector<int32_t> emitted_tail_;
     std::vector<std::pair<int32_t, float>> dist_;
 };

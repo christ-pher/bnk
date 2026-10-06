@@ -1,6 +1,7 @@
 #include "engine/generate.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace bnk {
@@ -11,6 +12,11 @@ void Generator::recent_tail(std::vector<int32_t> & out) const {
     const size_t n = std::min<size_t>(h.size(), 64);
     out.insert(out.end(), h.end() - n, h.end());
     out.insert(out.end(), emitted_tail_.begin(), emitted_tail_.end());
+}
+
+void Generator::row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist) {
+    const int K = sp_.top_k;
+    sampler_.distribution_topk(topk_ids_.data() + (size_t) row * K, topk_vals_.data() + (size_t) row * K, K, sp_, dist);
 }
 
 int32_t Generator::pick(const float * row, std::vector<std::pair<int32_t, float>> & dist) {
@@ -77,8 +83,16 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     if (sp_.greedy()) {
         b = eng_.argmax(eng_.last_T - 1);
     } else {
-        logits_host_ = eng_.logits_host(eng_.last_T - 1);
-        b = pick(logits_host_.data(), dist_);
+        if (Sampler::topk_ok(sp_, Engine::kTopkMax)) {
+            topk_ids_.resize(sp_.top_k);
+            topk_vals_.resize(sp_.top_k);
+            eng_.topk_rows_host(eng_.last_T - 1, 1, sp_.top_k, topk_ids_.data(), topk_vals_.data());
+            row_distribution(0, dist_);
+            b = sampler_.draw(dist_);
+        } else {
+            logits_host_ = eng_.logits_host(eng_.last_T - 1);
+            b = pick(logits_host_.data(), dist_);
+        }
     }
     pending_ = b;
     emitted_tail_.push_back(b);
@@ -108,13 +122,25 @@ std::vector<int32_t> Generator::next() {
         stats.verify_ms += now_ms() - t0;
         t0 = now_ms();
         const int V = eng_.cfg().n_vocab;
-        logits_host_.resize((size_t) T * V);
-        eng_.logits_rows_host(T, logits_host_.data());
+        // the top-k candidates of every row in one GPU pass (K values per row cross PCIe, not the vocabulary)
+        const bool gpu = Sampler::topk_ok(sp_, Engine::kTopkMax) && !getenv("BNK_HOST_SAMPLER");
+        if (gpu) {
+            topk_ids_.resize((size_t) T * sp_.top_k);
+            topk_vals_.resize((size_t) T * sp_.top_k);
+            eng_.topk_rows_host(0, T, sp_.top_k, topk_ids_.data(), topk_vals_.data());
+        } else {
+            logits_host_.resize((size_t) T * V);
+            eng_.logits_rows_host(T, logits_host_.data());
+        }
         bonus = -1;
         for (int i = 0; i < T; ++i) {
-            std::vector<int32_t> recent;
-            recent_tail(recent);
-            sampler_.distribution(logits_host_.data() + (size_t) i * V, V, sp_, recent, dist_);
+            if (gpu) {
+                row_distribution(i, dist_);
+            } else {
+                std::vector<int32_t> recent;
+                recent_tail(recent);
+                sampler_.distribution(logits_host_.data() + (size_t) i * V, V, sp_, recent, dist_);
+            }
             if (i == T - 1) { bonus = sampler_.draw(dist_); break; }
             const int32_t d = win[i + 1];
             float pd = 0.f;

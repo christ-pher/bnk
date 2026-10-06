@@ -829,6 +829,19 @@ void Engine::argmax_all(int T, int32_t * out) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
+void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals) {
+    if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
+    if (!topk_ids_.p) {
+        topk_ids_.alloc((size_t) kMaxWindow * kTopkMax);
+        topk_vals_.alloc((size_t) kMaxWindow * kTopkMax);
+    }
+    const int V = model_.cfg.n_vocab;
+    topk_rows(logits_.p + (size_t) row0 * V, T, V, K, topk_ids_, topk_vals_, st_);
+    CUDA_CHECK(cudaMemcpyAsync(ids, topk_ids_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(vals, topk_vals_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
 void Engine::logits_rows_host(int T, float * out) {
     CUDA_CHECK(cudaMemcpy(out, logits_.p, (size_t) T * model_.cfg.n_vocab * 4, cudaMemcpyDeviceToHost));
 }

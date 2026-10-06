@@ -73,6 +73,9 @@ void ple_conv_add(float * res, const float * gated, const float * hist_new, cons
 
 // ---- head
 void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t s);
+// The K largest of each of T rows of n floats (K <= 1024): ids[t][K] and their values vals[t][K], unordered; ties
+// at the K-th value go to the lowest indices, so the set is deterministic.
+void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals, cudaStream_t s);
 // one row: argmax and its softmax probability
 void argmax_prob(const float * logits, int n, int32_t * id, float * prob, cudaStream_t s);
 // R[t][s][:] += e[t][:]

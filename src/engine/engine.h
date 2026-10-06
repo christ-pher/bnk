@@ -129,6 +129,9 @@ public:
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_.threads(); }
     void logits_rows_host(int T, float * out);   // rows 0..T-1 of the last window's logits
+    // the K largest logits of rows row0..row0+T-1 of the last window, selected on the GPU: ids/vals [T][K] (host)
+    static constexpr int kTopkMax = 1024;
+    void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals);
     void set_mtp_pending(const float * R_row_dev, int cell);
     const Config & cfg() const { return model_.cfg; }
     const Model & model() const { return model_; }
@@ -232,7 +235,8 @@ private:
     DevBuf<float> conv_out_, z_, alpha_, beta_, gdn_o_, gdn_n_;
     DevBuf<float> qfull_, k_, v_, q_, attn_o_, attn_scratch_;
     DevBuf<float> rlogits_, rw_, sg_, su_, sh_, sgate_, shared_out_, moe_out_, logits_;
-    DevBuf<int32_t> rids_, argmax_dev_;
+    DevBuf<int32_t> rids_, argmax_dev_, topk_ids_;
+    DevBuf<float> topk_vals_;
     DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_, ple_hist_;
     DevBuf<int8_t> actq_, mixq_;
     DevBuf<float> actd_, mixd_;
