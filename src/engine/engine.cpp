@@ -335,7 +335,9 @@ void Engine::rebalance() {
         prefill_layout(pf_small_);
         prefill_staging_shrink();
     }
-    const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kCtxStep) / kCtxStep * kCtxStep));
+    // a window's worth past the position, as ensure_ctx keeps: the first drafts (Generator::start) write the
+    // drafter's K/V at pos, pos + 1 ... before any forward maps more (one cell of headroom wrote past the mapping)
+    const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kMaxWindow + kCtxStep - 1) / kCtxStep * kCtxStep));
     if (keep < cur_->ctx_mapped) map_ctx(keep);
     const size_t slack = 64ull << 20;
     budget_.make_room(0);   // re-syncs with the driver; VRAM taken outside the budget since then leaves the cache

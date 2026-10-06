@@ -101,6 +101,9 @@ void ElasticBuf::reserve(size_t max_bytes, VramBudget * budget, const char * nam
     reclaim_on_oom_ = reclaim_on_oom;
     reserved_ = vmem_round(max_bytes ? max_bytes : 1);
     cu_check(cuMemAddressReserve(&va_, reserved_, 0, 0, 0), "reserve");
+    if (getenv("BNK_VMEM_LOG"))   // to place a faulting address (an Xid 31 in the kernel log) in a buffer
+        fprintf(stderr, "bnk: reserved %s at 0x%llx-0x%llx\n", name, (unsigned long long) va_,
+                (unsigned long long) (va_ + reserved_));
 }
 
 void ElasticBuf::ensure(size_t bytes) {
