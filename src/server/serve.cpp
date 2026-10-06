@@ -46,6 +46,20 @@ void emit(const std::string & line) {
     fflush(stdout);
 }
 
+// After a request failed: when the GPU context is gone (an illegal access or another sticky error: every CUDA
+// call fails from then on), the process exits, so the server restarts the engine rather than fail every request
+// that follows. An ordinary error is reported once and cleared; a sticky one is returned again.
+void exit_if_gpu_lost() {
+    if (cudaDeviceSynchronize() == cudaSuccess) return;
+    cudaGetLastError();
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) return;
+    fprintf(stderr, "bnk: the GPU context is lost (%s): exiting so the engine can be restarted\n", cudaGetErrorString(e));
+    fflush(stderr);
+    fflush(stdout);
+    _exit(3);
+}
+
 struct Totals {
     int64_t requests = 0, gen_tokens = 0, prompt_tokens = 0, prefill_tokens = 0, reused = 0;
     int64_t rounds = 0, drafted = 0, accepted = 0;
@@ -419,6 +433,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         } catch (const std::exception & e) {
             shown = nullptr;
             emit(JsonOut().kv("type", "error").kv("id", id).kv("message", e.what()).done());
+            exit_if_gpu_lost();
             if (a->gen) {   // the slot may be half-processed: start it clean next time
                 try { eng.select(a->slot); eng.reset(); } catch (...) {}
             }
@@ -450,8 +465,10 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             if (draft_batch) Generator::draft_batch(gens);
             for (auto & a : active) deliver(*a);
         } catch (const std::exception & e) {
-            for (auto & a : active) {
+            for (auto & a : active)
                 emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
+            exit_if_gpu_lost();
+            for (auto & a : active) {
                 try { eng.select(a->slot); eng.reset(); } catch (...) {}
             }
             active.clear();

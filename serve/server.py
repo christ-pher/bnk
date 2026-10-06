@@ -381,7 +381,8 @@ class Handler(BaseHTTPRequestHandler):
             w = q.get("window", "life")
             return self._json(200, S.telemetry.layer_window(None if w == "life" else float(w)))
         if path == "/health":
-            return self._json(200 if S.engine.alive() else 503, {"status": "ok" if S.engine.alive() else "down"})
+            up = S.engine.alive() and S.engine.ready.is_set()   # not while the engine is (re)loading
+            return self._json(200 if up else 503, {"status": "ok" if up else "down"})
         if path.startswith("/v1/") or path.startswith("/api/"):
             return self._json(404, {"error": {"message": "not found"}})
         # the dashboard: files of the build, and index.html for anything else (client-side routes)
@@ -710,6 +711,12 @@ def main():
                 print(f"  {line}", flush=True)
             publish(line)
         S.engine.on_log = on_log
+    def on_restart(code):
+        print(f"bnk: the engine exited (code {code}); restarting it - parked conversations are gone, their next "
+              f"turns read their prompts again", flush=True)
+        with S.convs.lock:
+            S.convs.on_gpu.clear()
+    S.engine.on_restart = on_restart
     S.engine.start()
     S.convs.slots = S.engine.slots()
     info = S.engine.info

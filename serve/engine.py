@@ -34,36 +34,59 @@ class Engine:
         self.env = env
         self.on_telemetry = on_telemetry   # called with every telemetry snapshot
         self.on_log = on_log               # called with every engine log line
+        self.on_restart = None             # called with the exit code when the engine died and is restarted
         self.last_telemetry: dict = {}
+        self.stopping = False
+        self.restarts = 0
 
     def start(self, timeout: float = 900):
         log = open(self.log_path, "ab") if self.log_path else subprocess.DEVNULL
         env = dict(os.environ)
         if self.env:
             env.update(self.env)
-        self.proc = subprocess.Popen([self.exe, "serve", *self.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, bufsize=0, env=env)
+        # each process has its own readiness: the readers of one that died cannot mark a new one ready
+        ready = self.ready = threading.Event()
+        proc = self.proc = subprocess.Popen([self.exe, "serve", *self.args], stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=env)
         self.started_at = time.time()
-        threading.Thread(target=self._read_out, daemon=True).start()
-        threading.Thread(target=self._read_err, args=(log,), daemon=True).start()
-        if not self.ready.wait(timeout):
+        threading.Thread(target=self._read_out, args=(proc, ready), daemon=True).start()
+        threading.Thread(target=self._read_err, args=(proc, ready, log), daemon=True).start()
+        if not ready.wait(timeout):
             raise EngineError("the engine did not become ready")
-        if self.proc.poll() is not None:
+        if proc.poll() is not None:
             raise EngineError("the engine exited during startup:\n" + "\n".join(list(self.log_tail)[-20:]))
 
-    def _read_err(self, log):
-        for line in iter(self.proc.stderr.readline, b""):
+    def _restart(self, proc):
+        """The engine died while serving (e.g. it exits when the GPU context is lost): start a new one. Parked
+        conversations are gone, so their next turns read their prompts again."""
+        code = proc.wait()
+        while not self.stopping:
+            self.restarts += 1
+            if self.on_restart:
+                self.on_restart(code)
+            try:
+                self.start()
+                return
+            except Exception as e:   # e.g. the GPU is not usable yet: try again shortly
+                self.log_tail.append(f"bnk: engine restart failed: {e}")
+                time.sleep(10)
+
+    def _read_err(self, proc, ready, log):
+        for line in iter(proc.stderr.readline, b""):
             s = line.decode("utf-8", errors="replace").rstrip()
             self.log_tail.append(s)
+            if "the GPU context is lost" in s:   # exiting: no new requests to it
+                ready.clear()
             if self.on_log:
                 self.on_log(s)
             if log is not subprocess.DEVNULL:
                 log.write(line)
                 log.flush()
-        self.ready.set()
+        ready.set()
 
-    def _read_out(self):
-        for line in iter(self.proc.stdout.readline, b""):
+    def _read_out(self, proc, ready):
+        served = False   # this process became ready
+        for line in iter(proc.stdout.readline, b""):
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
@@ -71,7 +94,8 @@ class Engine:
             t = msg.get("type")
             if t == "ready":
                 self.info = msg
-                self.ready.set()
+                served = True
+                ready.set()
                 continue
             if t == "telemetry":
                 self.last_telemetry = msg
@@ -83,16 +107,30 @@ class Engine:
                 q = self.queues.get(key)
             if q is not None:
                 q.put(msg)
-        self.ready.set()
+        ready.set()
         with self.qlock:
             for q in self.queues.values():
-                q.put({"type": "error", "message": "the engine process exited"})
+                q.put({"type": "error", "message": "the engine process exited (restarting it)", "exited": True})
+        if served and not self.stopping:   # died after startup: bring up a new one
+            threading.Thread(target=self._restart, args=(proc,), daemon=True).start()
 
     def _send(self, obj):
         if self.proc is None or self.proc.poll() is not None:
             raise EngineError("the engine is not running")
-        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+            self.proc.stdin.flush()
+        except OSError as e:   # it is exiting (a broken pipe would read as a dropped client upstream)
+            raise EngineError(f"the engine is not running ({e})") from None
+
+    def _wait_engine(self, dead=None, timeout: float = 900) -> bool:
+        """Waits for a running, ready engine (not `dead`, a process that failed): while one is restarted."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.proc is not dead and self.alive() and self.ready.is_set():
+                return True
+            time.sleep(0.5)
+        return False
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -125,22 +163,39 @@ class Engine:
 
     def generate(self, prompt: list[int], params: dict, on_start=None):
         """Yields engine events for one request: prefill, tokens..., done (or error). `on_start(rid)` is called
-        when the request gets the engine (after waiting its turn)."""
-        rid = uuid.uuid4().hex[:12]
-        q = queue.Queue()
-        with self.qlock:
-            self.queues[rid] = q
+        when the request gets the engine (after waiting its turn). A request the engine took but had not started
+        when it died (it was exiting) goes to the engine that replaces it."""
         self._acquire()
+        rid, used = None, None   # used: the process the first attempt went to
         try:
-            if on_start:
-                on_start(rid)
-            self._send({"op": "generate", "id": rid, "prompt": prompt, **params})
-            while True:
-                msg = q.get()
-                msg["_rid"] = rid
-                yield msg
-                if msg.get("type") in ("done", "error"):
-                    break
+            for attempt in range(2):
+                rid = uuid.uuid4().hex[:12]   # a new id per attempt: a dead process's reader posts to the ids it knew
+                q = queue.Queue()
+                with self.qlock:
+                    self.queues[rid] = q
+                if not self._wait_engine(dead=used):   # while one is restarted
+                    raise EngineError("the engine is not running")
+                used = self.proc
+                if on_start:
+                    on_start(rid)
+                try:
+                    self._send({"op": "generate", "id": rid, "prompt": prompt, **params})
+                except EngineError:
+                    if attempt:
+                        raise
+                    continue
+                started = False
+                while True:
+                    msg = q.get()
+                    if msg.get("exited") and not started and not attempt:
+                        break   # retry
+                    started = True
+                    msg["_rid"] = rid
+                    yield msg
+                    if msg.get("type") in ("done", "error"):
+                        return
+                with self.qlock:
+                    self.queues.pop(rid, None)
         finally:
             self._release()
             with self.qlock:
@@ -153,6 +208,7 @@ class Engine:
             pass
 
     def stop(self):
+        self.stopping = True
         if self.alive():
             try:
                 self._send({"op": "quit"})
