@@ -11,8 +11,8 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 2 | ~~Profile the real multi-agent workload~~ | done, see below | | done |
 | 3a | ~~Batching feasibility~~ | done, see below: go | | done |
 | 3b | ~~Batched decode of several conversations~~ | done, see below | | done |
-| 4 | **Decode while a prompt is read**: run the other conversations' rounds between prefill chunks | an admitted turn's read (1-3 s, a first turn 40 s+) pauses every other agent's decoding | smoother multi-agent latency; part of the gap between the server (+14-17%) and the engine-level batch (+24%) | next |
-| 5 | **Batched drafting**: the drafter for every conversation of a round in one pass | per-conversation drafting is ~8 ms of a ~75 ms batched round | +5-10% batched *(estimate)* | |
+| 4 | ~~Decode while a prompt is read~~ | done, see below | | done |
+| 5 | ~~Batched drafting~~ | done, see below | | done |
 | 6 | **More rows per batched forward** (kMaxWindow 8 -> 16: GEMV / MoE kernels) | with 3 conversations each gets ~2.7 rows, so fewer drafts are verified | more tokens per round *(estimate)* | |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
@@ -24,9 +24,26 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
   s884), fusing the small ones.
 * **Decode is expert-miss bound**: CPU experts run at DRAM bandwidth (~50 GB/s) and the GPU waits on them ~29%
   of the time; a PCIe expert prefetch was measured slower (-21%).
-* Older open items: HC fusion, int8 KV, GPU sampler, faster `moe_plan`, T=8 GEMV.
+* Older open items: HC fusion, int8 KV, faster `moe_plan`, T=8 GEMV (see 6).
+* **First-turn reads dominate the multi-agent benchmark** (121 s of ~275 s in the 3-agent run): the prompt path
+  (GEMMs, expert streaming) is now the biggest lever there.
 
 ## Done
+
+* **Decode while a prompt is read** (2026-10-06, v0.1.2): `bnk serve` runs the other requests' rounds between a
+  read's prompt chunks, for `BNK_READ_SHARE` (0.5) of each chunk's time, never after the last chunk (whose logits
+  seed the first token). An agent decoding while another agent's 42K-token first turn is read stalled 36.1 s at
+  most; now 6.7 s (346 token deliveries during the read), the read itself 36 -> 52 s wall. Closed-loop 3-agent
+  throughput unchanged (the GPU is busy either way). Found on the way: the prompt path sized its expert staging
+  from the cache's resident count, which misses swaps in flight (old expert unmapped, new one not yet mapped);
+  with batching's every-step adaptation that crashed reads ("expert staging too small"). Now sized from the exact
+  unmapped count, before every chunk. `tools/serve_check.py`: concurrent serving with interleaved reads == alone.
+* **Batched drafting** (2026-10-06, v0.1.2): every conversation's drafter pass of a round in one forward
+  (`MtpLayer::run_multi/step_multi`: per-slot drafter KV and sparse attention, shared projections / MoE / head,
+  `argmax_prob_rows`). Drafts identical to per-conversation drafting (same forwards, same tokens on the exact
+  tier). 3 conversations decoding together: drafting + verify + commit per round 7.99 -> 6.04 ms, 80.8/85.7 ->
+  86.9/90.9 tok/s (+6-7%); the closed-loop server benchmark shows no difference beyond noise (rounds there often
+  batch fewer conversations).
 
 * **Batched decoding of several conversations** (2026-10-06): the engine holds `--slots` conversations (default 3
   in the server) with their own KV, DeltaNet / PLE state, snapshots and drafter KV; one forward runs every active

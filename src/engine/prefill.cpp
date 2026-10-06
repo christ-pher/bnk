@@ -127,7 +127,7 @@ void Engine::prefill_staging_ensure(bool full) {
     for (int round = 0; round < 4; ++round) {
         size_t need = 0;
         for (int il = 0; il < c.n_layer; ++il)
-            need = std::max(need, (size_t) (c.n_expert - cache_.resident(il)) * store_.blob_bytes(il));
+            need = std::max(need, (size_t) cache_.unmapped(il) * store_.blob_bytes(il));
         if (!full) need = std::min(need, small);
         if (need <= pf_.stage_bytes && pf_stage_b_[0].mapped() >= need) break;
         for (int i = 0; i < 2; ++i) pf_stage_b_[i].ensure(need);

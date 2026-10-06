@@ -37,6 +37,13 @@ public:
     size_t grow(size_t avail, cudaStream_t s);
     // experts of layer il that are resident (slots may also be empty after a grow, until filled)
     int resident(int il) const { return resident_l_[il]; }
+    // experts of layer il without a mapped slot right now (also those whose swap into a slot is still in flight:
+    // the old expert is unmapped at once, the new one only when its copy finishes)
+    int unmapped(int il) const {
+        int n = 0;
+        for (int e = 0; e < n_expert_; ++e) n += slot_of_host_[(size_t) il * n_expert_ + e] < 0;
+        return n;
+    }
     // VRAM bytes of one expert of layer il (R-layout rows)
     static size_t slot_bytes(const Model & m, int il);
     MoeLayerDesc desc(int il) const;

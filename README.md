@@ -52,6 +52,22 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### What v0.1.2 changed
+
+| | v0.1.1 | v0.1.2 |
+|---|---|---|
+| An agent decoding while another agent's 42K-token first turn is read: its longest stall | 36.1 s | **6.7 s** |
+| 3 conversations decoding together, drafting overhead per round | 7.99 ms | **6.04 ms** |
+| ... their total decode speed (`bnk multi`, ~32-42K each, two runs each) | 80.8 / 85.7 tok/s | **86.9 / 90.9 tok/s** (+6-7%) |
+| 3-agent server benchmark (3 turns of up to 1,500 tokens), overall | 34.2-35.6 tok/s | 33.1-35.5 tok/s (unchanged within noise) |
+
+The first row is decoding between another request's prompt chunks; the reading request takes longer in exchange
+(36 s of its own reading became 52 s of wall time: `BNK_READ_SHARE` sets the split). The next two rows are batched
+drafting, which pays while several conversations decode together; in the closed-loop server benchmark the agents
+are often at different stages, and the difference stays inside the run-to-run noise. v0.1.2 also fixes a crash
+("expert staging too small") when a prompt was read while the expert cache had swaps in flight, which batched
+decoding made likely.
+
 ### What v0.1.1 changed
 
 | | Before | v0.1.1 |
@@ -163,7 +179,10 @@ Exactness checks that every change has to pass (static CPU expert tier, greedy):
 * speculative decoding emits exactly the tokens of plain greedy decoding;
 * a conversation parked in host RAM and brought back emits exactly the tokens it would have without the
   interruption (`tools/park_check.py`, also with several slots);
-* each conversation decoded in a batch with others emits exactly the tokens it emits alone (`bnk multi`).
+* each conversation decoded in a batch with others emits exactly the tokens it emits alone (`bnk multi`), and
+  batched drafting proposes exactly the drafts each conversation's own drafter would;
+* requests served concurrently, with prompts read between other requests' decoding rounds, emit exactly what
+  they emit alone (`tools/serve_check.py`).
 
 A needle hidden at 40% depth in a 228K-token prompt is retrieved verbatim.
 
@@ -199,7 +218,8 @@ loads. GEMVs use dp4a, with activation sums that fold in the zero offsets; small
 **Speculative decoding.** The model's multi-token-prediction layer drafts up to four tokens per step, stopping
 early when its confidence drops below a cutoff. The main model then verifies the whole window in one pass, and
 the DeltaNet recurrent state is replayed for the accepted prefix, on a second stream while the drafter prepares
-the next window. Sampled requests use exact rejection sampling, so the output distribution is the model's own.
+the next window. With several conversations decoding together, every conversation's drafter pass runs in one
+forward (each on its own drafter KV, the projections, MoE and head shared). Sampled requests use exact rejection sampling, so the output distribution is the model's own.
 The drafter scores only a ~145K-token subset of the vocabulary (Latin scripts, code, symbols, emoji) and, like the
 main model, attends sparsely through its own indexer.
 
@@ -410,6 +430,8 @@ expert cache starts warm after the first session.
 |---|---|
 | `BNK_SLOTS=3` | conversations decoded at once |
 | `BNK_PARK_GIB=24`, `BNK_SLICE_S=10` | host RAM for parked conversations, and the time slice when requests wait for a slot; `0` turns either off |
+| `BNK_READ_SHARE=0.5` | while a prompt is read, the other requests decode for this share of each chunk's time (`0`: reads block them) |
+| `BNK_DRAFT_BATCH=0` | draft for each conversation on its own instead of in one batched pass |
 | `BNK_LOG_LEVEL=quiet\|info\|debug` | terminal output: `info` prints a line per request and a live status line |
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
@@ -455,8 +477,9 @@ over server-sent events (`GET /api/stream`); `GET /api/stats` returns a snapshot
 
 **Several agents.** Up to `--slots` requests (3) run at once, decoded together; more wait in line and take turns
 by time slice. Every conversation keeps its state between turns, on the GPU while it fits a slot and parked in
-host RAM otherwise, so a follow-up turn reads only its new tokens. Reading a prompt pauses the other
-conversations' decoding while it runs (1-3 s for a typical follow-up turn, longer for a first turn).
+host RAM otherwise, so a follow-up turn reads only its new tokens. While one request's prompt is read, the others
+keep decoding between its chunks (half of each chunk's time by default, `BNK_READ_SHARE`): a long first turn no
+longer freezes every other agent.
 
 **Engine CLI** - `build/bnk` also runs on its own:
 
@@ -473,7 +496,8 @@ build/bnk pdump --model M --tokens-file ids.csv --ref out.bin                 # 
 `BNK_ROUTE_LOG=file` records every decode step's routing and timing for `tools/batch_sim.py`.
 
 **Tools and tests:** `tools/multi_agent_bench.py` and `tools/agent_bench.py` (agent workloads against a running
-server), `tools/park_check.py` (parking exactness), `tools/llama_ref.cpp` (llama.cpp reference dumps for `check`),
+server), `tools/park_check.py` (parking exactness), `tools/serve_check.py` (concurrent serving exactness, reads
+interleaved with decoding), `tools/llama_ref.cpp` (llama.cpp reference dumps for `check`),
 `tests/` (kernel tests: `test_dequant`, `test_cpu_kernels`, `test_topk`; benchmarks: `bench_qsa_attn`,
 `bench_sampler`, `bench_gemv`, `bench_cpu_experts`).
 
@@ -514,7 +538,8 @@ third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 ## Limitations
 
 * Batched decoding shares at most 8 rows per step between the conversations, so each one verifies fewer drafts
-  than alone (3 conversations: ~2.7 rows each), and reading one conversation's prompt pauses the others.
+  than alone (3 conversations: ~2.7 rows each).
+* A prompt being read shares the GPU with the others' decoding, so it takes longer while others are active.
 * Decoding slows as the context fills: the KV cache takes VRAM from the expert cache (up to 7 GiB per conversation
   at 256K).
 * The thinking-loop guard catches exact repetition, not paraphrased loops.
