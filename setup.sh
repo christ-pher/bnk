@@ -165,14 +165,16 @@ NODE_DIR="$(ls -d "$HERE"/.venv/lib/python3*/site-packages/nodejs_wheel 2>/dev/n
 if command -v npm >/dev/null; then NPM=(npm)
 else NPM=("$NODE_DIR/bin/node" "$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js"); export PATH="$NODE_DIR/bin:$PATH"; fi
 (cd "$HERE/serve/web" && "${NPM[@]}" ci --silent && "${NPM[@]}" run build --silent) > /dev/null 2>&1 \
-  || warn "the dashboard did not build (the APIs still work; run.sh retries on start)"
+  || warn "the dashboard did not build (the APIs still work; run ./setup.sh again to retry)"
 [[ -f "$HERE/serve/web/dist/index.html" ]] && ok "serve/web/dist"
 
 # ------------------------------------------------------------------------------------------------ 6. models, MTP
 bold "6/6  Models and the MTP draft layer"
 ENVF="$HERE/bnk.env"
-if [[ -z "$MODELS" ]]; then   # the folder saved before, else ~/models
+if [[ -z "$MODELS" ]]; then   # the folder saved before, else run.sh's built-in one if it holds models, else ~/models
   MODELS="$(sed -n 's/^BNK_MODELS="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$ENVF" 2>/dev/null | tail -1)"
+  RUN_DEFAULT="$(sed -n 's/^MODELS="\${BNK_MODELS:-\(.*\)}"$/\1/p' "$HERE/run.sh" | head -1)"
+  [[ -z "$MODELS" && -n "$RUN_DEFAULT" ]] && ls "$RUN_DEFAULT"/*/*.gguf >/dev/null 2>&1 && MODELS="$RUN_DEFAULT"
   [[ -z "$MODELS" ]] && MODELS="$HOME/models"
 fi
 mkdir -p "$MODELS"
