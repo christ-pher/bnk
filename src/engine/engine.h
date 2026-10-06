@@ -59,6 +59,7 @@ struct EngineOptions {
     // instead of its prompt being read again. 0 = off (one conversation at a time, as before).
     double park_gib = 0;
     int park_min = 2048;             // conversations shorter than this are not worth parking
+    int slots = 1;                   // conversations held on the GPU at once (batched decoding when > 1)
 };
 
 struct StageTimes {
@@ -106,14 +107,18 @@ public:
     struct PrefillStats { double ms = 0, copy_wait_ms = 0; int64_t tokens = 0, chunks = 0; } pstats;
     // After prefill with an MTP layer: the last prompt row's residual and cell, which pair with the first
     // generated token (Generator drafts from them).
-    const float * mtp_pending_R() const { return mtp_R_; }
-    int mtp_pending_cell() const { return mtp_cell_; }
+    const float * mtp_pending_R() const { return cur_->mtp_R; }
+    int mtp_pending_cell() const { return cur_->mtp_cell; }
     int argmax(int t);
     void argmax_all(int T, int32_t * out);  // argmax of every row of the last window
     std::vector<float> logits_host(int t);
     const float * logits_dev() const { return logits_; }
 
-    int pos() const { return (int) history_.size(); }
+    int pos() const { return (int) cur_->history.size(); }
+    // conversation slots (EngineOptions::slots): select() makes slot i the current one
+    int slots() const { return (int) seqs_.size(); }
+    int current_slot() const;
+    void select(int slot);
     // Snapshots of the per-position-independent state (DeltaNet recurrences, conv and n-gram histories, the
     // drafter's last residual) so a later prompt that shares only part of the history can resume from the last
     // snapshot inside the shared part instead of starting over. The KV cache needs none: it is per position.
@@ -128,7 +133,7 @@ public:
     void drop_parked_all() { while (!parked_.empty()) drop_parked(parked_.size() - 1); }
     size_t parked_bytes() const;
     struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; } park_stats;
-    const std::vector<int32_t> & history() const { return history_; }
+    const std::vector<int32_t> & history() const { return cur_->history; }
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_.threads(); }
     void logits_rows_host(int T, float * out);   // rows 0..T-1 of the last window's logits
@@ -176,8 +181,6 @@ private:
     void pf_stage_layer(int il);
     void pf_stage_list(int il, const std::vector<int> & experts);
     void mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0);
-    float * mtp_R_ = nullptr;
-    int mtp_cell_ = -1;
 
     Model model_;
     ExpertStore store_;
@@ -189,11 +192,36 @@ private:
     cudaStream_t st_commit_ = nullptr;
     cudaEvent_t ev_verified_ = nullptr, ev_committed_ = nullptr;
     bool commit_inflight_ = false;
-    std::vector<int32_t> history_;
     struct Checkpoint { int pos = -1, mtp_cell = -1; uint64_t age = 0; float * host = nullptr; };
-    std::vector<Checkpoint> ckpts_;
     uint64_t ckpt_age_ = 0;
     static constexpr int kMaxCheckpoints = 6;
+
+    // One conversation's state on the GPU: its history, the KV cache and indexer keys of every attention layer,
+    // the DeltaNet recurrences and conv histories, the PLE n-gram history, its snapshots, and the CUDA graphs that
+    // bake its buffers' addresses. The engine holds opt.slots of them; cur_ is the one the single-sequence API
+    // (prefill, forward, commit, checkpoint, park ...) works on.
+    struct Seq {
+        std::vector<int32_t> history;
+        std::vector<Checkpoint> ckpts;
+        float * mtp_R = nullptr;
+        int mtp_cell = -1;
+        int pending_T = 0;   // rows of the last verify window not yet committed
+        std::vector<DevBuf<float>> conv_buf;    // [(K-1)+W][C] per GDN layer
+        DevBuf<float *> conv_ptrs;              // the GDN layers' conv_buf pointers (one shift kernel at commit)
+        std::vector<DevBuf<float>> ssm_state;   // [nv][S][S]
+        std::vector<DevBuf<half>> kc, vc;       // [max_ctx][Hkv][D] per attention layer
+        std::vector<DevBuf<half>> kraw;         // QSA raw indexer keys and pooled block keys per attention layer
+        std::vector<DevBuf<float>> pooled;
+        std::vector<ElasticBuf> kv_k, kv_v, kv_raw, kv_pool;
+        int ctx_mapped = 0;   // cells of context whose KV is mapped
+        DevBuf<float> ple_hist;
+        cudaGraphExec_t graphs[2][kMaxWindow + 1] = {};   // [commit_all][T]
+        cudaGraphExec_t commit_graphs[kMaxWindow + 1] = {};
+        bool used = false;   // ever held a conversation (an unused slot maps no context)
+    };
+    std::vector<std::unique_ptr<Seq>> seqs_;
+    Seq * cur_ = nullptr;
+    void alloc_seq(Seq & q);
     template <typename F> void each_state(F && f);   // f(device ptr, floats) over every saved buffer
     size_t state_floats();
     // f(device ptr, bytes) over every buffer holding per-position state for cells [0, cells) (KV, indexer keys
@@ -225,10 +253,7 @@ private:
     void drop_parked(size_t i);
     uint32_t seq_ = 0;
     int64_t fwd_count_ = 0;
-    cudaGraphExec_t graphs_[2][kMaxWindow + 1] = {};   // [commit_all][T]
-    cudaGraphExec_t commit_graphs_[kMaxWindow + 1] = {};
     bool commit_all_ = true;
-    int pending_T_ = 0;  // rows of the last verify window not yet committed
 
     // window inputs (pinned host) and their device copy
     WinParams * h_par_ = nullptr;
@@ -243,7 +268,7 @@ private:
     DevBuf<float> rlogits_, rw_, sg_, su_, sh_, sgate_, shared_out_, moe_out_, logits_;
     DevBuf<int32_t> rids_, argmax_dev_, topk_ids_;
     DevBuf<float> topk_vals_;
-    DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_, ple_hist_;
+    DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_;
     DevBuf<int8_t> actq_, mixq_;
     DevBuf<float> actd_, mixd_;
     DevBuf<int16_t> acts_, mixs_;
@@ -260,15 +285,9 @@ private:
     MoeMsg * msg(int il) const { return (MoeMsg *) (mail_ + (size_t) il * mail_stride_); }
     std::vector<ExpertTask> tasks_;
     // per-layer recurrent state
-    std::vector<DevBuf<float>> conv_buf_;   // [(K-1)+W][C] per GDN layer
-    DevBuf<float *> conv_ptrs_;             // the GDN layers' conv_buf_ pointers (one shift kernel at commit)
     int n_gdn_ = 0;
-    std::vector<DevBuf<float>> ssm_state_;  // [nv][S][S]
     std::vector<DevBuf<float>> gdn_co_, gdn_g_, gdn_b_;  // per GDN layer: the window's conv outputs, decay, beta
-    std::vector<DevBuf<half>> kc_, vc_;     // [max_ctx][Hkv][D] per attention layer
     // QSA: raw indexer keys and pooled block keys per attention layer, selection scratch
-    std::vector<DevBuf<half>> kraw_;
-    std::vector<DevBuf<float>> pooled_;
     DevBuf<float> ik_, iq_, qsa_scores_;
     DevBuf<int32_t> qsa_sel_, qsa_nsel_;
     QsaShape qsh_{};
@@ -281,8 +300,6 @@ private:
     int pf_cap_ = 0;   // the largest chunk the host-side buffers take
     // elastic VRAM (budget_ is declared first so it outlives every buffer charged to it)
     ElasticBuf pf_arena_, pf_stage_b_[2];
-    std::vector<ElasticBuf> kv_k_, kv_v_, kv_raw_, kv_pool_;
-    int ctx_mapped_ = 0;   // cells of context whose KV is mapped
     void prefill_layout(int N);
     void predict_stats(int il, int T);
     // BNK_ROUTE_LOG=file: per decode forward, every row's routed experts per layer (negative: not resident), the
@@ -333,11 +350,11 @@ template <typename F> void Engine::each_state(F && f) {
     const Config & c = model_.cfg;
     for (int il = 0; il < c.n_layer; ++il)
         if (!c.is_attn(il)) {
-            f(conv_buf_[il].p, conv_buf_[il].n);
-            f(ssm_state_[il].p, ssm_state_[il].n);
+            f(cur_->conv_buf[il].p, cur_->conv_buf[il].n);
+            f(cur_->ssm_state[il].p, cur_->ssm_state[il].n);
         }
-    if (ple_hist_.p) f(ple_hist_.p, ple_hist_.n);
-    if (mtp_R_) f(mtp_R_, (size_t) c.hc_dim());
+    if (cur_->ple_hist.p) f(cur_->ple_hist.p, cur_->ple_hist.n);
+    if (cur_->mtp_R) f(cur_->mtp_R, (size_t) c.hc_dim());
 }
 
 }  // namespace bnk

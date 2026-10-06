@@ -33,10 +33,12 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
 }
 
 Engine::~Engine() {
-    for (auto & k : ckpts_)
-        if (k.host) cudaFreeHost(k.host);
-    for (auto & gm : graphs_) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
-    for (auto & g : commit_graphs_) if (g) cudaGraphExecDestroy(g);
+    for (auto & q : seqs_) {
+        for (auto & k : q->ckpts)
+            if (k.host) cudaFreeHost(k.host);
+        for (auto & gm : q->graphs) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
+        for (auto & g : q->commit_graphs) if (g) cudaGraphExecDestroy(g);
+    }
     if (counts_.p) save_counts();
     if (mail_) cudaFreeHost(mail_);
     if (h_par_) cudaFreeHost(h_par_);
@@ -103,52 +105,35 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         const int ph = c.ple_heads();
         ple_emb_.alloc(W * ph * c.ple_dim); ple_key_.alloc(W * HC); ple_val_.alloc(W * E);
         ple_gated_.alloc(W * HC);
-        ple_hist_.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
         CUDA_CHECK(cudaHostAlloc((void **) &h_ple_rows_, (size_t) W * ph * model_.ple_table->row_bytes(),
                                  cudaHostAllocMapped));
     }
-    conv_buf_.resize(c.n_layer);
-    ssm_state_.resize(c.n_layer);
-    kraw_.resize(c.n_layer);
-    pooled_.resize(c.n_layer);
     gdn_co_.resize(c.n_layer);
     gdn_g_.resize(c.n_layer);
     gdn_b_.resize(c.n_layer);
-    kc_.resize(c.n_layer);
-    vc_.resize(c.n_layer);
-    kv_k_ = std::vector<ElasticBuf>(c.n_layer);
-    kv_v_ = std::vector<ElasticBuf>(c.n_layer);
-    kv_raw_ = std::vector<ElasticBuf>(c.n_layer);
-    kv_pool_ = std::vector<ElasticBuf>(c.n_layer);
     size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = 0; il < c.n_layer; ++il) {
         if (c.is_attn(il)) {
-            // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
-            const size_t kv = (size_t) opt.max_ctx * c.n_head_kv * c.head_dim;
-            kv_k_[il].reserve(kv * sizeof(half), &budget_, "KV cache");
-            kv_v_[il].reserve(kv * sizeof(half), &budget_, "KV cache");
-            kc_[il].view(kv_k_[il].as<half>(), kv);
-            vc_[il].view(kv_v_[il].as<half>(), kv);
             kv_cell_bytes += 2 * (size_t) c.n_head_kv * c.head_dim * sizeof(half);
             if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
-                const size_t nraw = (size_t) opt.max_ctx * c.idx_dim;
-                const size_t npool = (size_t) (opt.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim;
-                kv_raw_[il].reserve(nraw * sizeof(half), &budget_, "indexer keys");
-                kv_pool_[il].reserve(npool * sizeof(float), &budget_, "indexer keys");
-                kraw_[il].view(kv_raw_[il].as<half>(), nraw);
-                pooled_[il].view(kv_pool_[il].as<float>(), npool);
                 kv_cell_bytes += c.idx_dim * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
                 qsa_on_ = true;
             }
         } else {
-            conv_buf_[il].alloc((size_t) (c.ssm_conv - 1 + W) * C);
-            ssm_state_[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
             gdn_co_[il].alloc((size_t) W * C);
             gdn_g_[il].alloc((size_t) W * c.ssm_vheads);
             gdn_b_[il].alloc((size_t) W * c.ssm_vheads);
-            state_bytes += (conv_buf_[il].n + ssm_state_[il].n) * 4;
+            state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) c.ssm_vheads * c.ssm_state * c.ssm_state) * 4;
         }
     }
+    // the conversation slots: address space for every one, VRAM for the KV only as a conversation uses it
+    seqs_.clear();
+    for (int i = 0; i < std::max(1, opt.slots); ++i) {
+        seqs_.push_back(std::make_unique<Seq>());
+        alloc_seq(*seqs_.back());
+    }
+    cur_ = seqs_[0].get();
+    cur_->used = true;
     if (qsa_on_) {
         int r = 0;
         for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
@@ -160,9 +145,10 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     }
     if (opt.verbose)
         fprintf(stderr, "bnk: context %d: %.0f KiB of KV per token (%.2f GiB when full, mapped as used), "
-                        "recurrent state %.2f GiB, %d CPU expert threads\n",
+                        "recurrent state %.2f GiB, %d CPU expert threads%s\n",
                 opt.max_ctx, kv_cell_bytes / 1024.0, (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
-                state_bytes / 1073741824.0, cpu_.threads());
+                state_bytes / 1073741824.0, cpu_.threads(),
+                seqs_.size() > 1 ? (", " + std::to_string(seqs_.size()) + " conversation slots").c_str() : "");
 
     if (const char * rl = getenv("BNK_ROUTE_LOG")) {
         route_log_ = fopen(rl, "wb");
@@ -223,16 +209,69 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     reset();
 }
 
+void Engine::alloc_seq(Seq & q) {
+    const Config & c = model_.cfg;
+    const int W = kMaxWindow, C = c.conv_channels(), HC = c.hc_dim();
+    q.conv_buf.resize(c.n_layer);
+    q.ssm_state.resize(c.n_layer);
+    q.kraw.resize(c.n_layer);
+    q.pooled.resize(c.n_layer);
+    q.kc.resize(c.n_layer);
+    q.vc.resize(c.n_layer);
+    q.kv_k = std::vector<ElasticBuf>(c.n_layer);
+    q.kv_v = std::vector<ElasticBuf>(c.n_layer);
+    q.kv_raw = std::vector<ElasticBuf>(c.n_layer);
+    q.kv_pool = std::vector<ElasticBuf>(c.n_layer);
+    for (int il = 0; il < c.n_layer; ++il) {
+        if (c.is_attn(il)) {
+            // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
+            const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * c.head_dim;
+            q.kv_k[il].reserve(kv * sizeof(half), &budget_, "KV cache");
+            q.kv_v[il].reserve(kv * sizeof(half), &budget_, "KV cache");
+            q.kc[il].view(q.kv_k[il].as<half>(), kv);
+            q.vc[il].view(q.kv_v[il].as<half>(), kv);
+            if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
+                const size_t nraw = (size_t) opt_.max_ctx * c.idx_dim;
+                const size_t npool = (size_t) (opt_.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim;
+                q.kv_raw[il].reserve(nraw * sizeof(half), &budget_, "indexer keys");
+                q.kv_pool[il].reserve(npool * sizeof(float), &budget_, "indexer keys");
+                q.kraw[il].view(q.kv_raw[il].as<half>(), nraw);
+                q.pooled[il].view(q.kv_pool[il].as<float>(), npool);
+            }
+        } else {
+            q.conv_buf[il].alloc((size_t) (c.ssm_conv - 1 + W) * C);
+            q.ssm_state[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
+        }
+    }
+    if (c.ple_layer >= 0) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
+}
+
+int Engine::current_slot() const {
+    for (size_t i = 0; i < seqs_.size(); ++i)
+        if (seqs_[i].get() == cur_) return (int) i;
+    return -1;
+}
+
+void Engine::select(int slot) {
+    if (slot < 0 || slot >= (int) seqs_.size()) throw std::runtime_error("select: no slot " + std::to_string(slot));
+    join_commit();
+    cur_ = seqs_[slot].get();
+    if (!cur_->used) {   // first use: an empty conversation with the baseline context
+        cur_->used = true;
+        reset();
+    }
+}
+
 // KV cells [0, cells) backed by VRAM, in steps of kCtxStep cells; the expert cache gives the bytes up.
 void Engine::ensure_ctx(int cells) {
     cells = std::min(opt_.max_ctx, (cells + kCtxStep - 1) / kCtxStep * kCtxStep);
-    if (cells <= ctx_mapped_) return;
+    if (cells <= cur_->ctx_mapped) return;
     map_ctx(cells);
 }
 
 void Engine::map_ctx(int cells) {
     const Config & c = model_.cfg;
-    const bool grow = cells > ctx_mapped_;
+    const bool grow = cells > cur_->ctx_mapped;
     if (grow) {
         // one reclaim for everything below (each buffer asking on its own would shrink the cache ~50 times)
         size_t need = 0;
@@ -241,35 +280,35 @@ void Engine::map_ctx(int cells) {
         };
         for (int il = 0; il < c.n_layer; ++il) {
             const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
-            add(kv_k_[il], kv);
-            add(kv_v_[il], kv);
-            if (kv_raw_[il].reserved()) {
-                add(kv_raw_[il], (size_t) cells * c.idx_dim * sizeof(half));
-                add(kv_pool_[il], (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
+            add(cur_->kv_k[il], kv);
+            add(cur_->kv_v[il], kv);
+            if (cur_->kv_raw[il].reserved()) {
+                add(cur_->kv_raw[il], (size_t) cells * c.idx_dim * sizeof(half));
+                add(cur_->kv_pool[il], (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
             }
         }
         if (mtp_.loaded()) need += mtp_.ctx_bytes_needed(cells);
         if (!budget_.make_room(need)) throw std::runtime_error("not enough VRAM for a context of " + std::to_string(cells));
     }
     for (int il = 0; il < c.n_layer; ++il) {
-        if (!kv_k_[il].reserved()) continue;
+        if (!cur_->kv_k[il].reserved()) continue;
         const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
         if (grow) {
-            kv_k_[il].ensure(kv);
-            kv_v_[il].ensure(kv);
+            cur_->kv_k[il].ensure(kv);
+            cur_->kv_v[il].ensure(kv);
         } else {
-            kv_k_[il].shrink_to(kv);
-            kv_v_[il].shrink_to(kv);
+            cur_->kv_k[il].shrink_to(kv);
+            cur_->kv_v[il].shrink_to(kv);
         }
-        if (kv_raw_[il].reserved()) {
+        if (cur_->kv_raw[il].reserved()) {
             const size_t raw = (size_t) cells * c.idx_dim * sizeof(half);
             const size_t pool = (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float);
             if (grow) {
-                kv_raw_[il].ensure(raw);
-                kv_pool_[il].ensure(pool);
+                cur_->kv_raw[il].ensure(raw);
+                cur_->kv_pool[il].ensure(pool);
             } else {
-                kv_raw_[il].shrink_to(raw);
-                kv_pool_[il].shrink_to(pool);
+                cur_->kv_raw[il].shrink_to(raw);
+                cur_->kv_pool[il].shrink_to(pool);
             }
         }
     }
@@ -277,7 +316,7 @@ void Engine::map_ctx(int cells) {
         if (grow) mtp_.ensure_ctx(cells);
         else mtp_.release_ctx(cells);
     }
-    ctx_mapped_ = cells;
+    cur_->ctx_mapped = cells;
 }
 
 // After a prompt: the prompt buffers go back to their baseline, the context keeps what it uses (plus a step),
@@ -288,7 +327,7 @@ void Engine::rebalance() {
         prefill_staging_shrink();
     }
     const int keep = std::min(opt_.max_ctx, std::max(kCtxBaseline, (pos() + kCtxStep) / kCtxStep * kCtxStep));
-    if (keep < ctx_mapped_) map_ctx(keep);
+    if (keep < cur_->ctx_mapped) map_ctx(keep);
     const size_t slack = 64ull << 20;
     size_t room = budget_.free() > slack ? budget_.free() - slack : 0;
     if (opt_.expert_cache_gib >= 0) {   // a configured cache size is a cap, also when growing back
@@ -300,7 +339,7 @@ void Engine::rebalance() {
 
 int Engine::checkpoints() const {
     int n = 0;
-    for (const auto & k : ckpts_) n += k.pos >= 0;
+    for (const auto & k : cur_->ckpts) n += k.pos >= 0;
     return n;
 }
 
@@ -308,20 +347,20 @@ void Engine::checkpoint() {
     join_commit();
     const int p = pos();
     if (p == 0) return;
-    for (auto & k : ckpts_)
+    for (auto & k : cur_->ckpts)
         if (k.pos == p) { k.age = ++ckpt_age_; return; }
     size_t floats = 0;
     each_state([&](float *, size_t n) { floats += n; });
     Checkpoint * slot = nullptr;
-    for (auto & k : ckpts_)
+    for (auto & k : cur_->ckpts)
         if (k.pos < 0) { slot = &k; break; }
-    if (!slot && (int) ckpts_.size() < kMaxCheckpoints) {
-        ckpts_.emplace_back();
-        slot = &ckpts_.back();
+    if (!slot && (int) cur_->ckpts.size() < kMaxCheckpoints) {
+        cur_->ckpts.emplace_back();
+        slot = &cur_->ckpts.back();
         CUDA_CHECK(cudaHostAlloc((void **) &slot->host, floats * 4, 0));
     }
     if (!slot)  // the least recently used one goes
-        slot = &*std::min_element(ckpts_.begin(), ckpts_.end(), [](const Checkpoint & a, const Checkpoint & b) { return a.age < b.age; });
+        slot = &*std::min_element(cur_->ckpts.begin(), cur_->ckpts.end(), [](const Checkpoint & a, const Checkpoint & b) { return a.age < b.age; });
     size_t off = 0;
     each_state([&](float * d, size_t n) {
         CUDA_CHECK(cudaMemcpyAsync(slot->host + off, d, n * 4, cudaMemcpyDeviceToHost, st_));
@@ -329,14 +368,14 @@ void Engine::checkpoint() {
     });
     CUDA_CHECK(cudaStreamSynchronize(st_));
     slot->pos = p;
-    slot->mtp_cell = mtp_cell_;
+    slot->mtp_cell = cur_->mtp_cell;
     slot->age = ++ckpt_age_;
 }
 
 int Engine::rollback(int max_pos) {
     join_commit();
     Checkpoint * best = nullptr;
-    for (auto & k : ckpts_)
+    for (auto & k : cur_->ckpts)
         if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
     if (!best) return -1;
     size_t off = 0;
@@ -345,10 +384,10 @@ int Engine::rollback(int max_pos) {
         off += n;
     });
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    history_.resize(best->pos);
-    mtp_cell_ = best->mtp_cell;
+    cur_->history.resize(best->pos);
+    cur_->mtp_cell = best->mtp_cell;
     best->age = ++ckpt_age_;
-    for (auto & k : ckpts_)  // snapshots past the cut describe a history that is gone
+    for (auto & k : cur_->ckpts)  // snapshots past the cut describe a history that is gone
         if (k.pos > best->pos) k.pos = -1;
     return best->pos;
 }
@@ -356,19 +395,19 @@ int Engine::rollback(int max_pos) {
 void Engine::reset() {
     join_commit();
     const Config & c = model_.cfg;
-    history_.clear();
-    for (auto & k : ckpts_) k.pos = -1;
-    mtp_cell_ = -1;
+    cur_->history.clear();
+    for (auto & k : cur_->ckpts) k.pos = -1;
+    cur_->mtp_cell = -1;
     for (int il = 0; il < c.n_layer; ++il) {
         if (!c.is_attn(il)) {
-            CUDA_CHECK(cudaMemsetAsync(conv_buf_[il].p, 0, conv_buf_[il].n * 4, st_));
-            CUDA_CHECK(cudaMemsetAsync(ssm_state_[il].p, 0, ssm_state_[il].n * 4, st_));
+            CUDA_CHECK(cudaMemsetAsync(cur_->conv_buf[il].p, 0, cur_->conv_buf[il].n * 4, st_));
+            CUDA_CHECK(cudaMemsetAsync(cur_->ssm_state[il].p, 0, cur_->ssm_state[il].n * 4, st_));
         }
     }
-    if (ple_hist_.p) CUDA_CHECK(cudaMemsetAsync(ple_hist_.p, 0, ple_hist_.n * 4, st_));
+    if (cur_->ple_hist.p) CUDA_CHECK(cudaMemsetAsync(cur_->ple_hist.p, 0, cur_->ple_hist.n * 4, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
     // a new conversation: the context's VRAM back to its baseline (the cache takes it at the next rebalance)
-    if (ctx_mapped_ > kCtxBaseline) map_ctx(std::min(opt_.max_ctx, kCtxBaseline));
+    if (cur_->ctx_mapped > kCtxBaseline) map_ctx(std::min(opt_.max_ctx, kCtxBaseline));
 }
 
 void Engine::save_counts() {
@@ -413,11 +452,11 @@ void Engine::ple_gather(int T) {
     for (int t = 0; t < T; ++t) {
         const int p = pos0 + t;
         int64_t ctx[8];
-        ctx[0] = history_[p];
+        ctx[0] = cur_->history[p];
         bool cut = false;
         for (int s = 1; s < c.ple_ngram; ++s) {
             const int q = p - s;
-            const int64_t tok = (cut || q < 0) ? -1 : history_[q];
+            const int64_t tok = (cut || q < 0) ? -1 : cur_->history[q];
             cut = cut || tok < 0 || tok == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tok;
         }
@@ -447,16 +486,16 @@ void Engine::ple(int il, int T) {
     gemv_q(L.ple_value, act_, ple_emb_, D, T, ple_val_, E, st_);
     const int hist = (c.ple_conv - 1) * c.ple_ngram;
     ple_gate(ple_key_, res_, ple_val_, F(L.ple_norm_key), F(L.ple_norm_query), F(L.ple_norm_conv), ple_gated_,
-             ple_hist_.p + (size_t) hist * HC, T, c.hc, E, c.rms_eps, st_);
-    ple_conv_add(res_, ple_gated_, ple_hist_, (const half *) L.ple_conv1d.data, T, HC, c.ple_conv, c.ple_ngram, st_);
-    if (commit_all_) shift_rows(ple_hist_, HC, T, hist, st_);
+             cur_->ple_hist.p + (size_t) hist * HC, T, c.hc, E, c.rms_eps, st_);
+    ple_conv_add(res_, ple_gated_, cur_->ple_hist, (const half *) L.ple_conv1d.data, T, HC, c.ple_conv, c.ple_ngram, st_);
+    if (commit_all_) shift_rows(cur_->ple_hist, HC, T, hist, st_);
 }
 
 void Engine::gdn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
-    float * cb = conv_buf_[il];
+    float * cb = cur_->conv_buf[il];
     quantize_act(mixed_, E, T, E, mixact_, st_);
     gemv_q(L.wqkv, mixact_, mixed_, E, T, cb + (size_t) (K - 1) * C, C, st_);
     gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, st_);
@@ -469,7 +508,7 @@ void Engine::gdn(int il, int T) {
     gdn_conv(cb, F(L.ssm_conv1d), co, T, C, K, st_);
     dbg(st_, il, "conv_output_silu", co, (size_t) T * C);
     gdn_prep(co, T, C, c.ssm_groups, nv, S, gg, gb, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-    gdn_recurrence(co, C, gg, gb, ssm_state_[il], gdn_o_, T, c.ssm_groups, nv, S, commit_all_ ? T : 0, st_);
+    gdn_recurrence(co, C, gg, gb, cur_->ssm_state[il], gdn_o_, T, c.ssm_groups, nv, S, commit_all_ ? T : 0, st_);
     gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
     dbg(st_, il, "attn_output", gdn_o_, (size_t) T * nv * S);
     dbg(st_, il, "final_output", gdn_n_, (size_t) T * nv * S);
@@ -484,10 +523,10 @@ void Engine::enqueue_commit(int cnt) {
     const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     for (int il = 0; il < c.n_layer; ++il) {
         if (c.is_attn(il)) continue;
-        gdn_recurrence(gdn_co_[il], C, gdn_g_[il], gdn_b_[il], ssm_state_[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+        gdn_recurrence(gdn_co_[il], C, gdn_g_[il], gdn_b_[il], cur_->ssm_state[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
-    shift_rows_multi(conv_ptrs_, n_gdn_, C, cnt, K - 1, st_);
-    if (c.ple_layer >= 0) shift_rows(ple_hist_, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
+    shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
+    if (c.ple_layer >= 0) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
 }
 
 void Engine::join_commit() {
@@ -497,45 +536,45 @@ void Engine::join_commit() {
 }
 
 void Engine::commit(int cnt) {
-    if (!conv_ptrs_.p) {   // the GDN conv buffers never move: their pointer table once, before any capture
+    if (!cur_->conv_ptrs.p) {   // the GDN conv buffers never move: their pointer table once, before any capture
         const Config & c = model_.cfg;
         std::vector<float *> ptrs;
         for (int il = 0; il < c.n_layer; ++il)
-            if (!c.is_attn(il)) ptrs.push_back(conv_buf_[il].p);
+            if (!c.is_attn(il)) ptrs.push_back(cur_->conv_buf[il].p);
         n_gdn_ = (int) ptrs.size();
-        conv_ptrs_.alloc(ptrs.size());
-        CUDA_CHECK(cudaMemcpy(conv_ptrs_.p, ptrs.data(), ptrs.size() * sizeof(float *), cudaMemcpyHostToDevice));
+        cur_->conv_ptrs.alloc(ptrs.size());
+        CUDA_CHECK(cudaMemcpy(cur_->conv_ptrs.p, ptrs.data(), ptrs.size() * sizeof(float *), cudaMemcpyHostToDevice));
     }
-    if (pending_T_ == 0) throw std::runtime_error("commit: no verify window pending");
-    if (cnt < 1 || cnt > pending_T_) throw std::runtime_error("commit: count out of range");
-    history_.resize(history_.size() - (pending_T_ - cnt));
-    pending_T_ = 0;
+    if (cur_->pending_T == 0) throw std::runtime_error("commit: no verify window pending");
+    if (cnt < 1 || cnt > cur_->pending_T) throw std::runtime_error("commit: count out of range");
+    cur_->history.resize(cur_->history.size() - (cur_->pending_T - cnt));
+    cur_->pending_T = 0;
     static const bool same_stream = getenv("BNK_COMMIT_SAME_STREAM") != nullptr;
     if (opt_.use_graphs && !same_stream) {
-        if (!commit_graphs_[cnt]) {
+        if (!cur_->commit_graphs[cnt]) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             enqueue_commit(cnt);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&commit_graphs_[cnt], g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&cur_->commit_graphs[cnt], g, 0));
             cudaGraphDestroy(g);
         }
         // on the commit stream, after the verify window: the drafter (main stream) runs meanwhile
         CUDA_CHECK(cudaEventRecord(ev_verified_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(st_commit_, ev_verified_, 0));
-        CUDA_CHECK(cudaGraphLaunch(commit_graphs_[cnt], st_commit_));
+        CUDA_CHECK(cudaGraphLaunch(cur_->commit_graphs[cnt], st_commit_));
         CUDA_CHECK(cudaEventRecord(ev_committed_, st_commit_));
         commit_inflight_ = true;
     } else if (opt_.use_graphs) {
-        if (!commit_graphs_[cnt]) {
+        if (!cur_->commit_graphs[cnt]) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             enqueue_commit(cnt);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            CUDA_CHECK(cudaGraphInstantiate(&commit_graphs_[cnt], g, 0));
+            CUDA_CHECK(cudaGraphInstantiate(&cur_->commit_graphs[cnt], g, 0));
             cudaGraphDestroy(g);
         }
-        CUDA_CHECK(cudaGraphLaunch(commit_graphs_[cnt], st_));
+        CUDA_CHECK(cudaGraphLaunch(cur_->commit_graphs[cnt], st_));
     } else {
         enqueue_commit(cnt);
     }
@@ -549,20 +588,20 @@ void Engine::attn(int il, int T) {
     gemv_q(L.wq, mixact_, mixed_, E, T, qfull_, H * D * 2, st_);
     gemv_q(L.wk, mixact_, mixed_, E, T, k_, Hkv * D, st_);
     gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
-    attn_prep(qfull_, k_, v_, F(L.q_norm), F(L.k_norm), q_, kc_[il], vc_[il], T, H, Hkv, D, c.n_rot, c.rope_base,
+    attn_prep(qfull_, k_, v_, F(L.q_norm), F(L.k_norm), q_, cur_->kc[il], cur_->vc[il], T, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_);
-    if (kraw_[il].p) {
+    if (cur_->kraw[il].p) {
         // QSA: indexer keys and queries, pooled blocks, the per-query block selection, sparse attention
         gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, st_);
-        qsa_store_keys(ik_, kraw_[il], T, c.idx_dim, &d_par_->pos0, st_);
+        qsa_store_keys(ik_, cur_->kraw[il], T, c.idx_dim, &d_par_->pos0, st_);
         gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, st_);
         qsa_queries(iq_, F(L.idx_q_norm), T, qsh_, &d_par_->pos0, st_);
-        qsa_pool(kraw_[il], F(L.idx_k_norm), pooled_[il], T, qsh_, &d_par_->pos0, st_);
-        qsa_select(iq_, pooled_[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, T, qsh_, &d_par_->pos0, 0, st_);
-        qsa_attention(q_, kc_[il], vc_[il], qfull_, qsa_sel_, qsa_nsel_, attn_o_, T, qsh_, &d_par_->pos0,
+        qsa_pool(cur_->kraw[il], F(L.idx_k_norm), cur_->pooled[il], T, qsh_, &d_par_->pos0, st_);
+        qsa_select(iq_, cur_->pooled[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, T, qsh_, &d_par_->pos0, 0, st_);
+        qsa_attention(q_, cur_->kc[il], cur_->vc[il], qfull_, qsa_sel_, qsa_nsel_, attn_o_, T, qsh_, &d_par_->pos0,
                       1.f / sqrtf((float) D), attn_scratch_, st_);
     } else {
-        attention(q_, kc_[il], vc_[il], qfull_, attn_o_, T, H, Hkv, D, &d_par_->pos0, 1.f / sqrtf((float) D),
+        attention(q_, cur_->kc[il], cur_->vc[il], qfull_, attn_o_, T, H, Hkv, D, &d_par_->pos0, 1.f / sqrtf((float) D),
                   attn_scratch_, st_);
     }
     gemv_auto(L.wo, attn_o_, H * D, T, out_, E, false, act_, st_);
@@ -704,7 +743,7 @@ void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double
     moe_debug_times((uint64_t (*)[3]) ts.data(), L);
     // the conversation: a hash of its first tokens
     uint32_t h = 2166136261u;
-    for (size_t i = 0; i < std::min<size_t>(history_.size(), 256); ++i) h = (h ^ (uint32_t) history_[i]) * 16777619u;
+    for (size_t i = 0; i < std::min<size_t>(cur_->history.size(), 256); ++i) h = (h ^ (uint32_t) cur_->history[i]) * 16777619u;
     const int32_t hdr[6] = {0x54554f52, T, pos0, commit_all ? 1 : 0, (int32_t) h, L};
     const double tt[2] = {t0, t1};
     fwrite(hdr, 4, 6, route_log_);
@@ -755,19 +794,19 @@ void Engine::service_cpu(uint32_t seq, int T) {
 void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     join_commit();
     if (T < 1 || T > kMaxWindow) throw std::runtime_error("forward: bad window");
-    if (pending_T_) throw std::runtime_error("forward: the previous verify window was not committed");
+    if (cur_->pending_T) throw std::runtime_error("forward: the previous verify window was not committed");
     commit_all_ = commit_all;
     if (pos() + T > opt_.max_ctx) throw std::runtime_error("context full");
     ensure_ctx(pos() + T + kMaxWindow);
     const double t0 = now_ms();
     last_T = T;
     const int pos0 = pos();
-    history_.insert(history_.end(), tokens, tokens + T);
+    cur_->history.insert(cur_->history.end(), tokens, tokens + T);
     memcpy(h_tok_, tokens, T * 4);
     *h_par_ = WinParams{pos0, T, ++seq_, 0};
     ple_gather(T);
     if (opt_.use_graphs && !dump_all) {
-        cudaGraphExec_t & ge = graphs_[commit_all ? 1 : 0][T];
+        cudaGraphExec_t & ge = cur_->graphs[commit_all ? 1 : 0][T];
         if (!ge) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -793,7 +832,7 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     if (route_log_ && opt_.use_graphs && !dump_all) write_route_log(T, pos0, commit_all, t0, now_ms());
-    if (!commit_all) pending_T_ = T;
+    if (!commit_all) cur_->pending_T = T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
     times.total_ms += now_ms() - t0;
     times.calls++;
@@ -804,20 +843,20 @@ void Engine::forward(const int32_t * tokens, int T, bool commit_all) {
 void Engine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
     if (!mtp_.loaded()) return;
     const int HC = model_.cfg.hc_dim();
-    if (!mtp_R_) CUDA_CHECK(cudaMalloc(&mtp_R_, (size_t) HC * 4));
-    if (mtp_cell_ >= 0 && mtp_cell_ == pos0 - 1) mtp_.run(mtp_R_, tokens, 1, mtp_cell_, false, nullptr);
+    if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) HC * 4));
+    if (cur_->mtp_cell >= 0 && cur_->mtp_cell == pos0 - 1) mtp_.run(cur_->mtp_R, tokens, 1, cur_->mtp_cell, false, nullptr);
     for (int r0 = 0; r0 < n - 1; r0 += kMaxWindow) {
         const int rr = std::min(kMaxWindow, n - 1 - r0);
         mtp_.run(R_rows + (size_t) r0 * HC, tokens + r0 + 1, rr, pos0 + r0, false, nullptr);
     }
-    CUDA_CHECK(cudaMemcpyAsync(mtp_R_, R_rows + (size_t) (n - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
-    mtp_cell_ = pos0 + n - 1;
+    CUDA_CHECK(cudaMemcpyAsync(cur_->mtp_R, R_rows + (size_t) (n - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
+    cur_->mtp_cell = pos0 + n - 1;
 }
 
 size_t Engine::kv_bytes_mapped() const {
     size_t b = 0;
-    for (size_t il = 0; il < kv_k_.size(); ++il)
-        b += kv_k_[il].mapped() + kv_v_[il].mapped() + kv_raw_[il].mapped() + kv_pool_[il].mapped();
+    for (size_t il = 0; il < cur_->kv_k.size(); ++il)
+        b += cur_->kv_k[il].mapped() + cur_->kv_v[il].mapped() + cur_->kv_raw[il].mapped() + cur_->kv_pool[il].mapped();
     return b;
 }
 
@@ -887,9 +926,9 @@ void Engine::logits_rows_host(int T, float * out) {
 
 void Engine::set_mtp_pending(const float * R_row_dev, int cell) {
     if (!mtp_.loaded()) return;
-    if (!mtp_R_) CUDA_CHECK(cudaMalloc(&mtp_R_, (size_t) model_.cfg.hc_dim() * 4));
-    CUDA_CHECK(cudaMemcpyAsync(mtp_R_, R_row_dev, (size_t) model_.cfg.hc_dim() * 4, cudaMemcpyDeviceToDevice, st_));
-    mtp_cell_ = cell;
+    if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) model_.cfg.hc_dim() * 4));
+    CUDA_CHECK(cudaMemcpyAsync(cur_->mtp_R, R_row_dev, (size_t) model_.cfg.hc_dim() * 4, cudaMemcpyDeviceToDevice, st_));
+    cur_->mtp_cell = cell;
 }
 
 std::vector<float> Engine::logits_host(int t) {

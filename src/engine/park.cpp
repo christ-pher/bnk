@@ -41,13 +41,13 @@ size_t Engine::state_floats() {
 template <typename F> void Engine::each_ctx(int cells, F && f) {
     const Config & c = model_.cfg;
     for (int il = 0; il < c.n_layer; ++il) {
-        if (!kc_[il].p) continue;
+        if (!cur_->kc[il].p) continue;
         const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
-        f((void *) kc_[il].p, kv);
-        f((void *) vc_[il].p, kv);
-        if (kraw_[il].p) {
-            f((void *) kraw_[il].p, (size_t) cells * c.idx_dim * sizeof(half));
-            f((void *) pooled_[il].p, (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
+        f((void *) cur_->kc[il].p, kv);
+        f((void *) cur_->vc[il].p, kv);
+        if (cur_->kraw[il].p) {
+            f((void *) cur_->kraw[il].p, (size_t) cells * c.idx_dim * sizeof(half));
+            f((void *) cur_->pooled[il].p, (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
         }
     }
     if (mtp_.loaded()) mtp_.each_ctx(cells, f);
@@ -124,14 +124,14 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
     // one entry per conversation: an older copy whose history this one extends is superseded
     for (size_t i = parked_.size(); i-- > 0;) {
         const auto & h = parked_[i].history;
-        if (parked_[i].used != keep && h.size() <= history_.size() && std::equal(h.begin(), h.end(), history_.begin()))
+        if (parked_[i].used != keep && h.size() <= cur_->history.size() && std::equal(h.begin(), h.end(), cur_->history.begin()))
             drop_parked(i);
     }
     const size_t sfloats = state_floats();
     size_t bytes = sfloats * 4;
     each_ctx(n, [&](void *, size_t b) { bytes += b; });
     size_t ck_bytes = 0;
-    for (const auto & k : ckpts_) ck_bytes += k.pos >= 0 ? sfloats * 4 : 0;
+    for (const auto & k : cur_->ckpts) ck_bytes += k.pos >= 0 ? sfloats * 4 : 0;
     const size_t limit = (size_t) (opt_.park_gib * 1073741824.0);
     if (bytes + ck_bytes > limit) return;
     while (parked_bytes() + bytes + ck_bytes > limit) {   // least recently used first
@@ -157,7 +157,7 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
         CUDA_CHECK(cudaMemcpyAsync(p.host + off, d, f * 4, cudaMemcpyDeviceToHost, st_));
         off += f * 4;
     });
-    for (auto & k : ckpts_) {   // the snapshots: moved, or copied host to host meanwhile
+    for (auto & k : cur_->ckpts) {   // the snapshots: moved, or copied host to host meanwhile
         if (k.pos < 0) continue;
         Checkpoint c = k;
         if (move_ckpts) {
@@ -170,8 +170,8 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
         p.ckpts.push_back(c);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    p.history = history_;
-    p.mtp_cell = mtp_cell_;
+    p.history = cur_->history;
+    p.mtp_cell = cur_->mtp_cell;
     p.bytes = bytes + ck_bytes;
     p.used = ++park_age_;
     parked_.push_back(std::move(p));
@@ -199,17 +199,17 @@ void Engine::restore(size_t i) {
         off += f * 4;
     });
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    history_ = std::move(p.history);
-    mtp_cell_ = p.mtp_cell;
+    cur_->history = std::move(p.history);
+    cur_->mtp_cell = p.mtp_cell;
     // its snapshots replace the live ones (the slots keep their pinned buffers)
-    for (auto & k : ckpts_) k.pos = -1;
+    for (auto & k : cur_->ckpts) k.pos = -1;
     for (auto & c : p.ckpts) {
         Checkpoint * slot = nullptr;
-        for (auto & k : ckpts_)
+        for (auto & k : cur_->ckpts)
             if (k.pos < 0) { slot = &k; break; }
-        if (!slot && (int) ckpts_.size() < kMaxCheckpoints) {
-            ckpts_.emplace_back();
-            slot = &ckpts_.back();
+        if (!slot && (int) cur_->ckpts.size() < kMaxCheckpoints) {
+            cur_->ckpts.emplace_back();
+            slot = &cur_->ckpts.back();
             slot->host = ck_take();
         }
         if (!slot) break;
@@ -228,7 +228,7 @@ void Engine::restore(size_t i) {
 
 void Engine::select_conversation(const std::vector<int32_t> & prompt) {
     if (opt_.park_gib <= 0 || prompt.empty()) return;
-    const int live = reuse_of(history_, ckpts_, prompt);
+    const int live = reuse_of(cur_->history, cur_->ckpts, prompt);
     int best = -1, best_r = live;
     for (size_t i = 0; i < parked_.size(); ++i) {
         const int r = reuse_of(parked_[i].history, parked_[i].ckpts, prompt);

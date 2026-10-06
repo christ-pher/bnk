@@ -212,11 +212,11 @@ void Engine::pf_ple(int il, int N) {
     for (int t = 0; t < N; ++t) {
         const int ps = pos0 + t;
         int64_t ctx[8];
-        ctx[0] = history_[ps];
+        ctx[0] = cur_->history[ps];
         bool cut = false;
         for (int s = 1; s < c.ple_ngram; ++s) {
             const int q = ps - s;
-            const int64_t tok = (cut || q < 0) ? -1 : history_[q];
+            const int64_t tok = (cut || q < 0) ? -1 : cur_->history[q];
             cut = cut || tok < 0 || tok == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tok;
         }
@@ -237,11 +237,11 @@ void Engine::pf_ple(int il, int N) {
     gemm_.run(L.ple_key, p.ple_emb, D, N, p.ple_key, HC);
     gemm_.run(L.ple_value, p.ple_emb, D, N, p.ple_val, E);
     const int hist = (c.ple_conv - 1) * c.ple_ngram;
-    CUDA_CHECK(cudaMemcpyAsync(p.ple_hist.p, ple_hist_.p, (size_t) hist * HC * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(p.ple_hist.p, cur_->ple_hist.p, (size_t) hist * HC * 4, cudaMemcpyDeviceToDevice, st_));
     ple_gate(p.ple_key, p.res, p.ple_val, F(L.ple_norm_key), F(L.ple_norm_query), F(L.ple_norm_conv), p.ple_gated,
              p.ple_hist.p + (size_t) hist * HC, N, c.hc, E, c.rms_eps, st_);
     ple_conv_add(p.res, p.ple_gated, p.ple_hist, (const half *) L.ple_conv1d.data, N, HC, c.ple_conv, c.ple_ngram, st_);
-    CUDA_CHECK(cudaMemcpyAsync(ple_hist_.p, p.ple_hist.p + (size_t) N * HC, (size_t) hist * HC * 4,
+    CUDA_CHECK(cudaMemcpyAsync(cur_->ple_hist.p, p.ple_hist.p + (size_t) N * HC, (size_t) hist * HC * 4,
                                cudaMemcpyDeviceToDevice, st_));
 }
 
@@ -250,7 +250,7 @@ void Engine::pf_gdn(int il, int N) {
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     auto & p = pf_;
-    CUDA_CHECK(cudaMemcpyAsync(p.conv.p, conv_buf_[il].p, (size_t) (K - 1) * C * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(p.conv.p, cur_->conv_buf[il].p, (size_t) (K - 1) * C * 4, cudaMemcpyDeviceToDevice, st_));
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.wqkv, gemm_.xbuf(), E, N, p.conv.p + (size_t) (K - 1) * C, C);
     gemm_.run_h(L.wgate, gemm_.xbuf(), E, N, p.z, nv * S);
@@ -258,10 +258,10 @@ void Engine::pf_gdn(int il, int N) {
     gemm_.run_h(L.ssm_alpha, gemm_.xbuf(), E, N, p.g, nv);
     gdn_conv(p.conv, F(L.ssm_conv1d), p.co, N, C, K, st_);
     gdn_prep(p.co, N, C, c.ssm_groups, nv, S, p.g, p.b, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-    gdn_recurrence(p.co, C, p.g, p.b, ssm_state_[il], p.o, N, c.ssm_groups, nv, S, N, st_);
+    gdn_recurrence(p.co, C, p.g, p.b, cur_->ssm_state[il], p.o, N, c.ssm_groups, nv, S, N, st_);
     gated_rmsnorm(p.o, p.z, F(L.ssm_norm), p.n, N, nv, S, c.rms_eps, st_);
     gemm_.run(L.ssm_out, p.n, nv * S, N, p.out, E);
-    CUDA_CHECK(cudaMemcpyAsync(conv_buf_[il].p, p.conv.p + (size_t) N * C, (size_t) (K - 1) * C * 4,
+    CUDA_CHECK(cudaMemcpyAsync(cur_->conv_buf[il].p, p.conv.p + (size_t) N * C, (size_t) (K - 1) * C * 4,
                                cudaMemcpyDeviceToDevice, st_));
 }
 
@@ -273,21 +273,21 @@ void Engine::pf_attn(int il, int N) {
     const int pos0 = pos() - N;
     auto attention_prefill_rows = [&](int t0, int t1) {
         CUDA_CHECK(cudaMemsetAsync(p.nsel.p, 0, 64 * 4, st_));
-        qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, t0, t1, qsh_, pos0,
+        qsa_attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.sel, p.nsel, p.ao, t0, t1, qsh_, pos0,
                               1.f / sqrtf((float) D), st_);
     };
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.wq, gemm_.xbuf(), E, N, p.qfull, H * D * 2);
     gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
-    attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, kc_[il], vc_[il], N, H, Hkv, D, c.n_rot, c.rope_base,
+    attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_);
-    if (kraw_[il].p) {
+    if (cur_->kraw[il].p) {
         gemm_.run_h(L.idx_k, gemm_.xbuf(), E, N, p.ik, c.idx_dim);
         gemm_.run_h(L.idx_q, gemm_.xbuf(), E, N, p.iq, c.idx_heads * c.idx_dim);
-        qsa_store_keys(p.ik, kraw_[il], N, c.idx_dim, &d_par_->pos0, st_);
+        qsa_store_keys(p.ik, cur_->kraw[il], N, c.idx_dim, &d_par_->pos0, st_);
         qsa_queries(p.iq, F(L.idx_q_norm), N, qsh_, &d_par_->pos0, st_);
-        qsa_pool(kraw_[il], F(L.idx_k_norm), pooled_[il], N, qsh_, &d_par_->pos0, st_);
+        qsa_pool(cur_->kraw[il], F(L.idx_k_norm), cur_->pooled[il], N, qsh_, &d_par_->pos0, st_);
         // Rows up to the dense limit attend to everything; the others select blocks (64 rows at a time bound the
         // score scratch) and then attend in one launch, each block a row (BNK_QSA_PER64: per 64 rows, as before).
         static const bool old = getenv("BNK_QSA_PER64") != nullptr;
@@ -297,10 +297,10 @@ void Engine::pf_attn(int il, int N) {
             const int t1 = std::min(N, t0 + 64);
             int32_t * sel = old ? p.sel.p : p.sel.p + (size_t) (t0 - ts) * qsh_.top_blocks;
             int32_t * nsel = old ? p.nsel.p : p.nsel.p + (t0 - ts);
-            qsa_select(p.iq.p + (size_t) t0 * c.idx_heads * c.idx_dim, pooled_[il], p.scores, max_blocks_, sel,
+            qsa_select(p.iq.p + (size_t) t0 * c.idx_heads * c.idx_dim, cur_->pooled[il], p.scores, max_blocks_, sel,
                        nsel, t1 - t0, qsh_, &d_par_->pos0, t0, st_);
             if (old)
-                qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, sel, nsel, p.ao, t0, t1, qsh_, pos0,
+                qsa_attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, sel, nsel, p.ao, t0, t1, qsh_, pos0,
                                       1.f / sqrtf((float) D), st_);
             static const char * dsel = getenv("BNK_DUMP_SEL");
             if (dsel && il == env_int("BNK_DUMP_SEL_LAYER", 3)) {
@@ -319,12 +319,12 @@ void Engine::pf_attn(int il, int N) {
             }
         }
         if (!old && ts < N &&
-            !qsa_attention_prefill_multi(1, p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
+            !qsa_attention_prefill_multi(1, p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
                                          1.f / sqrtf((float) D), st_))
-            qsa_attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
+            qsa_attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.sel, p.nsel, p.ao, ts, N, qsh_, pos0,
                                   1.f / sqrtf((float) D), st_);
     } else {
-        attention_prefill(p.q, kc_[il], vc_[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
+        attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
     }
     gemm_.run(L.wo, p.ao, H * D, N, p.out, E);
 }
@@ -512,14 +512,14 @@ void Engine::pf_moe(int il, int N) {
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
     join_commit();
     if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
-    if (pending_T_) throw std::runtime_error("prefill_chunk: a verify window is pending");
+    if (cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
     const Config & c = model_.cfg;
     const int E = c.n_embd, HC = c.hc_dim();
     const double t0 = now_ms();
     auto & p = pf_;
     const int pos0 = pos();
-    history_.insert(history_.end(), tokens, tokens + N);
+    cur_->history.insert(cur_->history.end(), tokens, tokens + N);
     *h_par_ = WinParams{pos0, N, ++seq_, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
