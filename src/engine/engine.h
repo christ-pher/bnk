@@ -141,6 +141,8 @@ public:
     void select_conversation(const std::vector<int32_t> & prompt);
     // tokens of `prompt` the current slot's state can keep (its history, or its last snapshot inside the prefix)
     int reusable(const std::vector<int32_t> & prompt) const;
+    // slots with a request in flight (decoding, or the prompt being read): never moved off the GPU to make room
+    void set_busy(const std::vector<int> & slots);
     int parked() const { return (int) parked_.size(); }
     void drop_parked_all() { while (!parked_.empty()) drop_parked(parked_.size() - 1); }
     size_t parked_bytes() const;
@@ -275,6 +277,15 @@ private:
     void ck_give(float * p);
     // move_ckpts: the live snapshots go along instead of being copied (the live state is replaced next)
     void park(uint64_t keep = 0, bool move_ckpts = false);
+    // VRAM for `need` more bytes when the expert cache has nothing left to give: idle conversations (largest
+    // first) are parked in host RAM and their context unmapped. False when that is not enough either.
+    bool evict_idle(size_t need);
+    std::vector<char> busy_;
+    uint64_t restoring_ = 0;   // the parked entry restore() is bringing back: evict_idle's parking keeps it
+    // the prompt path's layout for chunks of N tokens; false when VRAM is short (the old layout stays)
+    bool try_layout(int N);
+    // the expert staging for this read; a whole layer's worth falls back to the small stage when VRAM is short
+    void staging_fit();
     void restore(size_t i);
     void drop_parked(size_t i);
     uint32_t seq_ = 0;

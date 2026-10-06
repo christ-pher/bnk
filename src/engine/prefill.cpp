@@ -135,6 +135,27 @@ void Engine::prefill_staging_ensure(bool full) {
     }
 }
 
+bool Engine::try_layout(int N) {
+    try {
+        prefill_layout(N);
+        return true;
+    } catch (const std::runtime_error & e) {
+        if (!strstr(e.what(), "VRAM")) throw;
+        return false;
+    }
+}
+
+void Engine::staging_fit() {
+    try {
+        prefill_staging_ensure(pf_full_);
+    } catch (const std::runtime_error & e) {
+        if (!pf_full_ || !strstr(e.what(), "VRAM")) throw;
+        pf_full_ = false;   // the experts that do not fit the small stage go to the CPU
+        prefill_staging_ensure(false);
+        if (opt_.verbose) fprintf(stderr, "bnk: VRAM is short: the prompt read streams fewer experts\n");
+    }
+}
+
 void Engine::prefill_staging_shrink() {
     const size_t small = vmem_round((size_t) opt_.stage_small_mib << 20);
     if (pf_stage_b_[0].mapped() <= small) return;
@@ -513,7 +534,7 @@ void Engine::prefill_chunk(const int32_t * tokens, int N) {
     join_commit();
     // the expert cache may have changed since the read began (other conversations decode between its chunks:
     // their cache adaptation and growing KV leave more experts outside VRAM), so the staging is checked again
-    prefill_staging_ensure(pf_full_);
+    staging_fit();
     if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
     if (cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
@@ -528,7 +549,7 @@ void Engine::prefill_chunk(const int32_t * tokens, int N) {
     CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
     dequant_gather(model_.tok_embd, p.tok, N, p.x, st_);
     hc_init(p.x, p.res, N, c.hc, E, st_);
-    p.prefetch = N >= opt_.prefetch_min;
+    p.prefetch = pf_full_ && N >= opt_.prefetch_min;   // a whole layer ahead needs the full stage
     if (p.prefetch) pf_stage_layer(0);
     for (int il = 0; il < c.n_layer; ++il) {
         const LayerWeights & L = model_.layers[il];

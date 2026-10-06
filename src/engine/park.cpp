@@ -186,9 +186,20 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
 void Engine::restore(size_t i) {
     join_commit();
     const double t0 = now_ms();
+    // making room may park idle conversations (evict_idle): that may drop other entries and move this one
+    const uint64_t id = parked_[i].used;
+    const int n = (int) parked_[i].history.size();
+    restoring_ = id;
+    try {
+        ensure_ctx(n + kMaxWindow);
+    } catch (...) {
+        restoring_ = 0;
+        throw;
+    }
+    restoring_ = 0;
+    for (size_t j = 0; j < parked_.size(); ++j)
+        if (parked_[j].used == id) i = j;
     Parked & p = parked_[i];
-    const int n = (int) p.history.size();
-    ensure_ctx(n + kMaxWindow);
     size_t off = 0;
     each_ctx(n, [&](void * d, size_t b) {
         CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, b, cudaMemcpyHostToDevice, st_));
@@ -224,6 +235,36 @@ void Engine::restore(size_t i) {
     if (opt_.verbose)
         fprintf(stderr, "bnk: resumed a parked conversation of %d tokens in %.0f ms; %zu parked\n", n, now_ms() - t0,
                 parked_.size());
+}
+
+void Engine::set_busy(const std::vector<int> & slots) {
+    busy_.assign(seqs_.size(), 0);
+    for (int s : slots)
+        if (s >= 0 && s < (int) busy_.size()) busy_[s] = 1;
+}
+
+bool Engine::evict_idle(size_t need) {
+    Seq * keep = cur_;
+    for (;;) {
+        if (budget_.make_room(need)) break;
+        int bi = -1;
+        for (int i = 0; i < (int) seqs_.size(); ++i) {
+            const Seq * q = seqs_[i].get();
+            if (q == keep || !q->used || (i < (int) busy_.size() && busy_[i]) || q->ctx_mapped <= kCtxBaseline) continue;
+            if (bi < 0 || q->ctx_mapped > seqs_[bi]->ctx_mapped) bi = i;
+        }
+        if (bi < 0) break;
+        use(seqs_[bi].get());
+        const int n = pos();
+        const size_t before = parked_.size();
+        if (opt_.park_gib > 0 && n >= opt_.park_min) park(restoring_);
+        if (opt_.verbose)
+            fprintf(stderr, "bnk: VRAM is short: moved an idle conversation of %d tokens off the GPU (slot %d, %s)\n", n, bi,
+                    parked_.size() > before ? "parked in RAM" : "not parked: its next turn reads it again");
+        reset();
+    }
+    use(keep);
+    return budget_.make_room(need);
 }
 
 int Engine::reusable(const std::vector<int32_t> & prompt) const {

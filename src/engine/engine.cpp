@@ -296,7 +296,7 @@ void Engine::map_ctx(int cells) {
             }
         }
         if (mtp_.loaded()) need += mtp_.ctx_bytes_needed(cells);
-        if (!budget_.make_room(need))
+        if (!budget_.make_room(need) && !evict_idle(need))
             throw std::runtime_error("not enough VRAM for a context of " + std::to_string(cells) + " (" + budget_.describe() + ")");
     }
     for (int il = 0; il < c.n_layer; ++il) {
@@ -964,10 +964,20 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     // small layout and stage; longer reads get bigger chunks and a stage that holds a whole layer's outside experts
     const int n = (int) tokens.size();
     if (pf_base_ > 0) {
-        const int lay = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
-        prefill_layout(lay);
+        const int want = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
+        // smaller chunks when VRAM is short (long contexts in every slot): slower, but the read goes through;
+        // conversations are moved off the GPU only when even the smallest layout does not fit
+        int lay = 0;
+        for (int pass = 0; pass < 2 && !lay; ++pass) {
+            for (int N : {want, pf_base_, pf_small_})
+                if (N <= want && try_layout(N)) { lay = N; break; }
+            if (!lay && (pass || !evict_idle(prefill_arena_bytes(pf_small_))))
+                throw std::runtime_error("not enough VRAM for the prompt buffers (" + budget_.describe() + ")");
+        }
+        if (lay < want && opt_.verbose)
+            fprintf(stderr, "bnk: VRAM is short: reading this prompt in chunks of %d tokens (not %d)\n", lay, want);
         pf_full_ = n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min;
-        prefill_staging_ensure(pf_full_);
+        staging_fit();
     }
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;

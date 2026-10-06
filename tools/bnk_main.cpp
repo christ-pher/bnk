@@ -82,6 +82,7 @@ int main(int argc, char ** argv) {
         else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();
         else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
+        else if (a == "--vram-reserve-gib") opt.vram_reserve_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next()), adapt_set = true;

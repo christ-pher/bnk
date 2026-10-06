@@ -377,6 +377,13 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         }
         return best;
     };
+    // the slots the engine may not move off the GPU when VRAM is short: those decoding, and the one being read
+    auto mark_busy = [&](int reading) {
+        std::vector<int> b;
+        for (auto & x : active) b.push_back(x->slot);
+        if (reading >= 0) b.push_back(reading);
+        eng.set_busy(b);
+    };
     // reads one request's prompt into a free slot (the others wait meanwhile); false = it failed or ended at once
     auto admit = [&](Json & req) -> bool {
         const std::string id = req["id"].str();
@@ -398,6 +405,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             sp.seed = (uint64_t) req["seed"].num(0);
             a->max_tokens = (int) req["max_tokens"].num(1024);
             a->slot = pick_slot(a->prompt);
+            mark_busy(a->slot);
             a->gen = std::make_unique<Generator>(eng, eng.mtp(), gopt, a->slot);
             a->gen->set_draft(req.has("draft") ? (int) req["draft"].num() : gopt.max_draft);
             a->gen->set_draft_min_p(req.has("draft_min_p") ? (float) req["draft_min_p"].num() : gopt.min_p);
@@ -477,6 +485,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             if (active[i]->stop) {
                 finish_request(*active[i]);
                 active.erase(active.begin() + (long) i);
+                mark_busy(-1);
             } else {
                 ++i;
             }
