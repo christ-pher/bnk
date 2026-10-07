@@ -9,6 +9,13 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 
+def _text(content) -> str:
+    """A message's text: a string, or the text parts of an OpenAI content list."""
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return content or ""
+
+
 class ChatTemplate:
     def __init__(self, source: str):
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True)
@@ -24,9 +31,23 @@ class ChatTemplate:
         self.template = env.from_string(source)
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kwargs) -> str:
+        # Qwen templates take one system message, first ("System message must be at the beginning"), and some know
+        # no "developer" role; agent harnesses send developer messages, several at the start and more mid-conversation
+        # (reminders, steering). Leading ones merge into one system message (trimmed, joined by newlines, as the
+        # templates that accept several do), later ones become user turns. A lone leading system message is untouched.
+        lead = 0
+        while lead < len(messages) and messages[lead].get("role") in ("system", "developer"):
+            lead += 1
         msgs = []
-        for m in messages:
+        if lead > 1 or (lead == 1 and messages[0].get("role") == "developer"):
+            parts = (_text(m.get("content")).strip() for m in messages[:lead])
+            msgs.append({"role": "system", "content": "\n".join(p for p in parts if p)})
+        else:
+            msgs.extend(dict(m) for m in messages[:lead])
+        for m in messages[lead:]:
             m = dict(m)
+            if m.get("role") in ("system", "developer"):
+                m["role"] = "user"
             # OpenAI tool calls carry JSON-string arguments; the template wants a mapping
             if m.get("tool_calls"):
                 calls = []
