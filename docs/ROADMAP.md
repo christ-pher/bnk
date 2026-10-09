@@ -16,6 +16,8 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 6 | **More rows per batched forward** (kMaxWindow 8 -> 16: GEMV / MoE kernels) | with 3 conversations each gets ~2.7 rows, so fewer drafts are verified | more tokens per round *(estimate)* | |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
+| 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | built, to measure |
+| 8 | **Dense GEMV efficiency** (decode with every expert resident) | the R-layout GEMVs reach 30-47% of HBM bandwidth; with two GPUs (no CPU misses) they are most of the forward | up to ~1.5x decode *(estimate)* | |
 
 ## Other areas (from the 78K nsys profile, 2026-10-05)
 
@@ -29,6 +31,14 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
   (GEMMs, expert streaming) is now the biggest lever there.
 
 ## Done
+
+* **Two GPUs as a pipeline** (2026-10-09, branch `dual-v100`): `--gpus 0,1` splits the layers into one stage per
+  GPU (balanced by memory, `--split` to override); every expert of IQ3_S fits two 32 GB cards. Prompt chunks
+  overlap across the GPUs; `BNK_PIPE_DECODE=1` keeps two batches in flight during decode. Checked as two stages on
+  one card (greedy tokens equal to one GPU, park_check, serve_check, `bnk multi --pipe`). A fully resident stage
+  (layers 0-19, nsys): 10.8 ms per forward at ~3.5 rows, 17.7 ms at 8 rows, prompts 2,404 tok/s for 20 layers; the
+  GPU is then busy back to back, dense GEMVs 46% of it (`gemv_r_k` 33.5%, `gemv_f_k` 12.8%), the experts' gate/up
+  and down 27%. Details: `docs/DUAL-GPU.md`.
 
 * **VRAM budget follows the driver** (2026-10-06, v0.1.3): an agent session with more conversations than slots
   (~60 parks/resumes) failed requests with `CUDA VMM create: out of memory`. Cause: forward-graph LRU churn

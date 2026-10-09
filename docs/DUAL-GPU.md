@@ -111,9 +111,33 @@ per-layer time (many small kernels: ~0.54 ms per layer where the weights alone w
 limit, and it is the same on one GPU.
 
 A layer pipeline does not make one conversation's forward faster than one GPU holding everything would: the two
-GPUs take turns. Batched conversations share the turns the same way. Keeping both GPUs busy at once during decode
-would take two batches in flight (one per GPU); with the drafter and verification on the last GPU between rounds,
-that was estimated at only +10-30% for several conversations and is not built.
+GPUs take turns. Batched conversations share the turns the same way, unless they decode in two lanes (below).
+
+## Two lanes: both GPUs busy while several conversations decode (`BNK_PIPE_DECODE=1`)
+
+With two GPUs and at least two requests in flight, `BNK_PIPE_DECODE=1` splits the requests into two lanes and
+keeps one batch of each in flight: every step runs one lane's batch on GPU 0 while the other lane's batch (which
+left GPU 0 the step before) runs on GPU 1, then verifies, commits and drafts that one. Each lane gets up to 8 rows
+of its own (more drafts verified per conversation than when all of them share 8 rows), and neither GPU waits for
+the other's layers.
+
+```
+GPU 0:  A1 ─────── B1 ─────── A2 ─────── B2 ───────
+GPU 1:  ·········· A1 ── fin ─ B1 ── fin ─ A2 ── fin ─
+```
+
+From the measured stage times (13 ms per GPU for one conversation's rows, ~3.5 ms to verify, commit and draft),
+two conversations would go from ~45 ms per round batched to ~33 ms per two lane steps, ~+35%; more for three (each
+lane keeps 8 rows). Projected, not measured: it is **off by default** until it is measured on two cards
+(`tools/multi_agent_bench.py`, or `bnk multi --gpus 0,1 --pipe` against `bnk multi --gpus 0,1`).
+
+What makes it correct: a verify window's DeltaNet intermediates stay on GPU 0 until the window is committed, and
+GPU 0 runs the other lane's forward in between; each lane has its own window buffers, hand-off buffers and commit
+graphs, so the commit replays its own lane's rows. A new request (its prompt is read on both GPUs), or a lane
+running out of requests, first drains the pipeline (the batch in flight finishes on GPU 1), and the server goes
+back to one batch per round. Checked on one card: `bnk multi --pipe` gives the same tokens as batched decoding
+(three conversations, deterministic CPU-only experts), `serve_check` passes with it on, and an HTTP run with three
+streams, a client disconnecting mid-stream and follow-up requests completes cleanly.
 
 ## Verified (on one GPU, two stages)
 
@@ -123,6 +147,7 @@ that was estimated at only +10-30% for several conversations and is not built.
   (history extended, and re-rendered from a snapshot). PASS.
 * `tools/serve_check.py --gpus 0,0`: three requests served together (batched rounds, decoding between another
   request's pipelined prompt chunks) produce exactly their tokens alone. PASS.
+* The same with `BNK_PIPE_DECODE=1` (two lanes). PASS. `bnk multi --pipe`: tokens identical to batched.
 * One GPU (`--gpus` unset or one id) produces exactly master's tokens.
 
 Not verified, because it needs the second card: anything specific to two devices (cross-device event waits,
