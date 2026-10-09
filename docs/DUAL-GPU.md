@@ -148,6 +148,12 @@ streams, a client disconnecting mid-stream and follow-up requests completes clea
 * `tools/serve_check.py --gpus 0,0`: three requests served together (batched rounds, decoding between another
   request's pipelined prompt chunks) produce exactly their tokens alone. PASS.
 * The same with `BNK_PIPE_DECODE=1` (two lanes). PASS. `bnk multi --pipe`: tokens identical to batched.
+* A 72K-token prompt (chunks of 8,192, pipelined): greedy output equal to master.
+* VRAM pressure (a park_check variant with `--vram-reserve-gib` raised until two ~21-36K conversations no longer
+  fit together): the idle one is parked off both stages to make room, later the other is parked to bring it back,
+  and its next turn is identical to a run without the other.
+* Through the HTTP server: concurrent streaming requests, a client disconnecting mid-stream, follow-up requests,
+  with and without `BNK_PIPE_DECODE=1`; telemetry lists both stages.
 * One GPU (`--gpus` unset or one id) produces exactly master's tokens.
 
 Not verified, because it needs the second card: anything specific to two devices (cross-device event waits,
