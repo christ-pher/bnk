@@ -62,6 +62,10 @@ class State:
             args.think_guard = bool(self.config.get("thinking_loop_guard", True))
         eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib),
                  "--slots", str(args.slots)]
+        if args.gpus:
+            eargs += ["--gpus", args.gpus]
+        if args.split:
+            eargs += ["--split", args.split]
         if args.ple_gguf:
             eargs += ["--ple-gguf", args.ple_gguf]
         if args.mtp:
@@ -688,6 +692,10 @@ def main():
                     help="conversations decoded at once, batched (several agents); 1 = one at a time")
     ap.add_argument("--park-gib", type=float, default=float(os.environ.get("BNK_PARK_GIB", "24")),
                     help="host RAM for parked conversations (several clients taking turns; 0 = off)")
+    ap.add_argument("--gpus", default=os.environ.get("BNK_GPUS", "all"),
+                    help="CUDA devices to run on, e.g. 0,1 (several: the layers are split between them); all = every GPU")
+    ap.add_argument("--split", default=os.environ.get("BNK_SPLIT_LAYERS", ""),
+                    help="first layer of each GPU after the first, e.g. 25 (default: balanced by memory)")
     ap.add_argument("--config", default="",
                     help="model config JSON (configs/*.json): sampling, speculation, guard, engine_args, server_args")
     ap.add_argument("--no-think-guard", dest="think_guard", action="store_false", default=None,

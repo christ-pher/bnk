@@ -22,6 +22,21 @@ inline double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Makes `dev` the current CUDA device for a scope (the previous one comes back after): every entry point of a
+// pipeline stage runs under one, so its allocations, streams and launches land on its own GPU.
+struct DeviceScope {
+    int prev = -1, dev;
+    explicit DeviceScope(int d) : dev(d) {
+        cudaGetDevice(&prev);
+        if (prev != dev) cudaSetDevice(dev);
+    }
+    ~DeviceScope() {
+        if (prev >= 0 && prev != dev) cudaSetDevice(prev);
+    }
+    DeviceScope(const DeviceScope &) = delete;
+    DeviceScope & operator=(const DeviceScope &) = delete;
+};
+
 inline int env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v && *v ? atoi(v) : def;

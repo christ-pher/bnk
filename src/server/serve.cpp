@@ -49,15 +49,19 @@ void emit(const std::string & line) {
 // After a request failed: when the GPU context is gone (an illegal access or another sticky error: every CUDA
 // call fails from then on), the process exits, so the server restarts the engine rather than fail every request
 // that follows. An ordinary error is reported once and cleared; a sticky one is returned again.
-void exit_if_gpu_lost() {
-    if (cudaDeviceSynchronize() == cudaSuccess) return;
-    cudaGetLastError();
-    const cudaError_t e = cudaDeviceSynchronize();
-    if (e == cudaSuccess) return;
-    fprintf(stderr, "bnk: the GPU context is lost (%s): exiting so the engine can be restarted\n", cudaGetErrorString(e));
-    fflush(stderr);
-    fflush(stdout);
-    _exit(3);
+void exit_if_gpu_lost(const Engine & eng) {
+    for (int d : eng.devices()) {
+        DeviceScope ds(d);
+        if (cudaDeviceSynchronize() == cudaSuccess) continue;
+        cudaGetLastError();
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e == cudaSuccess) continue;
+        fprintf(stderr, "bnk: the GPU context is lost on GPU %d (%s): exiting so the engine can be restarted\n", d,
+                cudaGetErrorString(e));
+        fflush(stderr);
+        fflush(stdout);
+        _exit(3);
+    }
 }
 
 struct Totals {
@@ -100,8 +104,27 @@ std::string arr(const V & v) {
 // cur: the request shown in "req"; inflight: the in-flight requests summed (for the lifetime counters)
 std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot, const Current & cur,
                            const Current & inflight, int active, const std::string & model_name) {
+    // VRAM of every GPU the pipeline uses (summed), and each one's
     size_t vfree = 0, vtotal = 0;
-    cudaMemGetInfo(&vfree, &vtotal);
+    std::string gpus = "[";
+    for (int d : eng.devices()) {
+        DeviceScope ds(d);
+        size_t f = 0, t = 0;
+        cudaMemGetInfo(&f, &t);
+        vfree += f;
+        vtotal += t;
+        gpus += (gpus.size() > 1 ? "," : "") + JsonOut().kv("device", d).kv("vram_total_mb", (double) t / 1048576.0)
+                    .kv("vram_used_mb", (double) (t - f) / 1048576.0).done();
+    }
+    gpus += "]";
+    std::string stages = "[";
+    for (int i = 0; i < eng.stages(); ++i) {
+        const Engine * st = eng.stage(i);
+        stages += (i ? "," : "") + JsonOut().kv("device", st->device()).kv("layer_begin", st->layer_begin())
+                      .kv("layer_end", st->layer_end()).kv("experts_resident", st->cache().resident())
+                      .kv("expert_cache_gb", (double) st->cache().bytes() / 1073741824.0).done();
+    }
+    stages += "]";
     struct sysinfo si;
     sysinfo(&si);
     const auto & c = eng.cfg();
@@ -147,14 +170,14 @@ std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot
         .kv("cpu_expert_ms", tot.cpu_expert_ms + (busy ? tm.cpu_experts_ms : 0.0))
         .kv("routed", routed)
         .kv("misses", misses)
-        .kv("swaps", (int64_t) eng.cache().swaps_done)
+        .kv("swaps", eng.cache_swaps())
         .kv("parks", eng.park_stats.parks)
         .kv("restores", eng.park_stats.restores)
         .kv("park_evictions", eng.park_stats.evictions)
         .kv("park_ms", eng.park_stats.park_ms)
         .kv("restore_ms", eng.park_stats.restore_ms);
     std::vector<int> slots(c.n_layer);
-    for (int il = 0; il < c.n_layer; ++il) slots[il] = eng.cache().slots(il);
+    for (int il = 0; il < c.n_layer; ++il) slots[il] = eng.cache_slots(il);
     JsonOut o;
     o.kv("type", "telemetry")
         .kv("t", wall_s())
@@ -172,9 +195,9 @@ std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot
         .kv("ram_total_mb", (double) si.totalram * si.mem_unit / 1048576.0)
         .kv("ram_free_mb", (double) (si.freeram + si.bufferram) * si.mem_unit / 1048576.0)
         .kv("rss_mb", rss_mb())
-        .kv("experts_resident", eng.cache().resident())
+        .kv("experts_resident", eng.cache_resident())
         .kv("experts_total", c.n_layer * c.n_expert)
-        .kv("expert_cache_gb", (double) eng.cache().bytes() / 1073741824.0)
+        .kv("expert_cache_gb", (double) eng.cache_bytes() / 1073741824.0)
         .kv("kv_gb", (double) eng.kv_bytes_mapped() / 1073741824.0)
         .kv("parked", eng.parked())
         .kv("parked_gb", (double) eng.parked_bytes() / 1073741824.0)
@@ -182,6 +205,8 @@ std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot
         .kv("mtp", eng.mtp() != nullptr)
         .raw("req", rq.done())
         .raw("life", lf.done())
+        .raw("gpus", gpus)
+        .raw("stages", stages)
         .raw("layer_slots", arr(slots))
         .raw("layer_routed", arr(eng.layer_routed))
         .raw("layer_misses", arr(eng.layer_misses));
@@ -441,7 +466,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         } catch (const std::exception & e) {
             shown = nullptr;
             emit(JsonOut().kv("type", "error").kv("id", id).kv("message", e.what()).done());
-            exit_if_gpu_lost();
+            exit_if_gpu_lost(eng);
             if (a->gen) {   // the slot may be half-processed: start it clean next time
                 try { eng.select(a->slot); eng.reset(); } catch (...) {}
             }
@@ -475,7 +500,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
         } catch (const std::exception & e) {
             for (auto & a : active)
                 emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
-            exit_if_gpu_lost();
+            exit_if_gpu_lost(eng);
             for (auto & a : active) {
                 try { eng.select(a->slot); eng.reset(); } catch (...) {}
             }

@@ -33,33 +33,209 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
 }
 
 Engine::~Engine() {
+    next_.reset();   // the later stages first, each on its own device
+    cudaSetDevice(dev_);
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts)
             if (k.host) cudaFreeHost(k.host);
         for (auto & gm : q->commit_graphs) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     }
     for (auto & kv : fwd_graphs_) cudaGraphExecDestroy(kv.second.exec);
-    if (counts_.p) save_counts();
+    if (counts_.p) save_counts_here();
     if (mail_) cudaFreeHost(mail_);
     if (h_par_) cudaFreeHost(h_par_);
     if (h_tok_) cudaFreeHost(h_tok_);
     if (h_ple_rows_) cudaFreeHost(h_ple_rows_);
     if (d_par_) cudaFree(d_par_);
+    if (xfer_in_) cudaFreeHost(xfer_in_);
+    if (pf_xfer_in_) cudaFreeHost(pf_xfer_in_);
+    if (ev_out_) cudaEventDestroy(ev_out_);
+}
+
+std::vector<int> Engine::devices() const {
+    std::vector<int> d;
+    for (const Engine * s = this; s; s = s->next_.get())
+        if (std::find(d.begin(), d.end(), s->dev_) == d.end()) d.push_back(s->dev_);
+    return d;
+}
+
+int Engine::cache_slots(int il) const {
+    for (const Engine * s = this; s; s = s->next_.get())
+        if (s->owns(il)) return s->cache_.slots(il);
+    return 0;
+}
+
+int Engine::cache_resident() const { return cache_.resident() + (next_ ? next_->cache_resident() : 0); }
+size_t Engine::cache_bytes() const { return cache_.bytes() + (next_ ? next_->cache_bytes() : 0); }
+int64_t Engine::cache_swaps() const { return cache_.swaps_done + (next_ ? next_->cache_swaps() : 0); }
+
+// Contiguous layer ranges, one per GPU. Each layer would hold its dense weights, all of its experts and the KV of
+// a full context; the first stage adds the token embeddings, the last the head and the drafter. The split minimizes
+// the largest share of a GPU's free memory, so with room for everything each GPU keeps its layers' experts
+// resident, and otherwise both fall short alike (the CPU computes the rest as on one GPU).
+std::vector<int> Engine::plan_split(const std::string & path, const EngineOptions & opt, const std::vector<int> & gpus) {
+    const int S = (int) gpus.size();
+    GgufModel g;
+    g.open(path);
+    const Config c = load_config(g);
+    const int L = c.n_layer;
+    std::vector<int> b{0};
+    if (!opt.split.empty()) {
+        if ((int) opt.split.size() != S - 1)
+            throw std::runtime_error("--split: give " + std::to_string(S - 1) + " layer(s) for " + std::to_string(S) + " GPUs");
+        for (int x : opt.split) {
+            if (x <= b.back() || x >= L)
+                throw std::runtime_error("--split: the first layers of the stages must increase within 1.." + std::to_string(L - 1));
+            b.push_back(x);
+        }
+        b.push_back(L);
+        return b;
+    }
+    if (S > L) throw std::runtime_error("more GPUs than layers");
+    std::vector<double> lay(L, 0.0);
+    double embd = 0, head = 0;
+    for (const TensorRef & t : g.tensors()) {
+        if (t.name.rfind("blk.", 0) == 0) {
+            const int il = atoi(t.name.c_str() + 4);
+            if (il >= 0 && il < L) lay[il] += (double) t.nbytes;
+        } else if (t.name == "token_embd.weight") {
+            embd = (double) t.nbytes;
+        } else if (t.name.rfind("output", 0) == 0) {
+            head += (double) t.nbytes;
+        }
+    }
+    for (int il = 0; il < L; ++il)
+        if (c.is_attn(il)) {
+            double cell = 4.0 * c.n_head_kv * c.head_dim;
+            if (c.compress_ratio[il] > 0) cell += 2.0 * c.idx_dim + 4.0 * c.idx_dim / c.compress_ratio[il];
+            lay[il] += cell * opt.max_ctx;
+        }
+    // per GPU: fixed costs (CUDA context, workspaces, prompt buffers) and the free memory; one GPU listed twice
+    // (a test of the split on one card) shares it
+    const double fixed = 2.0 * 1073741824.0;
+    double mtp_bytes = 0;
+    if (!opt.mtp.empty())
+        if (FILE * f = fopen(opt.mtp.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END);
+            mtp_bytes = (double) ftell(f);
+            fclose(f);
+        }
+    std::vector<double> cap(S);
+    for (int k = 0; k < S; ++k) {
+        DeviceScope ds(gpus[k]);
+        size_t fr = 0, tot = 0;
+        CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
+        const int same = (int) std::count(gpus.begin(), gpus.end(), gpus[k]);
+        cap[k] = std::max(1.0, (double) fr / same - fixed);
+    }
+    auto extra = [&](int k) {
+        double e = 0;
+        if (k == 0) e += embd;
+        if (k == S - 1) e += head + (mtp_bytes > 0 ? embd + mtp_bytes : 0);
+        return e;
+    };
+    // best[k][i]: the smallest worst load ratio of stages k.. over layers i..L-1 (and where stage k ends)
+    std::vector<std::vector<double>> best(S + 1, std::vector<double>(L + 1, 1e300));
+    std::vector<std::vector<int>> cut(S + 1, std::vector<int>(L + 1, -1));
+    best[S][L] = 0;
+    for (int k = S - 1; k >= 0; --k)
+        for (int i = 0; i < L; ++i) {
+            double sum = extra(k);
+            for (int j = i + 1; j <= L - (S - 1 - k); ++j) {   // stage k takes layers [i, j)
+                sum += lay[j - 1];
+                if (k == S - 1 && j != L) continue;
+                const double v = std::max(sum / cap[k], best[k + 1][j]);
+                if (v < best[k][i]) {
+                    best[k][i] = v;
+                    cut[k][i] = j;
+                }
+            }
+        }
+    for (int k = 0, i = 0; k < S; ++k) {
+        i = cut[k][i];
+        if (i < 0) throw std::runtime_error("cannot split the layers over the GPUs");
+        b.push_back(i);
+    }
+    if (opt.verbose) {
+        fprintf(stderr, "bnk: %d GPUs, layers split", S);
+        for (int k = 0; k < S; ++k) {
+            double sum = extra(k);
+            for (int il = b[k]; il < b[k + 1]; ++il) sum += lay[il];
+            fprintf(stderr, "%s %d-%d on GPU %d (all resident: %.1f of %.1f GiB)", k ? "," : "", b[k], b[k + 1] - 1, gpus[k],
+                    sum / 1073741824.0, cap[k] / 1073741824.0);
+        }
+        fprintf(stderr, "\n");
+    }
+    return b;
 }
 
 void Engine::load(const std::string & path, const EngineOptions & opt) {
-    opt_ = opt;
     ggml_cpu_init();
-    CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
+    std::vector<int> gpus = opt.gpus;
+    if (gpus.empty()) {
+        int d = 0;
+        CUDA_CHECK(cudaGetDevice(&d));
+        gpus = {d};
+    }
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    if (gpus.size() == 1 && gpus[0] < 0) {   // "all": every GPU bnk can run on (sm_70 and newer)
+        gpus.clear();
+        for (int d = 0; d < count; ++d) {
+            cudaDeviceProp pr;
+            CUDA_CHECK(cudaGetDeviceProperties(&pr, d));
+            if (pr.major >= 7) gpus.push_back(d);
+        }
+        if (gpus.empty()) throw std::runtime_error("no CUDA device of compute capability 7.0 or newer");
+    }
+    for (int d : gpus)
+        if (d < 0 || d >= count) throw std::runtime_error("no CUDA device " + std::to_string(d) + " (" + std::to_string(count) + " visible)");
+    const std::vector<int> bounds = gpus.size() > 1 ? plan_split(path, opt, gpus) : std::vector<int>{0, -1};
+    Engine * s = this, * prev = nullptr;
+    for (size_t k = 0; k < gpus.size(); ++k) {
+        s->head_ = this;
+        s->dev_ = gpus[k];
+        s->l0_ = bounds[k];
+        s->l1_ = bounds[k + 1];
+        s->last_ = k + 1 == gpus.size();
+        s->store_ = &own_store_;
+        s->cpu_ = &own_cpu_;
+        if (opt.verbose && gpus.size() > 1)
+            fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
+        s->load_stage(path, opt);
+        if (prev) {
+            prev->xfer_out_ = s->xfer_in_;
+            prev->pf_xfer_out_ = s->pf_xfer_in_;
+        }
+        if (k + 1 < gpus.size()) {
+            prev = s;
+            s->next_ = std::make_unique<Engine>();
+            s = s->next_.get();
+        }
+    }
+    CUDA_CHECK(cudaSetDevice(dev_));
+}
+
+void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
+    opt_ = opt;
+    const bool head = head_ == this;
+    CUDA_CHECK(cudaSetDevice(dev_));
+    // a second stage on the same GPU finds its context already made (the flag is the default on 64-bit anyway)
+    if (cudaSetDeviceFlags(cudaDeviceMapHost) != cudaSuccess) cudaGetLastError();
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_commit_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_verified_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_committed_, cudaEventDisableTiming));
-    model_.load(path, opt.verbose, opt.ple_gguf);
-    layer_routed.assign(model_.cfg.n_layer, 0);
-    layer_misses.assign(model_.cfg.n_layer, 0);
-    store_.build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
-    cpu_.init(model_, store_, opt.cpu_threads);
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_out_, cudaEventDisableTiming));
+    // the drafter embeds its tokens and shares the head: the last stage holds the embeddings too when it drafts
+    model_.load(path, opt.verbose, opt.ple_gguf, l0_, l1_, first() || (last_ && !opt.mtp.empty()), last_);
+    if (l1_ < 0) l1_ = model_.cfg.n_layer;
+    if (head) {
+        layer_routed.assign(model_.cfg.n_layer, 0);
+        layer_misses.assign(model_.cfg.n_layer, 0);
+        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
+        cpu_->init(model_, *store_, opt.cpu_threads);
+    }
 
     const Config & c = model_.cfg;
     const int W = kMaxWindow, E = c.n_embd, HC = c.hc_dim();
@@ -74,7 +250,8 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     attn_scratch_.alloc(attention_scratch_floats(W, c.n_head, c.head_dim, opt.max_ctx));
     rlogits_.alloc(W * c.n_expert); rw_.alloc(W * c.n_expert_used); rids_.alloc(W * c.n_expert_used);
     sg_.alloc(W * c.n_ff_shexp); su_.alloc(W * c.n_ff_shexp); sh_.alloc(W * c.n_ff_shexp); sgate_.alloc(W);
-    shared_out_.alloc(W * E); moe_out_.alloc(W * E); logits_.alloc((size_t) W * c.n_vocab);
+    shared_out_.alloc(W * E); moe_out_.alloc(W * E);
+    if (last_) logits_.alloc((size_t) W * c.n_vocab);
     argmax_dev_.alloc(W);
     const int64_t maxcols = std::max<int64_t>(HC, 16384);
     actq_.alloc(W * maxcols); actd_.alloc(W * maxcols / 32);
@@ -100,8 +277,15 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaHostAlloc((void **) &h_par_, kMaxSlots * sizeof(WinParams), cudaHostAllocMapped));
     CUDA_CHECK(cudaMalloc(&d_par_, kMaxSlots * sizeof(WinParams)));
     CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocMapped));
+    if (!first()) {   // the previous stage's residual rows come through here
+        CUDA_CHECK(cudaHostAlloc((void **) &xfer_in_, (size_t) W * HC * 4, cudaHostAllocPortable));
+        if (opt.prefill_chunk > 0)
+            CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_in_,
+                                     (size_t) std::max(opt.prefill_chunk, opt.prefill_chunk_max) * HC * 4,
+                                     cudaHostAllocPortable));
+    }
 
-    if (c.ple_layer >= 0) {
+    if (c.ple_layer >= 0 && owns(c.ple_layer)) {
         const int ph = c.ple_heads();
         ple_emb_.alloc(W * ph * c.ple_dim); ple_key_.alloc(W * HC); ple_val_.alloc(W * E);
         ple_gated_.alloc(W * HC);
@@ -112,7 +296,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     gdn_g_.resize(c.n_layer);
     gdn_b_.resize(c.n_layer);
     size_t state_bytes = 0, kv_cell_bytes = 0;
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
             kv_cell_bytes += 2 * (size_t) c.n_head_kv * c.head_dim * sizeof(half);
             if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
@@ -144,19 +328,21 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         qsa_scores_.alloc((size_t) W * max_blocks_); qsa_sel_.alloc((size_t) W * (c.idx_top_k / r)); qsa_nsel_.alloc(W);
     }
     if (opt.verbose)
-        fprintf(stderr, "bnk: context %d: %.0f KiB of KV per token (%.2f GiB when full, mapped as used), "
+        fprintf(stderr, "bnk: %scontext %d: %.0f KiB of KV per token (%.2f GiB when full, mapped as used), "
                         "recurrent state %.2f GiB, %d CPU expert threads%s\n",
+                first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
                 opt.max_ctx, kv_cell_bytes / 1024.0, (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
-                state_bytes / 1073741824.0, cpu_.threads(),
+                state_bytes / 1073741824.0, cpu_->threads(),
                 seqs_.size() > 1 ? (", " + std::to_string(seqs_.size()) + " conversation slots").c_str() : "");
 
     if (const char * rl = getenv("BNK_ROUTE_LOG")) {
+        if (!first() || !last_) throw std::runtime_error("BNK_ROUTE_LOG needs a single GPU");
         route_log_ = fopen(rl, "wb");
         if (!route_log_) throw std::runtime_error(std::string("cannot open ") + rl);
         route_dev_.alloc((size_t) c.n_layer * kMaxWindow * c.n_expert_used);
         cpu_us_.assign(c.n_layer, 0.f);
     }
-    if (!opt.mtp.empty())
+    if (last_ && !opt.mtp.empty())
         mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
@@ -175,11 +361,11 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
     budget_.set_reserve(reserve);
     budget_.reclaim = [this](size_t need) { return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0; };
-    ensure_ctx(std::min(opt.max_ctx, kCtxBaseline));
+    ensure_ctx_here(std::min(opt.max_ctx, kCtxBaseline));
     if (opt.prefill_chunk > 0) prefill_layout(pf_small_);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
     if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
-    if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    if (opt.verbose && head) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
     const size_t avail = budget_.free();
     size_t budget = avail;
     if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
@@ -188,10 +374,10 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         // outside the cache: iterate to a fixed point
         const size_t small = (size_t) opt.stage_small_mib << 20;
         for (int it = 0; it < 6; ++it) {
-            const auto slots = ExpertCache::plan(model_, store_, budget, rank);
+            const auto slots = ExpertCache::plan(model_, *store_, budget, rank, l0_, l1_);
             size_t need = 0;
-            for (int il = 0; il < c.n_layer; ++il)
-                need = std::max(need, (size_t) (c.n_expert - slots[il]) * store_.blob_bytes(il));
+            for (int il = l0_; il < l1_; ++il)
+                need = std::max(need, (size_t) (c.n_expert - slots[il]) * store_->blob_bytes(il));
             need = vmem_round(std::min(need, small));
             const size_t want = avail > 2 * need ? avail - 2 * need : 0;
             const size_t nb = opt.expert_cache_gib >= 0 ? std::min(want, (size_t) (opt.expert_cache_gib * 1073741824.0)) : want;
@@ -199,7 +385,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             budget = nb;
         }
     }
-    cache_.init(model_, store_, budget, rank, st_, opt.verbose, &budget_);
+    cache_.init(model_, *store_, budget, rank, st_, opt.verbose, &budget_, l0_, l1_);
     cache_ready_ = true;
     if (opt.prefill_chunk > 0) {
         prefill_staging_alloc();
@@ -208,7 +394,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
                             "2 x %.2f GiB of expert staging between prompts (more borrowed for long ones)\n",
                     pf_small_, pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
     }
-    reset();
+    reset_here();
 }
 
 void Engine::alloc_seq(Seq & q) {
@@ -224,7 +410,7 @@ void Engine::alloc_seq(Seq & q) {
     q.kv_v = std::vector<ElasticBuf>(c.n_layer);
     q.kv_raw = std::vector<ElasticBuf>(c.n_layer);
     q.kv_pool = std::vector<ElasticBuf>(c.n_layer);
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
             // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
             const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * c.head_dim;
@@ -245,7 +431,7 @@ void Engine::alloc_seq(Seq & q) {
             q.ssm_state[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
         }
     }
-    if (c.ple_layer >= 0) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
+    if (c.ple_layer >= 0 && owns(c.ple_layer)) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
 }
 
 void Engine::use(Seq * q) {
@@ -261,17 +447,27 @@ int Engine::current_slot() const {
 }
 
 void Engine::select(int slot) {
+    for (Engine * s = this; s; s = s->next_.get()) s->select_here(slot);
+}
+
+void Engine::select_here(int slot) {
+    DeviceScope ds(dev_);
     if (slot < 0 || slot >= (int) seqs_.size()) throw std::runtime_error("select: no slot " + std::to_string(slot));
     // no join: switching touches nothing on the GPU, and whatever does (forward, prefill, snapshots ...) joins
     use(seqs_[slot].get());
     if (!cur_->used) {   // first use: an empty conversation with the baseline context
         cur_->used = true;
-        reset();
+        reset_here();
     }
 }
 
 // KV cells [0, cells) backed by VRAM, in steps of kCtxStep cells; the expert cache gives the bytes up.
 void Engine::ensure_ctx(int cells) {
+    for (Engine * s = this; s; s = s->next_.get()) s->ensure_ctx_here(cells);
+}
+
+void Engine::ensure_ctx_here(int cells) {
+    DeviceScope ds(dev_);
     cells = std::min(opt_.max_ctx, (cells + kCtxStep - 1) / kCtxStep * kCtxStep);
     if (cells <= cur_->ctx_mapped) return;
     map_ctx(cells);
@@ -331,6 +527,11 @@ void Engine::map_ctx(int cells) {
 // After a prompt: the prompt buffers go back to their baseline, the context keeps what it uses (plus a step),
 // and the expert tier takes the free bytes back.
 void Engine::rebalance() {
+    for (Engine * s = this; s; s = s->next_.get()) s->rebalance_here();
+}
+
+void Engine::rebalance_here() {
+    DeviceScope ds(dev_);
     if (pf_base_ > 0) {
         prefill_layout(pf_small_);
         prefill_staging_shrink();
@@ -356,7 +557,12 @@ int Engine::checkpoints() const {
 }
 
 void Engine::checkpoint() {
-    join_commit();
+    for (Engine * s = this; s; s = s->next_.get()) s->checkpoint_here();
+}
+
+void Engine::checkpoint_here() {
+    DeviceScope ds(dev_);
+    join_commit_here();
     const int p = pos();
     if (p == 0) return;
     for (auto & k : cur_->ckpts)
@@ -385,7 +591,15 @@ void Engine::checkpoint() {
 }
 
 int Engine::rollback(int max_pos) {
-    join_commit();
+    const int r = rollback_here(max_pos);
+    for (Engine * s = next_.get(); s; s = s->next_.get())
+        if (s->rollback_here(max_pos) != r) throw std::runtime_error("rollback: the pipeline stages disagree");
+    return r;
+}
+
+int Engine::rollback_here(int max_pos) {
+    DeviceScope ds(dev_);
+    join_commit_here();
     Checkpoint * best = nullptr;
     for (auto & k : cur_->ckpts)
         if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
@@ -405,12 +619,17 @@ int Engine::rollback(int max_pos) {
 }
 
 void Engine::reset() {
-    join_commit();
+    for (Engine * s = this; s; s = s->next_.get()) s->reset_here();
+}
+
+void Engine::reset_here() {
+    DeviceScope ds(dev_);
+    join_commit_here();
     const Config & c = model_.cfg;
     cur_->history.clear();
     for (auto & k : cur_->ckpts) k.pos = -1;
     cur_->mtp_cell = -1;
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = l0_; il < l1_; ++il) {
         if (!c.is_attn(il)) {
             CUDA_CHECK(cudaMemsetAsync(cur_->conv_buf[il].p, 0, cur_->conv_buf[il].n * 4, st_));
             CUDA_CHECK(cudaMemsetAsync(cur_->ssm_state[il].p, 0, cur_->ssm_state[il].n * 4, st_));
@@ -423,8 +642,14 @@ void Engine::reset() {
 }
 
 void Engine::save_counts() {
-    // the device counters are cumulative for the session; the file gets this session's total added
+    for (Engine * s = this; s; s = s->next_.get()) s->save_counts_here();
+}
+
+void Engine::save_counts_here() {
+    // the device counters are cumulative for the session; the file gets this session's total added (each stage
+    // counts its own layers only and saves after the one before, so every stage adds its part)
     if (opt_.counts_out.empty()) return;
+    DeviceScope ds(dev_);
     const Config & c = model_.cfg;
     std::vector<uint32_t> now((size_t) c.n_layer * c.n_expert);
     CUDA_CHECK(cudaMemcpy(now.data(), counts_.p, now.size() * 4, cudaMemcpyDeviceToHost));
@@ -455,7 +680,7 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
 // host side: the n-gram hash rows of the window, gathered into pinned memory the graph reads
 void Engine::ple_gather() {
     const Config & c = model_.cfg;
-    if (c.ple_layer < 0) return;
+    if (c.ple_layer < 0 || !owns(c.ple_layer)) return;
     const double t0 = now_ms();
     const int ph = c.ple_heads();
     const TensorRef & tab = *model_.ple_table;
@@ -483,7 +708,7 @@ void Engine::ple_gather() {
             }
         }
     }
-    times.ple_ms += now_ms() - t0;
+    head_->times.ple_ms += now_ms() - t0;
 }
 
 void Engine::ple(int il, int T) {
@@ -551,26 +776,36 @@ void Engine::enqueue_commit(int cnt) {
     const Config & c = model_.cfg;
     const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     const size_t r0 = (size_t) cur_->last_r0;
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) continue;
         gdn_recurrence(gdn_co_[il].p + r0 * C, C, gdn_g_[il].p + r0 * nv, gdn_b_[il].p + r0 * nv, cur_->ssm_state[il],
                        nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
-    shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
-    if (c.ple_layer >= 0) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
+    if (n_gdn_) shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
+    if (cur_->ple_hist.p) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
 }
 
 void Engine::join_commit() {
+    for (Engine * s = this; s; s = s->next_.get()) s->join_commit_here();
+}
+
+void Engine::join_commit_here() {
     if (!commit_inflight_) return;
+    DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamWaitEvent(st_, ev_committed_, 0));
     commit_inflight_ = false;
 }
 
 void Engine::commit(int cnt) {
+    for (Engine * s = this; s; s = s->next_.get()) s->commit_here(cnt);
+}
+
+void Engine::commit_here(int cnt) {
+    DeviceScope ds(dev_);
     if (!cur_->conv_ptrs.p) {   // the GDN conv buffers never move: their pointer table once, before any capture
         const Config & c = model_.cfg;
         std::vector<float *> ptrs;
-        for (int il = 0; il < c.n_layer; ++il)
+        for (int il = l0_; il < l1_; ++il)
             if (!c.is_attn(il)) ptrs.push_back(cur_->conv_buf[il].p);
         n_gdn_ = (int) ptrs.size();
         cur_->conv_ptrs.alloc(ptrs.size());
@@ -679,7 +914,7 @@ void Engine::predict_stats(int il, int T) {
         ++layers;
     }
     prev_layer = -1;
-    if (il + 1 < c.n_layer) {
+    if (il + 1 < l1_) {
         if (!pred_logits_.p) {
             pred_logits_.alloc((size_t) kMaxWindow * c.n_expert);
             pred_ids_.alloc((size_t) kMaxWindow * 32);
@@ -719,11 +954,11 @@ void Engine::moe(int il, int T) {
         MoeMsg * m = msg(il);
         tasks_.clear();
         for (int i = 0; i < m->n_miss; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
-        if (!tasks_.empty()) cpu_.run(il, T, m->x(), tasks_, m->out(E));
-        times.misses += m->n_miss;
-        times.routed += (int64_t) T * k;
-        layer_misses[il] += m->n_miss;
-        layer_routed[il] += (int64_t) T * k;
+        if (!tasks_.empty()) cpu_->run(il, T, m->x(), tasks_, m->out(E));
+        head_->times.misses += m->n_miss;
+        head_->times.routed += (int64_t) T * k;
+        head_->layer_misses[il] += m->n_miss;
+        head_->layer_routed[il] += (int64_t) T * k;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         m->seq_done = m->seq_req;
     }
@@ -759,22 +994,30 @@ void Engine::layer_forward(int il, int T) {
     dbg(st_, il, "ffn_out", moe_out_, (size_t) T * c.n_embd);
     hc_combine(res_, moe_out_, inj_, T, c.hc, c.n_embd, st_);
     dbg(st_, il, "l_last", res_, (size_t) T * c.hc_dim());
-    if (dump_all) {
-        dumped_layers.resize(c.n_layer);
-        dumped_layers[il].resize((size_t) T * c.hc_dim());
-        CUDA_CHECK(cudaMemcpyAsync(dumped_layers[il].data(), res_.p, dumped_layers[il].size() * 4,
-                                   cudaMemcpyDeviceToHost, st_));
+    if (head_->dump_all) {
+        auto & dl = head_->dumped_layers;
+        dl.resize(c.n_layer);
+        dl[il].resize((size_t) T * c.hc_dim());
+        CUDA_CHECK(cudaMemcpyAsync(dl[il].data(), res_.p, dl[il].size() * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
     }
 }
 
+// This stage's part of a forward: the token embeddings (first stage) or the previous stage's residual rows, its
+// layers, then the head (last stage) or the residual rows out to the next stage.
 void Engine::enqueue_forward(int T) {
     const Config & c = model_.cfg;
+    const size_t rows = (size_t) T * c.hc_dim() * 4;
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, st_));
-    dequant_gather(model_.tok_embd, h_tok_, T, x_, st_);
-    hc_init(x_, res_, T, c.hc, c.n_embd, st_);
-    for (int il = 0; il < c.n_layer; ++il) layer_forward(il, T);
-    head(T);
+    if (first()) {
+        dequant_gather(model_.tok_embd, h_tok_, T, x_, st_);
+        hc_init(x_, res_, T, c.hc, c.n_embd, st_);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(res_.p, xfer_in_, rows, cudaMemcpyHostToDevice, st_));
+    }
+    for (int il = l0_; il < l1_; ++il) layer_forward(il, T);
+    if (last_) head(T);
+    else CUDA_CHECK(cudaMemcpyAsync(xfer_out_, res_.p, rows, cudaMemcpyDeviceToHost, st_));
 }
 
 void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double t1) {
@@ -808,25 +1051,25 @@ void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double
 void Engine::service_cpu(uint32_t seq, int T) {
     const Config & c = model_.cfg;
     const int E = c.n_embd;
-    for (int il = 0; il < c.n_layer; ++il) {
+    for (int il = l0_; il < l1_; ++il) {
         MoeMsg * m = msg(il);
         const double t0 = now_ms();
         while (__atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE) != seq) __builtin_ia32_pause();
         const double t1 = now_ms();
-        times.wait_ms += t1 - t0;
+        head_->times.wait_ms += t1 - t0;
         const int n = m->n_miss;
-        times.misses += n;
-        times.routed += (int64_t) T * c.n_expert_used;
-        layer_misses[il] += n;
-        layer_routed[il] += (int64_t) T * c.n_expert_used;
+        head_->times.misses += n;
+        head_->times.routed += (int64_t) T * c.n_expert_used;
+        head_->layer_misses[il] += n;
+        head_->layer_routed[il] += (int64_t) T * c.n_expert_used;
         if (n > 0) {
             tasks_.clear();
             for (int i = 0; i < n; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
-            cpu_.run(il, T, m->x(), tasks_, m->out(E));
+            cpu_->run(il, T, m->x(), tasks_, m->out(E));
             __atomic_thread_fence(__ATOMIC_RELEASE);
             m->seq_done = seq;
             const double t2 = now_ms();
-            times.cpu_experts_ms += t2 - t1;
+            head_->times.cpu_experts_ms += t2 - t1;
             if (route_log_) cpu_us_[il] = (float) ((t2 - t1) * 1e3);
             static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
             if (prof) fprintf(stderr, "svc L%02d n=%d wait %.1f us  cpu %.1f us\n", il, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
@@ -843,11 +1086,30 @@ int Engine::row0_of(int slot) const {
 }
 
 void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
-    join_commit();
     // windows in slot order, whatever order the caller lists them in: one graph per layout, not per permutation
     std::vector<BatchWin> batch = batch_in;
     std::sort(batch.begin(), batch.end(), [](const BatchWin & a, const BatchWin & b) { return a.slot < b.slot; });
     if (batch.empty() || batch.size() > (size_t) kMaxSlots) throw std::runtime_error("forward: bad batch");
+    const double t0 = now_ms();
+    // Every stage books the windows and captures its graph if this layout is new; only then are the graphs queued
+    // (each stage's after the one before), and the host answers the CPU experts of each stage's layers in turn
+    // while the GPUs work through them. Nothing may wait on a launched graph before its CPU part is answered: a
+    // capture (which can synchronize its stream, e.g. when the expert cache gives up VRAM) comes first.
+    for (Engine * s = this; s; s = s->next_.get()) s->fwd_prepare(batch);
+    cudaEvent_t after = nullptr;
+    for (Engine * s = this; s; s = s->next_.get()) {
+        s->fwd_launch(after);
+        after = s->ev_out_;
+    }
+    for (Engine * s = this; s; s = s->next_.get()) s->fwd_service();
+    for (Engine * s = this; s; s = s->next_.get()) s->fwd_end();
+    times.total_ms += now_ms() - t0;
+    times.calls++;
+}
+
+void Engine::fwd_prepare(const std::vector<BatchWin> & batch) {
+    DeviceScope ds(dev_);
+    join_commit_here();
     Seq * keep = cur_;
     int R = 0;
     for (const auto & b : batch) {
@@ -855,7 +1117,7 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
         R += b.T;
     }
     if (R > kMaxWindow) throw std::runtime_error("forward: more than kMaxWindow rows");
-    const double t0 = now_ms();
+    fwd_t0_ = now_ms();
     wins_.clear();
     ++seq_;
     std::vector<int> key{(int) batch.size()};
@@ -865,9 +1127,9 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
         for (const Win & w : wins_)
             if (w.q == q) throw std::runtime_error("forward: a slot twice in one batch");
         use(q);
-        if (!q->used) { q->used = true; reset(); }
+        if (!q->used) { q->used = true; reset_here(); }
         if (pos() + b.T > opt_.max_ctx) { use(keep); throw std::runtime_error("context full"); }
-        ensure_ctx(pos() + b.T + kMaxWindow);
+        ensure_ctx_here(pos() + b.T + kMaxWindow);
         const int r0 = wins_.empty() ? 0 : wins_.back().r0 + wins_.back().T;
         wins_.push_back(Win{q, r0, b.T, pos(), b.commit_all});
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
@@ -879,7 +1141,9 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
     use(keep);
     last_T = R;
     ple_gather();
-    if (opt_.use_graphs && !dump_all) {
+    fwd_graph_ = opt_.use_graphs && !head_->dump_all;
+    fwd_exec_ = nullptr;
+    if (fwd_graph_) {
         FwdGraph & fg = fwd_graphs_[key];
         if (!fg.exec) {
             while ((int) fwd_graphs_.size() > kMaxFwdGraphs) {   // the least recently used layout goes
@@ -910,34 +1174,50 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
             ++graph_captures_;
         }
         fg.used = ++fwd_graph_age_;
-        cudaGraphExec_t ge = fg.exec;
-        if (route_log_) moe_debug_reset(st_);
-        CUDA_CHECK(cudaGraphLaunch(ge, st_));
-        service_cpu(seq_, R);
-        static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
-        if (prof) {
-            CUDA_CHECK(cudaStreamSynchronize(st_));
-            uint64_t ts[64][3];
-            moe_debug_times(ts, model_.cfg.n_layer);
-            for (int il = 0; il < model_.cfg.n_layer; ++il)
-                fprintf(stderr, "gpu L%02d plan->wait %.1f us  wait %.1f us\n", il, (ts[il][1] - ts[il][0]) / 1e3,
-                        (ts[il][2] - ts[il][1]) / 1e3);
-        }
-    } else {
-        enqueue_forward(R);
+        fwd_exec_ = fg.exec;
     }
+}
+
+void Engine::fwd_launch(cudaEvent_t after) {
+    DeviceScope ds(dev_);
+    if (after) CUDA_CHECK(cudaStreamWaitEvent(st_, after, 0));   // the previous stage's residual rows
+    if (fwd_graph_) {
+        if (route_log_) moe_debug_reset(st_);
+        CUDA_CHECK(cudaGraphLaunch(fwd_exec_, st_));
+    } else {
+        enqueue_forward(last_T);   // eager: the CPU experts are answered inside
+    }
+    CUDA_CHECK(cudaEventRecord(ev_out_, st_));
+}
+
+void Engine::fwd_service() {
+    if (!fwd_graph_) return;
+    DeviceScope ds(dev_);
+    service_cpu(seq_, last_T);
+    static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
+    if (prof) {
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        uint64_t ts[64][3];
+        moe_debug_times(ts, model_.cfg.n_layer);
+        for (int il = l0_; il < l1_; ++il)
+            fprintf(stderr, "gpu L%02d plan->wait %.1f us  wait %.1f us\n", il, (ts[il][1] - ts[il][0]) / 1e3,
+                    (ts[il][2] - ts[il][1]) / 1e3);
+    }
+}
+
+void Engine::fwd_end() {
+    DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    if (route_log_ && opt_.use_graphs && !dump_all) write_route_log(R, wins_[0].pos0, wins_[0].commit, t0, now_ms());
+    if (route_log_ && fwd_graph_) write_route_log(last_T, wins_[0].pos0, wins_[0].commit, fwd_t0_, now_ms());
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
-    times.total_ms += now_ms() - t0;
-    times.calls++;
 }
 
 // The MTP layer's K/V for rows just processed: each row pairs with the token after it; the last row waits
 // for its successor (the next chunk's first token, or the first generated token).
 void Engine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
     if (!mtp_.loaded()) return;
+    DeviceScope ds(dev_);
     const int HC = model_.cfg.hc_dim();
     if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) HC * 4));
     if (cur_->mtp_cell >= 0 && cur_->mtp_cell == pos0 - 1) mtp_.run(cur_->mtp_R, tokens, 1, cur_->mtp_cell, false, nullptr);
@@ -953,44 +1233,62 @@ size_t Engine::kv_bytes_mapped() const {
     size_t b = 0;
     for (size_t il = 0; il < cur_->kv_k.size(); ++il)
         b += cur_->kv_k[il].mapped() + cur_->kv_v[il].mapped() + cur_->kv_raw[il].mapped() + cur_->kv_pool[il].mapped();
-    return b;
+    return b + (next_ ? next_->kv_bytes_mapped() : 0);
 }
 
 void Engine::prefill(const std::vector<int32_t> & tokens) {
+    DeviceScope ds(dev_);
     join_commit();
     size_t i = 0;
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
     // the chunk layout for this read, borrowing VRAM from the expert cache meanwhile: a short turn keeps the
-    // small layout and stage; longer reads get bigger chunks and a stage that holds a whole layer's outside experts
+    // small layout and stage; longer reads get bigger chunks and a stage that holds a whole layer's outside experts.
+    // Every stage reads the same chunks: the largest layout all of them fit.
     const int n = (int) tokens.size();
     if (pf_base_ > 0) {
         const int want = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
         // smaller chunks when VRAM is short (long contexts in every slot): slower, but the read goes through;
         // conversations are moved off the GPU only when even the smallest layout does not fit
+        auto fits = [&](int N) {
+            for (Engine * s = this; s; s = s->next_.get()) {
+                DeviceScope d2(s->dev_);
+                if (!s->try_layout(N)) return false;
+            }
+            return true;
+        };
         int lay = 0;
         for (int pass = 0; pass < 2 && !lay; ++pass) {
             for (int N : {want, pf_base_, pf_small_})
-                if (N <= want && try_layout(N)) { lay = N; break; }
-            if (!lay && (pass || !evict_idle(prefill_arena_bytes(pf_small_))))
-                throw std::runtime_error("not enough VRAM for the prompt buffers (" + budget_.describe() + ")");
+                if (N <= want && fits(N)) { lay = N; break; }
+            if (lay) break;
+            bool room = pass == 0;
+            for (Engine * s = this; s && room; s = s->next_.get()) {
+                DeviceScope d2(s->dev_);
+                if (!s->try_layout(pf_small_)) room = s->evict_idle(s->prefill_arena_bytes(pf_small_));
+            }
+            if (!room) throw std::runtime_error("not enough VRAM for the prompt buffers (" + budget_.describe() + ")");
         }
         if (lay < want && opt_.verbose)
             fprintf(stderr, "bnk: VRAM is short: reading this prompt in chunks of %d tokens (not %d)\n", lay, want);
-        pf_full_ = n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min;
-        staging_fit();
+        for (Engine * s = this; s; s = s->next_.get()) {
+            DeviceScope d2(s->dev_);
+            s->pf_full_ = n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min;
+            s->staging_fit();
+        }
     }
+    Engine * t = tail();
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
         if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
             const int N = (int) std::min<size_t>(pf_max_, left);
             prefill_chunk(tokens.data() + i, N);
-            mtp_feed(pf_.res, tokens.data() + i, N, pos0);
+            t->mtp_feed(t->pf_.res, tokens.data() + i, N, pos0);
             i += N;
         } else {
             const int T = (int) std::min<size_t>(kMaxWindow, left);
             forward(tokens.data() + i, T);
-            mtp_feed(res_, tokens.data() + i, T, pos0);
+            t->mtp_feed(t->res_, tokens.data() + i, T, pos0);
             i += T;
         }
         if (on_prefill_progress) on_prefill_progress(i, tokens.size());
@@ -1001,6 +1299,8 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
 }
 
 int Engine::argmax(int t) {
+    if (next_) return next_->argmax(t);
+    DeviceScope ds(dev_);
     argmax_rows(logits_.p + (size_t) t * model_.cfg.n_vocab, 1, model_.cfg.n_vocab, argmax_dev_, st_);
     int32_t r;
     CUDA_CHECK(cudaMemcpyAsync(&r, argmax_dev_.p, 4, cudaMemcpyDeviceToHost, st_));
@@ -1009,12 +1309,16 @@ int Engine::argmax(int t) {
 }
 
 void Engine::argmax_all(int T, int32_t * out, int row0) {
+    if (next_) return next_->argmax_all(T, out, row0);
+    DeviceScope ds(dev_);
     argmax_rows(logits_.p + (size_t) row0 * model_.cfg.n_vocab, T, model_.cfg.n_vocab, argmax_dev_, st_);
     CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals) {
+    if (next_) return next_->topk_rows_host(row0, T, K, ids, vals);
+    DeviceScope ds(dev_);
     if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
     if (!topk_ids_.p) {
         topk_ids_.alloc((size_t) kMaxWindow * kTopkMax);
@@ -1028,18 +1332,24 @@ void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals)
 }
 
 void Engine::logits_rows_host(int T, float * out, int row0) {
+    if (next_) return next_->logits_rows_host(T, out, row0);
+    DeviceScope ds(dev_);
     CUDA_CHECK(cudaMemcpy(out, logits_.p + (size_t) row0 * model_.cfg.n_vocab, (size_t) T * model_.cfg.n_vocab * 4,
                           cudaMemcpyDeviceToHost));
 }
 
 void Engine::set_mtp_pending(const float * R_row_dev, int cell) {
+    if (next_) return next_->set_mtp_pending(R_row_dev, cell);
     if (!mtp_.loaded()) return;
+    DeviceScope ds(dev_);
     if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) model_.cfg.hc_dim() * 4));
     CUDA_CHECK(cudaMemcpyAsync(cur_->mtp_R, R_row_dev, (size_t) model_.cfg.hc_dim() * 4, cudaMemcpyDeviceToDevice, st_));
     cur_->mtp_cell = cell;
 }
 
 std::vector<float> Engine::logits_host(int t) {
+    if (next_) return next_->logits_host(t);
+    DeviceScope ds(dev_);
     std::vector<float> v(model_.cfg.n_vocab);
     CUDA_CHECK(cudaMemcpy(v.data(), logits_.p + (size_t) t * model_.cfg.n_vocab, v.size() * 4,
                           cudaMemcpyDeviceToHost));

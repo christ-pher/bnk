@@ -73,8 +73,12 @@ struct Model {
     const TensorRef * ple_table = nullptr;                 // host (mmap), [ple_dim, rows]
     size_t vram_dense_bytes = 0;
 
-    // dense weights to VRAM; ple_path supplies per_layer_token_embd.weight when the model file has none
-    void load(const std::string & path, bool verbose = true, const std::string & ple_path = "");
+    // dense weights to VRAM (the current device); ple_path supplies per_layer_token_embd.weight when the model file
+    // has none. A pipeline stage (several GPUs) uploads only layers [l0, l1), the embeddings with `embd` and the
+    // head with `head`; the routed experts' placement is described for every layer either way.
+    void load(const std::string & path, bool verbose = true, const std::string & ple_path = "", int l0 = 0, int l1 = -1,
+              bool embd = true, bool head = true);
+    int l0 = 0, l1 = 0;   // the layers whose dense weights are on this device
     ~Model();
 
     bool repack_ = true;  // R layouts for dense quant matrices
@@ -83,6 +87,7 @@ struct Model {
 private:
     std::vector<void *> device_allocs_;
     QMat upload(const std::string & name, bool required = true);
+    void expert_src(int il);
 };
 
 }  // namespace bnk

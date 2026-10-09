@@ -128,11 +128,14 @@ Model::~Model() {
     for (void * p : device_allocs_) cudaFree(p);
 }
 
-void Model::load(const std::string & path, bool verbose, const std::string & ple_path) {
+void Model::load(const std::string & path, bool verbose, const std::string & ple_path, int first, int end, bool embd,
+                 bool head) {
     gguf.open(path);
     cfg = load_config(gguf);
     const Config & c = cfg;
-    if (verbose)
+    l0 = first;
+    l1 = end < 0 ? c.n_layer : end;
+    if (verbose && l0 == 0)
         fprintf(stderr, "bnk: %s: %d layers, %d experts (%d used), hc %d, %zu shard(s)\n",
                 gguf.get_str("general.name").c_str(), c.n_layer, c.n_expert, c.n_expert_used, c.hc,
                 gguf.shard_paths().size());
@@ -150,9 +153,13 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
     for (int il = 0; il < c.n_layer; ++il) {
         LayerWeights & L = layers[il];
         const std::string b = "blk." + std::to_string(il) + ".";
+        L.attn = c.is_attn(il);
+        if (il < l0 || il >= l1) {   // another stage's layer: only where its experts are (the expert store needs them)
+            expert_src(il);
+            continue;
+        }
         L.hc_attn = hcw(b + "hc_attn", true);
         L.hc_ffn = hcw(b + "hc_ffn", true);
-        L.attn = c.is_attn(il);
         if (L.attn) {
             L.wq = upload(b + "attn_q.weight");
             L.wk = upload(b + "attn_k.weight");
@@ -188,22 +195,14 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         L.sh_gate = upload(b + "ffn_gate_shexp.weight");
         L.sh_up = upload(b + "ffn_up_shexp.weight");
         L.sh_down = upload(b + "ffn_down_shexp.weight");
-
-        const TensorRef & g = gguf.get(b + "ffn_gate_exps.weight");
-        const TensorRef & u = gguf.get(b + "ffn_up_exps.weight");
-        const TensorRef & d = gguf.get(b + "ffn_down_exps.weight");
-        if (g.ne[2] != c.n_expert || u.ne[2] != c.n_expert || d.ne[2] != c.n_expert)
-            throw std::runtime_error("expert tensor shape mismatch in layer " + std::to_string(il));
-        L.gate_type = g.type; L.up_type = u.type; L.down_type = d.type;
-        L.gate_bytes = g.nbytes / c.n_expert;
-        L.up_bytes = u.nbytes / c.n_expert;
-        L.down_bytes = d.nbytes / c.n_expert;
-        L.gate_src = g.data; L.up_src = u.data; L.down_src = d.data;
+        expert_src(il);
     }
-    hc_head = hcw("output_hc", false);
-    output = upload("output.weight");
-    tok_embd = upload("token_embd.weight");
-    if (c.ple_layer >= 0) {
+    if (head) {
+        hc_head = hcw("output_hc", false);
+        output = upload("output.weight");
+    }
+    if (embd) tok_embd = upload("token_embd.weight");
+    if (c.ple_layer >= l0 && c.ple_layer < l1) {
         // the PLE table may live in another GGUF (--ple-gguf): a fine-tune that left it untouched can share the
         // base quant's copy instead of storing another 28.8 GB. The model's own table wins when it has one.
         ple_table = gguf.find("per_layer_token_embd.weight");
@@ -219,7 +218,26 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
                                  ggml_type_name(ple_table->type), ple_path.c_str());
         }
     }
-    if (verbose) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
+    if (verbose) {
+        if (l0 == 0 && l1 == c.n_layer) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
+        else fprintf(stderr, "bnk: layers %d-%d: dense weights in VRAM: %.2f GiB\n", l0, l1 - 1, vram_dense_bytes / 1073741824.0);
+    }
+}
+
+void Model::expert_src(int il) {
+    const Config & c = cfg;
+    LayerWeights & L = layers[il];
+    const std::string b = "blk." + std::to_string(il) + ".";
+    const TensorRef & g = gguf.get(b + "ffn_gate_exps.weight");
+    const TensorRef & u = gguf.get(b + "ffn_up_exps.weight");
+    const TensorRef & d = gguf.get(b + "ffn_down_exps.weight");
+    if (g.ne[2] != c.n_expert || u.ne[2] != c.n_expert || d.ne[2] != c.n_expert)
+        throw std::runtime_error("expert tensor shape mismatch in layer " + std::to_string(il));
+    L.gate_type = g.type; L.up_type = u.type; L.down_type = d.type;
+    L.gate_bytes = g.nbytes / c.n_expert;
+    L.up_bytes = u.nbytes / c.n_expert;
+    L.down_bytes = d.nbytes / c.n_expert;
+    L.gate_src = g.data; L.up_src = u.data; L.down_src = d.data;
 }
 
 }  // namespace bnk

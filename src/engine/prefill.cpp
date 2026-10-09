@@ -59,7 +59,7 @@ size_t Engine::prefill_carve(int N, bool dry_only) {
         carve(p.xq, (size_t) N * E); carve(p.xd, (size_t) N * E / 32);
         carve(p.hq, (size_t) N * k * F); carve(p.hd, (size_t) N * k * F / 32); carve(p.gu32, (size_t) N * k * 2 * F);
         carve(p.items, (size_t) (2 * (N * k + c.n_expert)) * sizeof(PfItem));
-        if (c.ple_layer >= 0) {
+        if (c.ple_layer >= 0 && owns(c.ple_layer)) {
             const int ph = c.ple_heads();
             carve(p.ple_emb, (size_t) N * ph * c.ple_dim); carve(p.ple_key, (size_t) N * HC);
             carve(p.ple_val, (size_t) N * E); carve(p.ple_gated, (size_t) N * HC);
@@ -92,7 +92,7 @@ void Engine::prefill_alloc(int N) {
     // fp16 copies of a group of experts' gate/up/down
     p.wexp_experts = 32;
     p.wexp.alloc((size_t) p.wexp_experts * 3 * F * E);
-    if (c.ple_layer >= 0)
+    if (c.ple_layer >= 0 && owns(c.ple_layer))
         CUDA_CHECK(cudaHostAlloc((void **) &p.ple_rows, (size_t) N * c.ple_heads() * model_.ple_table->row_bytes(),
                                  cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_ids, (size_t) N * k * 4, 0));
@@ -122,12 +122,11 @@ void Engine::prefill_alloc(int N) {
 // to settle), as streaming a whole layer ahead needs; otherwise the small stage kept between prompts, and the
 // prompt path's cost model sends the experts that do not fit to the CPU.
 void Engine::prefill_staging_ensure(bool full) {
-    const Config & c = model_.cfg;
     const size_t small = vmem_round((size_t) opt_.stage_small_mib << 20);
     for (int round = 0; round < 4; ++round) {
         size_t need = 0;
-        for (int il = 0; il < c.n_layer; ++il)
-            need = std::max(need, (size_t) cache_.unmapped(il) * store_.blob_bytes(il));
+        for (int il = l0_; il < l1_; ++il)
+            need = std::max(need, (size_t) cache_.unmapped(il) * store_->blob_bytes(il));
         if (!full) need = std::min(need, small);
         if (need <= pf_.stage_bytes && pf_stage_b_[0].mapped() >= need) break;
         for (int i = 0; i < 2; ++i) pf_stage_b_[i].ensure(need);
@@ -166,7 +165,7 @@ void Engine::prefill_staging_shrink() {
 void Engine::prefill_staging_alloc() {
     const Config & c = model_.cfg;
     size_t worst = 0;
-    for (int il = 0; il < c.n_layer; ++il) worst = std::max(worst, (size_t) c.n_expert * store_.blob_bytes(il));
+    for (int il = l0_; il < l1_; ++il) worst = std::max(worst, (size_t) c.n_expert * store_->blob_bytes(il));
     for (int i = 0; i < 2; ++i) {
         pf_stage_b_[i].reserve(worst, &budget_, "expert staging");
         pf_.stage[i] = pf_stage_b_[i].as<uint8_t>();
@@ -193,7 +192,7 @@ void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
     auto & p = pf_;
     const int b = il & 1;
     CUDA_CHECK(cudaStreamWaitEvent(p.copy, p.used[b], 0));
-    const size_t blob = store_.blob_bytes(il);
+    const size_t blob = store_->blob_bytes(il);
     std::vector<int> & idx = p.stage_idx[il];
     int n = 0;
     if (experts.size() * blob > p.stage_bytes)
@@ -201,7 +200,7 @@ void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
                                  std::to_string(il) + " need " + std::to_string((experts.size() * blob) >> 20) + " MiB");
     for (int e : experts) {
         idx[e] = n;
-        CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) n * blob, store_.blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
+        CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) n * blob, store_->blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
         ++n;
     }
     CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
@@ -251,7 +250,7 @@ void Engine::pf_ple(int il, int N) {
             }
         }
     }
-    times.ple_ms += now_ms() - t0;
+    head_->times.ple_ms += now_ms() - t0;
     QMat rows{p.ple_rows, (int) tab.type, (int64_t) N * ph, tab.ne[0], rb};
     dequant_rows(rows, 0, (int64_t) N * ph, p.ple_emb, st_);
     const int D = ph * c.ple_dim;
@@ -374,11 +373,11 @@ void Engine::pf_moe(int il, int N) {
     std::vector<int> cnt(c.n_expert, 0), off(c.n_expert + 1, 0);
     for (int i = 0; i < P; ++i) cnt[p.h_ids[i]]++;
     for (int e = 0; e < c.n_expert; ++e) off[e + 1] = off[e] + cnt[e];
-    for (int e = 0; e < c.n_expert; ++e) times.routed += cnt[e];
-    for (int e = 0; e < c.n_expert; ++e) layer_routed[il] += cnt[e];
+    for (int e = 0; e < c.n_expert; ++e) head_->times.routed += cnt[e];
+    for (int e = 0; e < c.n_expert; ++e) head_->layer_routed[il] += cnt[e];
 
     // where each used expert runs: VRAM cache, PCIe stage, or the CPU pool
-    const size_t blob = store_.blob_bytes(il);
+    const size_t blob = store_->blob_bytes(il);
     std::vector<char> on_cpu(c.n_expert, 0);
     if (!p.prefetch) {
         std::fill(p.stage_idx[il].begin(), p.stage_idx[il].end(), -1);
@@ -519,10 +518,10 @@ void Engine::pf_moe(int il, int N) {
         CUDA_CHECK(cudaEventSynchronize(p.xready));   // h_x / h_w are here; the expert GEMMs keep running
         for (auto & t : cpu_tasks) t.w = p.h_w[t.t * k + t.slot];
         const double tc = now_ms();
-        cpu_.run(il, N, p.h_x, cpu_tasks, p.h_cpu);
-        times.cpu_experts_ms += now_ms() - tc;
-        times.misses += (int64_t) cpu_tasks.size();
-        layer_misses[il] += (int64_t) cpu_tasks.size();
+        cpu_->run(il, N, p.h_x, cpu_tasks, p.h_cpu);
+        head_->times.cpu_experts_ms += now_ms() - tc;
+        head_->times.misses += (int64_t) cpu_tasks.size();
+        head_->layer_misses[il] += (int64_t) cpu_tasks.size();
         CUDA_CHECK(cudaMemcpyAsync(p.cpu.p, p.h_cpu, (size_t) N * E * 4, cudaMemcpyHostToDevice, st_));
         extra = p.cpu.p;
     }
@@ -531,7 +530,18 @@ void Engine::pf_moe(int il, int N) {
 }
 
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
-    join_commit();
+    const double t0 = now_ms();
+    for (Engine * s = this; s; s = s->next_.get()) s->prefill_chunk_here(tokens, N);
+    pstats.ms += now_ms() - t0;
+    pstats.tokens += N;
+    pstats.chunks++;
+}
+
+// This stage's part of a prompt chunk: embeddings (first stage) or the previous stage's residual rows, its layers,
+// then the head on the last token (last stage) or the rows out to the next stage.
+void Engine::prefill_chunk_here(const int32_t * tokens, int N) {
+    DeviceScope ds(dev_);
+    join_commit_here();
     // the expert cache may have changed since the read began (other conversations decode between its chunks:
     // their cache adaptation and growing KV leave more experts outside VRAM), so the staging is checked again
     staging_fit();
@@ -540,20 +550,23 @@ void Engine::prefill_chunk(const int32_t * tokens, int N) {
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
     const Config & c = model_.cfg;
     const int E = c.n_embd, HC = c.hc_dim();
-    const double t0 = now_ms();
     auto & p = pf_;
     const int pos0 = pos();
     cur_->history.insert(cur_->history.end(), tokens, tokens + N);
     *h_par_ = WinParams{pos0, N, ++seq_, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
-    dequant_gather(model_.tok_embd, p.tok, N, p.x, st_);
-    hc_init(p.x, p.res, N, c.hc, E, st_);
+    if (first()) {
+        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
+        dequant_gather(model_.tok_embd, p.tok, N, p.x, st_);
+        hc_init(p.x, p.res, N, c.hc, E, st_);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_, (size_t) N * HC * 4, cudaMemcpyHostToDevice, st_));
+    }
     p.prefetch = pf_full_ && N >= opt_.prefetch_min;   // a whole layer ahead needs the full stage
-    if (p.prefetch) pf_stage_layer(0);
-    for (int il = 0; il < c.n_layer; ++il) {
+    if (p.prefetch) pf_stage_layer(l0_);
+    for (int il = l0_; il < l1_; ++il) {
         const LayerWeights & L = model_.layers[il];
-        if (p.prefetch && il + 1 < c.n_layer) pf_stage_layer(il + 1);
+        if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
         if (il == c.ple_layer) pf_ple(il, N);
         pf_hc_pre(L.hc_attn, N, true);
         if (L.attn) pf_attn(il, N); else pf_gdn(il, N);
@@ -562,14 +575,14 @@ void Engine::prefill_chunk(const int32_t * tokens, int N) {
         pf_moe(il, N);
         hc_combine(p.res, p.moe, p.inj, N, c.hc, E, st_);
     }
-    // the head on the last token, through the decode buffers (row 0)
-    CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
-    head(1);
+    if (last_) {   // the head on the last token, through the decode buffers (row 0)
+        CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
+        head(1);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(pf_xfer_out_, p.res.p, (size_t) N * HC * 4, cudaMemcpyDeviceToHost, st_));
+    }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     last_T = 1;
-    pstats.ms += now_ms() - t0;
-    pstats.tokens += N;
-    pstats.chunks++;
 }
 
 }  // namespace bnk

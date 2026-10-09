@@ -30,6 +30,17 @@ static std::vector<int32_t> read_tokens(const std::string & path) {
     return v;
 }
 
+// "0,1" -> {0, 1}
+static std::vector<int> int_list(const std::string & s) {
+    std::vector<int> v;
+    for (size_t a = 0, b; a < s.size(); a = b + 1) {
+        b = s.find(',', a);
+        if (b == std::string::npos) b = s.size();
+        if (b > a) v.push_back(std::stoi(s.substr(a, b - a)));
+    }
+    return v;
+}
+
 static bool read_floats(const std::string & path, std::vector<float> & v) {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -53,7 +64,8 @@ static double rel_rms(const float * a, const float * b, size_t n) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: bnk run|check --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n");
+        fprintf(stderr, "usage: bnk run|check --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
+                        "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n");
         return 1;
     }
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
@@ -90,6 +102,8 @@ int main(int argc, char ** argv) {
         else if (a == "--park-gib") opt.park_gib = std::stod(next());
         else if (a == "--park-min") opt.park_min = std::stoi(next());
         else if (a == "--slots") opt.slots = std::stoi(next());
+        else if (a == "--gpus") { const std::string v = next(); opt.gpus = v == "all" ? std::vector<int>{-1} : int_list(v); }
+        else if (a == "--split") opt.split = int_list(next());
         else if (a == "--solo") solo = true;
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
@@ -333,6 +347,6 @@ int main(int argc, char ** argv) {
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
     printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
-           (long long) eng.cache().swaps_done);
+           (long long) eng.cache_swaps());
     return 0;
 }

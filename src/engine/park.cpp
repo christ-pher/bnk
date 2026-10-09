@@ -56,7 +56,7 @@ template <typename F> void Engine::each_ctx(int cells, F && f) {
 size_t Engine::parked_bytes() const {
     size_t b = 0;
     for (const auto & p : parked_) b += p.bytes;
-    return b;
+    return b + (next_ ? next_->parked_bytes() : 0);
 }
 
 uint8_t * Engine::pinned_take(size_t bytes, size_t * cap) {
@@ -115,8 +115,25 @@ void Engine::drop_parked(size_t i) {
     parked_.erase(parked_.begin() + (long) i);
 }
 
-// Copies the live conversation into host RAM (the live state is left as it is). Never drops the entry stamped
-// `keep` (one about to be restored).
+void Engine::drop_parked_id(uint64_t id) {
+    for (Engine * s = this; s; s = s->next_.get()) {
+        DeviceScope ds(s->dev_);
+        for (size_t i = 0; i < s->parked_.size(); ++i)
+            if (s->parked_[i].used == id) {
+                s->drop_parked(i);
+                break;
+            }
+    }
+}
+
+size_t Engine::park_bytes_here(int n) {
+    size_t bytes = state_floats() * 4;
+    each_ctx(n, [&](void *, size_t b) { bytes += b; });
+    return bytes;
+}
+
+// Copies the live conversation into host RAM (the live state is left as it is), on every stage. Never drops the
+// entry stamped `keep` (one about to be restored).
 void Engine::park(uint64_t keep, bool move_ckpts) {
     join_commit();
     const double t0 = now_ms();
@@ -125,13 +142,15 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
     for (size_t i = parked_.size(); i-- > 0;) {
         const auto & h = parked_[i].history;
         if (parked_[i].used != keep && h.size() <= cur_->history.size() && std::equal(h.begin(), h.end(), cur_->history.begin()))
-            drop_parked(i);
+            drop_parked_id(parked_[i].used);
     }
-    const size_t sfloats = state_floats();
-    size_t bytes = sfloats * 4;
-    each_ctx(n, [&](void *, size_t b) { bytes += b; });
-    size_t ck_bytes = 0;
-    for (const auto & k : cur_->ckpts) ck_bytes += k.pos >= 0 ? sfloats * 4 : 0;
+    size_t bytes = 0, ck_bytes = 0;
+    for (Engine * s = this; s; s = s->next_.get()) {
+        DeviceScope ds(s->dev_);
+        bytes += s->park_bytes_here(n);
+        const size_t sfloats = s->state_floats();
+        for (const auto & k : s->cur_->ckpts) ck_bytes += k.pos >= 0 ? sfloats * 4 : 0;
+    }
     const size_t limit = (size_t) (opt_.park_gib * 1073741824.0);
     if (bytes + ck_bytes > limit) return;
     while (parked_bytes() + bytes + ck_bytes > limit) {   // least recently used first
@@ -139,15 +158,35 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
         for (size_t i = 0; i < parked_.size(); ++i)
             if (parked_[i].used != keep && (lru == parked_.size() || parked_[i].used < parked_[lru].used)) lru = i;
         if (lru == parked_.size()) return;
-        drop_parked(lru);
+        drop_parked_id(parked_[lru].used);
         park_stats.evictions++;
     }
+    const uint64_t id = ++park_age_;
+    for (Engine * s = this; s; s = s->next_.get())
+        if (!s->park_copy(id, move_ckpts)) {
+            drop_parked_id(id);   // the stages that did park it
+            if (opt_.verbose) fprintf(stderr, "bnk: could not pin %.2f GiB to park a conversation\n", bytes / 1073741824.0);
+            return;
+        }
+    park_stats.parks++;
+    park_stats.park_ms += now_ms() - t0;
+    if (opt_.verbose)
+        fprintf(stderr, "bnk: parked a conversation of %d tokens (%.2f GiB) in %.0f ms; %zu parked, %.2f GiB\n", n,
+                (bytes + ck_bytes) / 1073741824.0, now_ms() - t0, parked_.size(), parked_bytes() / 1073741824.0);
+}
+
+// This stage's copy of the live conversation, entry `id` (false: no pinned memory for it).
+bool Engine::park_copy(uint64_t id, bool move_ckpts) {
+    DeviceScope ds(dev_);
+    join_commit_here();
+    const int n = pos();
+    const size_t sfloats = state_floats();
+    const size_t bytes = park_bytes_here(n);
+    size_t ck_bytes = 0;
+    for (const auto & k : cur_->ckpts) ck_bytes += k.pos >= 0 ? sfloats * 4 : 0;
     Parked p;
     p.host = pinned_take(bytes, &p.cap);
-    if (!p.host) {
-        if (opt_.verbose) fprintf(stderr, "bnk: could not pin %.2f GiB to park a conversation\n", bytes / 1073741824.0);
-        return;
-    }
+    if (!p.host) return false;
     size_t off = 0;
     each_ctx(n, [&](void * d, size_t b) {
         CUDA_CHECK(cudaMemcpyAsync(p.host + off, d, b, cudaMemcpyDeviceToHost, st_));
@@ -173,13 +212,9 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
     p.history = cur_->history;
     p.mtp_cell = cur_->mtp_cell;
     p.bytes = bytes + ck_bytes;
-    p.used = ++park_age_;
+    p.used = id;
     parked_.push_back(std::move(p));
-    park_stats.parks++;
-    park_stats.park_ms += now_ms() - t0;
-    if (opt_.verbose)
-        fprintf(stderr, "bnk: parked a conversation of %d tokens (%.2f GiB) in %.0f ms; %zu parked, %.2f GiB\n", n,
-                (bytes + ck_bytes) / 1073741824.0, now_ms() - t0, parked_.size(), parked_bytes() / 1073741824.0);
+    return true;
 }
 
 // Makes parked conversation i the live one (the live state is overwritten: park it first to keep it).
@@ -197,9 +232,22 @@ void Engine::restore(size_t i) {
         throw;
     }
     restoring_ = 0;
+    for (Engine * s = this; s; s = s->next_.get()) s->restore_copy(id);
+    park_stats.restores++;
+    park_stats.restore_ms += now_ms() - t0;
+    if (opt_.verbose)
+        fprintf(stderr, "bnk: resumed a parked conversation of %d tokens in %.0f ms; %zu parked\n", n, now_ms() - t0,
+                parked_.size());
+}
+
+void Engine::restore_copy(uint64_t id) {
+    DeviceScope ds(dev_);
+    size_t i = parked_.size();
     for (size_t j = 0; j < parked_.size(); ++j)
         if (parked_[j].used == id) i = j;
+    if (i == parked_.size()) throw std::runtime_error("restore: a pipeline stage lost the parked conversation");
     Parked & p = parked_[i];
+    const int n = (int) p.history.size();
     size_t off = 0;
     each_ctx(n, [&](void * d, size_t b) {
         CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, b, cudaMemcpyHostToDevice, st_));
@@ -230,11 +278,6 @@ void Engine::restore(size_t i) {
         slot->age = ++ckpt_age_;
     }
     drop_parked(i);
-    park_stats.restores++;
-    park_stats.restore_ms += now_ms() - t0;
-    if (opt_.verbose)
-        fprintf(stderr, "bnk: resumed a parked conversation of %d tokens in %.0f ms; %zu parked\n", n, now_ms() - t0,
-                parked_.size());
 }
 
 void Engine::set_busy(const std::vector<int> & slots) {
@@ -243,28 +286,37 @@ void Engine::set_busy(const std::vector<int> & slots) {
         if (s >= 0 && s < (int) busy_.size()) busy_[s] = 1;
 }
 
-bool Engine::evict_idle(size_t need) {
-    Seq * keep = cur_;
+bool Engine::evict_idle(size_t need) { return head_->evict_idle_for(this, need); }
+
+// Room for `need` bytes on `stage`: idle conversations go to host RAM (parked when worth it) on every stage, the
+// one using the most context on that stage first.
+bool Engine::evict_idle_for(Engine * stage, size_t need) {
+    const int keep = current_slot();
+    auto room = [&]() {
+        DeviceScope ds(stage->dev_);
+        return stage->budget_.make_room(need);
+    };
     for (;;) {
-        if (budget_.make_room(need)) break;
+        if (room()) break;
         int bi = -1;
-        for (int i = 0; i < (int) seqs_.size(); ++i) {
-            const Seq * q = seqs_[i].get();
-            if (q == keep || !q->used || (i < (int) busy_.size() && busy_[i]) || q->ctx_mapped <= kCtxBaseline) continue;
-            if (bi < 0 || q->ctx_mapped > seqs_[bi]->ctx_mapped) bi = i;
+        for (int i = 0; i < (int) stage->seqs_.size(); ++i) {
+            const Seq * q = stage->seqs_[i].get();
+            if (i == keep || !q->used || (i < (int) busy_.size() && busy_[i]) || q->ctx_mapped <= kCtxBaseline) continue;
+            if (bi < 0 || q->ctx_mapped > stage->seqs_[bi]->ctx_mapped) bi = i;
         }
         if (bi < 0) break;
-        use(seqs_[bi].get());
+        for (Engine * s = this; s; s = s->next_.get()) s->use(s->seqs_[bi].get());
         const int n = pos();
         const size_t before = parked_.size();
         if (opt_.park_gib > 0 && n >= opt_.park_min) park(restoring_);
         if (opt_.verbose)
-            fprintf(stderr, "bnk: VRAM is short: moved an idle conversation of %d tokens off the GPU (slot %d, %s)\n", n, bi,
+            fprintf(stderr, "bnk: VRAM is short%s: moved an idle conversation of %d tokens off the GPU (slot %d, %s)\n",
+                    next_ ? (" on GPU " + std::to_string(stage->dev_)).c_str() : "", n, bi,
                     parked_.size() > before ? "parked in RAM" : "not parked: its next turn reads it again");
-        reset();
+        for (Engine * s = this; s; s = s->next_.get()) s->reset_here();
     }
-    use(keep);
-    return budget_.make_room(need);
+    for (Engine * s = this; s; s = s->next_.get()) s->use(s->seqs_[keep].get());
+    return room();
 }
 
 int Engine::reusable(const std::vector<int32_t> & prompt) const {

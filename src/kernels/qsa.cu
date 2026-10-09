@@ -980,11 +980,13 @@ static void launch_multi(const float * q, const half * kc, const half * vc, cons
     const size_t region = std::max({(size_t) SPLIT * M * QA_KT * 4, (size_t) 8 * 256 * 4, (size_t) R * sh.top_blocks * 4});
     const size_t bytes = (size_t) M * QA_LD * 2 + (size_t) QA_KT * QA_LD * 2 + (size_t) M * (QA_KT + 8) * 2 +
                          (size_t) (R * sh.top_blocks + 8) * 8 + region;
-    static bool attr = false;
-    if (!attr) {
+    static bool attr[64] = {};   // a function attribute is per device (each GPU of a pipeline sets its own)
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (!attr[dev & 63]) {
         CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_prefill_multi_k<R, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int) bytes));
-        attr = true;
+        attr[dev & 63] = true;
         if (getenv("BNK_QSA_INFO")) {
             cudaFuncAttributes fa;
             int nb = 0;

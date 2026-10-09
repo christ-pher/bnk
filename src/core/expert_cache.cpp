@@ -226,16 +226,18 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
     return started;
 }
 
-static Ranking complete_ranking(const Ranking & rank, int n_layer, int n_expert) {
+// the ranking's pairs of layers [l0, l1), completed with every remaining pair of those layers
+static Ranking complete_ranking(const Ranking & rank, int n_layer, int n_expert, int l0 = 0, int l1 = -1) {
+    if (l1 < 0) l1 = n_layer;
     std::vector<char> seen((size_t) n_layer * n_expert, 0);
     Ranking full;
     for (auto [l, e] : rank)
-        if (l >= 0 && l < n_layer && e >= 0 && e < n_expert && !seen[(size_t) l * n_expert + e]) {
+        if (l >= l0 && l < l1 && e >= 0 && e < n_expert && !seen[(size_t) l * n_expert + e]) {
             seen[(size_t) l * n_expert + e] = 1;
             full.emplace_back(l, e);
         }
     for (int e = 0; e < n_expert; ++e)
-        for (int l = 0; l < n_layer; ++l)
+        for (int l = l0; l < l1; ++l)
             if (!seen[(size_t) l * n_expert + e]) full.emplace_back(l, e);
     return full;
 }
@@ -262,18 +264,21 @@ static std::vector<int> plan_slots(const Model & m, size_t budget, const Ranking
     return slots;
 }
 
-std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank) {
+std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank,
+                                   int l0, int l1) {
     (void) st;
-    return plan_slots(m, budget, complete_ranking(rank, m.cfg.n_layer, m.cfg.n_expert));
+    return plan_slots(m, budget, complete_ranking(rank, m.cfg.n_layer, m.cfg.n_expert, l0, l1));
 }
 
 void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s,
-                       bool verbose, VramBudget * vb) {
+                       bool verbose, VramBudget * vb, int l0, int l1) {
     m_ = &m;
     st_ = &st;
     n_layer_ = m.cfg.n_layer;
     n_expert_ = m.cfg.n_expert;
-    const Ranking full = complete_ranking(rank, n_layer_, n_expert_);
+    l0_ = l0;
+    l1_ = l1 < 0 ? n_layer_ : l1;
+    const Ranking full = complete_ranking(rank, n_layer_, n_expert_, l0_, l1_);
     rank_value_.assign((size_t) n_layer_ * n_expert_, 0.f);
     for (size_t i = 0; i < full.size(); ++i)
         rank_value_[(size_t) full[i].first * n_expert_ + full[i].second] = (float) (full.size() - i) / full.size();
@@ -301,6 +306,7 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     resident_ = 0;
     for (int l = 0; l < n_layer_; ++l) {
         sb_[l] = slot_bytes(m, l);
+        if (!owns(l)) continue;
         layer_buf_[l].reserve((size_t) n_expert_ * sb_[l], vb, "expert cache", false);
         layer_buf_[l].ensure(slot_expert_[l].size() * sb_[l]);
         layer_base_[l] = layer_buf_[l].as<uint8_t>();
@@ -318,9 +324,11 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     CUDA_CHECK(cudaMalloc(&slot_of_dev_, slot_of_host_.size() * 4));
     CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_, slot_of_host_.data(), slot_of_host_.size() * 4, cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
+    const int n = (l1_ - l0_) * n_expert_;
     if (verbose)
-        fprintf(stderr, "bnk: VRAM expert cache: %d of %d experts (%.1f%%), %.2f GiB\n", resident_,
-                n_layer_ * n_expert_, 100.0 * resident_ / (n_layer_ * n_expert_), bytes() / 1073741824.0);
+        fprintf(stderr, "bnk: VRAM expert cache%s: %d of %d experts (%.1f%%), %.2f GiB\n",
+                n == n_layer_ * n_expert_ ? "" : (" for layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1)).c_str(),
+                resident_, n, 100.0 * resident_ / n, bytes() / 1073741824.0);
 }
 
 size_t ExpertCache::shrink(size_t need, cudaStream_t s) {
@@ -400,7 +408,7 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
     const int L = n_layer_;
     // per layer: its non-resident experts, hottest first
     std::vector<std::vector<std::pair<float, int>>> cand(L);
-    for (int l = 0; l < L; ++l) {
+    for (int l = l0_; l < l1_; ++l) {
         for (int e = 0; e < n_expert_; ++e)
             if (slot_of_host_[(size_t) l * n_expert_ + e] < 0 && (busy_.empty() || !busy_[(size_t) l * n_expert_ + e]))
                 cand[l].push_back({-value(l, e), e});

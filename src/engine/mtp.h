@@ -85,6 +85,7 @@ private:
     void hc_pre(const HcWeights & w, const float * res, int T, bool inject, float * mixed, float * inj);
 
     bool loaded_ = false;
+    int dev_ = 0;
     const Model * main_ = nullptr;
     cudaStream_t st_ = nullptr;
     size_t vram_ = 0;

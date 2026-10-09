@@ -69,6 +69,7 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     main_ = &main;
     st_ = st;
     max_ctx_ = max_ctx;
+    CUDA_CHECK(cudaGetDevice(&dev_));   // the last pipeline stage's GPU (callers may have another one current)
     GgufModel g;
     g.open(path);
     const Config & c = main.cfg;
@@ -297,6 +298,7 @@ void MtpLayer::hc_pre(const HcWeights & w, const float * res, int T, bool inject
 }
 
 int MtpLayer::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
+    DeviceScope ds(dev_);
     if (n < 1 || n > kMaxWindow) throw std::runtime_error("mtp: bad row count");
     const int HC = main_->cfg.hc_dim();
     // no stream sync here: the pinned inputs below are read only by this layer's graphs, and forward() waits for
@@ -307,6 +309,7 @@ int MtpLayer::run(const float * R_rows, const int32_t * next_tokens, int n, int 
 }
 
 int MtpLayer::step(int32_t tok, int cell, float * prob) {
+    DeviceScope ds(dev_);
     const int HC = main_->cfg.hc_dim();
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_.p, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));
     h_io_[8] = tok;
@@ -433,6 +436,7 @@ void MtpLayer::ensure_multi() {
 }
 
 void MtpLayer::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) {
+    DeviceScope ds(dev_);
     ensure_multi();
     const int HC = main_->cfg.hc_dim();
     std::vector<MItem> mi;
@@ -448,6 +452,7 @@ void MtpLayer::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, 
 }
 
 void MtpLayer::step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) {
+    DeviceScope ds(dev_);
     ensure_multi();
     const int HC = main_->cfg.hc_dim();
     std::vector<MItem> mi;

@@ -26,10 +26,13 @@ public:
     ~ExpertCache();
     // Fills up to `budget` bytes of VRAM following `rank` (completed with every remaining pair). Each layer's
     // slots live in an elastic region charged to `vb`, so the cache can later shrink() and grow().
+    // A pipeline stage (several GPUs) caches only layers [l0, l1) (l1 < 0: every layer).
     void init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s, bool verbose,
-              VramBudget * vb);
+              VramBudget * vb, int l0 = 0, int l1 = -1);
     // The per-layer slot counts init() would choose, without allocating.
-    static std::vector<int> plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank);
+    static std::vector<int> plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank,
+                                 int l0 = 0, int l1 = -1);
+    bool owns(int il) const { return il >= l0_ && il < l1_; }
     // Gives back at least `need` bytes: drops the coldest slots (moving any hot expert out of a layer's tail
     // first) and unmaps the freed pages. Synchronizes `s`. Returns the bytes freed.
     size_t shrink(size_t need, cudaStream_t s);
@@ -63,6 +66,7 @@ private:
     const Model * m_ = nullptr;
     const ExpertStore * st_ = nullptr;
     int n_layer_ = 0, n_expert_ = 0, resident_ = 0;
+    int l0_ = 0, l1_ = 0;   // the layers this cache serves
     std::vector<ElasticBuf> layer_buf_;   // each layer's slots, slot i at i * slot_bytes
     std::vector<uint8_t *> layer_base_;
     std::vector<size_t> sb_;               // slot bytes per layer
