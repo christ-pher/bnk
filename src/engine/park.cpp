@@ -291,7 +291,11 @@ bool Engine::evict_idle(size_t need) { return head_->evict_idle_for(this, need);
 // Room for `need` bytes on `stage`: idle conversations go to host RAM (parked when worth it) on every stage, the
 // one using the most context on that stage first.
 bool Engine::evict_idle_for(Engine * stage, size_t need) {
-    const int keep = current_slot();
+    // the conversation that stage is making room for stays; every stage's current one is restored afterwards (a
+    // stage preparing a forward has its window's conversation current, which may not be the first stage's)
+    const int keep = stage->current_slot();
+    std::vector<Seq *> was;
+    for (Engine * s = this; s; s = s->next_.get()) was.push_back(s->cur_);
     auto room = [&]() {
         DeviceScope ds(stage->dev_);
         return stage->budget_.make_room(need);
@@ -315,7 +319,8 @@ bool Engine::evict_idle_for(Engine * stage, size_t need) {
                     parked_.size() > before ? "parked in RAM" : "not parked: its next turn reads it again");
         for (Engine * s = this; s; s = s->next_.get()) s->reset_here();
     }
-    for (Engine * s = this; s; s = s->next_.get()) s->use(s->seqs_[keep].get());
+    size_t k = 0;
+    for (Engine * s = this; s; s = s->next_.get()) s->use(was[k++]);
     return room();
 }
 

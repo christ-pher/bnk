@@ -1412,7 +1412,16 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
         posted = false;
         if (on_prefill_progress && handed < tokens.size()) on_prefill_progress(handed, tokens.size());
     };
-    while (i < tokens.size()) {
+    // an error on this thread waits for the worker first: the caller resets the conversation on every stage next
+    auto settle = [&]() {
+        if (!posted) return;
+        try {
+            worker_->wait();
+        } catch (...) {
+        }
+        posted = false;
+    };
+    while (i < tokens.size()) try {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
         if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
@@ -1451,6 +1460,9 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
         }
         handed = i;
         if (on_prefill_progress) on_prefill_progress(i, tokens.size());
+    } catch (...) {
+        settle();
+        throw;
     }
     if (posted) {
         worker_->wait();
