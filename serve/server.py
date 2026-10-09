@@ -304,7 +304,10 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
             kwargs["reasoning_effort"] = {"high": "xhigh", "minimal": "low"}.get(eff, eff)
     kwargs["enable_thinking"] = bool(thinking)
     text = S.template.render(body.get("messages", []), tools=body.get("tools"), add_generation_prompt=True, **kwargs)
-    return S.tok.encode(text), bool(thinking)
+    # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
+    tail = text[text.rfind("<|im_start|>assistant"):]
+    thinking = "<think>" in tail and "</think>" not in tail
+    return S.tok.encode(text), thinking
 
 
 # ------------------------------------------------------------------------------------------- HTTP
