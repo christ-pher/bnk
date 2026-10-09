@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -61,7 +62,8 @@ struct ExpertTask {
 class CpuExpertPool {
 public:
     void init(const Model & m, const ExpertStore & st, int n_threads);
-    // out[t][E] = sum over tasks of w * expert(x[t]); `out` is zeroed first. x: [T][E] host.
+    // out[t][E] = sum over tasks of w * expert(x[t]); `out` is zeroed first. x: [T][E] host. One caller at a
+    // time (pipeline stages reading a prompt run on two threads).
     void run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
     int threads() const { return pool_ ? pool_->size() : 0; }
     double last_ms = 0;
@@ -78,6 +80,7 @@ private:
     std::vector<std::vector<int>> groups_;   // tasks of the same expert
     int chunks_per_thread_ = 1;
     int rows_done_n_ = 0;
+    std::mutex mu_;
 };
 
 }  // namespace bnk

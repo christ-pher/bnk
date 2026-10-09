@@ -24,6 +24,7 @@ ap.add_argument("prompts", nargs="+")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
+ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=64)
 a = ap.parse_args()
 
@@ -34,6 +35,8 @@ if a.mtp:
     args += ["--mtp", a.mtp]
     if a.draft_vocab:
         args += ["--draft-vocab", a.draft_vocab]
+if a.gpus:
+    args += ["--gpus", a.gpus]
 eng = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 events: dict[str, list] = {}
 order: list = []   # (id, type, n tokens) in arrival order

@@ -41,25 +41,51 @@ class Broadcast:
 
 
 class GpuSampler:
-    """`nvidia-smi dmon` as a stream: utilization, power, temperature, clocks, PCIe traffic (1 s)."""
+    """`nvidia-smi dmon` as a stream: utilization, power, temperature, clocks, PCIe traffic (1 s), for every GPU.
+    `latest` sums them up (utilization averaged, temperature the hottest) and lists each one under "gpus"."""
 
     def __init__(self):
         self.latest: dict = {}
         self.static: dict = {}
+        self._per: dict[str, dict] = {}
         if shutil.which("nvidia-smi"):
             threading.Thread(target=self._run, daemon=True).start()
             threading.Thread(target=self._static, daemon=True).start()
 
     def _static(self):
         try:
-            out = subprocess.run(["nvidia-smi", "--query-gpu=name,power.limit,clocks.max.sm,pcie.link.gen.max,"
-                                  "pcie.link.width.current,driver_version", "--format=csv,noheader,nounits"],
-                                 capture_output=True, text=True, timeout=10).stdout.strip().split("\n")[0]
-            name, plim, smax, pgen, pwidth, drv = [x.strip() for x in out.split(",")]
-            self.static = {"name": name, "power_limit_w": _num(plim), "sm_clock_max": _num(smax),
-                           "pcie_gen": _num(pgen), "pcie_width": _num(pwidth), "driver": drv}
+            rows = subprocess.run(["nvidia-smi", "--query-gpu=name,power.limit,clocks.max.sm,pcie.link.gen.max,"
+                                   "pcie.link.width.current,driver_version", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=10).stdout.strip().split("\n")
+            gpus = []
+            for out in rows:
+                name, plim, smax, pgen, pwidth, drv = [x.strip() for x in out.split(",")]
+                gpus.append({"name": name, "power_limit_w": _num(plim), "sm_clock_max": _num(smax),
+                             "pcie_gen": _num(pgen), "pcie_width": _num(pwidth), "driver": drv})
+            st = dict(gpus[0])
+            if len(gpus) > 1:
+                st["name"] = f"{len(gpus)} x {gpus[0]['name']}" if all(g["name"] == gpus[0]["name"] for g in gpus) \
+                    else " + ".join(g["name"] for g in gpus)
+                st["power_limit_w"] = sum(g["power_limit_w"] or 0 for g in gpus)
+            st["count"] = len(gpus)
+            st["gpus"] = gpus
+            self.static = st
         except Exception:
             pass
+
+    def _publish(self):
+        per = [dict(v, index=int(k)) for k, v in sorted(self._per.items(), key=lambda kv: int(kv[0]))]
+        if not per:
+            return
+        def tot(key, f=sum):
+            vals = [g[key] for g in per if g.get(key) is not None]
+            return f(vals) if vals else None
+        self.latest = {"t": time.time(), "util": tot("util", lambda v: sum(v) / len(v)),
+                       "mem_util": tot("mem_util", lambda v: sum(v) / len(v)), "power_w": tot("power_w"),
+                       "temp_c": tot("temp_c", max), "mem_temp_c": tot("mem_temp_c", max),
+                       "sm_clock": tot("sm_clock", lambda v: sum(v) / len(v)), "mem_clock": tot("mem_clock", max),
+                       "pcie_rx_mbs": tot("pcie_rx_mbs"), "pcie_tx_mbs": tot("pcie_tx_mbs"),
+                       "gpus": per if len(per) > 1 else None}
 
     def _run(self):
         while True:
@@ -74,13 +100,21 @@ class GpuSampler:
                     if line.startswith("#") or not cols:
                         continue
                     v = dict(zip(cols, line.split()))
-                    if v.get("gpu") not in ("0", None):
+                    idx = v.get("gpu")
+                    if idx is None:
                         continue
-                    self.latest = {"t": time.time(), "util": _num(v.get("sm")), "mem_util": _num(v.get("mem")),
-                                   "power_w": _num(v.get("pwr")), "temp_c": _num(v.get("gtemp")),
-                                   "mem_temp_c": _num(v.get("mtemp")), "sm_clock": _num(v.get("pclk")),
-                                   "mem_clock": _num(v.get("mclk")), "pcie_rx_mbs": _num(v.get("rxpci")),
-                                   "pcie_tx_mbs": _num(v.get("txpci"))}
+                    # a new round of rows starts with GPU 0: publish the previous round first
+                    if idx in self._per and self._per[idx].get("_seen"):
+                        self._publish()
+                        for g in self._per.values():
+                            g["_seen"] = False
+                    self._per[idx] = {"util": _num(v.get("sm")), "mem_util": _num(v.get("mem")),
+                                      "power_w": _num(v.get("pwr")), "temp_c": _num(v.get("gtemp")),
+                                      "mem_temp_c": _num(v.get("mtemp")), "sm_clock": _num(v.get("pclk")),
+                                      "mem_clock": _num(v.get("mclk")), "pcie_rx_mbs": _num(v.get("rxpci")),
+                                      "pcie_tx_mbs": _num(v.get("txpci")), "_seen": True}
+                    if len(self._per) == 1:
+                        self._publish()
             except Exception:
                 pass
             time.sleep(5)

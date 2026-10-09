@@ -13,9 +13,13 @@
 // cross, through pinned host memory. The routed experts in host RAM and the CPU pool are shared.
 #pragma once
 
+#include <condition_variable>
+#include <exception>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <functional>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -72,6 +76,7 @@ struct EngineOptions {
     // same id twice runs two stages on one GPU (for testing the split on a single card; cap expert_cache_gib).
     std::vector<int> gpus;           // {-1}: every GPU of compute capability 7.0+
     std::vector<int> split;          // first layer of every stage after the first (empty: balanced by memory)
+    std::vector<double> stage_cache_gib;   // expert_cache_gib per stage (empty: expert_cache_gib for every one)
 };
 
 struct StageTimes {
@@ -99,6 +104,10 @@ public:
     int layer_begin() const { return l0_; }
     int layer_end() const { return l1_; }
     const Engine * stage(int i) const { return i == 0 ? this : next_ ? next_->stage(i - 1) : nullptr; }
+    // this stage's GPU time in decode forwards (from its graph's start to its end, waiting for the previous stage
+    // excluded), summed, and the forwards counted
+    double gpu_ms() const { return gpu_ms_; }
+    int64_t gpu_forwards() const { return gpu_forwards_; }
     // the expert caches of every stage together (telemetry)
     int cache_slots(int il) const;
     int cache_resident() const;
@@ -215,10 +224,31 @@ private:
     bool owns(int il) const { return il >= l0_ && il < l1_; }
     void load_stage(const std::string & path, const EngineOptions & opt);
     // the residual rows between stages: pinned, portable host memory written by this stage, read by the next one
-    // (xfer_out_ is the next stage's xfer_in_); decode windows and prompt chunks have their own
-    float * xfer_in_ = nullptr, * pf_xfer_in_ = nullptr;
-    float * xfer_out_ = nullptr, * pf_xfer_out_ = nullptr;
+    // (xfer_out_ is the next stage's xfer_in_); decode windows and prompt chunks have their own, prompt chunks two
+    // (the first stage writes the next chunk's while the later stages read this one's)
+    float * xfer_in_ = nullptr, * pf_xfer_in_[2] = {nullptr, nullptr};
+    float * xfer_out_ = nullptr, * pf_xfer_out_[2] = {nullptr, nullptr};
+    // Prompt reads pipelined over the stages: the first stage works on chunk k+1 (on the caller's thread) while
+    // this worker runs chunk k through the later ones. Between chunks both are idle (the caller's progress hook
+    // may decode other conversations then).
+    struct Worker {
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::function<void()> job;
+        bool busy = false, quit = false;
+        std::exception_ptr err;
+        Worker();
+        ~Worker();
+        void post(std::function<void()> f);   // after the previous job
+        void wait();                          // until idle; rethrows the job's exception
+    };
+    std::unique_ptr<Worker> worker_;
+    std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
+    cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part
+    double gpu_ms_ = 0;
+    int64_t gpu_forwards_ = 0;
     void reset_here();
     void select_here(int slot);
     void checkpoint_here();
@@ -237,7 +267,7 @@ private:
     double fwd_t0_ = 0;
     void fwd_service();
     void fwd_end();
-    void prefill_chunk_here(const int32_t * tokens, int N);
+    void prefill_chunk_here(const int32_t * tokens, int N, int buf = 0);
     // the VRAM budget shared by the expert cache, the context (KV) and the prompt path
     VramBudget budget_;
     void enqueue_forward(int T);

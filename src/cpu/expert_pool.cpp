@@ -142,6 +142,7 @@ static inline void split(int n, int part, int nparts, int & b, int & e) {
 }
 
 void CpuExpertPool::run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out) {
+    std::lock_guard<std::mutex> lk(mu_);
     const double t0 = now_ms();
     const Config & c = m_->cfg;
     const LayerWeights & L = m_->layers[il];

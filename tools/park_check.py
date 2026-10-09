@@ -24,6 +24,7 @@ ap.add_argument("model")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
+ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=48)
 ap.add_argument("--ctx-chars", type=int, default=12000)
 ap.add_argument("--slots", type=int, default=1, help="engine conversation slots (batched decoding when > 1)")
@@ -36,6 +37,8 @@ if a.mtp:
     args += ["--mtp", a.mtp]
     if a.draft_vocab:
         args += ["--draft-vocab", a.draft_vocab]
+if a.gpus:
+    args += ["--gpus", a.gpus]
 eng = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=0)
 im_start = tok.id_of("<|im_start|>")
 stops = [t for t in (tok.id_of("<|im_end|>"), tok.ids.get("eos_token_id")) if t is not None]

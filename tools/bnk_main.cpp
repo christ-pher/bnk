@@ -63,6 +63,8 @@ static double rel_rms(const float * a, const float * b, size_t n) {
 }
 
 int main(int argc, char ** argv) {
+    // GPU numbers as nvidia-smi shows them (CUDA's default order puts the fastest first)
+    setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
     if (argc < 2) {
         fprintf(stderr, "usage: bnk run|check --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
                         "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n");
@@ -93,7 +95,15 @@ int main(int argc, char ** argv) {
         else if (a == "--draft") gopt.max_draft = std::stoi(next());
         else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();
-        else if (a == "--cache-gib") opt.expert_cache_gib = std::stod(next());
+        else if (a == "--cache-gib") {   // one size, or one per GPU (comma-separated)
+            const std::string v = next();
+            if (v.find(',') == std::string::npos) opt.expert_cache_gib = std::stod(v);
+            else for (size_t a0 = 0, b; a0 < v.size(); a0 = b + 1) {
+                b = v.find(',', a0);
+                if (b == std::string::npos) b = v.size();
+                opt.stage_cache_gib.push_back(std::stod(v.substr(a0, b - a0)));
+            }
+        }
         else if (a == "--vram-reserve-gib") opt.vram_reserve_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
@@ -345,6 +355,12 @@ int main(int argc, char ** argv) {
     printf("drafting: run %.2f ms per round, %.2f further steps per round at %.2f ms each\n",
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
+    for (int i = 0; i < eng.stages(); ++i) {
+        const Engine * s = eng.stage(i);
+        printf("stage %d (GPU %d, layers %d-%d): %.2f ms of GPU time per forward over %lld forwards\n", i, s->device(),
+               s->layer_begin(), s->layer_end() - 1, s->gpu_ms() / std::max<int64_t>(1, s->gpu_forwards()),
+               (long long) s->gpu_forwards());
+    }
     printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
            (long long) eng.cache_swaps());

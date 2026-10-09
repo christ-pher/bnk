@@ -71,6 +71,9 @@ export interface Live {
   layer_slots: number[]
   layer_routed: number[]
   layer_misses: number[]
+  // the GPUs the engine runs on (several: a pipeline, each GPU a stage holding a range of layers)
+  gpus?: { device: number; vram_total_mb: number; vram_used_mb: number }[]
+  stages?: { device: number; layer_begin: number; layer_end: number; experts_resident: number; expert_cache_gb: number }[]
   gpu?: Gpu
   cores?: number[]
 }
@@ -86,6 +89,7 @@ export interface Gpu {
   mem_clock?: number | null
   pcie_rx_mbs?: number | null
   pcie_tx_mbs?: number | null
+  gpus?: (Omit<Gpu, "gpus"> & { index: number })[] | null // each GPU when there are several (the above sums them up)
 }
 
 export interface Sample {

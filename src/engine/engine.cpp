@@ -32,7 +32,58 @@ static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ld
     else gemv(W, &xq, nullptr, 0, T, y, ldy, false, s);
 }
 
+Engine::Worker::Worker() {
+    th = std::thread([this]() {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            cv.wait(lk, [&]() { return quit || job; });
+            if (!job) return;
+            auto f = std::move(job);
+            job = nullptr;
+            lk.unlock();
+            try {
+                f();
+            } catch (...) {
+                lk.lock();
+                err = std::current_exception();
+                lk.unlock();
+            }
+            lk.lock();
+            busy = false;
+            cv.notify_all();
+        }
+    });
+}
+
+Engine::Worker::~Worker() {
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        quit = true;
+    }
+    cv.notify_all();
+    th.join();
+}
+
+void Engine::Worker::post(std::function<void()> f) {
+    wait();
+    std::lock_guard<std::mutex> lk(mu);
+    job = std::move(f);
+    busy = true;
+    cv.notify_all();
+}
+
+void Engine::Worker::wait() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&]() { return !busy; });
+    if (err) {
+        auto e = err;
+        err = nullptr;
+        std::rethrow_exception(e);
+    }
+}
+
 Engine::~Engine() {
+    worker_.reset();
     next_.reset();   // the later stages first, each on its own device
     cudaSetDevice(dev_);
     for (auto & q : seqs_) {
@@ -48,8 +99,11 @@ Engine::~Engine() {
     if (h_ple_rows_) cudaFreeHost(h_ple_rows_);
     if (d_par_) cudaFree(d_par_);
     if (xfer_in_) cudaFreeHost(xfer_in_);
-    if (pf_xfer_in_) cudaFreeHost(pf_xfer_in_);
+    for (float * b : pf_xfer_in_)
+        if (b) cudaFreeHost(b);
     if (ev_out_) cudaEventDestroy(ev_out_);
+    if (ev_t0_) cudaEventDestroy(ev_t0_);
+    if (ev_t1_) cudaEventDestroy(ev_t1_);
 }
 
 std::vector<int> Engine::devices() const {
@@ -202,10 +256,17 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         s->cpu_ = &own_cpu_;
         if (opt.verbose && gpus.size() > 1)
             fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
-        s->load_stage(path, opt);
+        EngineOptions so = opt;
+        if (!opt.stage_cache_gib.empty()) {
+            if (opt.stage_cache_gib.size() != gpus.size())
+                throw std::runtime_error("expert cache sizes: give one, or one per GPU (" + std::to_string(gpus.size()) + ")");
+            so.expert_cache_gib = opt.stage_cache_gib[k];
+        }
+        s->load_stage(path, so);
         if (prev) {
             prev->xfer_out_ = s->xfer_in_;
-            prev->pf_xfer_out_ = s->pf_xfer_in_;
+            prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
+            prev->pf_xfer_out_[1] = s->pf_xfer_in_[1];
         }
         if (k + 1 < gpus.size()) {
             prev = s;
@@ -227,6 +288,8 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_verified_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_committed_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_out_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&ev_t0_));
+    CUDA_CHECK(cudaEventCreate(&ev_t1_));
     // the drafter embeds its tokens and shares the head: the last stage holds the embeddings too when it drafts
     model_.load(path, opt.verbose, opt.ple_gguf, l0_, l1_, first() || (last_ && !opt.mtp.empty()), last_);
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
@@ -280,9 +343,9 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (!first()) {   // the previous stage's residual rows come through here
         CUDA_CHECK(cudaHostAlloc((void **) &xfer_in_, (size_t) W * HC * 4, cudaHostAllocPortable));
         if (opt.prefill_chunk > 0)
-            CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_in_,
-                                     (size_t) std::max(opt.prefill_chunk, opt.prefill_chunk_max) * HC * 4,
-                                     cudaHostAllocPortable));
+            for (float *& b : pf_xfer_in_)
+                CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) std::max(opt.prefill_chunk, opt.prefill_chunk_max) * HC * 4,
+                                         cudaHostAllocPortable));
     }
 
     if (c.ple_layer >= 0 && owns(c.ple_layer)) {
@@ -1181,6 +1244,7 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch) {
 void Engine::fwd_launch(cudaEvent_t after) {
     DeviceScope ds(dev_);
     if (after) CUDA_CHECK(cudaStreamWaitEvent(st_, after, 0));   // the previous stage's residual rows
+    CUDA_CHECK(cudaEventRecord(ev_t0_, st_));
     if (fwd_graph_) {
         if (route_log_) moe_debug_reset(st_);
         CUDA_CHECK(cudaGraphLaunch(fwd_exec_, st_));
@@ -1188,6 +1252,7 @@ void Engine::fwd_launch(cudaEvent_t after) {
         enqueue_forward(last_T);   // eager: the CPU experts are answered inside
     }
     CUDA_CHECK(cudaEventRecord(ev_out_, st_));
+    CUDA_CHECK(cudaEventRecord(ev_t1_, st_));
 }
 
 void Engine::fwd_service() {
@@ -1208,6 +1273,13 @@ void Engine::fwd_service() {
 void Engine::fwd_end() {
     DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    float ms = 0.f;
+    if (cudaEventElapsedTime(&ms, ev_t0_, ev_t1_) == cudaSuccess) {
+        gpu_ms_ += ms;
+        gpu_forwards_++;
+    } else {
+        cudaGetLastError();
+    }
     if (route_log_ && fwd_graph_) write_route_log(last_T, wins_[0].pos0, wins_[0].commit, fwd_t0_, now_ms());
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
@@ -1277,9 +1349,44 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
         }
     }
     Engine * t = tail();
+    // several stages: chunk k+1 on the first stage while the worker runs chunk k through the others
+    static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
+    if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
+    size_t handed = 0;     // tokens given to the later stages so far
+    bool posted = false;   // a chunk is with the worker (its progress not reported yet)
+    int buf = 0;
+    auto drain = [&]() {
+        if (!posted) return;
+        worker_->wait();
+        posted = false;
+        if (on_prefill_progress && handed < tokens.size()) on_prefill_progress(handed, tokens.size());
+    };
     while (i < tokens.size()) {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
+        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
+            const int N = (int) std::min<size_t>(pf_max_, left);
+            const int32_t * tk = tokens.data() + i;
+            const double c0 = now_ms();
+            prefill_chunk_here(tk, N, buf);
+            worker_->wait();   // the previous chunk is through every stage (its progress reported here)
+            if (posted && on_prefill_progress) on_prefill_progress(handed, tokens.size());
+            const int b = buf;
+            worker_->post([this, t, tk, N, pos0, b, c0]() {
+                for (Engine * s = next_.get(); s; s = s->next_.get()) s->prefill_chunk_here(tk, N, b);
+                t->mtp_feed(t->pf_.res, tk, N, pos0);
+                std::lock_guard<std::mutex> lk(stats_mu_);
+                pstats.ms += now_ms() - c0;
+                pstats.tokens += N;
+                pstats.chunks++;
+            });
+            posted = true;
+            buf ^= 1;
+            i += N;
+            handed = i;
+            continue;
+        }
+        drain();   // a short tail or no pipeline: every stage idle first
         if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
             const int N = (int) std::min<size_t>(pf_max_, left);
             prefill_chunk(tokens.data() + i, N);
@@ -1291,8 +1398,16 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
             t->mtp_feed(t->res_, tokens.data() + i, T, pos0);
             i += T;
         }
+        handed = i;
         if (on_prefill_progress) on_prefill_progress(i, tokens.size());
     }
+    if (posted) {
+        worker_->wait();
+        if (on_prefill_progress) on_prefill_progress(handed, tokens.size());
+    }
+    // the first token's logits are the last stage's last rows: other conversations decoded between the chunks may
+    // have run through the first stages after this read's last chunk did
+    for (Engine * s = this; s; s = s->next_.get()) s->last_T = t->last_T;
     const double r0 = now_ms();
     rebalance();
     last_rebalance_ms = now_ms() - r0;

@@ -100,10 +100,25 @@ export function OverviewPage({ range }: { range: Range }) {
             <CardDescription>{overview?.gpu?.name ?? "GPU"}</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4">
-            <Meter label="VRAM" reading={`${fmt.gib(live?.vram_used_mb)} / ${fmt.gib(live?.vram_total_mb)}`}
-              value={live ? live.vram_used_mb / live.vram_total_mb : null}
-              hint={`Experts ${fmt.n(live?.expert_cache_gb, 1)} GiB · context ${fmt.n(live?.kv_gb, 2)} GiB`} />
-            <Meter label="Utilization" reading={fmt.pct((live?.gpu?.util ?? 0) / 100)} value={(live?.gpu?.util ?? 0) / 100} />
+            {live?.stages && live.stages.length > 1 && live.gpus ? (
+              // a pipeline over several GPUs: each one's layers, VRAM and utilization
+              live.stages.map((st) => {
+                const mem = live.gpus?.find((g) => g.device === st.device)
+                const util = live.gpu?.gpus?.find((g) => g.index === st.device)?.util
+                return (
+                  <Meter key={`${st.device}-${st.layer_begin}`} label={`GPU ${st.device} · layers ${st.layer_begin}–${st.layer_end - 1}`}
+                    reading={`${fmt.gib(mem?.vram_used_mb)} / ${fmt.gib(mem?.vram_total_mb)}`}
+                    value={mem ? mem.vram_used_mb / mem.vram_total_mb : null}
+                    hint={`Experts ${fmt.n(st.expert_cache_gb, 1)} GiB · ${fmt.n(st.experts_resident)} resident · utilization ${fmt.pct((util ?? 0) / 100)}`} />
+                )
+              })
+            ) : (
+              <Meter label="VRAM" reading={`${fmt.gib(live?.vram_used_mb)} / ${fmt.gib(live?.vram_total_mb)}`}
+                value={live ? live.vram_used_mb / live.vram_total_mb : null}
+                hint={`Experts ${fmt.n(live?.expert_cache_gb, 1)} GiB · context ${fmt.n(live?.kv_gb, 2)} GiB`} />
+            )}
+            <Meter label="Utilization" reading={fmt.pct((live?.gpu?.util ?? 0) / 100)} value={(live?.gpu?.util ?? 0) / 100}
+              hint={live?.gpu?.gpus ? `Average of ${live.gpu.gpus.length} GPUs` : undefined} />
             <Meter label="Power" reading={`${fmt.n(live?.gpu?.power_w)} W`}
               value={overview?.gpu?.power_limit_w && live?.gpu?.power_w != null ? live.gpu.power_w / overview.gpu.power_limit_w : null}
               hint={`${fmt.n(live?.gpu?.temp_c)} °C · SM ${fmt.n(live?.gpu?.sm_clock)} MHz`} />
