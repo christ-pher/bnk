@@ -1,5 +1,5 @@
-# bnk inference server, one model per instance: systemctl --user start bnk@iq3_s (orca, cyber-frost, abliterated,
-# swift, swift-abliterated). Only one instance fits the GPU: stop the running one before starting another.
+# bnk inference server, one model per instance: systemctl --user start bnk@iq3_s (or a path to a model's first
+# .gguf shard). Only one instance fits the GPU: stop the running one before starting another.
 # Logs: journalctl --user -u bnk@iq3_s -f
 [Unit]
 Description=bnk server (%i)

@@ -21,7 +21,7 @@ It is built for, and measured on, this machine:
 | OS / CUDA | Ubuntu 24.04, driver 580, CUDA 12.8 (CUDA 13 dropped sm_70) |
 
 **Contents:** [Quick start](#quick-start) · [Performance](#performance) · [How it works](#how-it-works) ·
-[Supported models](#supported-models) · [Setup in detail](#setup-in-detail) · [Using it](#using-it) ·
+[Models](#models) · [Setup in detail](#setup-in-detail) · [Using it](#using-it) ·
 [Troubleshooting](#troubleshooting) · [Repository](#repository) · [Limitations](#limitations)
 
 ## Quick start
@@ -39,7 +39,7 @@ driver and CUDA 12.8, then tells you to reboot; **reboot and run `./setup.sh --m
 it offers to download the default model (84 GB). Then:
 
 ```bash
-./run.sh iq3_s
+./run.sh            # pick a model from the list (or: ./run.sh iq3_s)
 ```
 
 and open `http://<this machine's IP>:8080` for the dashboard. The OpenAI-compatible API is at `/v1`, the
@@ -164,29 +164,6 @@ Several agents at once (`tools/multi_agent_bench.py`: three agents with their ow
 Runs of these benchmarks vary by about ±5% between batches (the adaptive expert cache, GPU clocks, the VM's
 host), so comparisons are made back to back and repeated.
 
-### CYBER-FROST-3.8 (Q5_K_M)
-
-Measured back to back with Orca on the same prompts (`bnk run`, greedy, warm routing counts, each model's
-speculation settings; the short-context rows average three chat prompts, the others decode 300 tokens after
-llama.cpp source code; before v0.1.1):
-
-| | CYBER-FROST Q5_K_M (78 GB of experts) | Orca IQ4_XS, same session |
-|---|---|---|
-| Speculative, greedy, short context | 52 tok/s | 58 tok/s |
-| Without speculation, greedy | 40 tok/s | 47 tok/s |
-| Speculative after ~1.7K / 30K tokens | 48 / 52 tok/s | 63 / 64 tok/s |
-| Speculative at 120K / 228K tokens | 46 / 42 tok/s | 57 / 54 tok/s |
-| Prompt processing, ~1.7K / 30K tokens | 212 / 627 tok/s | 248 / 697 tok/s |
-| Prompt processing, ~120K tokens | 674 tok/s (3.0 min) | 740 tok/s (2.7 min) |
-| Prompt processing, ~228K tokens | 742 tok/s (5.1 min) | 844 tok/s (4.5 min) |
-| 80K agent conversation, greedy (`tools/agent_bench.py`) | 53 tok/s, 4.7 s per turn read | |
-| 80K agent conversation, served (temperature 1.0) | 43 tok/s, 4.7-5.6 s per turn read | |
-
-Its experts are 28% larger than Orca's, so fewer fit in VRAM (27% of them vs 34%): more of each token's experts
-run on the CPU, which is bound by RAM bandwidth, and decoding is 10-22% slower (more so at long context).
-Speculation at temperature 1.0 gains most from a high draft cutoff (draft 5 / cutoff 0.8: ~47.5 tok/s served at
-short context, against ~41 with the engine defaults 3 / 0.5).
-
 For reference, the engine bnk replaces reached ~57 tok/s for decoding and 400-700 tok/s for prompt processing on
 the same machine.
 
@@ -286,63 +263,42 @@ the reasoning with a short note, and lets the model answer within the remaining 
 reuses the engine's state, so it costs ~0.3 s regardless of the conversation's length. Real reasoning traces stay
 under 5% repetition, well below the 55% trigger.
 
-## Supported models
+## Models
 
-Any GGUF of the `qwen4exp` architecture (Qwen3.8-Flash-Next and fine-tunes): 48 layers (36 gated DeltaNet + 12
-QSA full-attention), 512 routed experts (top 10) plus a shared expert, hyper-connections (4 streams), the
+bnk runs any GGUF of the `qwen4exp` architecture (Qwen3.8-Flash-Next and fine-tunes): 48 layers (36 gated DeltaNet
++ 12 QSA full-attention), 512 routed experts (top 10) plus a shared expert, hyper-connections (4 streams), the
 per-layer n-gram embedding. Expert formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K,
 Q5_K, Q6_K, Q8_0. Files that also carry an MTP block (`nextn_predict_layers`) load their trunk.
 
-| Preset (`./run.sh <preset>`) | Model | Size | Download |
-|---|---|---|---|
-| `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards | `tools/fetch_models.py iq3_s` |
-| `orca` | [orcarouter Qwen3.8-Flash-Next-Uncensored IQ4_XS](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) (gated) | 98 GB, 3 shards | `tools/fetch_models.py orca` |
-| `abliterated` | [SC117 GSQ-RCO-abliterated IQ3_S](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) | 84 GB, 2 shards | `tools/fetch_models.py abliterated` |
-| `swift`, `swift-abliterated` | ukisai's Swift 1.5 GSQ-RCO IQ3_XXS, and [SC117's abliterated transplant](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) | | by hand, below |
-| `cyber-frost` | Blackfrost-AI's CYBER-FROST-3.8 as `peasantsmith/CYBER-FROST-3.8-PS-GUFF` (Q5_K_M) | 84 GB without its PLE table | by hand, below |
-
-`tools/fetch_models.py` downloads a preset into the folder `run.sh` expects, pinned to the revision bnk was tested
-with, and checks every file's SHA-256 (`--list` shows the presets; run again to resume an interrupted download).
-Any other `qwen4exp` GGUF runs with `./run.sh /path/to/model-00001-of-0000N.gguf`; add a `configs/<name>.json` to
-set its sampling defaults.
-
-**GSQ-RCO-abliterated IQ3_S.** The IQ3_S above with 144 residual-writing tensors swapped for Orca's abliterated
-ones (mostly Q8_0 now); shard 2 and the MTP head are the stock ones. It starts from Orca's settings (temperature
-0.6, guard on).
-
-**Swift 1.5 GSQ-RCO-abliterated IQ3_XXS.** The same transplant applied to ukisai's Swift 1.5 IQ3_XXS: 144
-residual-writing tensors replaced (IQ4_XS / IQ4_NL / Q2_0), the other 1080 byte-identical. Swift's shard 2 holds
-layers 13-47, so both shards are needed. Card sampling (temperature 1.0).
+Each model is one file in `configs/`: its settings and the Hugging Face files it comes from. `./run.sh` lists
+exactly these models, and `./models.sh` manages them:
 
 ```bash
-.venv/bin/hf download SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF --include "IQ3_XXS/*" \
-    --local-dir /opt/models/swift-gsq-rco-abliterated
-./run.sh swift-abliterated   # BNK_SWIFT_ABLITERATED overrides the path; BNK_SWIFT for ./run.sh swift
+./models.sh list                               # the configured models, and which are downloaded
+./models.sh download iq3_s                     # download one (resumes if interrupted, checks every SHA-256)
+./models.sh download iq3_s --dir /data/models  # ... into a folder of your choice (remembered in bnk.env)
+./models.sh add SomeOrg/Some-Model-GGUF --include 'IQ4_XS/*' --alias some
+                                               # add a model: writes configs/<name>.json, then download it
 ```
 
-**CYBER-FROST-3.8.** Of the published quantizations of this fine-tune, PS-GUFF has the most precise experts that
-fit 128 GB of RAM and needs no new kernels (the other GGUFs use Q5_0/Q5_1/Q3_K/MXFP4 experts, or need more RAM).
-Three things about the file:
+| Config | Model | Size |
+|---|---|---|
+| `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
 
-* Its 28.8 GB PLE table is byte-identical to Orca's (checked with a SHA-256 of the whole tensor), so it is
-  downloaded without it (`tools/fetch_gguf.py`, 83.7 GB instead of 112.5 GB) and the engine reads the table from the
-  Orca file (`--ple-gguf`; `run.sh cyber-frost` passes it). Orca has to be downloaded too.
-* It declares its MTP block (`block_count` 49, `nextn_predict_layers` 1); the engine runs the 48-layer trunk and
-  drafts with `--mtp` as usual. That MTP head is byte-identical to the official Qwen one, so the stock draft layer
-  from `tools/build_mtp.py` is the model's own.
-* Its `compress_ratios` are all 0, which would mean dense attention, although the attention layers carry their
-  QSA indexers and the checkpoint's config says `indexer_compress_ratio` 4; the engine restores the ratio
-  (`BNK_NO_QSA=1` runs dense attention).
+**Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
+`$HF_HUB_CACHE`), the same place `hf download` uses, so a model already downloaded with `hf` is found as it is. With
+`--dir DIR` (or `./setup.sh --models DIR`) models go to `DIR/<config name>/` instead; the folder is saved to
+`bnk.env` as `BNK_MODELS`, and later downloads and `run.sh` use it. A model is looked for in `BNK_MODELS` first, then
+in the cache.
 
-Its chat template adds Blackfrost's own system prompt and a reasoning-effort line (`xhigh` by default; pass
-`chat_template_kwargs: {"reasoning_effort": "medium"|"low"}`), and always thinks.
+**Adding a model.** `./models.sh add REPO` reads the repo's file list; if it holds several models (quantization
+levels), it lists them with the `--include` pattern for each. The new config pins the repo's current commit and
+starts from bnk's default sampling and speculation (see [Per-model configs](#using-it)); tune them there. A model
+downloaded some other way can be configured by hand with `"source": {"path": "/path/to/model-00001-of-0000N.gguf"}`.
+`./run.sh /path/to/model-00001-of-0000N.gguf` also runs any GGUF without a config.
 
-```bash
-.venv/bin/python tools/fetch_gguf.py --repo peasantsmith/CYBER-FROST-3.8-PS-GUFF \
-    --file CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf --drop per_layer_token_embd.weight \
-    --out /opt/models/cyber-frost/CYBER-FROST-3.8-PS-Q5_K_M-noPLE.gguf
-./run.sh cyber-frost      # BNK_CYBER_FROST / BNK_PLE_GGUF override the two paths
-```
+**Gated models** need a Hugging Face account that accepted the model's terms on its page, and a read token
+(https://huggingface.co/settings/tokens) on this machine: `.venv/bin/hf auth login`.
 
 ## Setup in detail
 
@@ -354,9 +310,9 @@ Its chat template adds Blackfrost's own system prompt and a reasoning-effort lin
 | GPU | an sm_70 GPU (V100). Others are untested and would need their own tuning. |
 | Driver | NVIDIA 570 or newer (CUDA 12.8 needs it). |
 | CUDA | **12.x** (12.8 tested). CUDA 13 cannot build for the V100. |
-| RAM | enough to page-lock every expert, plus ~10 GB: 64 GB for IQ3_S (47 GB of experts), 80 GB for Orca (61 GB), 96 GB for CYBER-FROST (78 GB). |
+| RAM | enough to page-lock every expert, plus ~10 GB: 64 GB for IQ3_S (47 GB of experts). |
 | CPU | AVX2 (any recent x86_64). |
-| Disk | ~90 GB per model, ~5 GB for the MTP layer. |
+| Disk | ~90 GB per model, ~6 GB for the MTP layer and its source tensors. |
 | Network | for the driver, the packages, the MTP layer and the models. |
 
 ### Step by step
@@ -380,16 +336,17 @@ Its chat template adds Blackfrost's own system prompt and a reasoning-effort lin
    3. **The Python environment** (`.venv`): the server's dependencies, CMake and Ninja if the system's are too old.
    4. **The engine** (`build/bnk`), compiled for the V100. The log is `build-cmake.log`.
    5. **The dashboard** (`serve/web/dist`), with a bundled Node.js if there is none.
-   6. **The models folder and the MTP layer:** the folder defaults to `~/models` (`--models DIR` to change it) and
-      is saved to `bnk.env`, which `run.sh` reads. With `--mtp` it builds the speculative-decoding layer from the
-      official Qwen checkpoint (~5 GB downloaded, ~25% faster decoding). If no model is there yet, it offers to
-      download the default one (84 GB).
+   6. **Models and the MTP layer:** if the default model is not downloaded yet, it offers to download it (84 GB)
+      into the Hugging Face cache, or into `--models DIR` (saved to `bnk.env`, which `run.sh` reads). With `--mtp`
+      it builds the speculative-decoding layer from the official Qwen checkpoint (~5 GB downloaded, ~25% faster
+      decoding) into `~/.cache/bnk/mtp/`.
 3. **If it asked you to reboot:** `sudo reboot`, log back in, `cd bnk` and run `./setup.sh --mtp` again. It picks
    up where it stopped.
 4. **Start the server.**
    ```bash
-   ./run.sh iq3_s
+   ./run.sh
    ```
+   and pick the model from the list (or name it: `./run.sh iq3_s`).
    The first start takes about a minute (the experts are copied into page-locked RAM and the VRAM cache filled).
    It is ready when the terminal shows `listening on http://0.0.0.0:8080`.
 5. **Open the dashboard** at `http://<the machine's IP>:8080` (`hostname -I` shows the IP), or send a request:
@@ -408,16 +365,13 @@ Everything at once, without questions (the driver install still needs the reboot
 |---|---|
 | `--yes` | do not ask; install what is missing |
 | `--mtp` | build the MTP draft layer (recommended) |
-| `--models DIR` | where models go (default `~/models`; saved to `bnk.env`) |
-| `--download iq3_s,orca,abliterated` | download these models (84 / 98 / 84 GB) |
+| `--models DIR` | a folder for models (default: the Hugging Face cache; saved to `bnk.env`) |
+| `--download iq3_s` | download these models (config names or aliases, comma-separated) |
 | `--no-download` | never offer a download |
 | `--no-system` | never touch system packages, only report |
 | `--cuda DIR` | build with this CUDA toolkit |
 
-**More models later:** `.venv/bin/python tools/fetch_models.py --list`, then for example
-`.venv/bin/python tools/fetch_models.py orca --models ~/models`. Orca is gated: open its page on Hugging Face,
-accept its terms while logged in, create a read token at https://huggingface.co/settings/tokens, and run
-`.venv/bin/hf auth login` once.
+**More models later:** `./models.sh list`, `./models.sh add`, `./models.sh download` (see [Models](#models)).
 
 **By hand** (what `setup.sh` runs, for other distributions):
 
@@ -425,8 +379,8 @@ accept its terms while logged in, create a read token at https://huggingface.co/
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 && cmake --build build -j
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 (cd serve/web && npm ci && npm run build)
-.venv/bin/python tools/build_mtp.py --out ~/models/mtp/mtp-q2_0.gguf
-echo 'BNK_MODELS="'$HOME'/models"' >> bnk.env; echo 'BNK_MTP="'$HOME'/models/mtp/mtp-q2_0.gguf"' >> bnk.env
+.venv/bin/python tools/build_mtp.py --out ~/.cache/bnk/mtp/mtp-q2_0.gguf
+./models.sh download iq3_s
 ```
 
 The cache ranking learned while serving is saved to `~/.cache/bnk/counts-<model>.bnkc` and used next time, so the
@@ -438,8 +392,8 @@ expert cache starts warm after the first session.
 
 | | |
 |---|---|
-| `./run.sh` | on a terminal: pick a model from a list |
-| `./run.sh iq3_s` | a preset (`iq3_s`, `orca`, `abliterated`, `swift`, `swift-abliterated`, `cyber-frost`), or a path to a model's first `.gguf` shard |
+| `./run.sh` | on a terminal: pick a model from the list of `configs/` (a model not downloaded yet is offered for download) |
+| `./run.sh iq3_s` | a model by its config name or alias, or a path to a model's first `.gguf` shard |
 | `--port 8080` | HTTP port |
 | `--ctx 262144` | maximum context (256K is the model's native length; memory is only used as needed) |
 | `--slots 3` | conversations decoded at once (batched); `1` serves one at a time |
@@ -456,7 +410,7 @@ expert cache starts warm after the first session.
 | `BNK_VRAM_LOG=1`, `BNK_VMEM_LOG=1` | log to the engine log when the VRAM budget corrects itself against the driver / when the expert cache shrinks or grows |
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
-| `BNK_MODELS`, `BNK_MTP` | where models and the MTP layer live (`setup.sh` saves them to `bnk.env`) |
+| `BNK_MODELS`, `BNK_MTP` | a models folder (instead of the Hugging Face cache) and the MTP layer (`setup.sh` and `models.sh` save them to `bnk.env`) |
 | `BNK_API_KEY` | require this key from API clients |
 | `BNK_CPU_PIN=1`, `BNK_CPU_CHUNKS=3` | pin the CPU expert workers to cores / split their work dynamically (no measurable gain on this machine, so off by default) |
 
@@ -464,16 +418,25 @@ expert cache starts warm after the first session.
 
 ```json
 {
-  "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "notes": "free text",
+  "aliases": ["iq3_s"],
+  "source": {
+    "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+    "files": ["IQ3_S/...-00001-of-00002.gguf", "IQ3_S/...-00002-of-00002.gguf"]
+  },
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
-  "server_args": ["--model-id", "orca", "--max-tokens", "32768"],
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", "--max-tokens", "32768", "--slots", "2"],
   "engine_args": ["--threads", "24"]
 }
 ```
 
-This is where a model's persistent settings go; `run.sh <preset>` loads `configs/<preset>.json` (the file named
-after the model for a `.gguf` path). `server_args` are any server options (port, context, slots, model id,
+This is where a model's persistent settings go; the file's name is the model's name, and `run.sh` takes it or
+one of its `aliases`. `source` says what `./models.sh download` fetches (every shard, the first one first, at the
+pinned `revision`; or `"path"` for a model already on disk). For a `.gguf` path, `run.sh` loads the config named
+after the file if there is one. `server_args` are any server options (port, context, slots, model id,
 completion budget, API key ...) and are read as if typed before the command line, so options given to `run.sh`
 still win. `engine_args` go to the engine (`--threads`, `--cache-gib`, ...; see `tools/bnk_main.cpp`). Sampling
 values are defaults; a request's own fields take precedence. The shipped speculation settings come from sweeps on
@@ -531,11 +494,12 @@ interleaved with decoding), `tools/llama_ref.cpp` (llama.cpp reference dumps for
 | "driver ... is older than CUDA 12.8 needs" | `sudo apt install cuda-drivers`, reboot |
 | "CUDA 13 cannot target the V100" | install `cuda-toolkit-12-8` next to it; `setup.sh` finds `/usr/local/cuda-12.8` (or pass `--cuda /usr/local/cuda-12.8`) |
 | The build fails | the end of `build-cmake.log` names the error; a compiler older than g++ 12 is the usual cause |
-| Orca: "this model is gated" | accept the terms on its Hugging Face page, `.venv/bin/hf auth login`, run the download again |
-| "not enough disk space" | free some space, or put the models on a bigger disk with `--models DIR` |
+| "this model is gated" | accept the terms on its Hugging Face page, `.venv/bin/hf auth login`, run the download again |
+| "not enough disk space" | free some space, or put the models on a bigger disk: `./models.sh download NAME --dir DIR` |
 | A download stopped | run the same command again: finished files are kept, checked files are not re-hashed |
-| The server exits at start with an out-of-memory error | not enough RAM for the model's experts (see What you need); close other programs or use IQ3_S |
-| `unknown model` from `run.sh` | the preset's files are not where it looks: `BNK_MODELS` in `bnk.env`, or the per-preset variables (`BNK_ABLITERATED`, `BNK_SWIFT`, ...) |
+| The server exits at start with an out-of-memory error | not enough RAM for the model's experts (see What you need); close other programs or use a smaller quantization |
+| `no model '...' in configs/` from `run.sh` | `./models.sh list` shows the names and aliases; `./models.sh add REPO` adds a model |
+| `... is not downloaded yet` | `./models.sh download NAME`; if it is in a folder of your own, set `BNK_MODELS` in `bnk.env` (files at `DIR/<name>/...`) |
 | Port 8080 in use | `./run.sh iq3_s --port 8081` |
 | The dashboard is missing (the APIs still work) | run `./setup.sh` again; it rebuilds `serve/web/dist` |
 
@@ -549,9 +513,9 @@ src/engine/    engine (decode, batched decode, prefill, parking), MTP drafter, g
 src/server/    the engine's JSON-lines protocol and request scheduler (bnk serve)
 serve/         HTTP server: APIs, chat templates, tokenizer, conversations, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
-configs/       per-model defaults
+configs/       the models: settings and download source, one file each (models.sh manages them)
 docs/          ROADMAP.md: what was measured, what changed, what is next
-tools/         CLI, model and MTP downloaders, draft-vocabulary builder, agent benchmarks, batching simulator, checks
+tools/         CLI, models.py (behind models.sh), MTP builder, draft-vocabulary builder, agent benchmarks, batching simulator, checks
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 ```
@@ -570,7 +534,7 @@ What is planned next, with measurements behind each item: `docs/ROADMAP.md`.
 
 ## Credits
 
-The model architecture and weights are Qwen's; the IQ3_S quantization is ISTA DASLab's, the Uncensored IQ4_XS
-orcarouter's, the abliterated transplants SC117's, Swift ukisai's and CYBER-FROST Blackfrost-AI's. bnk vendors
+The model architecture and weights are Qwen's; the IQ3_S quantization is ISTA DASLab's, and the Uncensored IQ4_XS
+measured above orcarouter's. bnk vendors
 [ggml](https://github.com/ggml-org/ggml) (MIT) for its CPU quantization formats and GGUF parser, and uses
 [llama.cpp](https://github.com/ggml-org/llama.cpp) as its numerical reference.

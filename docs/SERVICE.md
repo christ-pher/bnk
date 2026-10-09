@@ -5,30 +5,25 @@ so changing models means stopping the running instance and starting another. No 
 
 ## Model names
 
-The part after `@` is the same name `run.sh` takes:
+The part after `@` is the same name `run.sh` takes: a model's config name or one of its aliases (`./models.sh list`
+shows them, and whether each is downloaded). `bnk@iq3_s` is Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S. A model has to be
+downloaded before its service starts (`./models.sh download <model>`); the service does not download it.
 
-| Instance                   | Model                                    |
-| -------------------------- | ---------------------------------------- |
-| `bnk@iq3_s`                | Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S         |
-| `bnk@orca`                 | Qwen3.8-Flash-Next-Uncensored-IQ4_XS     |
-| `bnk@cyber-frost`          | CYBER-FROST-3.8-PS-Q5_K_M                |
-| `bnk@abliterated`          | Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S |
-| `bnk@swift`                | Swift-1.5-GSQ-RCO-IQ3_XXS                |
-| `bnk@swift-abliterated`    | Swift-1.5-GSQ-RCO-abliterated-IQ3_XXS    |
+In the commands below, `<model>` is the one you are switching to.
 
 ## Change the model
 
 ```bash
 systemctl --user list-units 'bnk@*'          # which one is running now
 systemctl --user stop bnk@iq3_s               # stop it (frees the GPU and ~100 GB of RAM)
-systemctl --user start bnk@orca               # start the new one
-journalctl --user -u bnk@orca -f              # watch it load; ready when it prints "listening on http://0.0.0.0:8080"
+systemctl --user start bnk@<model>            # start the new one
+journalctl --user -u bnk@<model> -f           # watch it load; ready when it prints "listening on http://0.0.0.0:8080"
 ```
 
 Or as one line (stops whatever bnk instance is running, then starts the new one):
 
 ```bash
-systemctl --user stop 'bnk@*' && systemctl --user start bnk@orca
+systemctl --user stop 'bnk@*' && systemctl --user start bnk@<model>
 ```
 
 Check it is up:
@@ -45,19 +40,19 @@ Requires linger, set once: `sudo loginctl enable-linger chris`. Only enable **on
 
 ```bash
 systemctl --user disable bnk@iq3_s            # whichever was enabled before
-systemctl --user enable bnk@orca
+systemctl --user enable bnk@<model>
 systemctl --user list-unit-files 'bnk@*'      # check: exactly one "enabled"
 ```
 
-`systemctl --user enable --now bnk@orca` enables and starts it in one step (stop the old one first).
+`systemctl --user enable --now bnk@<model>` enables and starts it in one step (stop the old one first).
 
 ## Everyday commands
 
 ```bash
-systemctl --user status bnk@orca              # running? memory, PIDs
-systemctl --user restart bnk@orca             # restart the same model (e.g. after a git pull)
-journalctl --user -u bnk@orca --since "1 hour ago"
-journalctl --user -u bnk@orca -f              # live log (what the tmux pane used to show)
+systemctl --user status bnk@<model>           # running? memory, PIDs
+systemctl --user restart bnk@<model>          # restart the same model (e.g. after a git pull)
+journalctl --user -u bnk@<model> --since "1 hour ago"
+journalctl --user -u bnk@<model> -f           # live log (what the tmux pane used to show)
 ```
 
 ## Notes
