@@ -85,7 +85,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
-    bool solo = false, adapt_set = false;
+    bool solo = false, adapt_set = false, pipe = false;
     int max_new = 32;
     GenOptions gopt;
     EngineOptions opt;
@@ -129,6 +129,7 @@ int main(int argc, char ** argv) {
         else if (a == "--gpus") { const std::string v = next(); opt.gpus = v == "all" ? std::vector<int>{-1} : int_list(v); }
         else if (a == "--split") opt.split = int_list(next());
         else if (a == "--solo") solo = true;
+        else if (a == "--pipe") pipe = true;   // multi on two GPUs: two lanes in flight (Engine::forward_pipe)
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     if (mode == "serve") {
@@ -272,7 +273,61 @@ int main(int argc, char ** argv) {
         int64_t rounds = 0, forwards = 0;
         double fwd_ms = 0, fin_ms = 0;
         const double t2 = now_ms();
-        if (solo) {
+        if (pipe) {
+            // the prompts alternate between two lanes; each step runs one lane on the first GPU while the other
+            // (from the step before) runs on the second, then verifies, commits and drafts that one
+            std::vector<int> lane_of(n);
+            for (int i = 0; i < n; ++i) lane_of[i] = i & 1;
+            std::vector<Engine::BatchWin> mid_wins;
+            std::vector<int> mid_ids;
+            int mid = -1;
+            auto finish = [&](const std::vector<int> & ids) {
+                std::vector<Generator *> ga;
+                std::vector<std::vector<int32_t>> got(ids.size());
+                for (size_t j = 0; j < ids.size(); ++j) {
+                    got[j] = gens[ids[j]]->finish(false);
+                    ga.push_back(gens[ids[j]].get());
+                }
+                Generator::draft_batch(ga);
+                for (size_t j = 0; j < ids.size(); ++j)
+                    for (int t : got[j]) {
+                        outs[ids[j]].push_back(t);
+                        if (t == c.eos_token || (int) outs[ids[j]].size() >= max_new) break;
+                    }
+            };
+            while (true) {
+                const int x = mid == 0 ? 1 : 0;
+                std::vector<int> ids;
+                for (int i = 0; i < n; ++i)
+                    if (lane_of[i] == x && !done(i)) ids.push_back(i);
+                if (ids.empty() && mid < 0) {   // nothing in flight and this lane is done: the rest join it
+                    bool any = false;
+                    for (int i = 0; i < n; ++i) any |= !done(i);
+                    if (!any) break;
+                    for (int i = 0; i < n; ++i) lane_of[i] = x;
+                    continue;
+                }
+                std::vector<Generator *> ga;
+                for (int i : ids) ga.push_back(gens[i].get());
+                const std::vector<int> rows = Generator::share_rows(ga);
+                std::vector<Engine::BatchWin> wins;
+                for (size_t j = 0; j < ids.size(); ++j) {
+                    const auto & w = gens[ids[j]]->window(rows[j]);
+                    wins.push_back({ids[j], w.data(), (int) w.size(), w.size() == 1});
+                }
+                const double f0 = now_ms();
+                eng.forward_pipe(wins, x, mid_wins, mid >= 0 ? mid : 1 - x);
+                fwd_ms += now_ms() - f0;
+                ++forwards;
+                const double f1 = now_ms();
+                if (mid >= 0) finish(mid_ids);
+                fin_ms += now_ms() - f1;
+                mid = wins.empty() ? -1 : x;
+                mid_wins = wins;
+                mid_ids = ids;
+                ++rounds;
+            }
+        } else if (solo) {
             for (int i = 0; i < n; ++i)
                 while (!done(i)) {
                     for (int t : gens[i]->next()) {
@@ -326,7 +381,7 @@ int main(int argc, char ** argv) {
         const auto & tm = eng.times;
         printf("prefill %d prompts in %.1f ms\n", n, p1 - p0);
         printf("decode %s: %zu tokens in %.1f ms (%.2f tok/s total, %.2f per conversation); %lld forwards; "
-               "expert misses %.2f%% (%.2f per forward)\n", solo ? "one after another" : "batched", total, t3 - t2,
+               "expert misses %.2f%% (%.2f per forward)\n", solo ? "one after another" : pipe ? "in two lanes" : "batched", total, t3 - t2,
                total / ((t3 - t2) / 1000), total / ((t3 - t2) / 1000) / (solo ? 1 : n), (long long) forwards,
                100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls));
         if (!solo)

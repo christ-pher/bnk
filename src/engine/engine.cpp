@@ -89,7 +89,7 @@ Engine::~Engine() {
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts)
             if (k.host) cudaFreeHost(k.host);
-        for (auto & gm : q->commit_graphs) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
+        for (auto & gl : q->commit_graphs) for (auto & gm : gl) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     }
     for (auto & kv : fwd_graphs_) cudaGraphExecDestroy(kv.second.exec);
     if (counts_.p) save_counts_here();
@@ -98,7 +98,8 @@ Engine::~Engine() {
     if (h_tok_) cudaFreeHost(h_tok_);
     if (h_ple_rows_) cudaFreeHost(h_ple_rows_);
     if (d_par_) cudaFree(d_par_);
-    if (xfer_in_) cudaFreeHost(xfer_in_);
+    for (float * b : xfer_in_)
+        if (b) cudaFreeHost(b);
     for (float * b : pf_xfer_in_)
         if (b) cudaFreeHost(b);
     if (ev_out_) cudaEventDestroy(ev_out_);
@@ -264,7 +265,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         }
         s->load_stage(path, so);
         if (prev) {
-            prev->xfer_out_ = s->xfer_in_;
+            for (int l = 0; l < kLanes; ++l) prev->xfer_out_[l] = s->xfer_in_[l];
             prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
             prev->pf_xfer_out_[1] = s->pf_xfer_in_[1];
         }
@@ -341,7 +342,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaMalloc(&d_par_, kMaxSlots * sizeof(WinParams)));
     CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocMapped));
     if (!first()) {   // the previous stage's residual rows come through here
-        CUDA_CHECK(cudaHostAlloc((void **) &xfer_in_, (size_t) W * HC * 4, cudaHostAllocPortable));
+        for (float *& b : xfer_in_) CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) W * HC * 4, cudaHostAllocPortable));
         if (opt.prefill_chunk > 0)
             for (float *& b : pf_xfer_in_)
                 CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) std::max(opt.prefill_chunk, opt.prefill_chunk_max) * HC * 4,
@@ -355,9 +356,11 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         CUDA_CHECK(cudaHostAlloc((void **) &h_ple_rows_, (size_t) W * ph * model_.ple_table->row_bytes(),
                                  cudaHostAllocMapped));
     }
-    gdn_co_.resize(c.n_layer);
-    gdn_g_.resize(c.n_layer);
-    gdn_b_.resize(c.n_layer);
+    for (int l = 0; l < kLanes; ++l) {
+        gdn_co_[l].resize(c.n_layer);
+        gdn_g_[l].resize(c.n_layer);
+        gdn_b_[l].resize(c.n_layer);
+    }
     size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
@@ -367,9 +370,12 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
                 qsa_on_ = true;
             }
         } else {
-            gdn_co_[il].alloc((size_t) W * C);
-            gdn_g_[il].alloc((size_t) W * c.ssm_vheads);
-            gdn_b_[il].alloc((size_t) W * c.ssm_vheads);
+            // the second lane only for a pipeline (two batches in flight)
+            for (int l = 0; l < (first() && last_ ? 1 : kLanes); ++l) {
+                gdn_co_[l][il].alloc((size_t) W * C);
+                gdn_g_[l][il].alloc((size_t) W * c.ssm_vheads);
+                gdn_b_[l][il].alloc((size_t) W * c.ssm_vheads);
+            }
             state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) c.ssm_vheads * c.ssm_state * c.ssm_state) * 4;
         }
     }
@@ -811,7 +817,7 @@ void Engine::gdn(int il, int T) {
             CUDA_CHECK(cudaMemcpyAsync(w.q->conv_buf[il].p + (size_t) (K - 1) * C, conv_out_.p + (size_t) w.r0 * C,
                                        (size_t) w.T * C * 4, cudaMemcpyDeviceToDevice, st_));
     gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, st_);
-    float * co = gdn_co_[il], * gg = gdn_g_[il], * gb = gdn_b_[il];
+    float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
     gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, st_);
     gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, st_);
     dbg(st_, il, "hc_mixed_attn", mixed_, (size_t) T * E);
@@ -841,7 +847,8 @@ void Engine::enqueue_commit(int cnt) {
     const size_t r0 = (size_t) cur_->last_r0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) continue;
-        gdn_recurrence(gdn_co_[il].p + r0 * C, C, gdn_g_[il].p + r0 * nv, gdn_b_[il].p + r0 * nv, cur_->ssm_state[il],
+        const int ln = cur_->last_lane;
+        gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv, cur_->ssm_state[il],
                        nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
     if (n_gdn_) shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
@@ -880,7 +887,7 @@ void Engine::commit_here(int cnt) {
     cur_->pending_T = 0;
     static const bool same_stream = getenv("BNK_COMMIT_SAME_STREAM") != nullptr;
     if (opt_.use_graphs && !same_stream) {
-        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_r0][cnt];
+        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_lane][cur_->last_r0][cnt];
         if (!cg) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -896,7 +903,7 @@ void Engine::commit_here(int cnt) {
         CUDA_CHECK(cudaEventRecord(ev_committed_, st_commit_));
         commit_inflight_ = true;
     } else if (opt_.use_graphs) {
-        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_r0][cnt];
+        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_lane][cur_->last_r0][cnt];
         if (!cg) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -1076,11 +1083,11 @@ void Engine::enqueue_forward(int T) {
         dequant_gather(model_.tok_embd, h_tok_, T, x_, st_);
         hc_init(x_, res_, T, c.hc, c.n_embd, st_);
     } else {
-        CUDA_CHECK(cudaMemcpyAsync(res_.p, xfer_in_, rows, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(res_.p, xfer_in_[lane_], rows, cudaMemcpyHostToDevice, st_));
     }
     for (int il = l0_; il < l1_; ++il) layer_forward(il, T);
     if (last_) head(T);
-    else CUDA_CHECK(cudaMemcpyAsync(xfer_out_, res_.p, rows, cudaMemcpyDeviceToHost, st_));
+    else CUDA_CHECK(cudaMemcpyAsync(xfer_out_[lane_], res_.p, rows, cudaMemcpyDeviceToHost, st_));
 }
 
 void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double t1) {
@@ -1170,9 +1177,12 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
     times.calls++;
 }
 
-void Engine::fwd_prepare(const std::vector<BatchWin> & batch) {
+void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     DeviceScope ds(dev_);
     join_commit_here();
+    if (lane < 0 || lane >= kLanes || !gdn_co_[lane].size() || (l1_ > l0_ && lane > 0 && first() && last_))
+        throw std::runtime_error("forward: no lane " + std::to_string(lane));
+    lane_ = lane;
     Seq * keep = cur_;
     int R = 0;
     for (const auto & b : batch) {
@@ -1197,10 +1207,12 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch) {
         wins_.push_back(Win{q, r0, b.T, pos(), b.commit_all});
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
         q->last_r0 = r0;
+        q->last_lane = lane;
         memcpy(h_tok_ + r0, b.tokens, b.T * 4);
         h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
         key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
     }
+    key.push_back(lane);
     use(keep);
     last_T = R;
     ple_gather();
@@ -1253,6 +1265,45 @@ void Engine::fwd_launch(cudaEvent_t after) {
     }
     CUDA_CHECK(cudaEventRecord(ev_out_, st_));
     CUDA_CHECK(cudaEventRecord(ev_t1_, st_));
+}
+
+void Engine::forward_pipe(const std::vector<BatchWin> & first_in, int first_lane, const std::vector<BatchWin> & second_in,
+                          int second_lane) {
+    if (stages() != 2) throw std::runtime_error("forward_pipe: needs a pipeline of two GPUs");
+    if (!first_in.empty() && !second_in.empty() && first_lane == second_lane)
+        throw std::runtime_error("forward_pipe: the two batches need different lanes");
+    auto sorted = [](std::vector<BatchWin> b) {
+        std::sort(b.begin(), b.end(), [](const BatchWin & x, const BatchWin & y) { return x.slot < y.slot; });
+        return b;
+    };
+    const std::vector<BatchWin> a = sorted(first_in), b = sorted(second_in);
+    for (const auto & w : a)
+        for (const auto & v : b)
+            if (w.slot == v.slot) throw std::runtime_error("forward_pipe: a slot in both batches");
+    Engine * s1 = next_.get();
+    const double t0 = now_ms();
+    // the second batch's rows came from the first GPU in the previous call (already finished): no event to wait on
+    if (!a.empty()) fwd_prepare(a, first_lane);
+    if (!b.empty()) s1->fwd_prepare(b, second_lane);
+    if (!a.empty()) fwd_launch(nullptr);
+    if (!b.empty()) s1->fwd_launch(nullptr);
+    // each GPU's CPU experts answered at the same time: the second's on a helper thread
+    if (!b.empty()) {
+        if (!svc_) svc_ = std::make_unique<Worker>();
+        svc_->post([s1]() { s1->fwd_service(); });
+    }
+    std::exception_ptr err;
+    try {
+        if (!a.empty()) fwd_service();
+    } catch (...) {
+        err = std::current_exception();
+    }
+    if (!b.empty()) svc_->wait();
+    if (err) std::rethrow_exception(err);
+    if (!a.empty()) fwd_end();
+    if (!b.empty()) s1->fwd_end();
+    times.total_ms += now_ms() - t0;
+    times.calls++;
 }
 
 void Engine::fwd_service() {

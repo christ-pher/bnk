@@ -131,6 +131,13 @@ public:
     int64_t graph_captures() const { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
     size_t graph_bytes() const { return graph_bytes_ + (next_ ? next_->graph_bytes() : 0); }
     void forward_batch(const std::vector<BatchWin> & wins);
+    // Two batches in flight on a two-GPU pipeline: `first` runs on the first GPU while `second` runs on the second
+    // (`second` went through the first GPU in the previous call). Either may be empty. Each batch keeps to its lane
+    // (0 or 1) from the first GPU to its commit: the lanes have their own window buffers, so one batch's forward
+    // on the first GPU does not overwrite what the other's commit still needs. forward_batch() uses lane 0.
+    static constexpr int kLanes = 2;
+    void forward_pipe(const std::vector<BatchWin> & first, int first_lane, const std::vector<BatchWin> & second,
+                      int second_lane);
     int row0_of(int slot) const;   // where that slot's rows started in the last forward
     void commit(int c);
     // The commit (the DeltaNet recurrence over the kept rows) runs on its own stream, overlapping the drafter;
@@ -229,8 +236,9 @@ private:
     // the residual rows between stages: pinned, portable host memory written by this stage, read by the next one
     // (xfer_out_ is the next stage's xfer_in_); decode windows and prompt chunks have their own, prompt chunks two
     // (the first stage writes the next chunk's while the later stages read this one's)
-    float * xfer_in_ = nullptr, * pf_xfer_in_[2] = {nullptr, nullptr};
-    float * xfer_out_ = nullptr, * pf_xfer_out_[2] = {nullptr, nullptr};
+    float * xfer_in_[kLanes] = {}, * pf_xfer_in_[2] = {nullptr, nullptr};
+    float * xfer_out_[kLanes] = {}, * pf_xfer_out_[2] = {nullptr, nullptr};
+    int lane_ = 0;   // the lane of the forward this stage is preparing / running
     // Prompt reads pipelined over the stages: the first stage works on chunk k+1 (on the caller's thread) while
     // this worker runs chunk k through the later ones. Between chunks both are idle (the caller's progress hook
     // may decode other conversations then).
@@ -247,6 +255,7 @@ private:
         void wait();                          // until idle; rethrows the job's exception
     };
     std::unique_ptr<Worker> worker_;
+    std::unique_ptr<Worker> svc_;   // forward_pipe: answers the second stage's CPU experts meanwhile
     std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
     cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part
@@ -263,7 +272,7 @@ private:
     void save_counts_here();
     // forward_batch in four steps per stage: book the windows (and capture the graph); launch it after the previous
     // stage's; service the CPU experts; wait
-    void fwd_prepare(const std::vector<BatchWin> & batch);
+    void fwd_prepare(const std::vector<BatchWin> & batch, int lane = 0);
     void fwd_launch(cudaEvent_t after);
     bool fwd_graph_ = true;   // the forward in flight runs as a graph (else eagerly, the CPU part inside)
     cudaGraphExec_t fwd_exec_ = nullptr;
@@ -330,8 +339,9 @@ private:
         std::vector<ElasticBuf> kv_k, kv_v, kv_raw, kv_pool;
         int ctx_mapped = 0;   // cells of context whose KV is mapped
         DevBuf<float> ple_hist;
-        cudaGraphExec_t commit_graphs[kMaxWindow][kMaxWindow + 1] = {};   // [first row in the window][kept rows]
+        cudaGraphExec_t commit_graphs[kLanes][kMaxWindow][kMaxWindow + 1] = {};   // [lane][first row][kept rows]
         int last_r0 = 0;     // where its rows were in the last forward (for its commit)
+        int last_lane = 0;   // ... and in which lane's buffers
         bool used = false;   // ever held a conversation (an unused slot maps no context)
     };
     std::vector<std::unique_ptr<Seq>> seqs_;
@@ -430,7 +440,8 @@ private:
     std::vector<ExpertTask> tasks_;
     // per-layer recurrent state
     int n_gdn_ = 0;
-    std::vector<DevBuf<float>> gdn_co_, gdn_g_, gdn_b_;  // per GDN layer: the window's conv outputs, decay, beta
+    // per lane and GDN layer: the window's conv outputs, decay, beta (kept for the commit)
+    std::vector<DevBuf<float>> gdn_co_[kLanes], gdn_g_[kLanes], gdn_b_[kLanes];
     // QSA: raw indexer keys and pooled block keys per attention layer, selection scratch
     DevBuf<float> ik_, iq_, qsa_scores_;
     DevBuf<int32_t> qsa_sel_, qsa_nsel_;

@@ -516,6 +516,110 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             }
         }
     };
+    // Two GPUs with BNK_PIPE_DECODE=1: the requests in flight form two lanes, and each step runs one lane's batch
+    // on the first GPU while the other lane's (from the step before) runs on the second, then verifies, commits
+    // and drafts that one. Both GPUs work at once instead of taking turns. A new request, or a lane running
+    // empty, drains the pipeline first (the other lane goes through the second GPU alone), and the server goes
+    // back to one batch per round.
+    static const bool pipe_decode = eng.stages() == 2 && getenv("BNK_PIPE_DECODE") && atoi(getenv("BNK_PIPE_DECODE")) != 0;
+    struct Lane { std::vector<Active *> reqs; std::vector<Engine::BatchWin> wins; };
+    Lane lanes[2];
+    int mid = -1;         // the lane whose batch went through the first GPU only
+    bool piped = false;   // lanes formed
+    static const bool lane_draft_batch = !getenv("BNK_DRAFT_BATCH") || atoi(getenv("BNK_DRAFT_BATCH")) != 0;
+    auto pipe_fail = [&](const std::exception & e) {
+        for (auto & a : active) emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
+        exit_if_gpu_lost(eng);
+        for (auto & a : active) {
+            try { eng.select(a->slot); eng.reset(); } catch (...) {}
+        }
+        active.clear();
+        lanes[0] = Lane{};
+        lanes[1] = Lane{};
+        mid = -1;
+        piped = false;
+        mark_busy(-1);
+    };
+    // verify, commit and draft lane l's requests after their batch went through both GPUs, then deliver
+    auto lane_finish = [&](int l) {
+        std::vector<Generator *> gens;
+        for (Active * a : lanes[l].reqs) {
+            a->out = a->gen->finish(!lane_draft_batch);
+            gens.push_back(a->gen.get());
+        }
+        if (lane_draft_batch) Generator::draft_batch(gens);
+        for (Active * a : lanes[l].reqs) deliver(*a);
+    };
+    // requests of lane l that are done leave
+    auto lane_retire = [&](int l) {
+        auto & r = lanes[l].reqs;
+        for (size_t i = 0; i < r.size();) {
+            if (!r[i]->stop) { ++i; continue; }
+            Active * a = r[i];
+            r.erase(r.begin() + (long) i);
+            finish_request(*a);
+            for (size_t j = 0; j < active.size(); ++j)
+                if (active[j].get() == a) { active.erase(active.begin() + (long) j); break; }
+            mark_busy(-1);
+        }
+    };
+    auto pipe_drain = [&]() {
+        if (!piped) return;
+        try {
+            if (mid >= 0) {
+                const double f0 = now_ms();
+                eng.forward_pipe({}, 0, lanes[mid].wins, mid);
+                const double f1 = now_ms();
+                for (Active * a : lanes[mid].reqs) a->gen->stats.verify_ms += f1 - f0;
+                lane_finish(mid);
+                lane_retire(mid);
+            }
+        } catch (const std::exception & e) {
+            pipe_fail(e);
+            return;
+        }
+        lanes[0] = Lane{};
+        lanes[1] = Lane{};
+        mid = -1;
+        piped = false;
+    };
+    auto pipe_step = [&]() {
+        if (!piped) {   // two lanes, alternating over the requests in slot order
+            std::vector<Active *> order;
+            for (auto & a : active) order.push_back(a.get());
+            std::sort(order.begin(), order.end(), [](const Active * x, const Active * y) { return x->slot < y->slot; });
+            for (size_t i = 0; i < order.size(); ++i) lanes[i & 1].reqs.push_back(order[i]);
+            piped = true;
+            mid = -1;
+        }
+        const int x = mid == 0 ? 1 : 0;   // the lane whose next windows are ready
+        try {
+            std::vector<Generator *> gens;
+            for (Active * a : lanes[x].reqs) gens.push_back(a->gen.get());
+            const std::vector<int> rows = Generator::share_rows(gens);
+            std::vector<Engine::BatchWin> wins;
+            for (size_t i = 0; i < lanes[x].reqs.size(); ++i) {
+                Active * a = lanes[x].reqs[i];
+                const auto & w = a->gen->window(rows[i]);
+                wins.push_back({a->slot, w.data(), (int) w.size(), w.size() == 1});
+            }
+            const double f0 = now_ms();
+            eng.forward_pipe(wins, x, mid >= 0 ? lanes[mid].wins : std::vector<Engine::BatchWin>{}, mid >= 0 ? mid : 1 - x);
+            const double f1 = now_ms();
+            for (Active * a : lanes[x].reqs) a->gen->stats.verify_ms += (f1 - f0) / 2;
+            const int done = mid;
+            lanes[x].wins = wins;
+            mid = x;
+            if (done >= 0) {
+                for (Active * a : lanes[done].reqs) a->gen->stats.verify_ms += (f1 - f0) / 2;
+                lane_finish(done);
+                lane_retire(done);
+                if (lanes[done].reqs.empty()) pipe_drain();   // one lane left: back to one batch per round
+            }
+        } catch (const std::exception & e) {
+            pipe_fail(e);
+        }
+    };
     // While a request's prompt is read, the others keep decoding between its chunks: after each chunk but the last
     // (the last one leaves the first token's logits in the decode buffers), rounds for share x that chunk's time.
     static const double read_share = getenv("BNK_READ_SHARE") ? atof(getenv("BNK_READ_SHARE")) : 0.5;
@@ -554,6 +658,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             }
         }
         if (have) {
+            pipe_drain();   // a request's prompt is read on both GPUs, with nothing in flight
             const std::string op = req["op"].str();
             const std::string id = req["id"].str();
             if (op == "reset") {
@@ -577,8 +682,14 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             continue;   // admit every waiting request before the next round
         }
         if (active.empty()) continue;
-        // 2. one round for every request in flight: their windows in one batched forward
-        run_round();
+        // 2. one round for every request in flight: their windows in one batched forward (two GPUs, piped: one
+        // lane's step)
+        if (pipe_decode && active.size() >= 2) {
+            pipe_step();
+        } else {
+            pipe_drain();
+            if (!active.empty()) run_round();
+        }
         if (active.empty()) eng.times = StageTimes{};
         telemetry(false);
         // keep the learned routing counts on disk (the process may be killed rather than quit)
