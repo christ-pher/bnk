@@ -1,0 +1,23 @@
+# bnk inference server, one model per instance: systemctl --user start bnk@iq3_s (orca, cyber-frost, abliterated,
+# swift, swift-abliterated). Only one instance fits the GPU: stop the running one before starting another.
+# Logs: journalctl --user -u bnk@iq3_s -f
+[Unit]
+Description=bnk server (%i)
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/engines/bnk
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/engines/bnk/run.sh %i
+# The kernel OOM killer taking the engine must not stop the whole unit (the default, OOMPolicy=stop, is what took
+# the tmux pane down): serve/engine.py restarts the engine and the server keeps answering.
+OOMPolicy=continue
+# The server itself dying (any non-zero exit or signal) restarts it.
+Restart=on-failure
+RestartSec=15
+# Freeing ~100 GB of RAM and the GPU takes a while.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
