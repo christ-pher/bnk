@@ -81,7 +81,10 @@ if ! command -v nvidia-smi >/dev/null || ! nvidia-smi >/dev/null 2>&1; then
   fail "no NVIDIA driver"
 fi
 GPU="$(nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader | head -1)"
+NGPU="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
 ok "GPU: $GPU"
+# several GPUs: the server splits the model's layers between them (docs/DUAL-GPU.md)
+[[ "$NGPU" -gt 1 ]] && ok "$NGPU GPUs: the model's layers are split between them (BNK_GPUS=0 to use one)"
 CC="$(echo "$GPU" | cut -d, -f2 | tr -d ' ')"
 [[ "$CC" == "7.0" ]] || warn "bnk is built and tuned for sm_70 (V100); this GPU is sm_${CC/./} - expect to tune it"
 DRV="$(echo "$GPU" | cut -d, -f4 | tr -d ' ')"

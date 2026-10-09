@@ -5,6 +5,9 @@ single **NVIDIA V100** with lots of host RAM. The model does not fit in VRAM, so
 dense weights and the hottest experts live on the GPU, every expert lives in pinned system RAM, misses are computed
 by the CPU during decoding, and experts stream over PCIe while a prompt is read.
 
+With **two (or more) V100s** the model's layers are split between them (a pipeline): two 32 GB cards hold every
+expert, so the CPU leaves the decode path and prompts are read on both cards at once (`docs/DUAL-GPU.md`).
+
 On top of that: speculative decoding with the model's own MTP layer, a 256K context whose memory is lent to the
 expert cache until it is needed, **several agents served at once** (their conversations decoded together in one
 batch, and parked in host RAM between turns so a turn reads only its new tokens), a thinking-loop guard, an
@@ -256,6 +259,13 @@ snapshots, the drafter's KV: 28 KiB per token) in pinned host RAM and brings it 
 instead of reading its prompt again (`--park-gib`, 24 GiB by default, least recently used dropped first). A
 request that has generated for `--slice` seconds (10) while others wait for a slot gives its turn up and continues
 where it was, so one long answer does not hold the other agents up.
+
+**Several GPUs.** `--gpus` (the server's default: every GPU) splits the layers into contiguous ranges, one per GPU,
+balanced by the memory each needs and has. Each GPU holds its layers' dense weights, experts, KV and recurrent
+state; the first one embeds the tokens, the last one holds the head and the drafter; only the residual rows
+(40 KiB per token) cross between them, through pinned host memory. While one GPU reads a prompt chunk, the next
+GPU reads the previous chunk. One copy of the experts in host RAM and one CPU pool serve both. Details,
+projections and how it was checked on one card: `docs/DUAL-GPU.md`.
 
 **Thinking-loop guard.** Reasoning models occasionally loop. The server watches the thinking tokens and, when
 most of a recent 4K-token window repeats earlier 12-token stretches, lets the model finish its sentence, closes
@@ -514,7 +524,7 @@ src/server/    the engine's JSON-lines protocol and request scheduler (bnk serve
 serve/         HTTP server: APIs, chat templates, tokenizer, conversations, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
 configs/       the models: settings and download source, one file each (models.sh manages them)
-docs/          ROADMAP.md: what was measured, what changed, what is next
+docs/          ROADMAP.md: what was measured, what changed, what is next; DUAL-GPU.md: several GPUs
 tools/         CLI, models.py (behind models.sh), MTP builder, draft-vocabulary builder, agent benchmarks, batching simulator, checks
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
@@ -529,6 +539,9 @@ third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
   at 256K).
 * The thinking-loop guard catches exact repetition, not paraphrased loops.
 * Only sm_70 is built and tested; other GPUs would need their own tuning (and CUDA 13 no longer targets V100).
+* With several GPUs the layers run on one GPU after the other: one conversation's decode does not get faster than
+  one GPU holding everything would be; the gain is that everything fits. Two GPUs were tested as two stages on one
+  card (exact against one GPU), not yet on two cards.
 
 What is planned next, with measurements behind each item: `docs/ROADMAP.md`.
 
