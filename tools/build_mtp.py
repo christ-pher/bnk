@@ -1,6 +1,6 @@
 """Build bnk's MTP draft-layer GGUF from the official Qwen checkpoint.
 
-    .venv/bin/python tools/build_mtp.py --out /opt/models/bnk/mtp/mtp-q2_0.gguf
+    .venv/bin/python tools/build_mtp.py --out ~/.cache/bnk/mtp/mtp-q2_0.gguf
 
 Only the `mtp.*` tensors are fetched: the safetensors index and shard headers are read, then each tensor's byte
 range is requested (about 5 GB in all), cached under --cache, and checked against a second read of its header
@@ -149,7 +149,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=REPO)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--cache", default="/opt/models/bnk/mtp/official", help="downloaded BF16 tensors")
+    ap.add_argument("--cache", default=str(Path.home() / ".cache" / "bnk" / "mtp" / "official"), help="downloaded BF16 tensors")
     ap.add_argument("--workers", type=int, default=16)
     args = ap.parse_args()
     import gguf  # upstream gguf-py (pip install from llama.cpp's gguf-py)

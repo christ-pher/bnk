@@ -10,9 +10,9 @@
 #   --yes             do not ask (install system packages, the driver and CUDA, download what was asked for)
 #   --no-system       never touch system packages (only check and report)
 #   --mtp             build the MTP draft layer (downloads ~5 GB of the official Qwen checkpoint)
-#   --mtp-out PATH    where to write it (default: MODELS/mtp/mtp-q2_0.gguf)
-#   --models DIR      where model GGUFs live (default ~/models; saved to bnk.env for run.sh)
-#   --download LIST   download models: iq3_s (84 GB, the default model), orca (98 GB, gated), abliterated (84 GB)
+#   --mtp-out PATH    where to write it (default: ~/.cache/bnk/mtp/mtp-q2_0.gguf)
+#   --models DIR      a folder for downloaded models (default: the Hugging Face cache; saved to bnk.env)
+#   --download LIST   download these models from configs/, by name or alias (iq3_s: 84 GB, the default model)
 #   --no-download     never offer to download a model
 #   --cuda DIR        the CUDA toolkit to build with (default: detected; CUDA 12.x is required for sm_70)
 set -euo pipefail
@@ -89,7 +89,7 @@ if ! ver_ge "$DRV" 570; then
   warn "driver $DRV is older than CUDA 12.8 needs (570 or newer): sudo apt install cuda-drivers, then reboot"
 fi
 RAM_GB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1048576 ))
-if (( RAM_GB < 64 )); then warn "${RAM_GB} GB of RAM: every expert is page-locked in RAM (47 GB for IQ3_S, 61 GB for Orca IQ4_XS)"
+if (( RAM_GB < 64 )); then warn "${RAM_GB} GB of RAM: every expert is page-locked in RAM (47 GB for IQ3_S)"
 else ok "${RAM_GB} GB of RAM"; fi
 grep -q avx2 /proc/cpuinfo && ok "CPU has AVX2 ($(nproc) threads)" || fail "the CPU expert kernels need AVX2"
 
@@ -171,32 +171,25 @@ else NPM=("$NODE_DIR/bin/node" "$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js");
 # ------------------------------------------------------------------------------------------------ 6. models, MTP
 bold "6/6  Models and the MTP draft layer"
 ENVF="$HERE/bnk.env"
-if [[ -z "$MODELS" ]]; then   # the folder saved before, else run.sh's built-in one if it holds models, else ~/models
+MODELS_PY=("$HERE/.venv/bin/python" "$HERE/tools/models.py")
+if [[ -n "$MODELS" ]]; then   # a models folder instead of the Hugging Face cache, kept for run.sh and models.sh
+  MODELS="$(mkdir -p "$MODELS" && cd "$MODELS" && pwd)"
+  { grep -v '^BNK_MODELS=' "$ENVF" 2>/dev/null || true; echo "BNK_MODELS=\"$MODELS\""; } > "$ENVF.tmp" && mv "$ENVF.tmp" "$ENVF"
+else
   MODELS="$(sed -n 's/^BNK_MODELS="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$ENVF" 2>/dev/null | tail -1)"
-  RUN_DEFAULT="$(sed -n 's/^MODELS="\${BNK_MODELS:-\(.*\)}"$/\1/p' "$HERE/run.sh" | head -1)"
-  [[ -z "$MODELS" && -n "$RUN_DEFAULT" ]] && ls "$RUN_DEFAULT"/*/*.gguf >/dev/null 2>&1 && MODELS="$RUN_DEFAULT"
-  [[ -z "$MODELS" ]] && MODELS="$HOME/models"
 fi
-mkdir -p "$MODELS"
-{ grep -v '^BNK_MODELS=' "$ENVF" 2>/dev/null || true; echo "BNK_MODELS=\"$MODELS\""; } > "$ENVF.tmp" && mv "$ENVF.tmp" "$ENVF"
-ok "models directory: $MODELS (saved to bnk.env)"
-if [[ -z "$DOWNLOAD" && $NO_DL == 0 && ! -f "$MODELS/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf" ]]; then
-  if [[ $YES == 0 ]] && ask "no model found: download the default model, IQ3_S (84 GB), into $MODELS now?"; then DOWNLOAD=iq3_s; fi
+ok "models go to: ${MODELS:-the Hugging Face cache (${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub})}"
+if [[ -z "$DOWNLOAD" && $NO_DL == 0 ]] && ! "${MODELS_PY[@]}" resolve iq3_s >/dev/null 2>&1; then
+  if [[ $YES == 0 ]] && ask "the default model, IQ3_S (84 GB), is not downloaded: download it now?"; then DOWNLOAD=iq3_s; fi
 fi
-if [[ -n "$DOWNLOAD" ]]; then
-  "$HERE/.venv/bin/python" "$HERE/tools/fetch_models.py" ${DOWNLOAD//,/ } --models "$MODELS" \
-    || fail "the model download did not finish (run the same command again to resume)"
-  ok "models: $DOWNLOAD"
-fi
-if [[ "$DOWNLOAD" == *abliterated* ]]; then
-  { grep -v '^BNK_ABLITERATED=' "$ENVF" 2>/dev/null || true
-    echo "BNK_ABLITERATED=\"$MODELS/gsq-rco-abliterated/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf\""; } > "$ENVF.tmp" && mv "$ENVF.tmp" "$ENVF"
-fi
-# the draft layer: where it already is (an earlier setup), else inside the models folder
+for m in ${DOWNLOAD//,/ }; do
+  "${MODELS_PY[@]}" download "$m" || fail "the download of $m did not finish (run the same command again to resume)"
+  ok "model: $m"
+done
+# the draft layer: where it already is (an earlier setup), else bnk's cache folder
 if [[ -z "$MTP_OUT" ]]; then
   MTP_OUT="$(sed -n 's/^BNK_MTP="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$ENVF" 2>/dev/null | tail -1)"
-  [[ -z "$MTP_OUT" && -f /opt/models/bnk/mtp/mtp-q2_0.gguf ]] && MTP_OUT=/opt/models/bnk/mtp/mtp-q2_0.gguf
-  [[ -z "$MTP_OUT" ]] && MTP_OUT="$MODELS/mtp/mtp-q2_0.gguf"
+  [[ -z "$MTP_OUT" ]] && MTP_OUT="${XDG_CACHE_HOME:-$HOME/.cache}/bnk/mtp/mtp-q2_0.gguf"
 fi
 if [[ $MTP == 1 ]]; then
   mkdir -p "$(dirname "$MTP_OUT")"
@@ -211,7 +204,7 @@ fi
 
 echo
 bold "Done."
-echo "  Start a model:   ./run.sh iq3_s        (or: ./run.sh orca, or ./run.sh /path/to/model-00001-of-0000N.gguf)"
+echo "  Start a model:   ./run.sh              (pick from a list; or ./run.sh iq3_s)"
 echo "  Dashboard:       http://$(hostname -I 2>/dev/null | awk '{print $1}'):8080"
-echo "  Models:          $MODELS  (more: .venv/bin/python tools/fetch_models.py --list)"
+echo "  Models:          ./models.sh list      (add one: ./models.sh add REPO; download: ./models.sh download NAME)"
 exit 0

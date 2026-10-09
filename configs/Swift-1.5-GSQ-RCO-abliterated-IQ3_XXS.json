@@ -1,7 +1,0 @@
-{
-  "notes": "SC117 Swift 1.5 GSQ-RCO-abliterated IQ3_XXS: ukisai's Swift 1.5 IQ3_XXS with 144 residual-writing tensors (ssm_out, attn_output, ffn_down_shexp, ffn_down_exps) replaced by Orca's (orcarouter) abliterated ones; the other 1080 tensors are byte-identical. Swift ships no MTP head, so bnk uses its shared drafter (the card reports ~4 pp lower acceptance than upstream Swift). Sampling follows the card (Qwen's recommendation, same as upstream Swift); not tuned on this machine yet.",
-  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
-  "speculation": { "draft": 4, "draft_min_p": 0.8 },
-  "thinking_loop_guard": true,
-  "server_args": ["--model-id", "Swift-1.5-GSQ-RCO-abliterated-IQ3_XXS", "--max-tokens", "32768", "--slots", "2"]
-}
