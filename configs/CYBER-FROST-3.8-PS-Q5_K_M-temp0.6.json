@@ -1,0 +1,13 @@
+{
+  "notes": "CYBER-FROST-3.8 PS-GUFF Q5_K_M, accuracy-first sampling: the same file and settings as CYBER-FROST-3.8-PS-Q5_K_M.json except temperature 0.6 instead of the card's 1.0. bnk-bench (2026-10-05) scored 0.6 higher (0.82 vs 0.74), mainly fewer runaway-thinking cap-outs. Speculation (draft 5 / cutoff 0.8) was tuned at 1.0, not re-swept at 0.6. Same --model-id, so clients need no change when switching; routing counts are learned per config name (~/.cache/bnk/counts-<name>.bnkc).",
+  "aliases": ["cyber-frost-0.6"],
+  "source": {
+    "repo": "peasantsmith/CYBER-FROST-3.8-PS-GUFF",
+    "revision": "32867bb9e228afac427c136dd657b34b7c3f0e86",
+    "files": ["CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf"]
+  },
+  "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "speculation": { "draft": 5, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true,
+  "server_args": ["--model-id", "CYBER-FROST-3.8", "--ctx", "262144", "--max-tokens", "32768", "--slots", "2", "--park-gib", "12"]
+}

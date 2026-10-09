@@ -1,0 +1,13 @@
+{
+  "notes": "CYBER-FROST-3.8 (Blackfrost-AI fine-tune of Qwen3.8-Flash-Next), peasantsmith PS-GUFF Q5_K_M requant: Q5_K gate/up and IQ4_NL down experts (72.7 GiB, page-locked), IQ4_NL PLE table (26.8 GiB, read from the file's mmap), one 112.5 GB file. Sampling is the model file's own (general.sampling: temperature 1.0, top-p 0.95, top-k 20); bnk-bench (2026-10-05) scored it higher at temperature 0.6 (0.82 vs 0.74, fewer runaway-thinking cap-outs), the accuracy-first choice. Speculation from the earlier sweeps on this machine: draft 5 / cutoff 0.8 decoded ~47.5 tok/s vs ~41 with the engine defaults (3 / 0.5); its MTP head is byte-identical to the official one, so the stock draft layer is the model's own. --park-gib 12 instead of 24: experts + PLE take ~99.5 of 128 GiB, and 24 GiB of page-locked parking would push the PLE table out of the page cache. Its chat template always thinks and adds Blackfrost's own system prompt; the card asks for a generous max_tokens, as reasoning can use the whole budget.",
+  "aliases": ["cyber-frost"],
+  "source": {
+    "repo": "peasantsmith/CYBER-FROST-3.8-PS-GUFF",
+    "revision": "32867bb9e228afac427c136dd657b34b7c3f0e86",
+    "files": ["CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf"]
+  },
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
+  "speculation": { "draft": 5, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true,
+  "server_args": ["--model-id", "CYBER-FROST-3.8", "--ctx", "262144", "--max-tokens", "32768", "--slots", "2", "--park-gib", "12"]
+}
