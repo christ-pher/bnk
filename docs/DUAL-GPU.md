@@ -90,3 +90,41 @@ build/bnk run --model M.gguf --tokens-file p.txt --gpus 0,0 --split 24 --cache-g
 
 Cap the expert cache (`--cache-gib`): the first stage would otherwise take the whole card before the second
 loads.
+
+## What to expect (projected on one V100, 2026-10-09)
+
+The second V100 had not arrived yet, so the speed of two GPUs is projected from one: two stages on the same card
+(`--gpus 0,0 --split 20 --cache-gib 21,0`), the first holding layers 0-19 with **every** expert resident (18.85
+GiB), and each stage timing its own part (`bnk run` / `bnk multi` print it per stage). A fully resident stage is
+what each GPU of a real pair runs; the second stage here (CPU experts) only completes the forward.
+
+| Layers 0-19, every expert in VRAM | Measured | Whole model on two GPUs (projected) | One GPU today |
+|---|---|---|---|
+| Decode forward, one conversation (~3.5 rows) | 10.8 ms | ~27 ms (~0.54 ms per layer + head) | 45-70 ms (CPU experts) |
+| Decode forward, 3 conversations (8 rows) | 17.7 ms | ~44 ms (~0.89 ms per layer) | ~55-65 ms |
+| Prompt chunks of 2,048 tokens (9.8K prompt) | 2,404 tok/s | ~2,000 tok/s (24 layers per GPU, overlapped) | 570 tok/s (750 with 8K chunks) |
+
+So, roughly: **one conversation ~85-90 tok/s** greedy at short context (65 on one GPU), **three conversations ~105
+tok/s** together (85-90), and **prompt reads ~3x faster** (every expert is already on a GPU, nothing streams over
+PCIe, and the two GPUs work on consecutive chunks at once). Decoding no longer waits for the CPU; the GPU's own
+per-layer time (many small kernels: ~0.54 ms per layer where the weights alone would take ~0.17 ms) is the next
+limit, and it is the same on one GPU.
+
+A layer pipeline does not make one conversation's forward faster than one GPU holding everything would: the two
+GPUs take turns. Batched conversations share the turns the same way. Keeping both GPUs busy at once during decode
+would take two batches in flight (one per GPU); with the drafter and verification on the last GPU between rounds,
+that was estimated at only +10-30% for several conversations and is not built.
+
+## Verified (on one GPU, two stages)
+
+* Greedy output equal to the single-GPU engine (and to master): 96 tokens after a short prompt, 64 after a
+  9.8K-token prompt (chunked prompt path), with the prompt chunks pipelined and without.
+* `tools/park_check.py --gpus 0,0 --slots 2`: a conversation parked and brought back produces the same tokens
+  (history extended, and re-rendered from a snapshot). PASS.
+* `tools/serve_check.py --gpus 0,0`: three requests served together (batched rounds, decoding between another
+  request's pipelined prompt chunks) produce exactly their tokens alone. PASS.
+* One GPU (`--gpus` unset or one id) produces exactly master's tokens.
+
+Not verified, because it needs the second card: anything specific to two devices (cross-device event waits,
+per-device memory, the split planner's real numbers). The code keeps every stage's CUDA work under its own device
+(`DeviceScope`) and shares only portable pinned host memory between them.

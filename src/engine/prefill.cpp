@@ -548,6 +548,7 @@ void Engine::prefill_chunk(const int32_t * tokens, int N) {
 // then the head on the last token (last stage) or the rows out to the next stage.
 void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     DeviceScope ds(dev_);
+    const double t0 = now_ms();
     join_commit_here();
     // the expert cache may have changed since the read began (other conversations decode between its chunks:
     // their cache adaptation and growing KV leave more experts outside VRAM), so the staging is checked again
@@ -590,6 +591,8 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     last_T = 1;
+    pf_ms_ += now_ms() - t0;
+    pf_tokens_ += N;
 }
 
 }  // namespace bnk

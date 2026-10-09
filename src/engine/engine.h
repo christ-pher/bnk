@@ -108,6 +108,9 @@ public:
     // excluded), summed, and the forwards counted
     double gpu_ms() const { return gpu_ms_; }
     int64_t gpu_forwards() const { return gpu_forwards_; }
+    // this stage's wall time in prompt chunks (its layers, start to finish), and the tokens
+    double prompt_ms() const { return pf_ms_; }
+    int64_t prompt_tokens() const { return pf_tokens_; }
     // the expert caches of every stage together (telemetry)
     int cache_slots(int il) const;
     int cache_resident() const;
@@ -247,8 +250,8 @@ private:
     std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
     cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part
-    double gpu_ms_ = 0;
-    int64_t gpu_forwards_ = 0;
+    double gpu_ms_ = 0, pf_ms_ = 0;
+    int64_t gpu_forwards_ = 0, pf_tokens_ = 0;
     void reset_here();
     void select_here(int slot);
     void checkpoint_here();

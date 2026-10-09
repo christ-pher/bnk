@@ -62,6 +62,20 @@ static double rel_rms(const float * a, const float * b, size_t n) {
     return sqrt(num / (den + 1e-30));
 }
 
+// each pipeline stage's GPU time per decode forward
+static void print_stages(const Engine & eng) {
+    for (int i = 0; i < eng.stages(); ++i) {
+        const Engine * s = eng.stage(i);
+        printf("stage %d (GPU %d, layers %d-%d): %.2f ms of GPU time per forward over %lld forwards", i, s->device(),
+               s->layer_begin(), s->layer_end() - 1, s->gpu_ms() / std::max<int64_t>(1, s->gpu_forwards()),
+               (long long) s->gpu_forwards());
+        if (s->prompt_tokens())
+            printf("; prompt chunks %.1f s for %lld tokens (%.0f tok/s)", s->prompt_ms() / 1000, (long long) s->prompt_tokens(),
+                   s->prompt_tokens() / (s->prompt_ms() / 1000));
+        printf("\n");
+    }
+}
+
 int main(int argc, char ** argv) {
     // GPU numbers as nvidia-smi shows them (CUDA's default order puts the fastest first)
     setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
@@ -320,6 +334,7 @@ int main(int argc, char ** argv) {
                    fwd_ms / std::max<int64_t>(1, rounds), fin_ms / std::max<int64_t>(1, rounds));
         printf("forward graphs: %lld captured, %.1f MiB of device memory at capture\n", (long long) eng.graph_captures(),
                eng.graph_bytes() / 1048576.0);
+        print_stages(eng);
         return 0;
     }
 
@@ -355,12 +370,7 @@ int main(int argc, char ** argv) {
     printf("drafting: run %.2f ms per round, %.2f further steps per round at %.2f ms each\n",
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
-    for (int i = 0; i < eng.stages(); ++i) {
-        const Engine * s = eng.stage(i);
-        printf("stage %d (GPU %d, layers %d-%d): %.2f ms of GPU time per forward over %lld forwards\n", i, s->device(),
-               s->layer_begin(), s->layer_end() - 1, s->gpu_ms() / std::max<int64_t>(1, s->gpu_forwards()),
-               (long long) s->gpu_forwards());
-    }
+    print_stages(eng);
     printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
            (long long) eng.cache_swaps());
