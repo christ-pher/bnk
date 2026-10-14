@@ -203,7 +203,8 @@ public:
     void logits_rows_host(int T, float * out, int row0 = 0);   // rows row0..row0+T-1 of the last forward's logits
     // the K largest logits of rows row0..row0+T-1 of the last window, selected on the GPU: ids/vals [T][K] (host)
     static constexpr int kTopkMax = 1024;
-    void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals);
+    // z (optional): each row's sum of exp((logit - max) / temp) within 30 nats of its max (Sampler::distribution_head)
+    void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z = nullptr, float temp = 1.f);
     void set_mtp_pending(const float * R_row_dev, int cell);
     const Config & cfg() const { return model_.cfg; }
     const Model & model() const { return model_; }
@@ -422,6 +423,7 @@ private:
     DevBuf<float> rlogits_, rw_, sg_, su_, sh_, sgate_, shared_out_, moe_out_, logits_;
     DevBuf<int32_t> rids_, argmax_dev_, topk_ids_;
     DevBuf<float> topk_vals_;
+    DevBuf<double> topk_z_;
     DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_;
     DevBuf<int8_t> actq_, mixq_;
     DevBuf<float> actd_, mixd_;

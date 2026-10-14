@@ -1494,8 +1494,8 @@ void Engine::argmax_all(int T, int32_t * out, int row0) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
-void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals) {
-    if (next_) return next_->topk_rows_host(row0, T, K, ids, vals);
+void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp) {
+    if (next_) return next_->topk_rows_host(row0, T, K, ids, vals, z, temp);
     DeviceScope ds(dev_);
     if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
     if (!topk_ids_.p) {
@@ -1506,6 +1506,11 @@ void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals)
     topk_rows(logits_.p + (size_t) row0 * V, T, V, K, topk_ids_, topk_vals_, st_);
     CUDA_CHECK(cudaMemcpyAsync(ids, topk_ids_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(vals, topk_vals_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
+    if (z) {
+        if (!topk_z_.p) topk_z_.alloc(kMaxWindow);
+        row_expsum(logits_.p + (size_t) row0 * V, T, V, temp, topk_z_.p, st_);
+        CUDA_CHECK(cudaMemcpyAsync(z, topk_z_.p, (size_t) T * sizeof(double), cudaMemcpyDeviceToHost, st_));
+    }
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 

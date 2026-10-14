@@ -682,6 +682,39 @@ void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals
     topk_rows_k<<<T, 1024, 0, s>>>(x, n, K, ids, vals);
 }
 
+// z[t] = sum of exp((x - max) / temp) over row t's values within 30 nats of its max, as the host sampler sums them:
+// the division rounded as on the host, exp and the sum in double (fast-math's expf would differ)
+__global__ void row_expsum_k(const float * x, int n, float temp, double * z) {
+    __shared__ float bm[32];
+    __shared__ double bs[32];
+    const float * row = x + (size_t) blockIdx.x * n;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    float m = -FLT_MAX;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, row[i]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if (lane == 0) bm[wid] = m;
+    __syncthreads();
+    m = bm[0];
+    for (int q = 1; q < nw; ++q) m = fmaxf(m, bm[q]);
+    double sum = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float d = __fdiv_rn(__fsub_rn(row[i], m), temp);
+        if (d > -30.f) sum += exp((double) d);
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+    if (lane == 0) bs[wid] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int q = 1; q < nw; ++q) sum += bs[q];
+        z[blockIdx.x] = sum;
+    }
+}
+
+void row_expsum(const float * x, int T, int n, float temp, double * z, cudaStream_t s) {
+    if (T <= 0) return;
+    row_expsum_k<<<T, 1024, 0, s>>>(x, n, temp, z);
+}
+
 void argmax_rows(const float * logits, int T, int n, int32_t * out, cudaStream_t s) {
     argmax_k<<<T, 1024, 0, s>>>(logits, n, out);
 }

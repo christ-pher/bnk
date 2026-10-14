@@ -49,41 +49,57 @@ void Sampler::distribution_topk(const int32_t * ids, const float * logits, int k
     finish(sp, out);
 }
 
-void Sampler::finish(const SamplingParams & sp, std::vector<std::pair<int32_t, float>> & out) {
+bool Sampler::distribution_head(const int32_t * ids, const float * logits, int k, double z,
+                                const SamplingParams & sp, std::vector<std::pair<int32_t, float>> & out) {
+    out.clear();
+    cand_.clear();
+    for (int i = 0; i < k; ++i) cand_.emplace_back(ids[i], logits[i]);
+    return finish(sp, out, z);
+}
+
+bool Sampler::finish(const SamplingParams & sp, std::vector<std::pair<int32_t, float>> & out, double z_all) {
     const float temp = std::max(sp.temperature, 1e-4f);
     // most likely first (ties: lower token id first, so both candidate paths agree)
-    std::sort(cand_.begin(), cand_.end(), [](const auto & a, const auto & b) {
+    const auto before = [](const std::pair<int32_t, float> & a, const std::pair<int32_t, float> & b) {
         return a.second > b.second || (a.second == b.second && a.first < b.first);
-    });
-    const float mx = cand_[0].second;
-    double z = 0;
-    out.reserve(cand_.size());
-    for (const auto & c : cand_) {
-        const float p = std::exp((c.second - mx) / temp);
-        out.emplace_back(c.first, p);
-        z += p;
-    }
-    for (auto & c : out) c.second = (float) (c.second / z);
-    // min-p relative to the top probability, then top-p
-    if (sp.min_p > 0.f) {
-        const float thr = sp.min_p * out[0].second;
-        size_t w = 1;
-        while (w < out.size() && out[w].second >= thr) ++w;
-        out.resize(w);
-    }
-    if (sp.top_p < 1.f) {
+    };
+    float mx = cand_[0].second;
+    for (const auto & c : cand_) mx = std::max(mx, c.second);
+    double z = z_all;
+    if (z <= 0)
+        for (const auto & c : cand_) z += std::exp((c.second - mx) / temp);
+    // min-p relative to the top probability, then top-p, keep a prefix of the sorted candidates: only a head long
+    // enough to hold the cut is sorted, grown while the cut lies beyond it (without top-k there are ~100K
+    // candidates, and sorting all of them cost ~20 ms per row). With z_all, cand_ is already only such a head.
+    const float thr = sp.min_p * (float) (1.0f / z);
+    const size_t n = cand_.size();
+    const bool trunc = sp.min_p > 0.f || sp.top_p < 1.f;
+    size_t head = z_all <= 0 && trunc ? std::min<size_t>(n, 64) : n;
+    bool cut = false;
+    for (;;) {
+        if (head < n) std::nth_element(cand_.begin(), cand_.begin() + (long) head, cand_.end(), before);
+        // without min-p and top-p every candidate is kept: the order does not matter (draw() walks any order)
+        if (trunc || z_all > 0) std::sort(cand_.begin(), cand_.begin() + (long) head, before);
+        out.clear();
         double c = 0;
-        size_t w = 0;
-        while (w < out.size()) {
-            c += out[w].second;
-            ++w;
-            if (c >= sp.top_p) break;
+        cut = false;
+        for (size_t w = 0; w < head && !cut; ++w) {
+            // past the host's candidates (30 nats below the max): the head held all of them
+            if (z_all > 0 && (cand_[w].second - mx) / temp <= -30.f) { cut = true; break; }
+            const float p = (float) (std::exp((cand_[w].second - mx) / temp) / z);
+            if (sp.min_p > 0.f && w > 0 && p < thr) { cut = true; break; }
+            out.emplace_back(cand_[w].first, p);
+            c += p;
+            cut = sp.top_p < 1.f && c >= sp.top_p;
         }
-        out.resize(std::max<size_t>(w, 1));
+        if (cut || head == n) break;
+        head = std::min(n, head * 8);
     }
+    if (z_all > 0 && !cut) return false;   // the cut lies beyond the head
     double s = 0;
     for (auto & c : out) s += c.second;
     for (auto & c : out) c.second = (float) (c.second / s);
+    return true;
 }
 
 int32_t Sampler::draw(const std::vector<std::pair<int32_t, float>> & dist, int32_t exclude) {

@@ -14,9 +14,26 @@ void Generator::recent_tail(std::vector<int32_t> & out) const {
     out.insert(out.end(), emitted_tail_.begin(), emitted_tail_.end());
 }
 
-void Generator::row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist) {
-    const int K = sp_.top_k;
-    sampler_.distribution_topk(topk_ids_.data() + (size_t) row * K, topk_vals_.data() + (size_t) row * K, K, sp_, dist);
+int Generator::gpu_k() const { return sp_.top_k > 0 ? sp_.top_k : Engine::kTopkMax; }
+
+void Generator::gpu_candidates(int row0, int T) {
+    const int K = gpu_k();
+    topk_ids_.resize((size_t) T * K);
+    topk_vals_.resize((size_t) T * K);
+    topk_z_.resize(T);
+    eng_.topk_rows_host(row0, T, K, topk_ids_.data(), topk_vals_.data(), sp_.top_k > 0 ? nullptr : topk_z_.data(),
+                        std::max(sp_.temperature, 1e-4f));
+}
+
+bool Generator::row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist) {
+    const int K = gpu_k();
+    const int32_t * ids = topk_ids_.data() + (size_t) row * K;
+    const float * vals = topk_vals_.data() + (size_t) row * K;
+    if (sp_.top_k > 0) {
+        sampler_.distribution_topk(ids, vals, K, sp_, dist);
+        return true;
+    }
+    return sampler_.distribution_head(ids, vals, K, topk_z_[row], sp_, dist);
 }
 
 int32_t Generator::pick(const float * row, std::vector<std::pair<int32_t, float>> & dist) {
@@ -84,13 +101,12 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     if (sp_.greedy()) {
         b = eng_.argmax(eng_.last_T - 1);
     } else {
-        if (Sampler::topk_ok(sp_, Engine::kTopkMax)) {
-            topk_ids_.resize(sp_.top_k);
-            topk_vals_.resize(sp_.top_k);
-            eng_.topk_rows_host(eng_.last_T - 1, 1, sp_.top_k, topk_ids_.data(), topk_vals_.data());
-            row_distribution(0, dist_);
-            b = sampler_.draw(dist_);
-        } else {
+        bool done = false;
+        if (Sampler::gpu_ok(sp_, Engine::kTopkMax)) {
+            gpu_candidates(eng_.last_T - 1, 1);
+            if ((done = row_distribution(0, dist_))) b = sampler_.draw(dist_);
+        }
+        if (!done) {
             logits_host_ = eng_.logits_host(eng_.last_T - 1);
             b = pick(logits_host_.data(), dist_);
         }
@@ -160,23 +176,26 @@ std::vector<int32_t> Generator::finish(bool draft) {
         t0 = now_ms();
         const int V = eng_.cfg().n_vocab;
         // the top-k candidates of every row in one GPU pass (K values per row cross PCIe, not the vocabulary)
-        const bool gpu = Sampler::topk_ok(sp_, Engine::kTopkMax) && !getenv("BNK_HOST_SAMPLER");
+        // (without top-k: the 1,024 most likely and each row's normalizer, enough unless min-p and top-p keep more)
+        const bool gpu = Sampler::gpu_ok(sp_, Engine::kTopkMax) && !getenv("BNK_HOST_SAMPLER");
         if (gpu) {
-            topk_ids_.resize((size_t) T * sp_.top_k);
-            topk_vals_.resize((size_t) T * sp_.top_k);
-            eng_.topk_rows_host(r0, T, sp_.top_k, topk_ids_.data(), topk_vals_.data());
+            gpu_candidates(r0, T);
         } else {
             logits_host_.resize((size_t) T * V);
             eng_.logits_rows_host(T, logits_host_.data(), r0);
         }
         bonus = -1;
         for (int i = 0; i < T; ++i) {
-            if (gpu) {
-                row_distribution(i, dist_);
-            } else {
+            if (!gpu) {
                 std::vector<int32_t> recent;
                 recent_tail(recent);
                 sampler_.distribution(logits_host_.data() + (size_t) i * V, V, sp_, recent, dist_);
+            } else if (!row_distribution(i, dist_)) {   // the cut lies beyond the GPU's candidates: the whole row
+                logits_host_.resize(V);
+                eng_.logits_rows_host(1, logits_host_.data(), r0 + i);
+                std::vector<int32_t> recent;
+                sampler_.distribution(logits_host_.data(), V, sp_, recent, dist_);
+                ++stats.host_rows;
             }
             if (i == T - 1) { bonus = sampler_.draw(dist_); break; }
             const int32_t d = win[i + 1];

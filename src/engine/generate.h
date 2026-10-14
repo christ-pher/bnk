@@ -23,6 +23,7 @@ struct GenStats {
     double prefill_ms = 0, verify_ms = 0, commit_ms = 0, draft_ms = 0, sample_ms = 0;
     double draft_run_ms = 0;   // the drafter over the kept rows (and the first draft)
     int64_t draft_steps = 0;   // further one-row draft steps
+    int64_t host_rows = 0;     // rows sampled from the whole vocabulary on the host after the GPU candidates fell short
 };
 
 class Generator {
@@ -84,7 +85,11 @@ private:
     std::vector<int32_t> topk_ids_;
     std::vector<float> topk_vals_;
     // row `row`'s distribution: top-k on the GPU when the parameters allow it, else the whole row on the host
-    void row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist);
+    // false: top_k 0 and min-p / top-p keep more than the GPU's candidates (the row needs the host sampler)
+    bool row_distribution(int row, std::vector<std::pair<int32_t, float>> & dist);
+    int gpu_k() const;                        // candidates per row from the GPU: top_k, or kTopkMax without top-k
+    void gpu_candidates(int row0, int T);     // rows row0..row0+T-1: their candidates (and normalizers) from the GPU
+    std::vector<double> topk_z_;
     std::vector<int32_t> emitted_tail_;
     std::vector<std::pair<int32_t, float>> dist_;
 };

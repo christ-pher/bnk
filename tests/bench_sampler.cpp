@@ -1,5 +1,5 @@
 // Host sampling cost per row at the model's vocabulary size (CPU only): what each verify row pays today.
-//   build/bench_sampler [n_vocab=248320] [top_k=20]
+//   build/bench_sampler [n_vocab=248320] [top_k=20] [top_p=0.95]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +15,7 @@ int main(int argc, char ** argv) {
     SamplingParams sp;
     sp.temperature = 1.0f;
     sp.top_k = argc > 2 ? atoi(argv[2]) : 20;
-    sp.top_p = 0.95f;
+    sp.top_p = argc > 3 ? (float) atof(argv[3]) : 0.95f;
     std::mt19937 rng(1);
     std::normal_distribution<float> nd(0.f, 3.f);
     std::vector<float> logits(V);
