@@ -9,6 +9,7 @@ import collections
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -299,9 +300,29 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     return content, parser.reasoning_all, calls, finish, usage, timings
 
 
+TITLE_RE = re.compile(r"you are a title generator|generate a (?:short |brief )?title for this conversation", re.I)
+
+
+def title_request(body: dict) -> bool:
+    """A client's conversation-title request (opencode sends one with each session's first message). The model
+    thinks before a title like any other answer, and given a task ("build ...") it sometimes plans the task itself
+    first: thousands of tokens, minutes beside the real request. Titles need no thinking, whatever the client asks."""
+    if body.get("tools") or os.environ.get("BNK_TITLE_THINK") == "1":
+        return False
+    for m in body.get("messages", []):
+        c = m.get("content")
+        text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c or [] if isinstance(p, dict))
+        if TITLE_RE.search(text[:2000]):
+            return True
+    return False
+
+
 def chat_prompt(body: dict) -> tuple[list[int], bool]:
     kwargs = dict(body.get("chat_template_kwargs") or {})
     thinking = kwargs.get("enable_thinking", body.get("enable_thinking", True))
+    title = title_request(body)
+    if title:
+        thinking = False
     if body.get("reasoning_effort") and "reasoning_effort" not in kwargs:
         eff = body["reasoning_effort"]
         if eff == "none":
@@ -313,6 +334,8 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
     tail = text[text.rfind("<|im_start|>assistant"):]
     thinking = "<think>" in tail and "</think>" not in tail
+    if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
+        text, thinking = text + "\n</think>\n\n", False
     return S.tok.encode(text), thinking
 
 
