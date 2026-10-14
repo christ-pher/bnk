@@ -4,12 +4,14 @@ request's prompt chunks) must produce exactly the tokens they produce alone.
     .venv/bin/python tools/serve_check.py MODEL.gguf PROMPT_A.txt PROMPT_B.txt [PROMPT_C.txt] [--mtp MTP.gguf ...]
 
 Prompts are token-id files (as for `bnk run`); use ones longer than one prompt chunk (2,048 tokens) so a read is
-interrupted. Runs `bnk serve` with a static, CPU-only expert tier (deterministic) and greedy sampling:
+interrupted. Runs `bnk serve` (with BNK_EXACT=1: kernel choices that do not depend on the window size)
+with a static, CPU-only expert tier (deterministic) and greedy sampling:
   alone      : each request on a freshly reset engine, one at a time
   together   : the first request starts decoding, then the others arrive (their prompts read while it decodes)
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -37,7 +39,7 @@ if a.mtp:
         args += ["--draft-vocab", a.draft_vocab]
 if a.gpus:
     args += ["--gpus", a.gpus]
-eng = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 events: dict[str, list] = {}
 order: list = []   # (id, type, n tokens) in arrival order
 lock = threading.Lock()

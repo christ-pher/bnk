@@ -61,14 +61,65 @@ __global__ void rmsnorm_rows_k(const float * x, const float * w, float * y, int 
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[r * ldy + i] = xr[i] * inv * (wr ? wr[i] : 1.f);
 }
 
+// The same with the row held in registers (P float4 per thread, read once) and float4 loads: rows of a few
+// thousand floats, few rows (a decode window), where the two scalar passes were latency (~9 us for 20 rows of 2,560)
+template <int P>
+__global__ void rmsnorm_rows_v_k(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
+                                 int n, int64_t ldx, int64_t ldy, int64_t wstride_rows, float eps) {
+    __shared__ float sh[32];
+    const int r = blockIdx.x, n4 = n / 4;
+    const float4 * xr = (const float4 *) (x + r * ldx);
+    float4 v[P];
+    float ss = 0.f;
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int i = threadIdx.x + p * blockDim.x;
+        v[p] = i < n4 ? xr[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+        ss += v[p].x * v[p].x + v[p].y * v[p].y + v[p].z * v[p].z + v[p].w * v[p].w;
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / n + eps);
+    const float4 * wr = w ? (const float4 *) (w + (r % wstride_rows) * n) : nullptr;
+    float4 * yr = (float4 *) (y + r * ldy);
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int i = threadIdx.x + p * blockDim.x;
+        if (i < n4) {
+            const float4 g = wr ? wr[i] : make_float4(1.f, 1.f, 1.f, 1.f);
+            yr[i] = make_float4(v[p].x * inv * g.x, v[p].y * inv * g.y, v[p].z * inv * g.z, v[p].w * inv * g.w);
+        }
+    }
+}
+
+static void rmsnorm_launch(const float * x, const float * w, float * y, int rows, int n, int64_t ldx, int64_t ldy,
+                           int64_t wstride_rows, float eps, cudaStream_t s) {
+    static const bool scalar = getenv("BNK_RMSNORM_SCALAR") != nullptr;
+    const bool vec = !scalar && n % 4 == 0 && ldx % 4 == 0 && ldy % 4 == 0 && n <= 4 * 1024 * 8 &&
+                     ((uintptr_t) x | (uintptr_t) y | (uintptr_t) w) % 16 == 0;
+    if (!vec) {
+        rmsnorm_rows_k<<<rows, n >= 256 ? 256 : 128, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps);
+        return;
+    }
+    const int n4 = n / 4;
+    int P = 1;
+    while (P < 8 && (n4 + P - 1) / P > 512) P *= 2;   // at most 512 threads, at most 8 float4 each
+    const int threads = ((n4 + P - 1) / P + 31) / 32 * 32;
+    switch (P) {
+        case 1: rmsnorm_rows_v_k<1><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps); break;
+        case 2: rmsnorm_rows_v_k<2><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps); break;
+        case 4: rmsnorm_rows_v_k<4><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps); break;
+        default: rmsnorm_rows_v_k<8><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps);
+    }
+}
+
 void hc_norm(const float * res, const float * w, float * xn, int T, int hc, int E, float eps, cudaStream_t s) {
     // rows are (t, s); weight row = s
-    rmsnorm_rows_k<<<T * hc, 256, 0, s>>>(res, w, xn, E, E, E, hc, eps);
+    rmsnorm_launch(res, w, xn, T * hc, E, E, E, hc, eps, s);
 }
 
 void rmsnorm_rows(const float * x, const float * w, float * y, int rows, int n, int64_t ldx, int64_t ldy, float eps,
                   cudaStream_t s) {
-    rmsnorm_rows_k<<<rows, n >= 256 ? 256 : 128, 0, s>>>(x, w, y, n, ldx, ldy, 1, eps);
+    rmsnorm_launch(x, w, y, rows, n, ldx, ldy, 1, eps, s);
 }
 
 __global__ void silu_scale_k(float * x, int64_t n, float scale) {
@@ -458,17 +509,16 @@ void attention_prefill(const float * q, const half * kcache, const half * vcache
 
 // ------------------------------------------------------------------------------------------- routing
 // one warp per token, n_exp <= 1024: softmax over all experts, top-k by repeated warp argmax
+template <int PER>   // n_exp / 32 values per lane (rounded up)
 __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale) {
     const int t = blockIdx.x;
     const int lane = threadIdx.x;
     const float * lg = logits + (int64_t) t * n_exp;
-    constexpr int PER = 32;  // n_exp / 32 values per lane
     float v[PER];
-    const int per = (n_exp + 31) / 32;
     float mx = -FLT_MAX;
 #pragma unroll
     for (int i = 0; i < PER; ++i) {
-        v[i] = (i < per && lane + 32 * i < n_exp) ? lg[lane + 32 * i] : -FLT_MAX;
+        v[i] = lane + 32 * i < n_exp ? lg[lane + 32 * i] : -FLT_MAX;
         mx = fmaxf(mx, v[i]);
     }
     mx = warp_max(mx);
@@ -494,7 +544,10 @@ __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * i
             const int oi = __shfl_xor_sync(0xffffffff, bi, o);
             if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
         }
-        if ((bi & 31) == lane) v[bi >> 5] = -2.f;
+        // drop the winner (a static index: a runtime one put v[] in local memory)
+#pragma unroll
+        for (int i = 0; i < PER; ++i)
+            if (bi == lane + 32 * i) v[i] = -2.f;
         const float p = best / sum;
         wsum += p;
         if (lane == j) { myw = p; myid = bi; }
@@ -508,7 +561,9 @@ __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * i
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,
                 cudaStream_t s) {
     if (n_exp > 1024 || k > 32) { fprintf(stderr, "route_topk: unsupported shape\n"); abort(); }
-    route_topk_k<<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    if (n_exp <= 256) route_topk_k<8><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    else if (n_exp <= 512) route_topk_k<16><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    else route_topk_k<32><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
 }
 
 // ------------------------------------------------------------------------------------------- PLE

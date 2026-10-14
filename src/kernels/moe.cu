@@ -74,6 +74,7 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
         int q = 0;
         while (s_e[q] != e || s_sl[q] < 0) ++q;   // the first pair of this expert
         const int ent = s_first[q];
+        hits->pair_ent[j] = ent;
         atomicOr(&s_mask[ent], 1u << t);
         hits->e[ent].w[t] = wt;
         if (q == j) {
@@ -82,6 +83,7 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
         }
     }
     if (valid && sl < 0) {
+        hits->pair_ent[j] = -1;
         const int pos = s_miss[j];
         msg->miss_t[pos] = t;
         msg->miss_e[pos] = e;
@@ -342,7 +344,10 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
         };
         // several tokens: 8 lanes per row (more rows in flight per warp; bench_moe, 5 tokens: 187 -> 179 us on an
         // IQ2_S layer); one token: lpr_for (16 for 2,560 columns), which is faster there
-        static const int lpr_env = getenv("BNK_MOE_LPR") ? atoi(getenv("BNK_MOE_LPR")) : 0;
+        // (BNK_EXACT=1: 8 for every window, so the sums do not depend on the window's size)
+        static const int lpr_env = getenv("BNK_MOE_LPR")                         ? atoi(getenv("BNK_MOE_LPR"))
+                                   : getenv("BNK_EXACT") && atoi(getenv("BNK_EXACT")) ? std::min(8, lpr_for(E / 32))
+                                                                                     : 0;
         switch (lpr_env ? lpr_env : NT == 1 ? lpr_for(E / 32) : std::min(8, lpr_for(E / 32))) {
             case 32: L.template operator()<32>(); break;
             case 16: L.template operator()<16>(); break;
@@ -461,22 +466,30 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 
 __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __restrict__ part, MoeMsg * msg,
                              const float * __restrict__ shared, const float * __restrict__ sgate,
-                             float * __restrict__ out, int E) {
+                             float * __restrict__ out, int E, int k) {
+    // a token's experts added in its own routing order (pair t * k + slot), so the sum does not depend on the other
+    // tokens of the window (the hit list's order does); the entries and weights read once per block
+    __shared__ int s_ent[32];
+    __shared__ float s_w[32];
     const int t = blockIdx.y;
+    if (threadIdx.x < k) {
+        const int ent = hits->pair_ent[t * k + threadIdx.x];
+        s_ent[threadIdx.x] = ent;
+        s_w[threadIdx.x] = ent >= 0 ? hits->e[ent].w[t] : 0.f;
+    }
+    __syncthreads();
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= E) return;
     float acc = shared[(size_t) t * E + r] * sgate[t];
-    const int n = hits->n;
-    for (int i = 0; i < n; ++i) {
-        const HitEntry & h = hits->e[i];
-        if (h.mask & (1u << t)) acc += h.w[t] * part[((size_t) i * kMaxWindow + t) * E + r];
-    }
+    for (int q = 0; q < k; ++q)
+        if (s_ent[q] >= 0) acc += s_w[q] * part[((size_t) s_ent[q] * kMaxWindow + t) * E + r];
     if (hits->n_miss > 0) acc += ((volatile float *) msg->out(E))[(size_t) t * E + r];
     out[(size_t) t * E + r] = acc;
 }
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
                 int k, int E, cudaStream_t st) {
-    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E);
+    if (k > 32) { fprintf(stderr, "moe_reduce: k %d > 32\n", k); abort(); }
+    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E, k);
 }
 
 }  // namespace bnk

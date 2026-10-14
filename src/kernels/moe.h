@@ -40,6 +40,8 @@ struct HitList {
     int32_t n_miss;           // copy of the mailbox's, so device kernels need not read host memory
     int32_t pad[2];
     HitEntry e[kMaxRouted];
+    int32_t pair_ent[kMaxRouted];   // routed pair (t * k + slot) -> its hit entry, -1 for a miss (moe_reduce adds a
+                                    // token's experts in its own routing order, whatever else the window holds)
 };
 
 struct MoeLayerDesc {

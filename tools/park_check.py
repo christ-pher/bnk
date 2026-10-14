@@ -3,7 +3,8 @@ not another conversation ran on the engine in between (its state parked to host 
 
     .venv/bin/python tools/park_check.py MODEL.gguf [--mtp MTP.gguf --draft-vocab F] [--engine build/bnk]
 
-Runs `bnk serve` with a static, CPU-only expert tier (--cache-gib 0 --adapt-every 0, which keeps decoding
+Runs `bnk serve` (with BNK_EXACT=1: kernel choices that do not depend on the window size)
+with a static, CPU-only expert tier (--cache-gib 0 --adapt-every 0, which keeps decoding
 deterministic) and greedy sampling, and compares for each case:
   reference : A, then A's next turn
   parked    : A, then B (another conversation: A is parked), then A's next turn (A comes back)
@@ -11,6 +12,7 @@ Cases: the next turn extends A's history (full reuse), and the next turn re-rend
 from the snapshot at the start of A's last turn, which is parked along with the rest)."""
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,7 +41,7 @@ if a.mtp:
         args += ["--draft-vocab", a.draft_vocab]
 if a.gpus:
     args += ["--gpus", a.gpus]
-eng = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=0)
+eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=0)
 im_start = tok.id_of("<|im_start|>")
 stops = [t for t in (tok.id_of("<|im_end|>"), tok.ids.get("eos_token_id")) if t is not None]
 

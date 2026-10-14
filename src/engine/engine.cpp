@@ -107,6 +107,19 @@ Engine::~Engine() {
     if (ev_t1_) cudaEventDestroy(ev_t1_);
 }
 
+cudaStream_t Engine::fork(int i) {
+    if (!side_) return st_;
+    CUDA_CHECK(cudaEventRecord(ev_fork_[i], st_));
+    CUDA_CHECK(cudaStreamWaitEvent(st_side_[i], ev_fork_[i], 0));
+    return st_side_[i];
+}
+
+void Engine::join(int i) {
+    if (!side_) return;
+    CUDA_CHECK(cudaEventRecord(ev_join_[i], st_side_[i]));
+    CUDA_CHECK(cudaStreamWaitEvent(st_, ev_join_[i], 0));
+}
+
 std::vector<int> Engine::devices() const {
     std::vector<int> d;
     for (const Engine * s = this; s; s = s->next_.get())
@@ -288,6 +301,12 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_commit_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_verified_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_committed_, cudaEventDisableTiming));
+    side_ = !getenv("BNK_SIDE_STREAMS") || atoi(getenv("BNK_SIDE_STREAMS")) != 0;
+    for (int i = 0; i < 2; ++i) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st_side_[i], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_[i], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_join_[i], cudaEventDisableTiming));
+    }
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_out_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreate(&ev_t0_));
     CUDA_CHECK(cudaEventCreate(&ev_t1_));
@@ -740,11 +759,15 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
     if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))
         quantize_act(xn_, HC, T, HC, act_, st_);
+    // the inject projection beside down -> up -> mix (only when up does not quantize into act_, which inject reads)
+    const bool side = want_inject && is_float_format(w.up.type);
+    if (side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, fork(1));
     gemv_q(w.down, act_, xn_, HC, T, lo_, c.hc_rank, st_);
-    if (want_inject) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
+    if (want_inject && !side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
     silu_scale(lo_, (int64_t) T * c.hc_rank, 1.f / c.hc, st_);
     gemv_auto(w.up, lo_, c.hc_rank, T, gpre_, HC, false, act_, st_);
     hc_mix(xn_, gpre_, mixed_, T, c.hc, E, st_);
+    if (side) join(1);
 }
 
 // host side: the n-gram hash rows of the window, gathered into pinned memory the graph reads
@@ -809,6 +832,13 @@ void Engine::gdn(int il, int T) {
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     quantize_act(mixed_, E, T, E, mixact_, st_);
+    float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
+    {   // beta / alpha (needed at the prep) and the gate (at the norm) beside wqkv and its copies
+        cudaStream_t sb = fork(0);
+        gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, sb);
+        gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, sb);
+        gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, sb);
+    }
     // the new conv inputs go behind each window's own K-1 history rows (one window: straight there)
     const bool one = wins_.size() == 1;
     float * qkv = one ? wins_[0].q->conv_buf[il].p + (size_t) (K - 1) * C : conv_out_.p;
@@ -817,10 +847,7 @@ void Engine::gdn(int il, int T) {
         for (const Win & w : wins_)
             CUDA_CHECK(cudaMemcpyAsync(w.q->conv_buf[il].p + (size_t) (K - 1) * C, conv_out_.p + (size_t) w.r0 * C,
                                        (size_t) w.T * C * 4, cudaMemcpyDeviceToDevice, st_));
-    gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, st_);
-    float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
-    gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, st_);
-    gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, st_);
+    join(0);
     dbg(st_, il, "hc_mixed_attn", mixed_, (size_t) T * E);
     dbg(st_, il, "linear_attn_qkv_mixed", qkv, (size_t) T * C);
     dbg(st_, il, "z", z_, (size_t) T * nv * S);
@@ -924,14 +951,16 @@ void Engine::attn(int il, int T) {
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     quantize_act(mixed_, E, T, E, mixact_, st_);
+    const bool qsa = wins_[0].q->kraw[il].p != nullptr;
+    if (qsa) {   // the indexer's projections beside q / k / v
+        cudaStream_t sb = fork(0);
+        gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, sb);
+        gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, sb);
+    }
     gemv_q(L.wq, mixact_, mixed_, E, T, qfull_, H * D * 2, st_);
     gemv_q(L.wk, mixact_, mixed_, E, T, k_, Hkv * D, st_);
     gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
-    const bool qsa = wins_[0].q->kraw[il].p != nullptr;
-    if (qsa) {
-        gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, st_);
-        gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, st_);
-    }
+    if (qsa) join(0);
     for (size_t wi = 0; wi < wins_.size(); ++wi) {
         const Win & w = wins_[wi];
         const int * pos0 = &d_par_[wi].pos0;
@@ -1012,6 +1041,17 @@ void Engine::moe(int il, int T) {
     const int E = c.n_embd, k = c.n_expert_used, FF = c.n_ff_shexp;
     const MoeLayerDesc d = cache_.desc(il);
     quantize_act(mixed_, E, T, E, mixact_, st_);
+    // the shared expert (and its gate) needs only mixed / mixact: beside the routed experts (act_ is its own: the
+    // routed path does not touch it)
+    {
+        cudaStream_t sb = fork(0);
+        gemv_q(L.sh_gate, mixact_, mixed_, E, T, sg_, FF, sb);
+        gemv_q(L.sh_up, mixact_, mixed_, E, T, su_, FF, sb);
+        silu_mul(sg_, su_, sh_, (int64_t) T * FF, sb);
+        gemv_auto(L.sh_down, sh_, FF, T, shared_out_, E, false, act_, sb);
+        gemv_q(L.shexp_gate_inp, mixact_, mixed_, E, T, sgate_, 1, sb);
+        sigmoid_inplace(sgate_, T, sb);
+    }
     gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
     route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
     if (route_log_)
@@ -1034,13 +1074,8 @@ void Engine::moe(int il, int T) {
         m->seq_done = m->seq_req;
     }
     moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
-    gemv_q(L.sh_gate, mixact_, mixed_, E, T, sg_, FF, st_);
-    gemv_q(L.sh_up, mixact_, mixed_, E, T, su_, FF, st_);
-    silu_mul(sg_, su_, sh_, (int64_t) T * FF, st_);
-    gemv_auto(L.sh_down, sh_, FF, T, shared_out_, E, false, act_, st_);
-    gemv_q(L.shexp_gate_inp, mixact_, mixed_, E, T, sgate_, 1, st_);
-    sigmoid_inplace(sgate_, T, st_);
     moe_wait(moes_, msg(il), &d_par_->seq, st_);
+    join(0);
     moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_);
 }
 

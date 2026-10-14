@@ -362,7 +362,10 @@ static void launch_mma(const QMat & W, const ActQ8 & a, int T, float * y, int64_
 
 // from this many tokens on, the tensor-core kernel (when the activations have their fp16 copy); BNK_GEMV_MMA_MIN
 static int mma_min_tokens() {
-    static const int n = getenv("BNK_GEMV_MMA_MIN") ? atoi(getenv("BNK_GEMV_MMA_MIN")) : 4;
+    // BNK_EXACT=1: every window on the tensor cores, so a token's result never depends on how many rows share its
+    // window (batched / two-lane decoding then equal decoding alone, token for token)
+    static const int n = getenv("BNK_GEMV_MMA_MIN") ? atoi(getenv("BNK_GEMV_MMA_MIN"))
+                         : getenv("BNK_EXACT") && atoi(getenv("BNK_EXACT")) ? 1 : 4;
     return n;
 }
 

@@ -316,6 +316,15 @@ private:
     EngineOptions opt_;
     cudaStream_t st_ = nullptr;
     cudaStream_t st_commit_ = nullptr;
+    // Independent work of a layer on side streams (captured into the forward graph as parallel branches): the
+    // shared expert beside the routed ones, the DeltaNet gate/beta/alpha projections beside wqkv, the QSA indexer
+    // beside q/k/v. fork(i) starts side stream i after what st_ has queued; join(i) makes st_ wait for it.
+    // BNK_SIDE_STREAMS=0: everything on st_.
+    cudaStream_t st_side_[2] = {nullptr, nullptr};
+    cudaEvent_t ev_fork_[2] = {nullptr, nullptr}, ev_join_[2] = {nullptr, nullptr};
+    bool side_ = true;
+    cudaStream_t fork(int i);
+    void join(int i);
     cudaEvent_t ev_verified_ = nullptr, ev_committed_ = nullptr;
     bool commit_inflight_ = false;
     struct Checkpoint { int pos = -1, mtp_cell = -1; uint64_t age = 0; float * host = nullptr; };
