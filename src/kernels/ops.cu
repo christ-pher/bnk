@@ -412,10 +412,75 @@ __global__ void __launch_bounds__(32) gdn_rec_k(const float * __restrict__ co, i
         }
     }
 }
+// The same with each column's S rows split over 4 warps (32 rows each): 4x the warps (one warp per block left the
+// GPU at ~2 warps per SM) and 32-long dependent chains instead of 128; the partial dot products are added through
+// shared memory in a fixed order. 19.4 -> 12.0 us per layer at ~5 rows (8 warps: no faster). BNK_GDN_REC1=1: the
+// one-warp kernel.
+template <int S, int NW>
+__global__ void __launch_bounds__(32 * NW) gdn_rec4_k(const float * __restrict__ co, int C, const float * __restrict__ g,
+                                                  const float * __restrict__ beta, float * __restrict__ state,
+                                                  float * __restrict__ out, int T, int nk, int nv, int commit) {
+    constexpr int R = S / NW;   // rows per warp
+    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int j = blockIdx.y * 32 + lane;
+    const int hk = h % nk;
+    __shared__ float qs[S], ks[S], red[NW][32];
+    float col[R];
+    float * st = state + (int64_t) h * S * S + (int64_t) (w * R) * S + j;
+#pragma unroll
+    for (int i = 0; i < R; ++i) col[i] = st[(int64_t) i * S];
+    const float scale = rsqrtf((float) S);
+    for (int t = 0; t < T; ++t) {
+        const float * row = co + (int64_t) t * C;
+        __syncthreads();   // the previous step is done with qs / ks / red
+        for (int i = threadIdx.x; i < S; i += blockDim.x) {
+            qs[i] = row[hk * S + i];
+            ks[i] = row[nk * S + hk * S + i];
+        }
+        __syncthreads();
+        const float decay = __expf(g[t * nv + h]);
+        const float b = beta[t * nv + h];
+        float kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            col[i] *= decay;
+            kv += col[i] * ks[w * R + i];
+        }
+        red[w][lane] = kv;
+        __syncthreads();
+        kv = 0.f;
+#pragma unroll
+        for (int q = 0; q < NW; ++q) kv += red[q][lane];
+        const float v = row[2 * nk * S + h * S + j];
+        const float delta = (v - kv) * b;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            col[i] += ks[w * R + i] * delta;
+            o += col[i] * qs[w * R + i];
+        }
+        __syncthreads();   // every warp has read red (kv)
+        red[w][lane] = o;
+        __syncthreads();
+        if (out && w == 0) {
+            float os = 0.f;
+#pragma unroll
+            for (int q = 0; q < NW; ++q) os += red[q][lane];
+            out[((int64_t) t * nv + h) * S + j] = os * scale;
+        }
+        if (t + 1 == commit) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) st[(int64_t) i * S] = col[i];
+        }
+    }
+}
+
 void gdn_recurrence(const float * conv_out, int C, const float * g, const float * beta, float * state, float * out,
                     int T, int nk, int nv, int S, int commit, cudaStream_t s) {
     if (S != 128) { fprintf(stderr, "gdn: unsupported state size %d\n", S); abort(); }
-    gdn_rec_k<128><<<dim3(nv, 128 / 32), 32, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
+    static const bool one = getenv("BNK_GDN_REC1") != nullptr;
+    if (one) gdn_rec_k<128><<<dim3(nv, 128 / 32), 32, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
+    else gdn_rec4_k<128, 4><<<dim3(nv, 128 / 32), 128, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
 }
 
 __global__ void gated_rmsnorm_k(const float * o, const float * z, const float * w, float * y, int S, float eps) {
