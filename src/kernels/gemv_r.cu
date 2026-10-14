@@ -334,7 +334,14 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 }
 
 // K-splitting warps per row group: ~8 sub-blocks or more each, up to 8
+// Prefer a split whose share per warp is a multiple of 4 (the quad pairs take 4 sub-blocks per step; 80 sub-blocks
+// over 8 warps left half the quad pairs idle in each warp's last step): 80 -> 4 warps (attn_q 45.5 -> 39.9 us at 5
+// tokens), 192 -> 8. BNK_GEMV_MMA_KS overrides.
 static int mma_ks(int nsb) {
+    static const int env = getenv("BNK_GEMV_MMA_KS") ? atoi(getenv("BNK_GEMV_MMA_KS")) : 0;
+    if (env) return env;
+    for (int ks = 8; ks >= 2; ks >>= 1)
+        if (nsb >= ks * 8 && nsb % (4 * ks) == 0) return ks;
     int ks = 8;
     while (ks > 1 && nsb < ks * 8) ks >>= 1;
     return ks;
