@@ -16,7 +16,7 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 6 | **More rows per batched forward** (kMaxWindow 8 -> 16: GEMV / MoE kernels) | with 3 conversations each gets ~2.7 rows, so fewer drafts are verified | more tokens per round *(estimate)* | |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
-| 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | measured (2026-10-14): decode 67 tok/s with MTP, prompts ~1,900 tok/s; `BNK_PIPE_DECODE` still to measure |
+| 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | done (2026-10-14): decode 67 tok/s with MTP, prompts ~1,900 tok/s; two lanes +21-28% for 2-3 conversations, on by default |
 | 8 | **GPU efficiency of a decode forward** (every expert resident) | GEMVs at 170-280 GB/s for 8 rows, experts at 335-456 GB/s, ~50 small kernels per layer | up to ~1.5x decode *(estimate)* | in progress: -10% GPU time per forward (below) |
 
 ## Done (two V100s)

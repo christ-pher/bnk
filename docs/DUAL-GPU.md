@@ -136,7 +136,7 @@ limit, and it is the same on one GPU.
 A layer pipeline does not make one conversation's forward faster than one GPU holding everything would: the two
 GPUs take turns. Batched conversations share the turns the same way, unless they decode in two lanes (below).
 
-## Two lanes: both GPUs busy while several conversations decode (`BNK_PIPE_DECODE=1`)
+## Two lanes: both GPUs busy while several conversations decode (`BNK_PIPE_DECODE`, on by default)
 
 With two GPUs and at least two requests in flight, `BNK_PIPE_DECODE=1` splits the requests into two lanes and
 keeps one batch of each in flight: every step runs one lane's batch on GPU 0 while the other lane's batch (which
@@ -151,8 +151,13 @@ GPU 1:  ·········· A1 ── fin ─ B1 ── fin ─ A2 ── fin �
 
 From the measured stage times (13 ms per GPU for one conversation's rows, ~3.5 ms to verify, commit and draft),
 two conversations would go from ~45 ms per round batched to ~33 ms per two lane steps, ~+35%; more for three (each
-lane keeps 8 rows). Projected, not measured: it is **off by default** until it is measured on two cards
-(`tools/multi_agent_bench.py`, or `bnk multi --gpus 0,1 --pipe` against `bnk multi --gpus 0,1`).
+lane keeps 8 rows). **Measured on two V100s (2026-10-14, MTP, greedy, `bnk multi --gpus 0,1 [--pipe]`):** two conversations 83 -> 106
+tok/s together (+28%), three 131 -> 159 tok/s (+21%); each conversation ~53 tok/s instead of 41-44. Each
+conversation's tokens in two lanes are exactly its tokens decoded alone (`--solo`); batched rounds are not quite
+(with GPU experts the expert sums follow the batch's routing), so two lanes are also the more exact mode. **On by
+default** when the two stages are on different GPUs; `BNK_PIPE_DECODE=0` turns it off (and `=1` forces it, e.g.
+for `--gpus 0,0`). Through the HTTP server: concurrent streams at 50-61 tok/s each, a client disconnecting
+mid-stream and follow-up requests complete cleanly; `serve_check` passes.
 
 What makes it correct: a verify window's DeltaNet intermediates stay on GPU 0 until the window is committed, and
 GPU 0 runs the other lane's forward in between; each lane has its own window buffers, hand-off buffers and commit

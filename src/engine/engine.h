@@ -101,6 +101,7 @@ public:
     int stages() const { return next_ ? 1 + next_->stages() : 1; }
     std::vector<int> devices() const;
     int device() const { return dev_; }
+    int last_device() const { return next_ ? next_->last_device() : dev_; }   // the last stage's GPU
     int layer_begin() const { return l0_; }
     int layer_end() const { return l1_; }
     const Engine * stage(int i) const { return i == 0 ? this : next_ ? next_->stage(i - 1) : nullptr; }

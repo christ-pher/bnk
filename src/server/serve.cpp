@@ -516,12 +516,17 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             }
         }
     };
-    // Two GPUs with BNK_PIPE_DECODE=1: the requests in flight form two lanes, and each step runs one lane's batch
+    // Two GPUs (BNK_PIPE_DECODE, default on with two different GPUs; 0 turns it off): the requests in flight form
+    // two lanes, and each step runs one lane's batch
     // on the first GPU while the other lane's (from the step before) runs on the second, then verifies, commits
     // and drafts that one. Both GPUs work at once instead of taking turns. A new request, or a lane running
     // empty, drains the pipeline first (the other lane goes through the second GPU alone), and the server goes
     // back to one batch per round.
-    static const bool pipe_decode = eng.stages() == 2 && getenv("BNK_PIPE_DECODE") && atoi(getenv("BNK_PIPE_DECODE")) != 0;
+    // Measured on two V100s (3 conversations, MTP): 131 -> 159 tok/s together, and each conversation's tokens are
+    // exactly its tokens decoded alone (batched rounds are not: expert sums follow the batch's routing)
+    static const bool pipe_decode = eng.stages() == 2 &&
+                                    (getenv("BNK_PIPE_DECODE") ? atoi(getenv("BNK_PIPE_DECODE")) != 0
+                                                               : eng.device() != eng.last_device());
     struct Lane { std::vector<Active *> reqs; std::vector<Engine::BatchWin> wins; };
     Lane lanes[2];
     int mid = -1;         // the lane whose batch went through the first GPU only
