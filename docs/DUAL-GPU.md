@@ -96,20 +96,38 @@ loads.
 Two Tesla PG500-216 (V100 SXM2 32 GB on PCIe adapters, 150 W cap, PCIe 3.0 x16 each, no NVLink or peer access).
 IQ3_S, every expert resident (layers 0-25 / 26-47, 24.8 + 23.2 GiB of experts).
 
-| | One V100 | Two V100s |
-|---|---|---|
-| Decode, one conversation, plain greedy (`bnk run`) | ~45-50 tok/s | 54.7 tok/s (8.3 + 8.1 ms GPU per forward) |
-| Decode, one conversation, MTP (`bnk run`, draft 4) | ~60-65 tok/s | 67 tok/s at first; 86-88 tok/s after the GEMV/MoE work below |
-| Through the server (short and 56-70K prompts, MTP) | 54-62 tok/s | 63-79 tok/s |
-| Prompt reads, 36-56K tokens | 570-750 tok/s (1,331 at 78K) | 1,800-2,020 tok/s (pipelined; 1,250 with `BNK_PIPE_PROMPT=0`) |
+| | One V100 | Two V100s, first run | Two V100s, after the GPU work below |
+|---|---|---|---|
+| GPU time per forward, MTP windows (~3 rows) | | 16.45 + 14.76 ms | 11.88 + 10.77 ms (-27%) |
+| Decode, one conversation, plain greedy | ~45-50 tok/s | 54.7 tok/s | 69 tok/s |
+| Decode, one conversation, MTP (`bnk run`) | ~60-65 tok/s | 67-78 tok/s | ~100-120 tok/s (acceptance-dependent) |
+| Server, web UI settings (temp 0.7, 2,048 tokens) | | 76-79 tok/s | 92-96 tok/s |
+| 2 / 3 conversations together (two lanes) | | 83 / 131 tok/s (batched) | 137 / 173 tok/s |
+| Prompt reads, 36-56K tokens | 570-750 tok/s | 1,800-2,020 tok/s | 1,985-2,107 tok/s |
 
 No throttling seen: 48-57 °C under load, the power cap reached briefly while reading prompts.
 
-What a decode forward is spent on (nsys, MTP windows of ~4-5 rows, after the kernel work): dense quant GEMVs
-~33%, routed experts ~25%, float GEMVs ~12%, the rest many small kernels (norms, routing, DeltaNet, attention,
-HC mixing: ~50 kernels per layer). Done so far (`docs/ROADMAP.md`, item 8): tensor-core GEMV for windows of 5+
-rows, BF16 matrices as F16, IQ grid tables in shared memory, expert activations through L1: GPU time per forward
-16.45 / 14.76 ms -> 14.75 / 13.21 ms.
+What changed (each its own commit on `dual-v100`, measured alone; `docs/ROADMAP.md` item 8 has the details):
+
+* Dense GEMVs on the tensor cores (`gemv_mma_k`, `mma.m8n8k4`) from 4 rows, BF16 matrices as F16, no loads for
+  padding tokens, K split per row width: 8-row GEMVs 1.5-2x faster, closer to fp32 (error 5e-3 -> 3e-4).
+* Routed experts: IQ grid tables in shared memory, activations through L1, each expert's own token count per
+  block, 8 lanes per row for several tokens: IQ2_S layers 245 -> 179 us at 5 tokens.
+* Small kernels: the HC norm and mix quantize their own outputs, `hc_combine` folded into the next norm,
+  `route_topk` + `moe_plan` in one launch, `moe_wait` folded into `moe_reduce`, vectorized norms, the DeltaNet
+  recurrence over 4 warps, independent work on side streams (shared expert, gate / beta / alpha, indexer, inject).
+* Drafter: draft head re-quantized to Q4_K (step 0.82 -> 0.72 ms, same acceptance).
+* Two lanes on by default.
+
+Where a forward goes now (nsys, ~3-row windows): dense GEMVs ~49% (tensor-core kernel at ~400-450 GB/s for big
+matrices, the limit is load latency at 50% occupancy), routed experts ~25% (~450 GB/s; IQ2_S decode is
+instruction-heavy), the rest ~25% (DeltaNet recurrence, attention, routing, norms).
+
+**Exactness.** Speed-tuned kernel choices depend on the window's row count (tensor cores from 4 rows; 16 or 8 lanes
+per expert row), so a conversation decoded beside others can differ from itself alone in near-ties.
+`BNK_EXACT=1` pins both choices (~1% slower with MTP, 11% plain): then batched and two-lane decoding equal
+decoding alone token for token (3 conversations x 200 tokens), and the MoE adds a token's experts in its own routing
+order in every mode. `serve_check` and `park_check` set it; both pass on two GPUs.
 
 Sampling note: a request with `top_k: 0` used to take the host sampler (~23 ms per row, decode 63 -> 26 tok/s); it
 now samples from the GPU's 1,024 most likely tokens and each row's normalizer (identical distribution).

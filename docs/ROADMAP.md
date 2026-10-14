@@ -17,7 +17,7 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
 | 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | done (2026-10-14): decode 67 tok/s with MTP, prompts ~1,900 tok/s; two lanes +21-28% for 2-3 conversations, on by default |
-| 8 | **GPU efficiency of a decode forward** (every expert resident) | GEMVs at 170-280 GB/s for 8 rows, experts at 335-456 GB/s, ~50 small kernels per layer | up to ~1.5x decode *(estimate)* | in progress: -10% GPU time per forward (below) |
+| 8 | **GPU efficiency of a decode forward** (every expert resident) | GEMVs at 170-280 GB/s for 8 rows, experts at 335-456 GB/s, ~50 small kernels per layer | up to ~1.5x decode *(estimate)* | parts 1-2 done: -27% GPU time per forward (below); next: GEMV load latency, IQ decode cost |
 
 ## Done (two V100s)
 
@@ -30,6 +30,25 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
   expert gate/up kernel read 12.7x its weight bytes through L1 (IQ grid lookups in global memory): tables in
   shared memory, and no activation staging (occupancy). Per forward 16.45 / 14.76 -> 14.75 / 13.21 ms; decode
   78 -> 86-88 tok/s at equal acceptance. Tools: `bench_moe`, `bnk nll`, `bench_gemv` error column.
+* **GPU efficiency, part 2** (2026-10-14, overnight; per forward 14.75 / 13.21 -> 11.88 / 10.77 ms, each step
+  measured alone, same tokens unless noted):
+  * Tensor-core GEMV: no loads for tokens past the window (5 tokens: ssm_out 45 -> 33 us), used from 4 tokens; K
+    split so a warp's share is a multiple of 4 sub-blocks (attn_q 45.5 -> 39.9). 16 rows per warp: no faster.
+  * Routed experts: a block runs its expert's own token count (packed, a block-uniform switch; the mask test inside
+    the loop was predicated, so all NT dot products issued), up to 4 per pass; 8 lanes per row for several tokens.
+    IQ2_S layer 196 -> 179 us at 5 tokens.
+  * Side streams captured as parallel graph branches: 13.57 -> 13.07, 12.26 -> 11.76 ms.
+  * Fusions: norm + quantize, mix + quantize (12.80 -> 12.45), combine into the next norm (-> 12.26), route + plan
+    (-> 12.13), wait into reduce. Vectorized norms 9.1 -> 4.3 us, route_topk 12.2 -> 8.1, moe_reduce 8.8 -> 6.7.
+  * DeltaNet recurrence over 4 warps per column block: 19.4 -> 12.0 us per layer (NLL 1.7184).
+  * Draft head re-quantized to Q4_K: draft step 0.82 -> 0.72 ms, same acceptance.
+  * Two lanes on by default (2 / 3 conversations: 83 / 131 -> 106 / 159 tok/s at the time; 137 / 173 now).
+  * MoE sums in each token's routing order; `BNK_EXACT=1` for window-size-independent kernels (batched / two-lane
+    == alone, token for token).
+  * Tried, not kept: 16 rows per warp in the tensor-core GEMV (no faster), a 64-register cap on the expert kernels
+    (spills), 8 warps for the recurrence (no faster), the router as F16 (1.2% faster, NLL noise-level worse; opt-in
+    `BNK_ROUTER_F16`), the expert activation folded into the down kernel (its recompute costs what the launch
+    saves), dropping `volatile` from the mma asm (no change).
 * **`top_k: 0` sampling** (2026-10-14): from the GPU's 1,024 candidates and a row normalizer (`row_expsum`); the
   host path sorts only the head it needs. 25.7 -> 65.7 tok/s for such requests.
 
