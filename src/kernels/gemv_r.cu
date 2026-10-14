@@ -223,85 +223,107 @@ __device__ __forceinline__ void mma884(float (&c)[8], uint32_t a0, uint32_t a1, 
 // FMT: an R-layout quant format, or QT_F16 (plain fp16 rows: no unpacking). XF: the activations as fp32 (x, ldx),
 // converted on the way; else fp16 (the fp16 copy quantize_act writes). KS warps split a row group's K (1, 2, 4 or
 // 8); a block holds 8 / KS row groups of 8 rows.
-template <int FMT, bool XF>
+// a row's sub-block sb as 16 fp16 pairs (d * q - m), for the A fragments
+template <int FMT>
+__device__ __forceinline__ void mma_weights(const uint8_t * row, const ROff & o, int sb, uint32_t (&w)[16]) {
+    if constexpr (FMT == QT_F16) {
+        const uint4 * wp = (const uint4 *) (row + (size_t) sb * 64);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ((uint4 *) w)[i] = __ldg(wp + i);
+    } else {
+        Unpacked u;
+        RT<FMT>::unpack(row, o, sb, u);
+        const half2 d0 = __float2half2_rn(u.d0), d1 = __float2half2_rn(u.d1);
+        half2 m0 = __float2half2_rn(0.f), m1 = m0;
+        if constexpr (RT<FMT>::HAS_MIN) {
+            m0 = __float2half2_rn(-u.m0);
+            m1 = __float2half2_rn(-u.m1);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            half2 lo, hi;
+            i8x4_to_h2((uint32_t) u.w[i], lo, hi);
+            w[2 * i] = h2u(__hfma2(lo, i < 4 ? d0 : d1, i < 4 ? m0 : m1));
+            w[2 * i + 1] = h2u(__hfma2(hi, i < 4 ? d0 : d1, i < 4 ? m0 : m1));
+        }
+    }
+}
+
+// FMT: an R-layout quant format, or QT_F16 (plain fp16 rows: no unpacking). XF: the activations as fp32 (x, ldx),
+// converted on the way; else fp16 (the fp16 copy quantize_act writes). RG row groups of 8 rows per warp share each
+// activation load (RG = 2: half the activation traffic, which was ~2.5x the weight bytes). KS warps split a row
+// block's K (1, 2, 4 or 8); a block holds 8 / KS row blocks of 8 * RG rows.
+template <int FMT, bool XF, int RG>
 __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
                                                   int nsb, const void * __restrict__ xv_, int64_t ldx, int T,
                                                   float * __restrict__ y, int64_t ldy, int accumulate, int ks) {
-    __shared__ float part[8][64];
+    __shared__ float part[8][64 * RG];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int grp = blockIdx.x * (8 / ks) + warp / ks, kp = warp % ks;
     const int qp = (lane >> 2) & 3, j = (lane & 3) | ((lane >> 4) << 2);   // quad pair; row / token within it
-    const int r = grp * 8 + j;
-    const uint8_t * row = W + (size_t) min(r, rows - 1) * row_bytes;
-    const int per = (nsb + ks - 1) / ks, sb0 = kp * per, sb1 = min(nsb, sb0 + per);
-    float c[8];
+    const uint8_t * rowp[RG];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) c[i] = 0.f;
+    for (int g = 0; g < RG; ++g) rowp[g] = W + (size_t) min(grp * 8 * RG + g * 8 + j, rows - 1) * row_bytes;
+    const int per = (nsb + ks - 1) / ks, sb0 = kp * per, sb1 = min(nsb, sb0 + per);
+    float c[RG][8];
+#pragma unroll
+    for (int g = 0; g < RG; ++g)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) c[g][i] = 0.f;
     for (int s = sb0; s < sb1; s += 4) {
         const int sb = s + qp;
-        uint32_t w[16];
-        uint32_t xw[16];   // token j's 32 activations of this sub-block, fp16 (columns of tokens >= T: computed,
-                           // not stored)
-        if (sb < sb1) {
-            if constexpr (FMT == QT_F16) {
-                const uint4 * wp = (const uint4 *) (row + (size_t) sb * 64);
+        const bool ok = sb < sb1;
+        uint32_t xw[16];   // token j's 32 activations of this sub-block, fp16
+        if (!ok || j >= T) {   // past K, or a token past the window (its column is not stored): zeros, no loads
 #pragma unroll
-                for (int i = 0; i < 4; ++i) ((uint4 *) w)[i] = __ldg(wp + i);
-            } else {
-                Unpacked u;
-                RT<FMT>::unpack(row, o, sb, u);
-                const half2 d0 = __float2half2_rn(u.d0), d1 = __float2half2_rn(u.d1);
-                half2 m0 = __float2half2_rn(0.f), m1 = m0;
-                if constexpr (RT<FMT>::HAS_MIN) {
-                    m0 = __float2half2_rn(-u.m0);
-                    m1 = __float2half2_rn(-u.m1);
-                }
+            for (int i = 0; i < 16; ++i) xw[i] = 0;
+        } else if constexpr (XF) {
+            const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    half2 lo, hi;
-                    i8x4_to_h2((uint32_t) u.w[i], lo, hi);
-                    w[2 * i] = h2u(__hfma2(lo, i < 4 ? d0 : d1, i < 4 ? m0 : m1));
-                    w[2 * i + 1] = h2u(__hfma2(hi, i < 4 ? d0 : d1, i < 4 ? m0 : m1));
-                }
-            }
-            if constexpr (XF) {
-                const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const float4 f = __ldg(xp + i);
-                    xw[2 * i] = h2u(__floats2half2_rn(sat_h(f.x), sat_h(f.y)));
-                    xw[2 * i + 1] = h2u(__floats2half2_rn(sat_h(f.z), sat_h(f.w)));
-                }
-            } else {
-                const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
-#pragma unroll
-                for (int i = 0; i < 4; ++i) ((uint4 *) xw)[i] = __ldg(xp + i);
+            for (int i = 0; i < 8; ++i) {
+                const float4 f = __ldg(xp + i);
+                xw[2 * i] = h2u(__floats2half2_rn(sat_h(f.x), sat_h(f.y)));
+                xw[2 * i + 1] = h2u(__floats2half2_rn(sat_h(f.z), sat_h(f.w)));
             }
         } else {
+            const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
 #pragma unroll
-            for (int i = 0; i < 16; ++i) w[i] = xw[i] = 0;
+            for (int i = 0; i < 4; ++i) ((uint4 *) xw)[i] = __ldg(xp + i);
         }
 #pragma unroll
-        for (int kk = 0; kk < 8; ++kk) mma884(c, w[2 * kk], w[2 * kk + 1], xw[2 * kk], xw[2 * kk + 1]);
-    }
-    // the 4 quad pairs hold partial sums of the same 8x8 tile in the same registers
+        for (int g = 0; g < RG; ++g) {
+            uint32_t w[16];
+            if (ok) mma_weights<FMT>(rowp[g], o, sb, w);
+            else
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        c[i] += __shfl_xor_sync(0xffffffff, c[i], 4);
-        c[i] += __shfl_xor_sync(0xffffffff, c[i], 8);
+                for (int i = 0; i < 16; ++i) w[i] = 0;
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) mma884(c[g], w[2 * kk], w[2 * kk + 1], xw[2 * kk], xw[2 * kk + 1]);
+        }
     }
-    if (qp == 0) {
+    // the 4 quad pairs hold partial sums of the same tiles in the same registers
+#pragma unroll
+    for (int g = 0; g < RG; ++g)
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int rr = (lane & 1) + (i & 2) + ((lane >> 4) << 2), t = (i & 4) + (lane & 2) + (i & 1);
-            part[warp][t * 8 + rr] = c[i];
+            c[g][i] += __shfl_xor_sync(0xffffffff, c[g][i], 4);
+            c[g][i] += __shfl_xor_sync(0xffffffff, c[g][i], 8);
         }
+    if (qp == 0) {
+#pragma unroll
+        for (int g = 0; g < RG; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int rr = (lane & 1) + (i & 2) + ((lane >> 4) << 2), t = (i & 4) + (lane & 2) + (i & 1);
+                part[warp][t * 8 * RG + g * 8 + rr] = c[g][i];
+            }
     }
     __syncthreads();
-    // each row group's K parts added in a fixed order (deterministic)
-    const int g = threadIdx.x >> 6, e = threadIdx.x & 63;   // 4 row groups per pass of 256 threads
-    for (int gg = g; gg < 8 / ks; gg += 4) {
-        const int t = e >> 3, rr = (blockIdx.x * (8 / ks) + gg) * 8 + (e & 7);
+    // each row block's K parts added in a fixed order (deterministic)
+    constexpr int E = 64 * RG;   // (token, row) pairs per row block
+    for (int idx = threadIdx.x; idx < (8 / ks) * E; idx += 256) {
+        const int gg = idx / E, e = idx % E;
+        const int t = e / (8 * RG), rr = (blockIdx.x * (8 / ks) + gg) * 8 * RG + e % (8 * RG);
         if (t < T && rr < rows) {
             float v = 0.f;
             for (int w = 0; w < ks; ++w) v += part[gg * ks + w][e];
@@ -322,10 +344,14 @@ template <int FMT, bool XF>
 static void launch_mma_k(const QMat & W, const void * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc,
                          cudaStream_t s) {
     const int nsb = (int) (W.cols / 32), ks = mma_ks(nsb);
-    const int groups = (int) ((W.rows + 7) / 8), per_block = 8 / ks;
+    // BNK_GEMV_MMA_RG=2: 16 rows per warp (half the activation loads; measured no faster on a V100, so off)
+    static const int rg_env = getenv("BNK_GEMV_MMA_RG") ? atoi(getenv("BNK_GEMV_MMA_RG")) : 1;
+    const int rg = rg_env == 2 && W.rows >= 2048 ? 2 : 1;
+    const int groups = (int) ((W.rows + 8 * rg - 1) / (8 * rg)), per_block = 8 / ks;
     const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
-    gemv_mma_k<FMT, XF><<<(groups + per_block - 1) / per_block, 256, 0, s>>>(
-        (const uint8_t *) W.data, W.row_bytes, o, (int) W.rows, nsb, x, ldx, T, y, ldy, acc ? 1 : 0, ks);
+    auto k = rg == 2 ? gemv_mma_k<FMT, XF, 2> : gemv_mma_k<FMT, XF, 1>;
+    k<<<(groups + per_block - 1) / per_block, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o, (int) W.rows, nsb,
+                                                           x, ldx, T, y, ldy, acc ? 1 : 0, ks);
     check_launch("gemv_mma");
 }
 
@@ -336,7 +362,7 @@ static void launch_mma(const QMat & W, const ActQ8 & a, int T, float * y, int64_
 
 // from this many tokens on, the tensor-core kernel (when the activations have their fp16 copy); BNK_GEMV_MMA_MIN
 static int mma_min_tokens() {
-    static const int n = getenv("BNK_GEMV_MMA_MIN") ? atoi(getenv("BNK_GEMV_MMA_MIN")) : 5;
+    static const int n = getenv("BNK_GEMV_MMA_MIN") ? atoi(getenv("BNK_GEMV_MMA_MIN")) : 4;
     return n;
 }
 
