@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ h
 }
 
 // ---- R-layout hit kernels: LPR lanes per row, the entry's token activations staged in shared memory
-template <int FMT, int NT, int LPR>
+template <int FMT, int NT, int LPR, bool STAGE>
 __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                   size_t blob, size_t up_off, size_t grow, ROff o, int F, int E,
                                                   const int8_t * __restrict__ aq, const float * __restrict__ ad,
@@ -220,15 +220,27 @@ __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ h
     if (ent >= hits->n) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    int8_t * aqs = (int8_t *) sm;
-    float * ads = (float *) (sm + (size_t) NT * E);
     const int nb = E / 32;
-    for (int t = 0; t < NT; ++t) {
-        if (!(mask & (1u << t))) continue;
-        for (int i = threadIdx.x; i < E / 16; i += blockDim.x)
-            ((int4 *) (aqs + (size_t) t * E))[i] = __ldg((const int4 *) (aq + t * cols_pad) + i);
-        for (int i = threadIdx.x; i < nb; i += blockDim.x) ads[t * nb + i] = __ldg(ad + t * (cols_pad / 32) + i);
+    // the tokens' activations: staged in shared memory (STAGE), or read through L1 (most experts of a window get
+    // one token, and the staging for NT of them limits occupancy)
+    const int8_t * aqs = aq;
+    const float * ads = ad;
+    int64_t sq = cols_pad, sd = cols_pad / 32;
+    if constexpr (STAGE) {
+        int8_t * q = (int8_t *) sm;
+        float * dd = (float *) (sm + (size_t) NT * E);
+        for (int t = 0; t < NT; ++t) {
+            if (!(mask & (1u << t))) continue;
+            for (int i = threadIdx.x; i < E / 16; i += blockDim.x)
+                ((int4 *) (q + (size_t) t * E))[i] = __ldg((const int4 *) (aq + t * cols_pad) + i);
+            for (int i = threadIdx.x; i < nb; i += blockDim.x) dd[t * nb + i] = __ldg(ad + t * (cols_pad / 32) + i);
+        }
+        aqs = q;
+        ads = dd;
+        sq = E;
+        sd = nb;
     }
+    rt_tables_load<FMT>();
     __syncthreads();
     constexpr int RPW = 32 / LPR;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -242,12 +254,12 @@ __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ h
         const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
         for (int sb = sub; sb < nb; sb += LPR) {
             Unpacked u;
-            RT<FMT>::unpack(row, o, sb, u);
+            unpack_sm<FMT>(row, o, sb, u);
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
                 if (mask & (1u << t)) {
-                    const int4 * ap = (const int4 *) (aqs + (size_t) t * E + sb * 32);
-                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ads[t * nb + sb]);
+                    const int4 * ap = (const int4 *) (aqs + t * sq + sb * 32);
+                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ads[t * sd + sb]);
                 }
             }
         }
@@ -283,6 +295,7 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
         for (int i = threadIdx.x; i < F / 16; i += blockDim.x) ((int4 *) (hqs + (size_t) t * F))[i] = ((const int4 *) (hq + b * F))[i];
         for (int i = threadIdx.x; i < nb; i += blockDim.x) hds[t * nb + i] = hd[b * nb + i];
     }
+    rt_tables_load<FMT>();
     __syncthreads();
     constexpr int RPW = 32 / LPR;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -296,7 +309,7 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
         const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
         for (int sb = sub; sb < nb; sb += LPR) {
             Unpacked u;
-            RT<FMT>::unpack(row, o, sb, u);
+            unpack_sm<FMT>(row, o, sb, u);
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
                 if (mask & (1u << t)) {
@@ -330,8 +343,13 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
     auto gu = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
-            moe_gu_r_k<FMT, NT, LPR><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, smg, st>>>(
-                s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+            static const bool stage = getenv("BNK_MOE_STAGE") && atoi(getenv("BNK_MOE_STAGE")) != 0;
+            if (stage)
+                moe_gu_r_k<FMT, NT, LPR, true><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, smg, st>>>(
+                    s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+            else
+                moe_gu_r_k<FMT, NT, LPR, false><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, 0, st>>>(
+                    s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
         };
         switch (lpr_for(E / 32)) {
             case 32: L.template operator()<32>(); break;

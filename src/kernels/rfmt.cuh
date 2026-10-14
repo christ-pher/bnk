@@ -16,6 +16,24 @@ __device__ __forceinline__ uint32_t spread1_hi(uint32_t h4) { return ((h4 * 0x00
 // 4 2-bit fields of a byte into bytes 0..3
 __device__ __forceinline__ uint32_t spread2(uint32_t b) { return (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303u; }
 
+// The IQ formats' lookup tables (ggml's __device__ arrays, in global memory) are read at random indices, up to 32
+// sectors per warp request: kernels that unpack a lot of them copy the table into shared memory once per block
+// (rt_tables_load) and unpack through it (unpack_t<true>). File-scope __shared__: a kernel only gets the ones it
+// uses.
+__shared__ uint2 s_iq2s_grid[1024];
+__shared__ uint2 s_iq2xxs_grid[256];
+__shared__ uint2 s_iq2xs_grid[512];
+__shared__ uint32_t s_iq3xxs_grid[256];
+__shared__ uint32_t s_iq3s_grid[512];
+__shared__ uint8_t s_ksigns[128];
+
+template <bool SM> __device__ __forceinline__ uint2 t_iq2s(int i) { return SM ? s_iq2s_grid[i] : *(const uint2 *) (iq2s_grid + i); }
+template <bool SM> __device__ __forceinline__ uint2 t_iq2xxs(int i) { return SM ? s_iq2xxs_grid[i] : *(const uint2 *) (iq2xxs_grid + i); }
+template <bool SM> __device__ __forceinline__ uint2 t_iq2xs(int i) { return SM ? s_iq2xs_grid[i] : *(const uint2 *) (iq2xs_grid + i); }
+template <bool SM> __device__ __forceinline__ uint32_t t_iq3xxs(int i) { return SM ? s_iq3xxs_grid[i] : iq3xxs_grid[i]; }
+template <bool SM> __device__ __forceinline__ uint32_t t_iq3s(int i) { return SM ? s_iq3s_grid[i] : iq3s_grid[i]; }
+template <bool SM> __device__ __forceinline__ uint32_t t_ksigns(int i) { return SM ? s_ksigns[i] : ksigns_iq2xs[i]; }
+
 template <int FMT> struct RT;
 
 template <> struct RT<QT_Q4_K> {
@@ -126,7 +144,10 @@ template <> struct RT<QT_IQ4_XS> {
 
 template <> struct RT<QT_IQ2_S> {
     static constexpr bool HAS_MIN = false;
-    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    static constexpr bool HAS_TABLE = true;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) { unpack_t<false>(row, o, sb, u); }
+    template <bool SM>
+    __device__ static void unpack_t(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint32_t g = *(const uint32_t *) (row + o.a + 4 * sb);
         const uint32_t sg = *(const uint32_t *) (row + o.b + 4 * sb);
         const uint32_t qh = row[o.c + sb];
@@ -138,7 +159,7 @@ template <> struct RT<QT_IQ2_S> {
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             const int idx = ((g >> (8 * il)) & 0xff) | ((qh << (8 - 2 * il)) & 0x300);
-            const uint2 gr = *(const uint2 *) (iq2s_grid + idx);
+            const uint2 gr = t_iq2s<SM>(idx);
             const uint32_t s8 = (sg >> (8 * il)) & 0xff;
             u.w[2 * il + 0] = apply_signs4(gr.x, s8 & 0xF);
             u.w[2 * il + 1] = apply_signs4(gr.y, s8 >> 4);
@@ -148,7 +169,10 @@ template <> struct RT<QT_IQ2_S> {
 
 template <> struct RT<QT_IQ2_XXS> {
     static constexpr bool HAS_MIN = false;
-    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    static constexpr bool HAS_TABLE = true;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) { unpack_t<false>(row, o, sb, u); }
+    template <bool SM>
+    __device__ static void unpack_t(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint32_t a = *(const uint32_t *) (row + o.a + 4 * sb);   // 4 grid indices
         const uint32_t b = *(const uint32_t *) (row + o.b + 4 * sb);   // 4x7-bit signs + 4-bit scale (top nibble)
         const float d = h2f(*(const uint16_t *) (row + o.c + 2 * (sb >> 3)));
@@ -156,8 +180,8 @@ template <> struct RT<QT_IQ2_XXS> {
         u.m0 = u.m1 = 0.f;
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
-            const uint2 gr = *(const uint2 *) (iq2xxs_grid + ((a >> (8 * il)) & 0xff));
-            const uint32_t s8 = ksigns_iq2xs[(b >> (7 * il)) & 127];
+            const uint2 gr = t_iq2xxs<SM>((a >> (8 * il)) & 0xff);
+            const uint32_t s8 = t_ksigns<SM>((b >> (7 * il)) & 127);
             u.w[2 * il + 0] = apply_signs4(gr.x, s8 & 0xF);
             u.w[2 * il + 1] = apply_signs4(gr.y, s8 >> 4);
         }
@@ -166,7 +190,10 @@ template <> struct RT<QT_IQ2_XXS> {
 
 template <> struct RT<QT_IQ2_XS> {
     static constexpr bool HAS_MIN = false;
-    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    static constexpr bool HAS_TABLE = true;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) { unpack_t<false>(row, o, sb, u); }
+    template <bool SM>
+    __device__ static void unpack_t(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint2 q = *(const uint2 *) (row + o.a + 8 * sb);   // 4 uint16: 9-bit grid idx + 7-bit sign idx
         const uint32_t sc = row[o.b + sb];
         const float d = h2f(*(const uint16_t *) (row + o.c + 2 * (sb >> 3)));
@@ -176,8 +203,8 @@ template <> struct RT<QT_IQ2_XS> {
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             const uint32_t q16 = ((il < 2 ? q.x : q.y) >> (16 * (il & 1))) & 0xffff;
-            const uint2 gr = *(const uint2 *) (iq2xs_grid + (q16 & 511));
-            const uint32_t s8 = ksigns_iq2xs[q16 >> 9];
+            const uint2 gr = t_iq2xs<SM>(q16 & 511);
+            const uint32_t s8 = t_ksigns<SM>(q16 >> 9);
             u.w[2 * il + 0] = apply_signs4(gr.x, s8 & 0xF);
             u.w[2 * il + 1] = apply_signs4(gr.y, s8 >> 4);
         }
@@ -186,7 +213,10 @@ template <> struct RT<QT_IQ2_XS> {
 
 template <> struct RT<QT_IQ3_XXS> {
     static constexpr bool HAS_MIN = false;
-    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    static constexpr bool HAS_TABLE = true;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) { unpack_t<false>(row, o, sb, u); }
+    template <bool SM>
+    __device__ static void unpack_t(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint2 g = *(const uint2 *) (row + o.a + 8 * sb);
         const uint32_t aux = *(const uint32_t *) (row + o.b + 4 * sb);
         const float d = h2f(*(const uint16_t *) (row + o.c + 2 * (sb >> 3)));
@@ -196,16 +226,19 @@ template <> struct RT<QT_IQ3_XXS> {
         for (int il = 0; il < 4; ++il) {
             const uint32_t gw = il < 2 ? g.x : g.y;
             const int sh = 16 * (il & 1);
-            const uint32_t sg = ksigns_iq2xs[(aux >> (7 * il)) & 127];
-            u.w[2 * il + 0] = apply_signs4(iq3xxs_grid[(gw >> sh) & 0xff], sg & 0xF);
-            u.w[2 * il + 1] = apply_signs4(iq3xxs_grid[(gw >> (sh + 8)) & 0xff], sg >> 4);
+            const uint32_t sg = t_ksigns<SM>((aux >> (7 * il)) & 127);
+            u.w[2 * il + 0] = apply_signs4(t_iq3xxs<SM>((gw >> sh) & 0xff), sg & 0xF);
+            u.w[2 * il + 1] = apply_signs4(t_iq3xxs<SM>((gw >> (sh + 8)) & 0xff), sg >> 4);
         }
     }
 };
 
 template <> struct RT<QT_IQ3_S> {
     static constexpr bool HAS_MIN = false;
-    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    static constexpr bool HAS_TABLE = true;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) { unpack_t<false>(row, o, sb, u); }
+    template <bool SM>
+    __device__ static void unpack_t(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
         const uint2 q = *(const uint2 *) (row + o.a + 8 * sb);
         const uint32_t sg = *(const uint32_t *) (row + o.b + 4 * sb);
         const int qh = row[o.c + sb];
@@ -216,8 +249,8 @@ template <> struct RT<QT_IQ3_S> {
         for (int il = 0; il < 4; ++il) {
             const uint32_t qw = il < 2 ? q.x : q.y;
             const int sh = 16 * (il & 1);
-            const uint32_t g1 = iq3s_grid[((qw >> sh) & 0xff) | ((qh << (8 - 2 * il)) & 256)];
-            const uint32_t g2 = iq3s_grid[((qw >> (sh + 8)) & 0xff) | ((qh << (7 - 2 * il)) & 256)];
+            const uint32_t g1 = t_iq3s<SM>(((qw >> sh) & 0xff) | ((qh << (8 - 2 * il)) & 256));
+            const uint32_t g2 = t_iq3s<SM>(((qw >> (sh + 8)) & 0xff) | ((qh << (7 - 2 * il)) & 256));
             const uint32_t s8 = (sg >> (8 * il)) & 0xff;
             u.w[2 * il + 0] = apply_signs4(g1, s8 & 0xF);
             u.w[2 * il + 1] = apply_signs4(g2, s8 >> 4);
@@ -238,6 +271,36 @@ template <> struct RT<QT_Q2_0> {
         }
     }
 };
+
+// unpack through the shared-memory tables when the format has one (rt_tables_load first)
+template <int FMT, typename = void> struct RTHasTable { static constexpr bool value = false; };
+template <int FMT> struct RTHasTable<FMT, decltype((void) RT<FMT>::HAS_TABLE)> { static constexpr bool value = RT<FMT>::HAS_TABLE; };
+
+template <int FMT>
+__device__ __forceinline__ void unpack_sm(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+    if constexpr (RTHasTable<FMT>::value) RT<FMT>::template unpack_t<true>(row, o, sb, u);
+    else RT<FMT>::unpack(row, o, sb, u);
+}
+
+// copies FMT's tables into shared memory (all threads of the block; a __syncthreads must follow)
+template <int FMT>
+__device__ __forceinline__ void rt_tables_load() {
+    const int n = blockDim.x * blockDim.y, t = threadIdx.y * blockDim.x + threadIdx.x;
+    if constexpr (FMT == QT_IQ2_S) {
+        for (int i = t; i < 1024; i += n) s_iq2s_grid[i] = *(const uint2 *) (iq2s_grid + i);
+    } else if constexpr (FMT == QT_IQ2_XXS) {
+        for (int i = t; i < 256; i += n) s_iq2xxs_grid[i] = *(const uint2 *) (iq2xxs_grid + i);
+        for (int i = t; i < 128; i += n) s_ksigns[i] = ksigns_iq2xs[i];
+    } else if constexpr (FMT == QT_IQ2_XS) {
+        for (int i = t; i < 512; i += n) s_iq2xs_grid[i] = *(const uint2 *) (iq2xs_grid + i);
+        for (int i = t; i < 128; i += n) s_ksigns[i] = ksigns_iq2xs[i];
+    } else if constexpr (FMT == QT_IQ3_XXS) {
+        for (int i = t; i < 256; i += n) s_iq3xxs_grid[i] = iq3xxs_grid[i];
+        for (int i = t; i < 128; i += n) s_ksigns[i] = ksigns_iq2xs[i];
+    } else if constexpr (FMT == QT_IQ3_S) {
+        for (int i = t; i < 512; i += n) s_iq3s_grid[i] = iq3s_grid[i];
+    }
+}
 
 #define BNK_DISPATCH_R(fmt, F)                                       \
     switch (fmt) {                                                   \
