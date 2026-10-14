@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include "kernels/moe.h"
@@ -210,124 +211,119 @@ __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ h
 }
 
 // ---- R-layout hit kernels: LPR lanes per row, the entry's token activations staged in shared memory
-template <int FMT, int NT, int LPR, bool STAGE>
+// One row's dot products with an expert's N tokens: LPR lanes per row stride over its sub-blocks, then reduce. The
+// tokens are packed 4 bits each in `tp` (token i: activations at aq + tok_i * sq, scales at ad + tok_i * sd). N is the
+// expert's own token count (a block-uniform switch picks it): a token the expert was not routed is never computed
+// (a mask test inside the loop was predicated, so all NT dot products issued anyway).
+template <int FMT, int LPR, int N>
+__device__ __forceinline__ void row_dots(const uint8_t * row, const ROff & o, int nb, int sub, uint32_t tp,
+                                         const int8_t * aq, int64_t sq, const float * ad, int64_t sd, float (&acc)[4]) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) acc[i] = 0.f;
+    for (int sb = sub; sb < nb; sb += LPR) {
+        Unpacked u;
+        unpack_sm<FMT>(row, o, sb, u);
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const int t = (tp >> (4 * i)) & 15;
+            const int4 * ap = (const int4 *) (aq + t * sq + sb * 32);
+            acc[i] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ad[t * sd + sb]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+#pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1) acc[i] += __shfl_xor_sync(0xffffffff, acc[i], off);
+    }
+}
+
+template <int FMT, int NT, int LPR>
+__device__ __forceinline__ void row_dots_n(int n, const uint8_t * row, const ROff & o, int nb, int sub, uint32_t tp,
+                                           const int8_t * aq, int64_t sq, const float * ad, int64_t sd, float (&acc)[4]) {
+    switch (n) {   // the same for the whole block
+        case 1: row_dots<FMT, LPR, 1>(row, o, nb, sub, tp, aq, sq, ad, sd, acc); break;
+        case 2: if constexpr (NT >= 2) row_dots<FMT, LPR, 2>(row, o, nb, sub, tp, aq, sq, ad, sd, acc); break;
+        case 3: if constexpr (NT >= 4) row_dots<FMT, LPR, 3>(row, o, nb, sub, tp, aq, sq, ad, sd, acc); break;
+        default: if constexpr (NT >= 4) row_dots<FMT, LPR, 4>(row, o, nb, sub, tp, aq, sq, ad, sd, acc);
+    }
+}
+
+// the expert's tokens packed 4 bits each (in order), their count; past the count, the last token repeats
+__device__ __forceinline__ uint32_t pack_tokens(uint32_t mask, int & n) {
+    uint32_t tp = 0;
+    n = 0;
+    int last = 0;
+#pragma unroll
+    for (int t = 0; t < kMaxWindow; ++t)
+        if (mask & (1u << t)) {
+            tp |= (uint32_t) t << (4 * n);
+            ++n;
+            last = t;
+        }
+    for (int i = n; i < 8; ++i) tp |= (uint32_t) last << (4 * i);
+    return tp;
+}
+
+// gate and up rows of every hit expert (gu_out[ent][t][2F]); activations read through L1
+template <int FMT, int NT, int LPR>
 __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                   size_t blob, size_t up_off, size_t grow, ROff o, int F, int E,
                                                   const int8_t * __restrict__ aq, const float * __restrict__ ad,
                                                   int64_t cols_pad, float * __restrict__ gu_out) {
-    extern __shared__ __align__(16) uint8_t sm[];
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
-    const HitEntry & h = hits->e[ent];
-    const uint32_t mask = h.mask;
-    const int nb = E / 32;
-    // the tokens' activations: staged in shared memory (STAGE), or read through L1 (most experts of a window get
-    // one token, and the staging for NT of them limits occupancy)
-    const int8_t * aqs = aq;
-    const float * ads = ad;
-    int64_t sq = cols_pad, sd = cols_pad / 32;
-    if constexpr (STAGE) {
-        int8_t * q = (int8_t *) sm;
-        float * dd = (float *) (sm + (size_t) NT * E);
-        for (int t = 0; t < NT; ++t) {
-            if (!(mask & (1u << t))) continue;
-            for (int i = threadIdx.x; i < E / 16; i += blockDim.x)
-                ((int4 *) (q + (size_t) t * E))[i] = __ldg((const int4 *) (aq + t * cols_pad) + i);
-            for (int i = threadIdx.x; i < nb; i += blockDim.x) dd[t * nb + i] = __ldg(ad + t * (cols_pad / 32) + i);
-        }
-        aqs = q;
-        ads = dd;
-        sq = E;
-        sd = nb;
-    }
+    int n;
+    const uint32_t tp = pack_tokens(hits->e[ent].mask, n);
     rt_tables_load<FMT>();
     __syncthreads();
     constexpr int RPW = 32 / LPR;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int sub = lane % LPR;
-    const int r = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR;
-    const bool ok = r < 2 * F;
-    float acc[NT];
+    const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, 2 * F - 1);   // all lanes shuffle
+    const uint8_t * row = base + (size_t) hits->e[ent].slot * blob +
+                          (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
+    // up to 4 tokens per pass (an expert with 5-8 tokens of a window, rare, reads its rows twice): the 8-token path
+    // needed registers that cost every block occupancy
+    for (int p0 = 0; p0 < n; p0 += 4) {
+        const uint32_t tq = tp >> (4 * p0);
+        float acc[4];
+        row_dots_n<FMT, NT, LPR>(min(4, n - p0), row, o, E / 32, sub, tq, aq, cols_pad, ad, cols_pad / 32, acc);
+        if (sub == 0 && r0 < 2 * F) {
 #pragma unroll
-    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
-    if (ok) {
-        const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
-        for (int sb = sub; sb < nb; sb += LPR) {
-            Unpacked u;
-            unpack_sm<FMT>(row, o, sb, u);
-#pragma unroll
-            for (int t = 0; t < NT; ++t) {
-                if (mask & (1u << t)) {
-                    const int4 * ap = (const int4 *) (aqs + t * sq + sb * 32);
-                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ads[t * sd + sb]);
-                }
-            }
+            for (int i = 0; i < 4; ++i)
+                if (p0 + i < n) gu_out[((size_t) ent * kMaxWindow + ((tq >> (4 * i)) & 15)) * 2 * F + r] = acc[i];
         }
-    }
-#pragma unroll
-    for (int t = 0; t < NT; ++t) {
-#pragma unroll
-        for (int off = LPR / 2; off > 0; off >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off);
-    }
-    if (ok && sub == 0) {
-#pragma unroll
-        for (int t = 0; t < NT; ++t)
-            if (mask & (1u << t)) gu_out[((size_t) ent * kMaxWindow + t) * 2 * F + r] = acc[t];
     }
 }
 
+// down rows of every hit expert over its tokens' activated hidden rows (part[ent][t][E])
 template <int FMT, int NT, int LPR>
 __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                     size_t blob, size_t down_off, size_t drow, ROff o, int F, int E,
                                                     const int8_t * __restrict__ hq, const float * __restrict__ hd,
                                                     float * __restrict__ part) {
-    extern __shared__ __align__(16) uint8_t sm[];
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
-    const HitEntry & h = hits->e[ent];
-    const uint32_t mask = h.mask;
+    int n;
+    const uint32_t tp = pack_tokens(hits->e[ent].mask, n);
     const int nb = F / 32;
-    int8_t * hqs = (int8_t *) sm;
-    float * hds = (float *) (sm + (size_t) NT * F);
-    for (int t = 0; t < NT; ++t) {
-        if (!(mask & (1u << t))) continue;
-        const size_t b = (size_t) ent * kMaxWindow + t;
-        for (int i = threadIdx.x; i < F / 16; i += blockDim.x) ((int4 *) (hqs + (size_t) t * F))[i] = ((const int4 *) (hq + b * F))[i];
-        for (int i = threadIdx.x; i < nb; i += blockDim.x) hds[t * nb + i] = hd[b * nb + i];
-    }
     rt_tables_load<FMT>();
     __syncthreads();
     constexpr int RPW = 32 / LPR;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int sub = lane % LPR;
-    const int r = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR;
-    const bool ok = r < E;
-    float acc[NT];
+    const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, E - 1);
+    const uint8_t * row = base + (size_t) hits->e[ent].slot * blob + down_off + (size_t) r * drow;
+    const size_t b0 = (size_t) ent * kMaxWindow;
+    for (int p0 = 0; p0 < n; p0 += 4) {   // up to 4 tokens per pass, as above
+        const uint32_t tq = tp >> (4 * p0);
+        float acc[4];
+        row_dots_n<FMT, NT, LPR>(min(4, n - p0), row, o, nb, sub, tq, hq + b0 * F, F, hd + b0 * nb, nb, acc);
+        if (sub == 0 && r0 < E) {
 #pragma unroll
-    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
-    if (ok) {
-        const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
-        for (int sb = sub; sb < nb; sb += LPR) {
-            Unpacked u;
-            unpack_sm<FMT>(row, o, sb, u);
-#pragma unroll
-            for (int t = 0; t < NT; ++t) {
-                if (mask & (1u << t)) {
-                    const int4 * ap = (const int4 *) (hqs + (size_t) t * F + sb * 32);
-                    acc[t] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], hds[t * nb + sb]);
-                }
-            }
+            for (int i = 0; i < 4; ++i)
+                if (p0 + i < n) part[(b0 + ((tq >> (4 * i)) & 15)) * E + r] = acc[i];
         }
-    }
-#pragma unroll
-    for (int t = 0; t < NT; ++t) {
-#pragma unroll
-        for (int off = LPR / 2; off > 0; off >>= 1) acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off);
-    }
-    if (ok && sub == 0) {
-#pragma unroll
-        for (int t = 0; t < NT; ++t)
-            if (mask & (1u << t)) part[((size_t) ent * kMaxWindow + t) * E + r] = acc[t];
     }
 }
 
@@ -338,20 +334,16 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
                           cudaStream_t st) {
     const int maxent = T * k;
     const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
-    const size_t smg = (size_t) NT * E + (size_t) NT * (E / 32) * 4;
-    const size_t smd = (size_t) NT * F + (size_t) NT * (F / 32) * 4;
     auto gu = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
-            static const bool stage = getenv("BNK_MOE_STAGE") && atoi(getenv("BNK_MOE_STAGE")) != 0;
-            if (stage)
-                moe_gu_r_k<FMT, NT, LPR, true><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, smg, st>>>(
-                    s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
-            else
-                moe_gu_r_k<FMT, NT, LPR, false><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, 0, st>>>(
-                    s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+            moe_gu_r_k<FMT, NT, LPR><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, 0, st>>>(
+                s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
         };
-        switch (lpr_for(E / 32)) {
+        // several tokens: 8 lanes per row (more rows in flight per warp; bench_moe, 5 tokens: 187 -> 179 us on an
+        // IQ2_S layer); one token: lpr_for (16 for 2,560 columns), which is faster there
+        static const int lpr_env = getenv("BNK_MOE_LPR") ? atoi(getenv("BNK_MOE_LPR")) : 0;
+        switch (lpr_env ? lpr_env : NT == 1 ? lpr_for(E / 32) : std::min(8, lpr_for(E / 32))) {
             case 32: L.template operator()<32>(); break;
             case 16: L.template operator()<16>(); break;
             case 8: L.template operator()<8>(); break;
@@ -363,7 +355,7 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
     auto dn = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
-            moe_down_r_k<FMT, NT, LPR><<<dim3(maxent, (E + rows - 1) / rows), 256, smd, st>>>(
+            moe_down_r_k<FMT, NT, LPR><<<dim3(maxent, (E + rows - 1) / rows), 256, 0, st>>>(
                 s.hits, d.base, d.blob, d.gate_bytes + d.up_bytes, d.drow, dof, F, E, s.hq, s.hd, s.part);
         };
         switch (lpr_for(F / 32)) {
