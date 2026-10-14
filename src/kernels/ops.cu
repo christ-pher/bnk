@@ -91,18 +91,33 @@ __device__ __forceinline__ void quant4_store(float4 v, int64_t i, ActQ8 q) {
     }
 }
 
-template <int P, bool Q = false>
+// C (HC rows only, wstride_rows = hc): first x += out[t] * 2 sigmoid(inj[t][s] / hc), as hc_combine, written back to x
+// (x is not const then)
+template <int P, bool Q = false, bool C = false>
 __global__ void rmsnorm_rows_v_k(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
-                                 int n, int64_t ldx, int64_t ldy, int64_t wstride_rows, float eps, ActQ8 q = {}) {
+                                 int n, int64_t ldx, int64_t ldy, int64_t wstride_rows, float eps, ActQ8 q = {},
+                                 const float * __restrict__ cout = nullptr, const float * __restrict__ cinj = nullptr) {
     __shared__ float sh[32];
     const int r = blockIdx.x, n4 = n / 4;
     const float4 * xr = (const float4 *) (x + r * ldx);
+    float cw = 0.f;
+    if constexpr (C) cw = 2.f * sigmoidf_(cinj[r] / (float) wstride_rows);   // inj[t * hc + s], r = t * hc + s
     float4 v[P];
     float ss = 0.f;
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         const int i = threadIdx.x + p * blockDim.x;
         v[p] = i < n4 ? xr[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+        if constexpr (C) {
+            if (i < n4) {
+                const float4 o = ((const float4 *) (cout + (int64_t) (r / wstride_rows) * n))[i];
+                v[p].x += o.x * cw;
+                v[p].y += o.y * cw;
+                v[p].z += o.z * cw;
+                v[p].w += o.w * cw;
+                ((float4 *) (const_cast<float *>(x) + r * ldx))[i] = v[p];
+            }
+        }
         ss += v[p].x * v[p].x + v[p].y * v[p].y + v[p].z * v[p].z + v[p].w * v[p].w;
     }
     ss = block_sum(ss, sh);
@@ -142,24 +157,31 @@ static void rmsnorm_launch(const float * x, const float * w, float * y, int rows
     }
 }
 
-void hc_norm_q(const float * res, const float * w, float * xn, int T, int hc, int E, float eps, ActQ8 & q,
-               cudaStream_t s) {
+void hc_norm_q(float * res, const float * w, float * xn, int T, int hc, int E, float eps, ActQ8 & q, cudaStream_t s,
+               const float * comb_out, const float * comb_inj) {
     const int n4 = E / 4;
     int P = 1;
     while (P < 8 && (n4 + P - 1) / P > 512) P *= 2;
     const int threads = (n4 + P - 1) / P;
     if (E % 128 || threads % 32 || getenv("BNK_RMSNORM_SCALAR")) {   // whole warps over whole quant blocks only
+        if (comb_out) hc_combine(res, comb_out, comb_inj, T, hc, E, s);
         hc_norm(res, w, xn, T, hc, E, eps, s);
         quantize_act(xn, (int64_t) hc * E, T, (int64_t) hc * E, q, s);
         return;
     }
     q.T = T;
     q.cols = q.cols_pad = (int64_t) hc * E;
+    auto L = [&]<int PP>() {
+        if (comb_out)
+            rmsnorm_rows_v_k<PP, true, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q, comb_out, comb_inj);
+        else
+            rmsnorm_rows_v_k<PP, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q);
+    };
     switch (P) {
-        case 1: rmsnorm_rows_v_k<1, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
-        case 2: rmsnorm_rows_v_k<2, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
-        case 4: rmsnorm_rows_v_k<4, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
-        default: rmsnorm_rows_v_k<8, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q);
+        case 1: L.template operator()<1>(); break;
+        case 2: L.template operator()<2>(); break;
+        case 4: L.template operator()<4>(); break;
+        default: L.template operator()<8>();
     }
 }
 

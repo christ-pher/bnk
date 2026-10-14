@@ -765,14 +765,16 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     const int E = c.n_embd, HC = c.hc_dim();
     // the norm quantizes its output for down / inject in the same pass (BNK_FUSE_QUANT=0: separately)
     static const bool fuse = !getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0;
-    if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type))) {
-        if (fuse) hc_norm_q(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, act_, st_);
-        else {
-            hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
-            quantize_act(xn_, HC, T, HC, act_, st_);
-        }
+    // a pending hc_combine (the previous block's output into res_) goes into the same pass when fused
+    const float * pend = pend_out_;
+    pend_out_ = nullptr;
+    if (fuse && (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))) {
+        hc_norm_q(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, act_, st_, pend, inj_);
     } else {
+        if (pend) hc_combine(res_, pend, inj_, T, c.hc, E, st_);
         hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
+        if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))
+            quantize_act(xn_, HC, T, HC, act_, st_);
     }
     // the inject projection beside down -> up -> mix (only when up does not quantize into act_, which inject reads)
     const bool side = want_inject && is_float_format(w.up.type);
@@ -1109,17 +1111,27 @@ void Engine::head(int T) {
 void Engine::layer_forward(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    if (il == c.ple_layer) ple(il, T);
+    if (il == c.ple_layer) {   // the PLE adds into res_: a pending combine first
+        if (pend_out_) hc_combine(res_, pend_out_, inj_, T, c.hc, c.n_embd, st_);
+        pend_out_ = nullptr;
+        ple(il, T);
+    }
     hc_pre(L.hc_attn, T, true);
     if (L.attn) attn(il, T); else gdn(il, T);
-    hc_combine(res_, out_, inj_, T, c.hc, c.n_embd, st_);
+    // the combines go into the next norm's pass (hc_pre) where one follows: after the attention always, after the
+    // MoE unless this is the stage's last layer (the residual leaves the stage) or layers are being dumped
+    static const bool defer = (!getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0) && !getenv("BNK_DUMP_DIR");
+    const bool dfr = defer && !head_->dump_all;
+    if (dfr) pend_out_ = out_;
+    else hc_combine(res_, out_, inj_, T, c.hc, c.n_embd, st_);
     dbg(st_, il, "hc_combine", res_, (size_t) T * c.hc_dim());
     hc_pre(L.hc_ffn, T, true);
     dbg(st_, il, "hc_mixed_ffn", mixed_, (size_t) T * c.n_embd);
     dbg(st_, il, "hc_inject_ffn", inj_, (size_t) T * c.hc);
     moe(il, T);
     dbg(st_, il, "ffn_out", moe_out_, (size_t) T * c.n_embd);
-    hc_combine(res_, moe_out_, inj_, T, c.hc, c.n_embd, st_);
+    if (dfr && il + 1 < l1_) pend_out_ = moe_out_;
+    else hc_combine(res_, moe_out_, inj_, T, c.hc, c.n_embd, st_);
     dbg(st_, il, "l_last", res_, (size_t) T * c.hc_dim());
     if (head_->dump_all) {
         auto & dl = head_->dumped_layers;
@@ -1142,6 +1154,7 @@ void Engine::enqueue_forward(int T) {
     } else {
         CUDA_CHECK(cudaMemcpyAsync(res_.p, xfer_in_[lane_], rows, cudaMemcpyHostToDevice, st_));
     }
+    pend_out_ = nullptr;
     for (int il = l0_; il < l1_; ++il) layer_forward(il, T);
     if (last_) head(T);
     else CUDA_CHECK(cudaMemcpyAsync(xfer_out_[lane_], res_.p, rows, cudaMemcpyDeviceToHost, st_));
