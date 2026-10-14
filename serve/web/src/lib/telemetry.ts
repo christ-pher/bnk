@@ -7,8 +7,16 @@ import { useEffect, useState, useSyncExternalStore } from "react"
 
 export type Phase = "idle" | "prefill" | "decode"
 
+export interface Peak {
+  value: number // tok/s
+  t: number // when it was set
+  active?: number // decode: requests decoding together
+  tokens?: number // prompt: new tokens read
+}
+
 export interface Live {
   t: number
+  peaks?: { decode?: Peak; prefill?: Peak } // records since the server started
   active?: number // requests in flight (reading or generating)
   model: string
   phase: Phase

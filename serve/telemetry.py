@@ -161,6 +161,7 @@ class CpuSampler:
 
 class Telemetry:
     HISTORY = 3600  # seconds kept at 1 s
+    PEAK_PROMPT_MIN = 1000
 
     def __init__(self):
         self.latest: dict = {}
@@ -177,6 +178,10 @@ class Telemetry:
         self.decoding = None
         self._conv_prev: dict[int, tuple[float, int]] = {}
         self._conv_tps: dict[int, collections.deque] = {}
+        # records since the server started: decode (every request together, 5 s of uninterrupted decoding, as the
+        # dashboard's decode number) and prompt reads (a whole prompt of PEAK_PROMPT_MIN new tokens or more)
+        self.peaks: dict = {}
+        self._dec5: collections.deque = collections.deque(maxlen=5)
         threading.Thread(target=self._sampler, daemon=True).start()
 
     # the engine's telemetry lines arrive here (engine reader thread)
@@ -193,7 +198,14 @@ class Telemetry:
             m = dict(self.latest)
         m["gpu"] = self.gpu.latest
         m["cores"] = self.cores
+        m["peaks"] = self.peaks
         return m
+
+    def on_request(self, rec: dict):
+        """A finished request: its prompt read may set the prompt-processing record."""
+        tps, new = rec.get("prefill_tps"), (rec.get("prompt_tokens") or 0) - (rec.get("reused") or 0)
+        if tps and new >= self.PEAK_PROMPT_MIN and tps > (self.peaks.get("prefill") or {}).get("value", 0):
+            self.peaks = {**self.peaks, "prefill": {"value": round(tps, 1), "t": rec.get("time"), "tokens": new}}
 
     def _rate(self, a: dict, b: dict) -> dict:
         la, lb = a.get("life", {}), b.get("life", {})
@@ -244,6 +256,12 @@ class Telemetry:
                  "gpu_temp_c": g.get("temp_c"), "pcie_rx_mbs": g.get("pcie_rx_mbs"),
                  "pcie_tx_mbs": g.get("pcie_tx_mbs"), "pos": cur.get("pos")}
             s["reqs"] = self._per_request()
+            self._dec5.append(r.get("gen_tps_total"))
+            if len(self._dec5) == 5 and all(v is not None for v in self._dec5):
+                v = sum(self._dec5) / 5
+                if v > (self.peaks.get("decode") or {}).get("value", 0):
+                    self.peaks = {**self.peaks, "decode": {"value": round(v, 1), "t": s["t"],
+                                                           "active": cur.get("active", 0)}}
             # each GPU's own readings when there are several (the fields above sum them up or take the hottest)
             per = g.get("gpus") or []
             if len(per) > 1:

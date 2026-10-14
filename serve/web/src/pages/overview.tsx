@@ -9,7 +9,17 @@ import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
 import { fmt } from "@/lib/format"
 import { headline } from "@/lib/metrics"
-import { useTelemetry, useUptime, windowed, type Range } from "@/lib/telemetry"
+import { useTelemetry, useUptime, windowed, type Peak, type Range } from "@/lib/telemetry"
+
+// a record since the server started: the value, and when (and over what) it was set
+function PeakLine({ peak, what }: { peak?: Peak; what: (p: Peak) => string }) {
+  if (!peak) return null
+  return (
+    <span title={`Set at ${fmt.clock(peak.t)}${what(peak) ? ` · ${what(peak)}` : ""}`}>
+      Peak <span className="font-medium text-foreground tabular">{fmt.n(peak.value, 1)} tok/s</span> · {fmt.ago(peak.t)}
+    </span>
+  )
+}
 
 export function OverviewPage({ range }: { range: Range }) {
   const live = useTelemetry((s) => s.live)
@@ -30,20 +40,26 @@ export function OverviewPage({ range }: { range: Range }) {
           unit="tok/s"
           action={<SourceBadge source={h.decode.source} />}
           footer={
-            h.requests.length > 1 ? (
-              <ul className="flex w-full flex-col gap-0.5">
-                {h.requests.map((q) => (
-                  <li key={q.conv} className="flex items-baseline justify-between gap-3">
-                    <span className="min-w-0 truncate" title={q.label}>
-                      #{q.conv} {q.label}
-                    </span>
-                    <span className="shrink-0 font-medium text-foreground tabular">{fmt.n(q.tps, 1)} tok/s</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <span>All requests together, generated tokens per second, speculation included</span>
-            )
+            <>
+              <PeakLine
+                peak={live?.peaks?.decode}
+                what={(p) => (p.active && p.active > 1 ? `${p.active} requests together` : "")}
+              />
+              {h.requests.length > 1 ? (
+                <ul className="flex w-full flex-col gap-0.5">
+                  {h.requests.map((q) => (
+                    <li key={q.conv} className="flex items-baseline justify-between gap-3">
+                      <span className="min-w-0 truncate" title={q.label}>
+                        #{q.conv} {q.label}
+                      </span>
+                      <span className="shrink-0 font-medium text-foreground tabular">{fmt.n(q.tps, 1)} tok/s</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <span>All requests together, generated tokens per second, speculation included</span>
+              )}
+            </>
           }
         >
           <Sparkline values={spark.map((s) => s.gen_tps_total ?? null)} color="var(--chart-1)" />
@@ -53,7 +69,12 @@ export function OverviewPage({ range }: { range: Range }) {
           value={fmt.n(h.prefill.value, 0)}
           unit="tok/s"
           action={<SourceBadge source={h.prefill.source} />}
-          footer={<span>New prompt tokens per second (reused prefix excluded)</span>}
+          footer={
+            <>
+              <PeakLine peak={live?.peaks?.prefill} what={(p) => (p.tokens ? `${fmt.n(p.tokens)}-token prompt` : "")} />
+              <span>New prompt tokens per second (reused prefix excluded)</span>
+            </>
+          }
         >
           <Sparkline values={spark.map((s) => s.prefill_tps)} color="var(--chart-2)" />
         </StatCard>

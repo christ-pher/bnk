@@ -295,6 +295,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
            "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, "conversation": cid,
            "wall_s": time.time() - t0, **timings}
     S.recent.append(rec)
+    S.telemetry.on_request(rec)
     S.telemetry.bus.publish("request", rec)
     S.convs.end(cid, tail, rec)
     return content, parser.reasoning_all, calls, finish, usage, timings
