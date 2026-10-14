@@ -244,6 +244,14 @@ class Telemetry:
                  "gpu_temp_c": g.get("temp_c"), "pcie_rx_mbs": g.get("pcie_rx_mbs"),
                  "pcie_tx_mbs": g.get("pcie_tx_mbs"), "pos": cur.get("pos")}
             s["reqs"] = self._per_request()
+            # each GPU's own readings when there are several (the fields above sum them up or take the hottest)
+            per = g.get("gpus") or []
+            if len(per) > 1:
+                vram = {d.get("device"): d.get("vram_used_mb") for d in cur.get("gpus") or []}
+                s["gpus"] = [{"util": x.get("util"), "power_w": x.get("power_w"), "temp_c": x.get("temp_c"),
+                              "sm_clock": x.get("sm_clock"), "pcie_rx_mbs": x.get("pcie_rx_mbs"),
+                              "pcie_tx_mbs": x.get("pcie_tx_mbs"), "vram_used_mb": vram.get(x.get("index"))}
+                             for x in per]
             self.history.append(s)
             if cur.get("layer_routed") is not None:
                 self.layer_hist.append((cur.get("t", 0), cur["layer_routed"], cur["layer_misses"]))

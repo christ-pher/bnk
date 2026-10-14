@@ -116,6 +116,17 @@ export interface Sample {
   pcie_tx_mbs: number | null
   pos: number
   reqs?: RequestSpeed[] // each conversation generating in this second, its own speed over the last 5 s
+  gpus?: GpuSample[] // each GPU's own readings when there are several
+}
+
+export interface GpuSample {
+  util: number | null
+  power_w: number | null
+  temp_c: number | null
+  sm_clock: number | null
+  pcie_rx_mbs: number | null
+  pcie_tx_mbs: number | null
+  vram_used_mb: number | null
 }
 
 export interface RequestSpeed {
@@ -192,7 +203,16 @@ export interface Overview {
   waiting: number
   defaults: { temperature: number; top_k: number; top_p: number }
   engine: { n_ctx: number; n_vocab: number; mtp: boolean; name: string; args: string[] }
-  gpu: { name?: string; power_limit_w?: number; sm_clock_max?: number; pcie_gen?: number; pcie_width?: number; driver?: string }
+  gpu: {
+    name?: string
+    power_limit_w?: number
+    sm_clock_max?: number
+    pcie_gen?: number
+    pcie_width?: number
+    driver?: string
+    count?: number
+    gpus?: { name: string; power_limit_w: number | null }[] // each GPU (the above sums the limits)
+  }
   live: Live
   history: Sample[]
   recent: RequestRecord[]
