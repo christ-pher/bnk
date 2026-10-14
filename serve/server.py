@@ -83,6 +83,7 @@ class State:
         self.engine = Engine(args.engine, eargs, log_path=args.log, on_telemetry=self.telemetry.on_engine,
                              on_log=lambda line: self.telemetry.bus.publish("log", {"t": time.time(), "line": line}))
         self.convs = Conversations(self.tok, self.im_start, self.telemetry.bus.publish, parking=args.park_gib > 0)
+        self.telemetry.decoding = self.convs.decoding
 
 
 S: State | None = None
@@ -180,6 +181,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                     continue
                 generated.extend(ev["ids"])
                 tail.extend(ev["ids"])
+                S.convs.produced(cid, len(ev["ids"]))
                 piece = dec.feed(ev["ids"])
                 with S.lock:
                     if S.active:

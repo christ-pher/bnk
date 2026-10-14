@@ -173,6 +173,10 @@ class Telemetry:
         self.layer_hist: collections.deque = collections.deque(maxlen=self.HISTORY + 60)  # (t, routed, misses)
         self._last_live = 0.0
         self.lock = threading.Lock()
+        # per-request speeds: the server sets `decoding` (conversations generating now, with their token counts)
+        self.decoding = None
+        self._conv_prev: dict[int, tuple[float, int]] = {}
+        self._conv_tps: dict[int, collections.deque] = {}
         threading.Thread(target=self._sampler, daemon=True).start()
 
     # the engine's telemetry lines arrive here (engine reader thread)
@@ -239,10 +243,33 @@ class Telemetry:
                  "cpu": round(cpu, 1), "gpu_util": g.get("util"), "gpu_power_w": g.get("power_w"),
                  "gpu_temp_c": g.get("temp_c"), "pcie_rx_mbs": g.get("pcie_rx_mbs"),
                  "pcie_tx_mbs": g.get("pcie_tx_mbs"), "pos": cur.get("pos")}
+            s["reqs"] = self._per_request()
             self.history.append(s)
             if cur.get("layer_routed") is not None:
                 self.layer_hist.append((cur.get("t", 0), cur["layer_routed"], cur["layer_misses"]))
             self.bus.publish("sample", s)
+
+    def _per_request(self) -> list[dict]:
+        """Each generating conversation's tokens per second of wall time over the last 5 s (the same window as the
+        dashboard's combined rate, so the requests add up to it)."""
+        if self.decoding is None:
+            return []
+        now = time.time()
+        out, seen = [], set()
+        for cid, label, n in self.decoding():
+            seen.add(cid)
+            prev = self._conv_prev.get(cid)
+            self._conv_prev[cid] = (now, n)
+            if prev is None or now <= prev[0]:
+                continue
+            q = self._conv_tps.setdefault(cid, collections.deque(maxlen=5))
+            q.append(max(0, n - prev[1]) / (now - prev[0]))
+            out.append({"conv": cid, "label": label, "tps": round(sum(q) / len(q), 2)})
+        for cid in list(self._conv_prev):
+            if cid not in seen:
+                self._conv_prev.pop(cid, None)
+                self._conv_tps.pop(cid, None)
+        return out
 
     def layer_window(self, seconds: float | None) -> dict:
         """Per-layer expert uses and CPU misses over the last `seconds` (None: since the engine started)."""

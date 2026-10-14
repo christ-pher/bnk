@@ -30,17 +30,23 @@ export function OverviewPage({ range }: { range: Range }) {
           unit="tok/s"
           action={<SourceBadge source={h.decode.source} />}
           footer={
-            h.combined ? (
-              <span>
-                <span className="font-medium text-foreground tabular">{fmt.n(h.combined.value, 1)} tok/s</span> combined across{" "}
-                {h.combined.active} requests
-              </span>
+            h.requests.length > 1 ? (
+              <ul className="flex w-full flex-col gap-0.5">
+                {h.requests.map((q) => (
+                  <li key={q.conv} className="flex items-baseline justify-between gap-3">
+                    <span className="min-w-0 truncate" title={q.label}>
+                      #{q.conv} {q.label}
+                    </span>
+                    <span className="shrink-0 font-medium text-foreground tabular">{fmt.n(q.tps, 1)} tok/s</span>
+                  </li>
+                ))}
+              </ul>
             ) : (
-              <span>Generated tokens per second, speculation included</span>
+              <span>All requests together, generated tokens per second, speculation included</span>
             )
           }
         >
-          <Sparkline values={spark.map((s) => s.gen_tps)} color="var(--chart-1)" />
+          <Sparkline values={spark.map((s) => s.gen_tps_total ?? null)} color="var(--chart-1)" />
         </StatCard>
         <StatCard
           label="Prompt processing"

@@ -115,6 +115,13 @@ export interface Sample {
   pcie_rx_mbs: number | null
   pcie_tx_mbs: number | null
   pos: number
+  reqs?: RequestSpeed[] // each conversation generating in this second, its own speed over the last 5 s
+}
+
+export interface RequestSpeed {
+  conv: number
+  label: string
+  tps: number
 }
 
 export interface RequestRecord {

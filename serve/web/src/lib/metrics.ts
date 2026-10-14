@@ -1,5 +1,5 @@
 // Headline numbers derived from the live snapshot, the 1 s history and the finished requests.
-import type { Live, RequestRecord, Sample } from "./telemetry"
+import type { Live, RequestRecord, RequestSpeed, Sample } from "./telemetry"
 
 export interface Headline {
   decode: { value: number | null; source: "live" | "last" | "none" }
@@ -8,7 +8,7 @@ export interface Headline {
   tokensPerRound: number | null
   hitRate: number | null // share of expert uses served from VRAM, last minute (lifetime when idle long)
   hitRateLifetime: number | null
-  combined: { value: number; active: number } | null // all requests in flight together (2 or more)
+  requests: RequestSpeed[] // each request generating now, its own speed (they add up to decode while live)
 }
 
 function mean(xs: (number | null | undefined)[]): number | null {
@@ -16,13 +16,10 @@ function mean(xs: (number | null | undefined)[]): number | null {
   return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null
 }
 
-// Several requests decoded together share each step, so each one's own rate understates the server: the tokens all
-// of them generated per second of wall time, over the last 5 s.
-function combinedRate(live: Live | null, history: Sample[]): Headline["combined"] {
-  const active = live?.active ?? 0
-  if (active < 2) return null
-  const v = mean(history.slice(-5).map((s) => s.gen_tps_total ?? null))
-  return v != null ? { value: v, active } : null
+// While generating: the tokens every request in flight produced per second of wall time, over the last 5 s (several
+// requests decoded together share each step, so any one request's rate understates the server).
+function totalRate(history: Sample[]): number | null {
+  return mean(history.slice(-5).map((s) => s.gen_tps_total ?? null))
 }
 
 export function headline(live: Live | null, history: Sample[], recent: RequestRecord[]): Headline {
@@ -30,7 +27,10 @@ export function headline(live: Live | null, history: Sample[], recent: RequestRe
   const minute = history.slice(-60)
   const r = live?.req
   let decode: Headline["decode"] = { value: null, source: "none" }
-  if (live?.phase === "decode" && r && r.gen_ms > 400 && r.gen_tokens > 1) {
+  const total = live?.phase === "decode" ? totalRate(history) : null
+  if (total != null) {
+    decode = { value: total, source: "live" }
+  } else if (live?.phase === "decode" && r && r.gen_ms > 400 && r.gen_tokens > 1) {
     decode = { value: (r.gen_tokens - 1) / (r.gen_ms / 1000), source: "live" }
   } else if (last?.tps) {
     decode = { value: last.tps, source: "last" }
@@ -61,6 +61,6 @@ export function headline(live: Live | null, history: Sample[], recent: RequestRe
     tokensPerRound: tpr,
     hitRate: recentMiss != null ? 1 - recentMiss : lifeHit,
     hitRateLifetime: lifeHit,
-    combined: combinedRate(live, history),
+    requests: live?.phase === "decode" ? (history.length ? (history[history.length - 1].reqs ?? []) : []) : [],
   }
 }

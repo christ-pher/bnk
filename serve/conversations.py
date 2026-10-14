@@ -46,6 +46,7 @@ class Conversation:
         self.turns: collections.deque = collections.deque(maxlen=MAX_TURNS)
         self.n_turns = 0
         self.gen_total = 0
+        self.produced = 0            # tokens generated, counted as they stream (the dashboard's per-request speed)
         self.read_ms_total = 0.0
         self.last_active = self.created
 
@@ -144,6 +145,17 @@ class Conversations:
                                                      "gen_tokens", "tps", "slices", "finish", "wall_s")})
             self._set(c, "idle")
         self._push()
+
+    def produced(self, cid: int, n: int):
+        with self.lock:
+            c = self.items.get(cid)
+            if c:
+                c.produced += n
+
+    def decoding(self) -> list[tuple[int, str, int]]:
+        """(id, label, tokens generated so far) of every conversation generating now."""
+        with self.lock:
+            return [(c.id, c.label, c.produced) for c in self.items.values() if c.status == "generating"]
 
     def snapshot(self) -> list[dict]:
         with self.lock:
