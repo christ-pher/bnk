@@ -11,6 +11,16 @@ import { fmt } from "@/lib/format"
 import { headline } from "@/lib/metrics"
 import { useTelemetry, useUptime, windowed, type Peak, type Range } from "@/lib/telemetry"
 
+// the average since the server started, over the time spent on that work (idle time left out)
+function AverageLine({ value }: { value?: number | null }) {
+  if (value == null) return null
+  return (
+    <span title="Since the server started, over the time spent on this work (idle time left out)">
+      Average <span className="font-medium text-foreground tabular">{fmt.n(value, 1)} tok/s</span>
+    </span>
+  )
+}
+
 // a record since the server started: the value, and when (and over what) it was set
 function PeakLine({ peak, what }: { peak?: Peak; what: (p: Peak) => string }) {
   if (!peak) return null
@@ -45,6 +55,7 @@ export function OverviewPage({ range }: { range: Range }) {
                 peak={live?.peaks?.decode}
                 what={(p) => (p.active && p.active > 1 ? `${p.active} requests together` : "")}
               />
+              <AverageLine value={live?.averages?.decode} />
               {h.requests.length > 1 ? (
                 <ul className="flex w-full flex-col gap-0.5">
                   {h.requests.map((q) => (
@@ -72,6 +83,7 @@ export function OverviewPage({ range }: { range: Range }) {
           footer={
             <>
               <PeakLine peak={live?.peaks?.prefill} what={(p) => (p.tokens ? `${fmt.n(p.tokens)}-token prompt` : "")} />
+              <AverageLine value={live?.averages?.prefill} />
               <span>New prompt tokens per second (reused prefix excluded)</span>
             </>
           }

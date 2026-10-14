@@ -17,6 +17,7 @@ export interface Peak {
 export interface Live {
   t: number
   peaks?: { decode?: Peak; prefill?: Peak } // records since the server started
+  averages?: { decode: number | null; prefill: number | null } // tok/s since the server started (time at work only)
   active?: number // requests in flight (reading or generating)
   model: string
   phase: Phase

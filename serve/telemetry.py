@@ -182,6 +182,9 @@ class Telemetry:
         # dashboard's decode number) and prompt reads (a whole prompt of PEAK_PROMPT_MIN new tokens or more)
         self.peaks: dict = {}
         self._dec5: collections.deque = collections.deque(maxlen=5)
+        # averages since the server started: decode over the seconds anything decoded (every request together),
+        # prompt reads over the time spent reading (every prompt, weighted by its new tokens)
+        self._avg = {"dec_tokens": 0, "dec_s": 0.0, "pf_tokens": 0, "pf_ms": 0.0}
         threading.Thread(target=self._sampler, daemon=True).start()
 
     # the engine's telemetry lines arrive here (engine reader thread)
@@ -199,11 +202,17 @@ class Telemetry:
         m["gpu"] = self.gpu.latest
         m["cores"] = self.cores
         m["peaks"] = self.peaks
+        a = self._avg
+        m["averages"] = {"decode": a["dec_tokens"] / a["dec_s"] if a["dec_s"] > 0 else None,
+                         "prefill": a["pf_tokens"] / (a["pf_ms"] / 1000) if a["pf_ms"] > 0 else None}
         return m
 
     def prompt_read(self, new_tokens: int, ms: float):
         """A prompt read just finished (as the request starts generating): it may set the prompt-processing record."""
         tps = new_tokens / (ms / 1000) if ms > 0 else 0
+        if new_tokens > 0 and ms > 0:
+            self._avg["pf_tokens"] += new_tokens
+            self._avg["pf_ms"] += ms
         if new_tokens >= self.PEAK_PROMPT_MIN and tps > (self.peaks.get("prefill") or {}).get("value", 0):
             self.peaks = {**self.peaks, "prefill": {"value": round(tps, 1), "t": time.time(), "tokens": new_tokens}}
 
@@ -224,7 +233,7 @@ class Telemetry:
                # decoded in one batch each count the whole step)
                "gen_tps_total": d("gen_tokens") / dt if d("gen_tokens") > 0 else None,
                "prefill_tps": d("prefill_tokens") / (pms / 1000) if pms > 50 and d("prefill_tokens") > 0 else None,
-               "gen_tokens": d("gen_tokens"), "prefill_tokens": d("prefill_tokens")}
+               "gen_tokens": d("gen_tokens"), "prefill_tokens": d("prefill_tokens"), "gen_s": gms / 1000, "dt": dt}
         out["accept"] = d("accepted") / d("drafted") if d("drafted") > 0 else None
         out["tokens_per_round"] = d("gen_tokens") / d("rounds") if d("rounds") > 0 else None
         out["miss_rate"] = d("misses") / d("routed") if d("routed") > 0 else None
@@ -257,6 +266,13 @@ class Telemetry:
                  "pcie_tx_mbs": g.get("pcie_tx_mbs"), "pos": cur.get("pos")}
             s["reqs"] = self._per_request()
             self._dec5.append(r.get("gen_tps_total"))
+            if r.get("gen_tps_total") is not None:
+                # the wall time spent decoding in this interval: the engine's decode time is summed over the requests
+                # decoding together, so divided by how many there were (a request that starts or ends mid-second
+                # counts only its part of it)
+                n = max(1, len(s["reqs"]) or cur.get("active", 1))
+                self._avg["dec_tokens"] += r.get("gen_tokens", 0)
+                self._avg["dec_s"] += min(r["dt"], r["gen_s"] / n)
             if len(self._dec5) == 5 and all(v is not None for v in self._dec5):
                 v = sum(self._dec5) / 5
                 if v > (self.peaks.get("decode") or {}).get("value", 0):
