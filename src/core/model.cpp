@@ -124,7 +124,7 @@ QMat Model::upload(const std::string & name, bool required) {
     static const bool keep_bf16 = getenv("BNK_KEEP_BF16") != nullptr;
     // (not the router: its fp32 path picks the experts, and stays exact)
     if (!keep_bf16 && t->type == GGML_TYPE_BF16 && t->nrows() >= 2 && t->ne[0] % 32 == 0 &&
-        name.find("ffn_gate_inp") == std::string::npos) {
+        (name.find("ffn_gate_inp") == std::string::npos || getenv("BNK_ROUTER_F16"))) {
         const int64_t n = t->nrows() * t->ne[0];
         std::vector<float> f((size_t) n);
         ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, f.data(), n);

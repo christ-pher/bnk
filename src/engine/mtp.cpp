@@ -3,10 +3,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 #include "ggml.h"
 #include "kernels/ops.h"
 #include "kernels/qsa.h"
+#include "kernels/rfmt.h"
 
 namespace bnk {
 
@@ -263,7 +266,42 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
                 if (v >= 0 && v < c.n_vocab) ids.push_back(v);
             fclose(f);
             const QMat & H = main.output;
-            if (!ids.empty() && H.row_bytes % 16 == 0) {
+            // The draft head's rows re-quantized to Q4_K (BNK_DRAFT_HEAD=TYPE another type, =keep the model's own):
+            // they are read once per draft step (Q6_K: ~300 MB, 0.33 ms of a 0.82 ms step; Q4_K: step 0.72 ms, the
+            // same acceptance, ~1.5 s more to load). Drafts only propose; the main model decides.
+            const char * dh = getenv("BNK_DRAFT_HEAD") ? getenv("BNK_DRAFT_HEAD") : "q4_K";
+            const TensorRef * ht = main.gguf.find("output.weight");
+            int dt = -1;
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+                if (ggml_get_type_traits((ggml_type) t)->type_name && !strcmp(ggml_type_name((ggml_type) t), dh)) dt = t;
+            if (dt >= 0 && (!r_supported(dt) || (ht && (int) ht->type == dt) || (ht && ht->ne[0] % 256))) dt = -1;
+            if (!ids.empty() && ht && dt >= 0 && ggml_get_type_traits((ggml_type) ht->type)->to_float) {
+                n_dvocab_ = (int) ids.size();
+                CUDA_CHECK(cudaMalloc(&dvocab_, ids.size() * 4));
+                allocs_.push_back(dvocab_);
+                CUDA_CHECK(cudaMemcpy(dvocab_, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                const int64_t cols = ht->ne[0], n = (int64_t) ids.size();
+                const size_t rb = ggml_row_size((ggml_type) dt, cols);
+                std::vector<uint8_t> q(rb * n);
+                const auto * tr = ggml_get_type_traits((ggml_type) ht->type);
+                const int nth = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+                std::vector<std::thread> th;
+                for (int w = 0; w < nth; ++w)
+                    th.emplace_back([&, w]() {
+                        std::vector<float> f((size_t) cols * 64);
+                        for (int64_t r0 = (int64_t) w * 64; r0 < n; r0 += (int64_t) nth * 64) {
+                            const int64_t m = std::min<int64_t>(64, n - r0);
+                            for (int64_t i = 0; i < m; ++i)
+                                tr->to_float(ht->data + (size_t) ids[r0 + i] * ht->row_bytes(), f.data() + i * cols, cols);
+                            ggml_quantize_chunk((ggml_type) dt, f.data(), q.data() + (size_t) r0 * rb, 0, m, cols, nullptr);
+                        }
+                    });
+                for (auto & t : th) t.join();
+                void * d;
+                dhead_ = upload_matrix(q.data(), dt, n, cols, rb, true, &d);
+                allocs_.push_back(d);
+                vram_ += dhead_.row_bytes * n;
+            } else if (!ids.empty() && H.row_bytes % 16 == 0) {
                 n_dvocab_ = (int) ids.size();
                 CUDA_CHECK(cudaMalloc(&dvocab_, ids.size() * 4));
                 allocs_.push_back(dvocab_);
