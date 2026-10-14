@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "kernels/moe.h"
+#include "kernels/route.cuh"
 #include "kernels/qdot.cuh"
 #include "kernels/rfmt.cuh"
 #include "kernels/rfmt_impl.h"
@@ -25,7 +26,7 @@ void bump_seq(uint32_t * seq, cudaStream_t st) { bump_seq_k<<<1, 1, 0, st>>>(seq
 // One thread per (token, slot) pair, everything in shared memory (n = T * k <= kMaxRouted = 128). The outputs are
 // in pair order, as before: a hit entry is created by the first pair of its expert, misses keep their pair order
 // (the CPU sums a token's experts in that order, so results do not depend on this kernel's scheduling).
-__global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, const float * w, int T, int k,
+__device__ __forceinline__ void moe_plan_body(const int32_t * ids, const float * w, int T, int k,
                                                          const int32_t * slot_of, HitList * hits, MoeMsg * msg,
                                                          const float * x, int E, const uint32_t * seq,
                                                          uint32_t * counts) {
@@ -34,21 +35,26 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
     __shared__ unsigned s_mask[kMaxRouted];
     __shared__ int s_nh, s_nm;
     const int n = T * k, j = threadIdx.x;
+    const bool in = j < kMaxRouted;   // threads past kMaxRouted (a bigger block) only join the barriers
     const bool valid = j < n;
     const int e = valid ? ids[j] : -1;
     const int t = valid ? j / k : 0;
     const float wt = valid ? w[j] : 0.f;
     const int sl = valid ? slot_of[e] : -1;
     if (valid && counts) atomicAdd(&counts[e], 1u);
-    s_e[j] = e;
-    s_sl[j] = sl;
-    s_mask[j] = 0;
+    if (in) {
+        s_e[j] = e;
+        s_sl[j] = sl;
+        s_mask[j] = 0;
+    }
     __syncthreads();
     // is this pair its expert's first hit?
     bool first = valid && sl >= 0;
     for (int q = 0; first && q < j; ++q) first = s_e[q] != e;
-    s_first[j] = first;
-    s_miss[j] = valid && sl < 0;
+    if (in) {
+        s_first[j] = first;
+        s_miss[j] = valid && sl < 0;
+    }
     __syncthreads();
     // exclusive prefix sums (n <= 128: one warp walks it)
     if (j < 32) {
@@ -108,6 +114,40 @@ __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, co
         msg->seq_req = *seq;
         g_moe_ts[g_moe_layer & 63][0] = gtimer();
     }
+}
+
+__global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, const float * w, int T, int k,
+                                                         const int32_t * slot_of, HitList * hits, MoeMsg * msg,
+                                                         const float * x, int E, const uint32_t * seq,
+                                                         uint32_t * counts) {
+    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
+}
+
+// route_topk and moe_plan in one launch: warp t picks token t's experts (as route_topk_k), then the block plans
+template <int PER>
+__global__ void __launch_bounds__(256) moe_route_plan_k(const float * logits, int n_exp, float w_scale, int32_t * ids,
+                                                        float * w, int T, int k, const int32_t * slot_of,
+                                                        HitList * hits, MoeMsg * msg, const float * x, int E,
+                                                        const uint32_t * seq, uint32_t * counts) {
+    const int t = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (t < T) route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, t, lane);
+    __syncthreads();   // the ids / weights (global, this block's writes) for the plan
+    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
+}
+
+void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * ids, float * w, int T, int k,
+                    const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg, const float * x, int E, const uint32_t * seq,
+                    uint32_t * counts_layer, cudaStream_t st) {
+    if (T * k > kMaxRouted || T > 8 || k > 32 || n_exp > 1024) {
+        fprintf(stderr, "moe_route_plan: unsupported shape\n");
+        abort();
+    }
+    if (n_exp <= 512)
+        moe_route_plan_k<16><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
+                                               counts_layer);
+    else
+        moe_route_plan_k<32><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
+                                               counts_layer);
 }
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,

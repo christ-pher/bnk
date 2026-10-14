@@ -68,6 +68,10 @@ struct MoeScratch {
     uint32_t * counts = nullptr;  // [n_layer][n_expert] routing frequency (device)
 };
 
+// route_topk (logits -> ids / w) and moe_plan in one launch
+void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * ids, float * w, int T, int k,
+                    const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg, const float * x, int E, const uint32_t * seq,
+                    uint32_t * counts_layer, cudaStream_t st);
 // Builds the hit list and the CPU request (mailbox `msg`, host-mapped), then signals seq.
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s,
               MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);

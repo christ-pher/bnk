@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "kernels/ops.h"
+#include "kernels/route.cuh"
 
 namespace bnk {
 
@@ -627,54 +628,9 @@ void attention_prefill(const float * q, const half * kcache, const half * vcache
 
 // ------------------------------------------------------------------------------------------- routing
 // one warp per token, n_exp <= 1024: softmax over all experts, top-k by repeated warp argmax
-template <int PER>   // n_exp / 32 values per lane (rounded up)
+template <int PER>
 __global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale) {
-    const int t = blockIdx.x;
-    const int lane = threadIdx.x;
-    const float * lg = logits + (int64_t) t * n_exp;
-    float v[PER];
-    float mx = -FLT_MAX;
-#pragma unroll
-    for (int i = 0; i < PER; ++i) {
-        v[i] = lane + 32 * i < n_exp ? lg[lane + 32 * i] : -FLT_MAX;
-        mx = fmaxf(mx, v[i]);
-    }
-    mx = warp_max(mx);
-    float sum = 0.f;
-#pragma unroll
-    for (int i = 0; i < PER; ++i) {
-        v[i] = v[i] == -FLT_MAX ? 0.f : __expf(v[i] - mx);
-        sum += v[i];
-    }
-    sum = warp_sum(sum);
-    float wsum = 0.f;
-    float myw = 0.f;
-    int myid = 0;
-    for (int j = 0; j < k; ++j) {
-        float best = -1.f;
-        int bi = 0;
-#pragma unroll
-        for (int i = 0; i < PER; ++i)
-            if (v[i] > best) { best = v[i]; bi = lane + 32 * i; }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffff, best, o);
-            const int oi = __shfl_xor_sync(0xffffffff, bi, o);
-            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
-        }
-        // drop the winner (a static index: a runtime one put v[] in local memory)
-#pragma unroll
-        for (int i = 0; i < PER; ++i)
-            if (bi == lane + 32 * i) v[i] = -2.f;
-        const float p = best / sum;
-        wsum += p;
-        if (lane == j) { myw = p; myid = bi; }
-    }
-    if (lane < k) {
-        const float sc = (w_scale != 0.f ? w_scale : 1.f) / wsum;
-        ids[t * k + lane] = myid;
-        w[t * k + lane] = myw * sc;
-    }
+    route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, blockIdx.x, threadIdx.x);
 }
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,
                 cudaStream_t s) {

@@ -1076,11 +1076,19 @@ void Engine::moe(int il, int T) {
         sigmoid_inplace(sgate_, T, sb);
     }
     gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
-    route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
+    // the experts' choice and the hit list in one launch (BNK_FUSE_PLAN=0: two)
+    static const bool fuse_plan = !getenv("BNK_FUSE_PLAN") || atoi(getenv("BNK_FUSE_PLAN")) != 0;
+    if (fuse_plan) {
+        moe_route_plan(rlogits_, c.n_expert, c.expert_weights_scale, rids_, rw_, T, k, d, moes_, msg(il), mixed_, E,
+                       &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
+    } else {
+        route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
+        moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert,
+                 st_);
+    }
     if (route_log_)
         CUDA_CHECK(cudaMemcpyAsync(route_dev_.p + (size_t) il * kMaxWindow * k, rids_.p, (size_t) T * k * 4,
                                    cudaMemcpyDeviceToDevice, st_));
-    moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
     if (!opt_.use_graphs || dump_all) {  // eager mode: answer the CPU part right here
         CUDA_CHECK(cudaStreamSynchronize(st_));
         static const bool pstats = getenv("BNK_PREDICT_STATS") != nullptr;
