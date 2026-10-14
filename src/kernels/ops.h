@@ -1,5 +1,6 @@
 // Elementwise / normalization / attention / routing kernels. Activations are fp32, token-major [T][...].
 #pragma once
+#include "kernels/gemv.h"
 
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -15,6 +16,11 @@ void hc_norm(const float * res, const float * w, float * xn, int T, int hc, int 
 void silu_scale(float * x, int64_t n, float scale, cudaStream_t s);
 // mixed[t][e] = mean_s xn[t][s*E+e] * sigmoid(g[t][s*E+e])
 void hc_mix(const float * xn, const float * g, float * mixed, int T, int hc, int E, cudaStream_t s);
+// the same, also quantizing mixed into q (what quantize_act(mixed, E, T, E, q) would write, bit for bit)
+void hc_mix_q(const float * xn, const float * g, float * mixed, int T, int hc, int E, ActQ8 & q, cudaStream_t s);
+// hc_norm, also quantizing xn [T][hc * E] into q (as quantize_act(xn, hc * E, T, hc * E, q))
+void hc_norm_q(const float * res, const float * w, float * xn, int T, int hc, int E, float eps, ActQ8 & q,
+               cudaStream_t s);
 // res[t][s] += out[t] * 2*sigmoid(inj[t][s]/hc)
 void hc_combine(float * res, const float * out, const float * inj, int T, int hc, int E, cudaStream_t s);
 

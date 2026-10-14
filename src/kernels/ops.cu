@@ -63,9 +63,37 @@ __global__ void rmsnorm_rows_k(const float * x, const float * w, float * y, int 
 
 // The same with the row held in registers (P float4 per thread, read once) and float4 loads: rows of a few
 // thousand floats, few rows (a decode window), where the two scalar passes were latency (~9 us for 20 rows of 2,560)
-template <int P>
+// One quantized activation block of 32 values spread over 8 lanes (4 each, consecutive lanes): what quantize_act_k
+// writes for it (scale amax / 127, codes, the two 16-value code sums, the fp16 copy), bit for bit. `i` is the index of
+// this lane's first value in the activation buffer.
+__device__ __forceinline__ void quant4_store(float4 v, int64_t i, ActQ8 q) {
+    float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    const float dd = amax / 127.f;
+    const float id = dd > 0.f ? 1.f / dd : 0.f;
+    const int a = __float2int_rn(v.x * id), b = __float2int_rn(v.y * id), c = __float2int_rn(v.z * id),
+              e = __float2int_rn(v.w * id);
+    *(char4 *) (q.q + i) = make_char4((signed char) a, (signed char) b, (signed char) c, (signed char) e);
+    const int lane = threadIdx.x & 31;
+    if ((lane & 7) == 0) q.d[i / 32] = dd;
+    if (q.s) {
+        int sm = a + b + c + e;
+        sm += __shfl_xor_sync(0xffffffff, sm, 2);
+        sm += __shfl_xor_sync(0xffffffff, sm, 1);
+        if ((lane & 3) == 0) q.s[i / 16] = (int16_t) sm;
+    }
+    if (q.h) {
+        const half2 h0 = __floats2half2_rn(fminf(fmaxf(v.x, -65504.f), 65504.f), fminf(fmaxf(v.y, -65504.f), 65504.f));
+        const half2 h1 = __floats2half2_rn(fminf(fmaxf(v.z, -65504.f), 65504.f), fminf(fmaxf(v.w, -65504.f), 65504.f));
+        *(half2 *) (q.h + i) = h0;
+        *(half2 *) (q.h + i + 2) = h1;
+    }
+}
+
+template <int P, bool Q = false>
 __global__ void rmsnorm_rows_v_k(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
-                                 int n, int64_t ldx, int64_t ldy, int64_t wstride_rows, float eps) {
+                                 int n, int64_t ldx, int64_t ldy, int64_t wstride_rows, float eps, ActQ8 q = {}) {
     __shared__ float sh[32];
     const int r = blockIdx.x, n4 = n / 4;
     const float4 * xr = (const float4 *) (x + r * ldx);
@@ -84,10 +112,12 @@ __global__ void rmsnorm_rows_v_k(const float * __restrict__ x, const float * __r
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         const int i = threadIdx.x + p * blockDim.x;
-        if (i < n4) {
-            const float4 g = wr ? wr[i] : make_float4(1.f, 1.f, 1.f, 1.f);
-            yr[i] = make_float4(v[p].x * inv * g.x, v[p].y * inv * g.y, v[p].z * inv * g.z, v[p].w * inv * g.w);
-        }
+        const float4 g = wr && i < n4 ? wr[i] : make_float4(1.f, 1.f, 1.f, 1.f);
+        const float4 o = make_float4(v[p].x * inv * g.x, v[p].y * inv * g.y, v[p].z * inv * g.z, v[p].w * inv * g.w);
+        if (i < n4) yr[i] = o;
+        // rows are consecutive in q (row r at r * n): n % 32 == 0, and whole 8-lane groups are in or out of the row
+        if constexpr (Q)
+            if (i < n4) quant4_store(o, (int64_t) r * n + 4 * i, q);
     }
 }
 
@@ -109,6 +139,27 @@ static void rmsnorm_launch(const float * x, const float * w, float * y, int rows
         case 2: rmsnorm_rows_v_k<2><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps); break;
         case 4: rmsnorm_rows_v_k<4><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps); break;
         default: rmsnorm_rows_v_k<8><<<rows, threads, 0, s>>>(x, w, y, n, ldx, ldy, wstride_rows, eps);
+    }
+}
+
+void hc_norm_q(const float * res, const float * w, float * xn, int T, int hc, int E, float eps, ActQ8 & q,
+               cudaStream_t s) {
+    const int n4 = E / 4;
+    int P = 1;
+    while (P < 8 && (n4 + P - 1) / P > 512) P *= 2;
+    const int threads = (n4 + P - 1) / P;
+    if (E % 128 || threads % 32 || getenv("BNK_RMSNORM_SCALAR")) {   // whole warps over whole quant blocks only
+        hc_norm(res, w, xn, T, hc, E, eps, s);
+        quantize_act(xn, (int64_t) hc * E, T, (int64_t) hc * E, q, s);
+        return;
+    }
+    q.T = T;
+    q.cols = q.cols_pad = (int64_t) hc * E;
+    switch (P) {
+        case 1: rmsnorm_rows_v_k<1, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
+        case 2: rmsnorm_rows_v_k<2, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
+        case 4: rmsnorm_rows_v_k<4, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q); break;
+        default: rmsnorm_rows_v_k<8, true><<<T * hc, threads, 0, s>>>(res, w, xn, E, E, E, hc, eps, q);
     }
 }
 
@@ -143,6 +194,51 @@ __global__ void hc_mix_k(const float * xn, const float * g, float * mixed, int h
 }
 void hc_mix(const float * xn, const float * g, float * mixed, int T, int hc, int E, cudaStream_t s) {
     hc_mix_k<<<dim3(nblk(E, 256), T), 256, 0, s>>>(xn, g, mixed, hc, E);
+}
+
+// hc_mix and quantize_act's work on its output in one pass: a warp is one 32-value block (E % 32 == 0)
+__global__ void hc_mix_q_k(const float * xn, const float * g, float * mixed, int hc, int E, ActQ8 q) {
+    const int t = blockIdx.y;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    if (e - lane >= E) return;   // whole warps
+    float acc = 0.f;
+    if (e < E) {
+        for (int s = 0; s < hc; ++s) {
+            const int64_t i = (int64_t) t * hc * E + s * E + e;
+            acc += xn[i] * sigmoidf_(g[i]);
+        }
+        acc /= hc;
+        mixed[(int64_t) t * E + e] = acc;
+    }
+    // as quantize_act_k (E is a multiple of 32: every lane of the warp holds a value)
+    float amax = fabsf(acc);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    const float dd = amax / 127.f;
+    const float id = dd > 0.f ? 1.f / dd : 0.f;
+    const int qi = __float2int_rn(acc * id);
+    const int64_t nb = E / 32, b = e / 32;
+    q.q[(int64_t) t * E + e] = (int8_t) qi;
+    if (lane == 0) q.d[t * nb + b] = dd;
+    if (q.s) {
+        int sm = qi;
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffff, sm, o);
+        if ((lane & 15) == 0) q.s[(t * nb + b) * 2 + (lane >> 4)] = (int16_t) sm;
+    }
+    if (q.h) q.h[(int64_t) t * E + e] = __float2half_rn(fminf(fmaxf(acc, -65504.f), 65504.f));
+}
+
+void hc_mix_q(const float * xn, const float * g, float * mixed, int T, int hc, int E, ActQ8 & q, cudaStream_t s) {
+    if (E % 32) {
+        hc_mix(xn, g, mixed, T, hc, E, s);
+        quantize_act(mixed, E, T, E, q, s);
+        return;
+    }
+    q.T = T;
+    q.cols = q.cols_pad = E;
+    hc_mix_q_k<<<dim3(nblk(E, 256), T), 256, 0, s>>>(xn, g, mixed, hc, E, q);
 }
 
 __global__ void hc_combine_k(float * res, const float * out, const float * inj, int hc, int E) {

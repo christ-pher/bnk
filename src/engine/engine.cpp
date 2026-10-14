@@ -107,6 +107,13 @@ Engine::~Engine() {
     if (ev_t1_) cudaEventDestroy(ev_t1_);
 }
 
+// mixact_ = quantize(mixed_), unless the hc_mix that just wrote mixed_ quantized it already
+void Engine::quantize_mixed(int T) {
+    const int E = model_.cfg.n_embd;
+    if (!mix_quantized_) quantize_act(mixed_, E, T, E, mixact_, st_);
+    mix_quantized_ = false;
+}
+
 cudaStream_t Engine::fork(int i) {
     if (!side_) return st_;
     CUDA_CHECK(cudaEventRecord(ev_fork_[i], st_));
@@ -756,9 +763,17 @@ void Engine::save_counts_here() {
 void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     const Config & c = model_.cfg;
     const int E = c.n_embd, HC = c.hc_dim();
-    hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
-    if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))
-        quantize_act(xn_, HC, T, HC, act_, st_);
+    // the norm quantizes its output for down / inject in the same pass (BNK_FUSE_QUANT=0: separately)
+    static const bool fuse = !getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0;
+    if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type))) {
+        if (fuse) hc_norm_q(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, act_, st_);
+        else {
+            hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
+            quantize_act(xn_, HC, T, HC, act_, st_);
+        }
+    } else {
+        hc_norm(res_, F(w.norm), xn_, T, c.hc, E, c.rms_eps, st_);
+    }
     // the inject projection beside down -> up -> mix (only when up does not quantize into act_, which inject reads)
     const bool side = want_inject && is_float_format(w.up.type);
     if (side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, fork(1));
@@ -766,7 +781,13 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     if (want_inject && !side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
     silu_scale(lo_, (int64_t) T * c.hc_rank, 1.f / c.hc, st_);
     gemv_auto(w.up, lo_, c.hc_rank, T, gpre_, HC, false, act_, st_);
-    hc_mix(xn_, gpre_, mixed_, T, c.hc, E, st_);
+    // mixed and its quantization (mixact_, for the attention / DeltaNet / MoE that follow) in one pass
+    if (fuse) {
+        hc_mix_q(xn_, gpre_, mixed_, T, c.hc, E, mixact_, st_);
+        mix_quantized_ = true;
+    } else {
+        hc_mix(xn_, gpre_, mixed_, T, c.hc, E, st_);
+    }
     if (side) join(1);
 }
 
@@ -831,7 +852,7 @@ void Engine::gdn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
-    quantize_act(mixed_, E, T, E, mixact_, st_);
+    quantize_mixed(T);
     float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
     {   // beta / alpha (needed at the prep) and the gate (at the norm) beside wqkv and its copies
         cudaStream_t sb = fork(0);
@@ -950,7 +971,7 @@ void Engine::attn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
-    quantize_act(mixed_, E, T, E, mixact_, st_);
+    quantize_mixed(T);
     const bool qsa = wins_[0].q->kraw[il].p != nullptr;
     if (qsa) {   // the indexer's projections beside q / k / v
         cudaStream_t sb = fork(0);
@@ -1040,7 +1061,7 @@ void Engine::moe(int il, int T) {
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd, k = c.n_expert_used, FF = c.n_ff_shexp;
     const MoeLayerDesc d = cache_.desc(il);
-    quantize_act(mixed_, E, T, E, mixact_, st_);
+    quantize_mixed(T);
     // the shared expert (and its gate) needs only mixed / mixact: beside the routed experts (act_ is its own: the
     // routed path does not touch it)
     {

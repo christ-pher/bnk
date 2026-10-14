@@ -324,6 +324,8 @@ private:
     cudaEvent_t ev_fork_[2] = {nullptr, nullptr}, ev_join_[2] = {nullptr, nullptr};
     bool side_ = true;
     cudaStream_t fork(int i);
+    bool mix_quantized_ = false;   // mixact_ holds quantize(mixed_) (hc_pre's fused hc_mix_q), for the next user
+    void quantize_mixed(int T);
     void join(int i);
     cudaEvent_t ev_verified_ = nullptr, ev_committed_ = nullptr;
     bool commit_inflight_ = false;
