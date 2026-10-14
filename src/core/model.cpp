@@ -1,3 +1,4 @@
+#include <cmath>
 #include "core/model.h"
 
 #include <cstdio>
@@ -117,6 +118,26 @@ QMat Model::upload(const std::string & name, bool required) {
         device_allocs_.push_back(d);
         vram_dense_bytes += m.row_bytes * m.rows;
         return m;
+    }
+    // the other BF16 matrices become F16 (exact within fp16's normal range: 3 more mantissa bits), which the
+    // tensor cores read directly when several tokens go through them; kept BF16 if a value is out of range
+    static const bool keep_bf16 = getenv("BNK_KEEP_BF16") != nullptr;
+    // (not the router: its fp32 path picks the experts, and stays exact)
+    if (!keep_bf16 && t->type == GGML_TYPE_BF16 && t->nrows() >= 2 && t->ne[0] % 32 == 0 &&
+        name.find("ffn_gate_inp") == std::string::npos) {
+        const int64_t n = t->nrows() * t->ne[0];
+        std::vector<float> f((size_t) n);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, f.data(), n);
+        float mx = 0.f;
+        for (float v : f) mx = std::max(mx, std::fabs(v));
+        if (mx < 65504.f) {
+            std::vector<ggml_fp16_t> h((size_t) n);
+            ggml_fp32_to_fp16_row(f.data(), h.data(), n);
+            QMat m = upload_matrix(h.data(), GGML_TYPE_F16, t->nrows(), t->ne[0], (size_t) t->ne[0] * 2, repack, &d);
+            device_allocs_.push_back(d);
+            vram_dense_bytes += m.row_bytes * m.rows;
+            return m;
+        }
     }
     QMat m = upload_matrix(t->data, (int) t->type, t->nrows(), t->ne[0], t->row_bytes(), repack, &d);
     device_allocs_.push_back(d);

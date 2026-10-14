@@ -320,9 +320,10 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     const int64_t maxcols = std::max<int64_t>(HC, 16384);
     actq_.alloc(W * maxcols); actd_.alloc(W * maxcols / 32);
     acts_.alloc(W * maxcols / 16);
-    act_.q = actq_; act_.d = actd_; act_.s = acts_;
-    mixq_.alloc(W * E + 64); mixd_.alloc(W * E / 32 + 8); mixs_.alloc(W * E / 16 + 16);
-    mixact_.q = mixq_; mixact_.d = mixd_; mixact_.s = mixs_;
+    acth_.alloc(W * maxcols);
+    act_.q = actq_; act_.d = actd_; act_.s = acts_; act_.h = acth_;
+    mixq_.alloc(W * E + 64); mixd_.alloc(W * E / 32 + 8); mixs_.alloc(W * E / 16 + 16); mixh_.alloc(W * E + 64);
+    mixact_.q = mixq_; mixact_.d = mixd_; mixact_.s = mixs_; mixact_.h = mixh_;
 
     // MoE scratch
     const int F = c.n_ff_exp;

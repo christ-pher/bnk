@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
     // GPU numbers as nvidia-smi shows them (CUDA's default order puts the fastest first)
     setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
     if (argc < 2) {
-        fprintf(stderr, "usage: bnk run|check --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
+        fprintf(stderr, "usage: bnk run|check|nll --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
                         "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n");
         return 1;
     }
@@ -147,6 +147,37 @@ int main(int argc, char ** argv) {
     Engine eng;
     eng.load(model, opt);
     const Config & c = eng.cfg();
+
+    if (mode == "nll") {
+        // teacher-forced negative log-likelihood of the tokens through the decode path, in windows of BNK_NLL_T
+        // (default 5) rows: how well the model predicts a text, for comparing kernel variants
+        const int T = std::max(1, std::min(env_int("BNK_NLL_T", 5), (int) kMaxWindow));
+        const int V = c.n_vocab;
+        std::vector<float> lg((size_t) T * V);
+        double nll = 0;
+        int64_t n = 0, top1 = 0;
+        for (size_t i = 0; i + 1 < prompt.size(); i += T) {
+            const int t = (int) std::min<size_t>(T, prompt.size() - 1 - i);
+            eng.forward(prompt.data() + i, t);
+            eng.logits_rows_host(t, lg.data());
+            for (int r = 0; r < t; ++r) {
+                const float * row = lg.data() + (size_t) r * V;
+                const int want = prompt[i + r + 1];
+                float mx = row[0];
+                int am = 0;
+                for (int v = 1; v < V; ++v)
+                    if (row[v] > mx) mx = row[v], am = v;
+                double z = 0;
+                for (int v = 0; v < V; ++v) z += std::exp((double) row[v] - mx);
+                nll += std::log(z) - ((double) row[want] - mx);
+                top1 += am == want;
+                ++n;
+            }
+        }
+        printf("nll %.5f per token over %lld tokens (windows of %d), ppl %.4f, top-1 %.2f%%\n", nll / n, (long long) n, T,
+               std::exp(nll / n), 100.0 * top1 / n);
+        return 0;
+    }
 
     if (mode == "pdump") {
         // batched prompt pass; the last position's logits to --ref (raw float32), for comparing engine variants.

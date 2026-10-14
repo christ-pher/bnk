@@ -426,6 +426,7 @@ private:
     DevBuf<double> topk_z_;
     DevBuf<float> ple_emb_, ple_key_, ple_val_, ple_gated_;
     DevBuf<int8_t> actq_, mixq_;
+    DevBuf<half> acth_, mixh_;   // the activations in fp16 too (tensor-core GEMV for several tokens)
     DevBuf<float> actd_, mixd_;
     DevBuf<int16_t> acts_, mixs_;
     ActQ8 act_, mixact_;
