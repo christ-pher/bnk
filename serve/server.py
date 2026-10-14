@@ -168,6 +168,8 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
             t = ev.get("type")
             if t == "prefill":
                 S.convs.status(cid, "generating", rid)
+                if not first_prefill:   # the prompt's own read (not a resumed slice's): it may set the record
+                    S.telemetry.prompt_read(len(prompt_ids) - (ev.get("reused") or 0), ev.get("ms") or 0)
                 first_prefill = first_prefill or ev
                 slice_t0 = time.time()
                 with S.lock:
@@ -295,7 +297,6 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
            "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, "conversation": cid,
            "wall_s": time.time() - t0, **timings}
     S.recent.append(rec)
-    S.telemetry.on_request(rec)
     S.telemetry.bus.publish("request", rec)
     S.convs.end(cid, tail, rec)
     return content, parser.reasoning_all, calls, finish, usage, timings

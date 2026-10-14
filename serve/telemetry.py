@@ -201,11 +201,11 @@ class Telemetry:
         m["peaks"] = self.peaks
         return m
 
-    def on_request(self, rec: dict):
-        """A finished request: its prompt read may set the prompt-processing record."""
-        tps, new = rec.get("prefill_tps"), (rec.get("prompt_tokens") or 0) - (rec.get("reused") or 0)
-        if tps and new >= self.PEAK_PROMPT_MIN and tps > (self.peaks.get("prefill") or {}).get("value", 0):
-            self.peaks = {**self.peaks, "prefill": {"value": round(tps, 1), "t": rec.get("time"), "tokens": new}}
+    def prompt_read(self, new_tokens: int, ms: float):
+        """A prompt read just finished (as the request starts generating): it may set the prompt-processing record."""
+        tps = new_tokens / (ms / 1000) if ms > 0 else 0
+        if new_tokens >= self.PEAK_PROMPT_MIN and tps > (self.peaks.get("prefill") or {}).get("value", 0):
+            self.peaks = {**self.peaks, "prefill": {"value": round(tps, 1), "t": time.time(), "tokens": new_tokens}}
 
     def _rate(self, a: dict, b: dict) -> dict:
         la, lb = a.get("life", {}), b.get("life", {})
