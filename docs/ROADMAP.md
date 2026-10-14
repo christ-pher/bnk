@@ -16,8 +16,22 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 | 6 | **More rows per batched forward** (kMaxWindow 8 -> 16: GEMV / MoE kernels) | with 3 conversations each gets ~2.7 rows, so fewer drafts are verified | more tokens per round *(estimate)* | |
 | 3c | ~~Sampling on the GPU~~ | done, see below | | done |
 | 3d | ~~Drafting cost~~ | done, see below | | done |
-| 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | built, to measure |
-| 8 | **Dense GEMV efficiency** (decode with every expert resident) | the R-layout GEMVs reach 30-47% of HBM bandwidth; with two GPUs (no CPU misses) they are most of the forward | up to ~1.5x decode *(estimate)* | |
+| 7 | **Two V100s**: measure the pipeline on two cards (split, decode, prompt reads, `BNK_PIPE_DECODE`) | built and checked on one card as two stages (`docs/DUAL-GPU.md`) | decode ~+35% (one conversation), prompts ~3x *(projected)* | measured (2026-10-14): decode 67 tok/s with MTP, prompts ~1,900 tok/s; `BNK_PIPE_DECODE` still to measure |
+| 8 | **GPU efficiency of a decode forward** (every expert resident) | GEMVs at 170-280 GB/s for 8 rows, experts at 335-456 GB/s, ~50 small kernels per layer | up to ~1.5x decode *(estimate)* | in progress: -10% GPU time per forward (below) |
+
+## Done (two V100s)
+
+* **GPU efficiency, part 1** (2026-10-14): (a) the dp4a GEMV at 5-8 rows was bound by instruction issue (the dot
+  product and its scales repeated per row): `gemv_mma_k` unpacks each sub-block once into fp16 registers and uses
+  the tensor cores (`mma.m8n8k4`), 8 rows per warp, quad pairs on consecutive sub-blocks, K split over a block's
+  warps and summed in a fixed order. 8 rows: attn_qkv 79 -> 49 us, ssm_out 67 -> 45, output head 2.0 -> 1.2 ms;
+  error vs fp32 5e-3 -> 3e-4; NLL over 4K tokens 1.7245 -> 1.7211. Used from 5 rows (`BNK_GEMV_MMA_MIN`); at 4
+  the dp4a kernel is as fast. (b) BF16 matrices (except the router) load as F16 and use the same kernel. (c) The
+  expert gate/up kernel read 12.7x its weight bytes through L1 (IQ grid lookups in global memory): tables in
+  shared memory, and no activation staging (occupancy). Per forward 16.45 / 14.76 -> 14.75 / 13.21 ms; decode
+  78 -> 86-88 tok/s at equal acceptance. Tools: `bench_moe`, `bnk nll`, `bench_gemv` error column.
+* **`top_k: 0` sampling** (2026-10-14): from the GPU's 1,024 candidates and a row normalizer (`row_expsum`); the
+  host path sorts only the head it needs. 25.7 -> 65.7 tok/s for such requests.
 
 ## Other areas (from the 78K nsys profile, 2026-10-05)
 

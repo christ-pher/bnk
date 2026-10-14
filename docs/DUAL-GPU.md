@@ -91,6 +91,29 @@ build/bnk run --model M.gguf --tokens-file p.txt --gpus 0,0 --split 24 --cache-g
 Cap the expert cache (`--cache-gib`): the first stage would otherwise take the whole card before the second
 loads.
 
+## Measured on two V100s (2026-10-14)
+
+Two Tesla PG500-216 (V100 SXM2 32 GB on PCIe adapters, 150 W cap, PCIe 3.0 x16 each, no NVLink or peer access).
+IQ3_S, every expert resident (layers 0-25 / 26-47, 24.8 + 23.2 GiB of experts).
+
+| | One V100 | Two V100s |
+|---|---|---|
+| Decode, one conversation, plain greedy (`bnk run`) | ~45-50 tok/s | 54.7 tok/s (8.3 + 8.1 ms GPU per forward) |
+| Decode, one conversation, MTP (`bnk run`, draft 4) | ~60-65 tok/s | 67 tok/s at first; 86-88 tok/s after the GEMV/MoE work below |
+| Through the server (short and 56-70K prompts, MTP) | 54-62 tok/s | 63-79 tok/s |
+| Prompt reads, 36-56K tokens | 570-750 tok/s (1,331 at 78K) | 1,800-2,020 tok/s (pipelined; 1,250 with `BNK_PIPE_PROMPT=0`) |
+
+No throttling seen: 48-57 °C under load, the power cap reached briefly while reading prompts.
+
+What a decode forward is spent on (nsys, MTP windows of ~4-5 rows, after the kernel work): dense quant GEMVs
+~33%, routed experts ~25%, float GEMVs ~12%, the rest many small kernels (norms, routing, DeltaNet, attention,
+HC mixing: ~50 kernels per layer). Done so far (`docs/ROADMAP.md`, item 8): tensor-core GEMV for windows of 5+
+rows, BF16 matrices as F16, IQ grid tables in shared memory, expert activations through L1: GPU time per forward
+16.45 / 14.76 ms -> 14.75 / 13.21 ms.
+
+Sampling note: a request with `top_k: 0` used to take the host sampler (~23 ms per row, decode 63 -> 26 tok/s); it
+now samples from the GPU's 1,024 most likely tokens and each row's normalizer (identical distribution).
+
 ## What to expect (projected on one V100, 2026-10-09)
 
 The second V100 had not arrived yet, so the speed of two GPUs is projected from one: two stages on the same card
