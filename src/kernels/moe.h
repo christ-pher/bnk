@@ -76,8 +76,9 @@ void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, i
 // Waits for the CPU's answer when the layer had misses.
 void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStream_t st);
 // out[t] = sum hits + shared * sgate[t] + cpu answer
+// wait_seq: moe_wait's work (and its layer counter) in the same launch
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
-                int k, int E, cudaStream_t st);
+                int k, int E, cudaStream_t st, const uint32_t * wait_seq = nullptr);
 void moe_debug_times(uint64_t (*out)[3], int n);
 // restarts the per-layer timestamps at layer 0 (on `st`, before a forward: the drafter's MoE calls advance them)
 void moe_debug_reset(cudaStream_t st);

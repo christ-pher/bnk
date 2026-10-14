@@ -1097,9 +1097,8 @@ void Engine::moe(int il, int T) {
         m->seq_done = m->seq_req;
     }
     moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
-    moe_wait(moes_, msg(il), &d_par_->seq, st_);
     join(0);
-    moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_);
+    moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_, &d_par_->seq);   // (waits for the CPU too)
 }
 
 void Engine::head(int T) {

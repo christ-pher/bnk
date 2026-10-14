@@ -466,7 +466,25 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 
 __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __restrict__ part, MoeMsg * msg,
                              const float * __restrict__ shared, const float * __restrict__ sgate,
-                             float * __restrict__ out, int E, int k) {
+                             float * __restrict__ out, int E, int k, const uint32_t * seq) {
+    // seq: moe_wait's work first (the CPU's answer when the layer had misses; block 0 keeps the timestamps), which
+    // saves its launch
+    if (seq) {
+        const bool b0 = blockIdx.x == 0 && blockIdx.y == 0;
+        if (threadIdx.x == 0) {
+            const int L = g_moe_layer & 63;
+            if (b0) g_moe_ts[L][1] = gtimer();
+            if (hits->n_miss != 0) {
+                const uint32_t want = *seq;
+                while (msg->seq_done != want) __nanosleep(200);
+                __threadfence_system();
+            }
+            if (b0) {
+                g_moe_ts[L][2] = gtimer();
+                g_moe_layer = L + 1;   // only block 0 uses it here; the next plan runs after this launch
+            }
+        }
+    }
     // a token's experts added in its own routing order (pair t * k + slot), so the sum does not depend on the other
     // tokens of the window (the hit list's order does); the entries and weights read once per block
     __shared__ int s_ent[32];
@@ -486,10 +504,11 @@ __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __
     if (hits->n_miss > 0) acc += ((volatile float *) msg->out(E))[(size_t) t * E + r];
     out[(size_t) t * E + r] = acc;
 }
+
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
-                int k, int E, cudaStream_t st) {
+                int k, int E, cudaStream_t st, const uint32_t * wait_seq) {
     if (k > 32) { fprintf(stderr, "moe_reduce: k %d > 32\n", k); abort(); }
-    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E, k);
+    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E, k, wait_seq);
 }
 
 }  // namespace bnk
