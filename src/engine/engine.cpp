@@ -489,8 +489,11 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         prefill_staging_alloc();
         if (opt.verbose)
             fprintf(stderr, "bnk: prompt path: chunks of %d / %d / %d tokens (short turns / prompts / long prompts), "
-                            "2 x %.2f GiB of expert staging between prompts (more borrowed for long ones)\n",
-                    pf_small_, pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
+                            "%.2f / %.2f / %.2f GiB of buffers, 2 x %.2f GiB of expert staging between prompts (more borrowed "
+                            "for long ones)\n",
+                    pf_small_, pf_base_, pf_big_, prefill_arena_bytes(pf_small_) / 1073741824.0,
+                    prefill_arena_bytes(pf_base_) / 1073741824.0, prefill_arena_bytes(pf_big_) / 1073741824.0,
+                    pf_.stage_bytes / 1073741824.0);
     }
     reset_here();
     // every slot's snapshot buffers pinned now: pinning one during a request cost its turn ~60 ms per GPU. The

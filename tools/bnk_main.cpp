@@ -83,7 +83,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: bnk run|check|nll --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
                         "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n"
-                        "           [--kv8 0]   (fp16 K/V cache instead of 8-bit; BNK_KV8=0 likewise)\n");
+                        "           [--kv8 1]   (8-bit K/V cache: less VRAM at long contexts; BNK_KV8=1 likewise)\n");
         return 1;
     }
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
@@ -91,7 +91,7 @@ int main(int argc, char ** argv) {
     int max_new = 32;
     GenOptions gopt;
     EngineOptions opt;
-    opt.kv8 = env_int("BNK_KV8", 1) != 0;   // 8-bit K/V by default; --kv8 wins
+    opt.kv8 = env_int("BNK_KV8", 0) != 0;   // fp16 K/V by default; --kv8 wins
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
