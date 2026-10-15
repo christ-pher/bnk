@@ -247,8 +247,8 @@ void moe_tc_down(const TcItem * items, const TcBlock * blocks, int nblocks, cons
     if (nblocks <= 0) return;
     if (F % 32 != 0 || E % (2 * kTcRows) != 0) throw std::runtime_error("moe_tc: unsupported expert shape");
     const ROff dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
-    const dim3 grid(nblocks, E / (2 * kTcRows));
     const size_t off = d.gate_bytes + d.up_bytes;
+    const dim3 grid(nblocks, E / (2 * kTcRows));
     if (d.rlay) {
         auto f = [&]<int FMT>() {
             moe_tc_k<FMT, true, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof);
