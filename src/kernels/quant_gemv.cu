@@ -345,15 +345,20 @@ static void launch_float(const QMat & W, const float * x, int64_t ldx, int T, fl
 }
 
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
-          bool accumulate, cudaStream_t s) {
+          bool accumulate, cudaStream_t s, GemvSplit sp) {
     if (T < 1 || T > kMaxWindow) throw std::runtime_error("gemv: window out of range");
     if (W.layout == 1) {
         if (!a || a->cols != W.cols) throw std::runtime_error("gemv: activation not quantized for this width");
-        gemv_r(W, *a, T, y, ldy, accumulate, s);
+        gemv_r(W, *a, T, y, ldy, accumulate, s, sp);
         return;
     }
     if (is_float_format(W.type) && !getenv("BNK_OLD_FLOAT")) {
-        gemv_float2(W, x, ldx, T, y, ldy, accumulate, s);
+        gemv_float2(W, x, ldx, T, y, ldy, accumulate, s, sp);
+        return;
+    }
+    if (sp.y2 && sp.r1 < W.rows) {   // the other paths: the two halves as two launches
+        gemv(qmat_rows(W, 0, sp.r1), a, x, ldx, T, y, ldy, accumulate, s);
+        gemv(qmat_rows(W, sp.r1, W.rows - sp.r1), a, x, ldx, T, sp.y2, sp.ldy2, accumulate, s);
         return;
     }
     if (is_float_format(W.type)) {
@@ -377,7 +382,12 @@ bool use_ref_gemv() {
 }
 
 void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,
-               ActQ8 & scratch, cudaStream_t s) {
+               ActQ8 & scratch, cudaStream_t s, GemvSplit sp) {
+    if (sp.y2 && sp.r1 < W.rows && (is_float_format(W.type) ? getenv("BNK_OLD_FLOAT") != nullptr : W.layout != 1 || use_ref_gemv())) {
+        gemv_auto(qmat_rows(W, 0, sp.r1), x, ldx, T, y, ldy, accumulate, scratch, s);
+        gemv_auto(qmat_rows(W, sp.r1, W.rows - sp.r1), x, ldx, T, sp.y2, sp.ldy2, accumulate, scratch, s);
+        return;
+    }
     if (!is_float_format(W.type) && use_ref_gemv()) {
         const int grid = grid_for_rows(W.rows, 8);
         const ROff ro{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
@@ -393,10 +403,10 @@ void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, i
         return;
     }
     if (is_float_format(W.type)) {
-        gemv(W, nullptr, x, ldx, T, y, ldy, accumulate, s);
+        gemv(W, nullptr, x, ldx, T, y, ldy, accumulate, s, sp);
     } else {
         quantize_act(x, ldx, T, W.cols, scratch, s);
-        gemv(W, &scratch, nullptr, 0, T, y, ldy, accumulate, s);
+        gemv(W, &scratch, nullptr, 0, T, y, ldy, accumulate, s, sp);
     }
 }
 

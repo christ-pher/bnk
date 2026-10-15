@@ -95,6 +95,14 @@ QMat Model::upload(const std::string & name, bool required) {
         if (required) throw std::runtime_error("missing tensor " + name);
         return QMat{};
     }
+    return upload_data(name, t->data, (int) t->type, t->nrows(), t->ne[0], t->row_bytes());
+}
+
+QMat Model::upload_data(const std::string & name, const uint8_t * data, int type_, int64_t nrows, int64_t ne0,
+                        size_t row_bytes) {
+    struct { const uint8_t * data; int type; int64_t nrows_, ne0_; size_t rb; int64_t nrows() const { return nrows_; }
+             int64_t ne[1]; size_t row_bytes() const { return rb; } } tt{data, type_, nrows, ne0, row_bytes, {ne0}};
+    const auto * t = &tt;
     void * d = nullptr;
     // token embeddings stay in ggml layout (gathered by row); every other matrix is repacked when possible
     const bool repack = repack_ && name != "token_embd.weight";
@@ -145,6 +153,42 @@ QMat Model::upload(const std::string & name, bool required) {
     return m;
 }
 
+// The two tensors stacked as one matrix (their host rows concatenated) through the same conversions as upload():
+// a and b become views of the result's rows. False (a and b stay separate) when the formats or widths differ.
+bool Model::stack(const std::string & na, const std::string & nb, QMat & a, QMat & b, QMat & ab) {
+    const TensorRef * ta = gguf.find(na), * tb = gguf.find(nb);
+    if (!ta || !tb || ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->row_bytes() != tb->row_bytes()) return false;
+    if (!a.valid() || !b.valid()) return false;
+    // the conversions in upload() depend on the name: both must convert the same way
+    auto kind = [&](const std::string & n) {
+        return (int) (n.find("_down") != std::string::npos || n.find("_inject") != std::string::npos ||
+                      n.find("ple_") != std::string::npos) * 2 + (int) (n.find("ffn_gate_inp") != std::string::npos);
+    };
+    if (ta->type == GGML_TYPE_BF16 && kind(na) != kind(nb)) return false;
+    std::vector<uint8_t> buf((size_t) (ta->nrows() + tb->nrows()) * ta->row_bytes());
+    memcpy(buf.data(), ta->data, (size_t) ta->nrows() * ta->row_bytes());
+    memcpy(buf.data() + (size_t) ta->nrows() * ta->row_bytes(), tb->data, (size_t) tb->nrows() * tb->row_bytes());
+    // the old separate uploads are released: the stacked one replaces them
+    for (QMat * m : {&a, &b})
+        for (size_t i = 0; i < device_allocs_.size(); ++i)
+            if (device_allocs_[i] == m->data) {
+                vram_dense_bytes -= m->row_bytes * m->rows;
+                cudaFree(device_allocs_[i]);
+                device_allocs_.erase(device_allocs_.begin() + (long) i);
+                break;
+            }
+    ab = upload_data(na, buf.data(), (int) ta->type, ta->nrows() + tb->nrows(), ta->ne[0], ta->row_bytes());
+    if (ab.layout != a.layout || ab.type != a.type) {   // (conversions differ after all: keep them apart)
+        a = upload(na);
+        b = upload(nb);
+        ab = QMat{};
+        return false;
+    }
+    a = qmat_rows(ab, 0, ta->nrows());
+    b = qmat_rows(ab, ta->nrows(), tb->nrows());
+    return true;
+}
+
 Model::~Model() {
     for (void * p : device_allocs_) cudaFree(p);
 }
@@ -161,12 +205,16 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
                 gguf.get_str("general.name").c_str(), c.n_layer, c.n_expert, c.n_expert_used, c.hc,
                 gguf.shard_paths().size());
 
+    static const bool stacks = !getenv("BNK_STACK") || atoi(getenv("BNK_STACK")) != 0;
     auto hcw = [&](const std::string & p, bool inject) {
         HcWeights h;
         h.norm = upload(p + "_norm.weight");
         h.down = upload(p + "_down.weight");
         h.up = upload(p + "_up.weight");
-        if (inject) h.inject = upload(p + "_inject.weight");
+        if (inject) {
+            h.inject = upload(p + "_inject.weight");
+            if (stacks) stack(p + "_down.weight", p + "_inject.weight", h.down, h.inject, h.down_inject);
+        }
         return h;
     };
 
@@ -192,6 +240,10 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
             L.idx_k = upload(b + "indexer.k_proj.weight", false);
             L.idx_q_norm = upload(b + "indexer.q_norm.weight", false);
             L.idx_k_norm = upload(b + "indexer.k_norm.weight", false);
+            if (stacks) {
+                stack(b + "attn_k.weight", b + "attn_v.weight", L.wk, L.wv, L.wkv);
+                if (L.idx_q.valid()) stack(b + "indexer.k_proj.weight", b + "indexer.q_proj.weight", L.idx_k, L.idx_q, L.idx_kq);
+            }
         } else {
             L.wqkv = upload(b + "attn_qkv.weight");
             L.wgate = upload(b + "attn_gate.weight");
@@ -202,6 +254,7 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
             L.ssm_dt = upload(b + "ssm_dt.bias");
             L.ssm_a = upload(b + "ssm_a");
             L.ssm_norm = upload(b + "ssm_norm.weight");
+            if (stacks) stack(b + "ssm_beta.weight", b + "ssm_alpha.weight", L.ssm_beta, L.ssm_alpha, L.ssm_ba);
         }
         if (il == c.ple_layer) {
             L.ple_key = upload(b + "ple_key.weight");
@@ -216,6 +269,10 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         L.sh_gate = upload(b + "ffn_gate_shexp.weight");
         L.sh_up = upload(b + "ffn_up_shexp.weight");
         L.sh_down = upload(b + "ffn_down_shexp.weight");
+        if (stacks) {
+            stack(b + "ffn_gate_inp.weight", b + "ffn_gate_inp_shexp.weight", L.router, L.shexp_gate_inp, L.router_sg);
+            stack(b + "ffn_gate_shexp.weight", b + "ffn_up_shexp.weight", L.sh_gate, L.sh_up, L.sh_gu);
+        }
         expert_src(il);
     }
     if (head) {

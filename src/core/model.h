@@ -43,6 +43,7 @@ Config load_config(const GgufModel & g);
 
 struct HcWeights {
     QMat norm, down, up, inject;  // norm: f32 [hc*n_embd]; inject absent for the head mixer
+    QMat down_inject;             // down | inject stacked (the decode path's one launch); down / inject are its row views
 };
 
 struct LayerWeights {
@@ -57,6 +58,10 @@ struct LayerWeights {
     QMat ple_key, ple_value, ple_norm_key, ple_norm_query, ple_norm_conv, ple_conv1d;
     // MoE
     QMat router, shexp_gate_inp, sh_gate, sh_up, sh_down;
+    // Stacked pairs for the decode path (one launch, a split output); the parts above are row views into them
+    // when the pair exists (same format and input width): beta | alpha, indexer k | q, router | shared gate, shared
+    // gate | up, k | v
+    QMat ssm_ba, idx_kq, router_sg, sh_gu, wkv;
     // routed experts: format of each matrix (the bytes live in the expert store)
     int gate_type = 0, up_type = 0, down_type = 0;
     size_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;   // per expert
@@ -87,6 +92,10 @@ struct Model {
 private:
     std::vector<void *> device_allocs_;
     QMat upload(const std::string & name, bool required = true);
+    QMat upload_data(const std::string & name, const uint8_t * data, int type, int64_t rows, int64_t cols,
+                     size_t row_bytes);
+    // two matrices of the same format and width stacked (a | b): one upload; a and b become row views of it
+    bool stack(const std::string & na, const std::string & nb, QMat & a, QMat & b, QMat & ab);
     void expert_src(int il);
 };
 

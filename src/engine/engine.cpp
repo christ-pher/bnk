@@ -27,9 +27,9 @@ static void dbg(cudaStream_t st, int il, const char * name, const float * dev, s
 
 // y = W x, with x already quantized in `xq` when W is a quant format.
 static void gemv_q(const QMat & W, const ActQ8 & xq, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
-                   cudaStream_t s) {
-    if (is_float_format(W.type)) gemv(W, nullptr, x, ldx, T, y, ldy, false, s);
-    else gemv(W, &xq, nullptr, 0, T, y, ldy, false, s);
+                   cudaStream_t s, GemvSplit sp = {}) {
+    if (is_float_format(W.type)) gemv(W, nullptr, x, ldx, T, y, ldy, false, s, sp);
+    else gemv(W, &xq, nullptr, 0, T, y, ldy, false, s, sp);
 }
 
 Engine::Worker::Worker() {
@@ -794,11 +794,14 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
         if (!is_float_format(w.down.type) || (want_inject && !is_float_format(w.inject.type)))
             quantize_act(xn_, HC, T, HC, act_, st_);
     }
-    // the inject projection beside down -> up -> mix (only when up does not quantize into act_, which inject reads)
-    const bool side = want_inject && is_float_format(w.up.type);
+    // the inject projection: stacked under down (one launch, the rows from hc_rank on into inj_), else beside
+    // down -> up -> mix on a side stream (only when up does not quantize into act_, which inject reads)
+    const bool stacked = want_inject && w.down_inject.valid();
+    const bool side = want_inject && !stacked && is_float_format(w.up.type);
     if (side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, fork(1));
-    gemv_q(w.down, act_, xn_, HC, T, lo_, c.hc_rank, st_);
-    if (want_inject && !side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
+    if (stacked) gemv_q(w.down_inject, act_, xn_, HC, T, lo_, c.hc_rank, st_, GemvSplit{c.hc_rank, inj_, c.hc});
+    else gemv_q(w.down, act_, xn_, HC, T, lo_, c.hc_rank, st_);
+    if (want_inject && !side && !stacked) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
     // silu(lo / hc) inside the quantization pass of w.up's input (one launch instead of two)
     if (!is_float_format(w.up.type) && !use_ref_gemv()) {
         quantize_act_silu(lo_, 1.f / c.hc, c.hc_rank, T, c.hc_rank, act_, st_);
@@ -882,8 +885,11 @@ void Engine::gdn(int il, int T) {
     float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
     {   // beta / alpha (needed at the prep) and the gate (at the norm) beside wqkv and its copies
         cudaStream_t sb = fork(0);
-        gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, sb);
-        gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, sb);
+        if (L.ssm_ba.valid()) gemv_q(L.ssm_ba, mixact_, mixed_, E, T, gb, nv, sb, GemvSplit{nv, gg, nv});
+        else {
+            gemv_q(L.ssm_beta, mixact_, mixed_, E, T, gb, nv, sb);
+            gemv_q(L.ssm_alpha, mixact_, mixed_, E, T, gg, nv, sb);
+        }
         gemv_q(L.wgate, mixact_, mixed_, E, T, z_, nv * S, sb);
     }
     // the new conv inputs go behind each window's own K-1 history rows (one window: straight there)
@@ -1007,12 +1013,18 @@ void Engine::attn(int il, int T) {
     const bool qsa = wins_[0].q->kraw[il].p != nullptr;
     if (qsa) {   // the indexer's projections beside q / k / v
         cudaStream_t sb = fork(0);
-        gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, sb);
-        gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, sb);
+        if (L.idx_kq.valid()) gemv_q(L.idx_kq, mixact_, mixed_, E, T, ik_, c.idx_dim, sb, GemvSplit{c.idx_dim, iq_, (int64_t) c.idx_heads * c.idx_dim});
+        else {
+            gemv_q(L.idx_k, mixact_, mixed_, E, T, ik_, c.idx_dim, sb);
+            gemv_q(L.idx_q, mixact_, mixed_, E, T, iq_, c.idx_heads * c.idx_dim, sb);
+        }
     }
     gemv_q(L.wq, mixact_, mixed_, E, T, qfull_, H * D * 2, st_);
-    gemv_q(L.wk, mixact_, mixed_, E, T, k_, Hkv * D, st_);
-    gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
+    if (L.wkv.valid()) gemv_q(L.wkv, mixact_, mixed_, E, T, k_, Hkv * D, st_, GemvSplit{Hkv * D, v_, (int64_t) Hkv * D});
+    else {
+        gemv_q(L.wk, mixact_, mixed_, E, T, k_, Hkv * D, st_);
+        gemv_q(L.wv, mixact_, mixed_, E, T, v_, Hkv * D, st_);
+    }
     if (qsa) join(0);
     for (size_t wi = 0; wi < wins_.size(); ++wi) {
         const Win & w = wins_[wi];
@@ -1098,8 +1110,11 @@ void Engine::moe(int il, int T) {
     // routed path does not touch it)
     {
         cudaStream_t sb = fork(0);
-        gemv_q(L.sh_gate, mixact_, mixed_, E, T, sg_, FF, sb);
-        gemv_q(L.sh_up, mixact_, mixed_, E, T, su_, FF, sb);
+        if (L.sh_gu.valid()) gemv_q(L.sh_gu, mixact_, mixed_, E, T, sg_, FF, sb, GemvSplit{FF, su_, FF});
+        else {
+            gemv_q(L.sh_gate, mixact_, mixed_, E, T, sg_, FF, sb);
+            gemv_q(L.sh_up, mixact_, mixed_, E, T, su_, FF, sb);
+        }
         // silu(gate) * up inside the quantization pass of sh_down's input; the gate's sigmoid in moe_reduce
         if (!is_float_format(L.sh_down.type) && !use_ref_gemv()) {
             quantize_act_silu_mul(sg_, su_, FF, T, FF, act_, sb);
@@ -1108,9 +1123,10 @@ void Engine::moe(int il, int T) {
             silu_mul(sg_, su_, sh_, (int64_t) T * FF, sb);
             gemv_auto(L.sh_down, sh_, FF, T, shared_out_, E, false, act_, sb);
         }
-        gemv_q(L.shexp_gate_inp, mixact_, mixed_, E, T, sgate_, 1, sb);
+        if (!L.router_sg.valid()) gemv_q(L.shexp_gate_inp, mixact_, mixed_, E, T, sgate_, 1, sb);
     }
-    gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
+    if (L.router_sg.valid()) gemv_q(L.router_sg, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_, GemvSplit{c.n_expert, sgate_, 1});
+    else gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
     // the experts' choice and the hit list in one launch (BNK_FUSE_PLAN=0: two)
     static const bool fuse_plan = !getenv("BNK_FUSE_PLAN") || atoi(getenv("BNK_FUSE_PLAN")) != 0;
     if (fuse_plan) {

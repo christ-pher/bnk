@@ -47,22 +47,39 @@ void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T,
 bool quantize_gated_norm(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
                          cudaStream_t s);
 
-// y[t*ldy + r] (+)= W[r,:] . x_t   for r < W.rows, t < T.
+// Two matrices that share an input are stacked into one at load time (Model: beta | alpha, the indexer's k | q,
+// router | shared-expert gate, shared gate | up, HC down | inject, k | v): one launch, and the rows from r1 on go
+// to a second output y2 (row stride ldy2), so each consumer still reads a contiguous array.
+struct GemvSplit {
+    int r1 = 0x7fffffff;
+    float * y2 = nullptr;
+    int64_t ldy2 = 0;
+};
+
+// y[t*ldy + r] (+)= W[r,:] . x_t   for r < W.rows, t < T (rows from sp.r1 on into sp.y2).
 //   quantized W: x comes from `a` (quantize_act first); float W: x comes from `x`/ldx.
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T,
-          float * y, int64_t ldy, bool accumulate, cudaStream_t s);
+          float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp = {});
 
 // BNK_GEMV_REF=1: the reference dp4a kernel for every quantized GEMV (debugging)
 bool use_ref_gemv();
 
 // Convenience: quantizes into `scratch` when W needs it.
 void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
-               bool accumulate, ActQ8 & scratch, cudaStream_t s);
+               bool accumulate, ActQ8 & scratch, cudaStream_t s, GemvSplit sp = {});
 
 // GEMV v2 kernels (gemv_r.cu): R-layout quant rows and float rows.
-void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s);
+void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s,
+            GemvSplit sp = {});
 void gemv_float2(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,
-                 cudaStream_t s);
+                 cudaStream_t s, GemvSplit sp = {});
+// rows [r0, r0 + n) of W as a matrix of their own (same storage)
+inline QMat qmat_rows(const QMat & W, int64_t r0, int64_t n) {
+    QMat v = W;
+    v.data = (const uint8_t *) W.data + (size_t) r0 * W.row_bytes;
+    v.rows = n;
+    return v;
+}
 // Upload a ggml-layout host matrix to the device, repacked to the R layout when supported.
 QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size_t row_bytes, bool repack,
                    void ** dev_alloc);

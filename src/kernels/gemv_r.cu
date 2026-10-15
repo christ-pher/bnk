@@ -12,6 +12,11 @@
 
 namespace bnk {
 
+// the output cell of (token t, row r): y, or the second output from row sp.r1 on
+__device__ __forceinline__ float * gemv_out(const GemvSplit & sp, float * y, int64_t ldy, int t, int r) {
+    return r < sp.r1 ? y + (int64_t) t * ldy + r : sp.y2 + (int64_t) t * sp.ldy2 + (r - sp.r1);
+}
+
 static int sm_count2() {
     static int n = 0;
     if (!n) {
@@ -29,7 +34,7 @@ template <int FMT, int NT, int LPR, bool SPLITK, bool SMEM>
 __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
                                                 int nsb, const int8_t * __restrict__ aq, const float * __restrict__ ad,
                                                 const int16_t * __restrict__ asum, int64_t cols_pad, int T,
-                                                float * __restrict__ y, int64_t ldy, int accumulate) {
+                                                float * __restrict__ y, int64_t ldy, int accumulate, GemvSplit sp) {
     extern __shared__ __align__(16) uint8_t smem[];
     constexpr int RPW = 32 / LPR;  // rows per warp
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -132,7 +137,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
                         float s = 0.f;
 #pragma unroll
                         for (int w = 0; w < 8; ++w) s += red[w][rsel][t];
-                        float * yp = y + t * ldy + r;
+                        float * yp = gemv_out(sp, y, ldy, t, r);
                         *yp = accumulate ? *yp + s : s;
                     }
                 }
@@ -142,7 +147,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
                 if (t < T) {
-                    float * yp = y + t * ldy + r;
+                    float * yp = gemv_out(sp, y, ldy, t, r);
                     *yp = accumulate ? *yp + acc[t] : acc[t];
                 }
             }
@@ -151,7 +156,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
 }
 
 template <int FMT, int NT, int LPR, bool SPLITK>
-static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s) {
+static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s, GemvSplit sp) {
     const int nsb = (int) (W.cols / 32);
     constexpr int RPW = 32 / LPR;
     const int ngroups = (int) ((W.rows + RPW - 1) / RPW);
@@ -168,25 +173,25 @@ static void launch_r2(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
     if (use_smem)
         gemv_r_k<FMT, NT, LPR, SPLITK, true><<<grid, 256, smem, s>>>((const uint8_t *) W.data, W.row_bytes, o,
                                                                     (int) W.rows, nsb, a.q, a.d, a.s, a.cols_pad, T, y,
-                                                                    ldy, accf);
+                                                                    ldy, accf, sp);
     else
         gemv_r_k<FMT, NT, LPR, SPLITK, false><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o,
                                                                   (int) W.rows, nsb, a.q, a.d, a.s, a.cols_pad, T, y, ldy,
-                                                                  accf);
+                                                                  accf, sp);
     check_launch("gemv_r");
 }
 
 template <int NT>
-static void launch_r1(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s) {
+static void launch_r1(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s, GemvSplit sp) {
     const int nsb = (int) (W.cols / 32);
     // few rows and a long K: split K across the 8 warps of a block
     const bool splitk = W.rows * 8 < (int64_t) sm_count2() * 64 && nsb >= 64;
     auto f = [&]<int FMT>() {
-        if (splitk) launch_r2<FMT, NT, 32, true>(W, a, T, y, ldy, acc, s);
-        else if (nsb >= 24) launch_r2<FMT, NT, 32, false>(W, a, T, y, ldy, acc, s);
-        else if (nsb >= 12) launch_r2<FMT, NT, 16, false>(W, a, T, y, ldy, acc, s);
-        else if (nsb >= 6) launch_r2<FMT, NT, 8, false>(W, a, T, y, ldy, acc, s);
-        else launch_r2<FMT, NT, 4, false>(W, a, T, y, ldy, acc, s);
+        if (splitk) launch_r2<FMT, NT, 32, true>(W, a, T, y, ldy, acc, s, sp);
+        else if (nsb >= 24) launch_r2<FMT, NT, 32, false>(W, a, T, y, ldy, acc, s, sp);
+        else if (nsb >= 12) launch_r2<FMT, NT, 16, false>(W, a, T, y, ldy, acc, s, sp);
+        else if (nsb >= 6) launch_r2<FMT, NT, 8, false>(W, a, T, y, ldy, acc, s, sp);
+        else launch_r2<FMT, NT, 4, false>(W, a, T, y, ldy, acc, s, sp);
     };
     BNK_DISPATCH_R(W.type, f);
 }
@@ -207,7 +212,8 @@ static void launch_r1(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
 template <int FMT, bool XF, int RG>
 __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
                                                   int nsb, const void * __restrict__ xv_, int64_t ldx, int T,
-                                                  float * __restrict__ y, int64_t ldy, int accumulate, int ks) {
+                                                  float * __restrict__ y, int64_t ldy, int accumulate, int ks,
+                                                  GemvSplit sp) {
     __shared__ float part[8][64 * RG];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int grp = blockIdx.x * (8 / ks) + warp / ks, kp = warp % ks;
@@ -278,7 +284,7 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
         if (t < T && rr < rows) {
             float v = 0.f;
             for (int w = 0; w < ks; ++w) v += part[gg * ks + w][e];
-            float * yp = y + (int64_t) t * ldy + rr;
+            float * yp = gemv_out(sp, y, ldy, t, rr);
             *yp = accumulate ? *yp + v : v;
         }
     }
@@ -300,7 +306,7 @@ static int mma_ks(int nsb) {
 
 template <int FMT, bool XF>
 static void launch_mma_k(const QMat & W, const void * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc,
-                         cudaStream_t s) {
+                         cudaStream_t s, GemvSplit sp = {}) {
     const int nsb = (int) (W.cols / 32), ks = mma_ks(nsb);
     // BNK_GEMV_MMA_RG=2: 16 rows per warp (half the activation loads; measured no faster on a V100, so off)
     static const int rg_env = getenv("BNK_GEMV_MMA_RG") ? atoi(getenv("BNK_GEMV_MMA_RG")) : 1;
@@ -309,12 +315,12 @@ static void launch_mma_k(const QMat & W, const void * x, int64_t ldx, int T, flo
     const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
     auto k = rg == 2 ? gemv_mma_k<FMT, XF, 2> : gemv_mma_k<FMT, XF, 1>;
     k<<<(groups + per_block - 1) / per_block, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o, (int) W.rows, nsb,
-                                                           x, ldx, T, y, ldy, acc ? 1 : 0, ks);
+                                                           x, ldx, T, y, ldy, acc ? 1 : 0, ks, sp);
     check_launch("gemv_mma");
 }
 
-static void launch_mma(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s) {
-    auto f = [&]<int FMT>() { launch_mma_k<FMT, false>(W, a.h, a.cols_pad, T, y, ldy, acc, s); };
+static void launch_mma(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool acc, cudaStream_t s, GemvSplit sp) {
+    auto f = [&]<int FMT>() { launch_mma_k<FMT, false>(W, a.h, a.cols_pad, T, y, ldy, acc, s, sp); };
     BNK_DISPATCH_R(W.type, f);
 }
 
@@ -327,12 +333,12 @@ static int mma_min_tokens() {
     return n;
 }
 
-void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s) {
-    if (a.h && T >= mma_min_tokens() && mma_min_tokens() > 0) return launch_mma(W, a, T, y, ldy, accumulate, s);
-    if (T == 1) launch_r1<1>(W, a, T, y, ldy, accumulate, s);
-    else if (T == 2) launch_r1<2>(W, a, T, y, ldy, accumulate, s);
-    else if (T <= 4) launch_r1<4>(W, a, T, y, ldy, accumulate, s);
-    else launch_r1<8>(W, a, T, y, ldy, accumulate, s);
+void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp) {
+    if (a.h && T >= mma_min_tokens() && mma_min_tokens() > 0) return launch_mma(W, a, T, y, ldy, accumulate, s, sp);
+    if (T == 1) launch_r1<1>(W, a, T, y, ldy, accumulate, s, sp);
+    else if (T == 2) launch_r1<2>(W, a, T, y, ldy, accumulate, s, sp);
+    else if (T <= 4) launch_r1<4>(W, a, T, y, ldy, accumulate, s, sp);
+    else launch_r1<8>(W, a, T, y, ldy, accumulate, s, sp);
 }
 
 // ------------------------------------------------------------------------------ float rows
@@ -366,7 +372,7 @@ __device__ __forceinline__ void loadf8(const uint8_t * row, int64_t i, float (&w
 template <int FMT, int NT, int LPR, bool SPLITK>
 __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, size_t row_bytes, int rows,
                                                 int nch, const float * __restrict__ x, int64_t ldx, int T,
-                                                float * __restrict__ y, int64_t ldy, int accumulate) {
+                                                float * __restrict__ y, int64_t ldy, int accumulate, GemvSplit sp) {
     constexpr int RPW = 32 / LPR;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int sub = lane % LPR, rsel = lane / LPR;
@@ -421,7 +427,7 @@ __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, 
                         float s = 0.f;
 #pragma unroll
                         for (int w = 0; w < 8; ++w) s += red[w][rsel][t];
-                        float * yp = y + t * ldy + r;
+                        float * yp = gemv_out(sp, y, ldy, t, r);
                         *yp = accumulate ? *yp + s : s;
                     }
                 }
@@ -431,7 +437,7 @@ __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, 
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
                 if (t < T) {
-                    float * yp = y + t * ldy + r;
+                    float * yp = gemv_out(sp, y, ldy, t, r);
                     *yp = accumulate ? *yp + acc[t] : acc[t];
                 }
             }
@@ -441,49 +447,49 @@ __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, 
 
 template <int FMT, int NT, int LPR, bool SPLITK>
 static void launch_f2(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc,
-                      cudaStream_t s) {
+                      cudaStream_t s, GemvSplit sp) {
     const int nch = (int) (W.cols / 8);
     constexpr int RPW = 32 / LPR;
     const int ngroups = (int) ((W.rows + RPW - 1) / RPW);
     const int grid = SPLITK ? ngroups : std::min((ngroups + 7) / 8, sm_count2() * 8);
     gemv_f_k<FMT, NT, LPR, SPLITK><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows, nch, x,
-                                                        ldx, T, y, ldy, acc ? 1 : 0);
+                                                        ldx, T, y, ldy, acc ? 1 : 0, sp);
     check_launch("gemv_f");
 }
 
 template <int FMT, int NT>
 static void launch_f1(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc,
-                      cudaStream_t s) {
+                      cudaStream_t s, GemvSplit sp) {
     const int nch = (int) (W.cols / 8);
     const bool splitk = W.rows * 8 < (int64_t) sm_count2() * 64 && nch >= 256;
-    if (splitk) launch_f2<FMT, NT, 32, true>(W, x, ldx, T, y, ldy, acc, s);
-    else if (nch >= 96 || nch % 32 == 0) launch_f2<FMT, NT, 32, false>(W, x, ldx, T, y, ldy, acc, s);
-    else if (nch % 8 == 0 || nch >= 48) launch_f2<FMT, NT, 8, false>(W, x, ldx, T, y, ldy, acc, s);
-    else launch_f2<FMT, NT, 4, false>(W, x, ldx, T, y, ldy, acc, s);
+    if (splitk) launch_f2<FMT, NT, 32, true>(W, x, ldx, T, y, ldy, acc, s, sp);
+    else if (nch >= 96 || nch % 32 == 0) launch_f2<FMT, NT, 32, false>(W, x, ldx, T, y, ldy, acc, s, sp);
+    else if (nch % 8 == 0 || nch >= 48) launch_f2<FMT, NT, 8, false>(W, x, ldx, T, y, ldy, acc, s, sp);
+    else launch_f2<FMT, NT, 4, false>(W, x, ldx, T, y, ldy, acc, s, sp);
 }
 
 template <int NT>
 static void launch_f0(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc,
-                      cudaStream_t s) {
+                      cudaStream_t s, GemvSplit sp) {
     switch (W.type) {
-        case QT_F32: launch_f1<QT_F32, NT>(W, x, ldx, T, y, ldy, acc, s); break;
-        case QT_F16: launch_f1<QT_F16, NT>(W, x, ldx, T, y, ldy, acc, s); break;
-        case QT_BF16: launch_f1<QT_BF16, NT>(W, x, ldx, T, y, ldy, acc, s); break;
+        case QT_F32: launch_f1<QT_F32, NT>(W, x, ldx, T, y, ldy, acc, s, sp); break;
+        case QT_F16: launch_f1<QT_F16, NT>(W, x, ldx, T, y, ldy, acc, s, sp); break;
+        case QT_BF16: launch_f1<QT_BF16, NT>(W, x, ldx, T, y, ldy, acc, s, sp); break;
         default: bnk_unsupported_format(W.type);
     }
 }
 
 void gemv_float2(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,
-                 cudaStream_t s) {
+                 cudaStream_t s, GemvSplit sp) {
     // fp16 rows, several tokens: the tensor cores (x read as fp32 and converted)
     // (not tiny matrices: a few row groups cannot fill the GPU)
     if (W.type == QT_F16 && W.rows >= 256 && W.cols % 32 == 0 && ldx % 4 == 0 && T >= mma_min_tokens() &&
         mma_min_tokens() > 0)
-        return launch_mma_k<QT_F16, true>(W, x, ldx, T, y, ldy, accumulate, s);
-    if (T == 1) launch_f0<1>(W, x, ldx, T, y, ldy, accumulate, s);
-    else if (T == 2) launch_f0<2>(W, x, ldx, T, y, ldy, accumulate, s);
-    else if (T <= 4) launch_f0<4>(W, x, ldx, T, y, ldy, accumulate, s);
-    else launch_f0<8>(W, x, ldx, T, y, ldy, accumulate, s);
+        return launch_mma_k<QT_F16, true>(W, x, ldx, T, y, ldy, accumulate, s, sp);
+    if (T == 1) launch_f0<1>(W, x, ldx, T, y, ldy, accumulate, s, sp);
+    else if (T == 2) launch_f0<2>(W, x, ldx, T, y, ldy, accumulate, s, sp);
+    else if (T <= 4) launch_f0<4>(W, x, ldx, T, y, ldy, accumulate, s, sp);
+    else launch_f0<8>(W, x, ldx, T, y, ldy, accumulate, s, sp);
 }
 
 }  // namespace bnk
