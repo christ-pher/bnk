@@ -10,7 +10,7 @@ greedy output unchanged). Items are in the order they will be worked on.
 | 2 | **Expert kernel register diet** (`moe_tc.cu`): ncu shows 8 warps per SM, 40% issue, 4.9 cycles per issued instruction, latency-bound. Two blocks per SM without spills (the 128-register token-split try spilled and ran IQ2_S/IQ3_XXS layers 3x slower) | ~2x on the expert share, ~20-25% on cold reads | medium | tried 2026-10-15: a WMMA version with the unpacked weights staged in shared memory (88-142 registers, two blocks per SM) was slower in both 16x32 and 32x32 warp-tile forms (32K cold 2,412 / 2,424 vs 2,740 tok/s): the fragment reloads from shared memory cost more than the latency they hide. The K-split kernel stays; a next attempt should keep its register-resident weights and get a second block per SM by halving the token tile instead |
 | 3 | **Dense prompt GEMMs**: cuBLAS at ~46 TFLOPS with fp32 outputs (`Kernel2`, 64x64 tiles); fp16 outputs plus the convert folded into the next kernel, or bigger tiles | ~10% on reads | small | measured 2026-10-15 (`build/bench_gemm`): the big shapes already run at 70-81 TFLOPS with fp32 outputs; fp16 outputs help only the small ones (router, shared expert: 0.26 -> 0.17 ms per 4,096-token chunk), ~1% of a read; cublasLt heuristics no better. Closed |
 | 4 | **Decode**: (a) window 8 -> 16 rows (scoped 2026-10-15: `kMaxWindow` is baked into ~78 sites: the MoE hit lists and mailbox sizes, the GEMV kernels' per-token register arrays (NT <= 8, the mma kernel's 8-token quad-pair groups), the commit graph tables [lane][first row][kept rows], the drafter's graphs and batched items, `PfItem`, the sampler's row buffers; a 2-3 day change, gains only with 2-3 streams) for batched streams (roadmap item 6: more drafts verified per conversation when 2-3 decode together); (b) the IQ expert unpack (experts at ~half of HBM bandwidth, instruction-bound); (c) remaining small-kernel fusion (402 tiny launches per forward, ~12% of GPU time, mostly overlapped already) | (a) 10-20% with several streams; (b) 5-10%; (c) 3-5% | medium | |
-| 5 | **Tensor parallel for one conversation** (both GPUs on every layer instead of taking turns; each card idles ~50% of a single-stream round today) | ~1.6x single-stream decode on paper | large: see below | exploring |
+| 5 | **Tensor parallel for one conversation** (both GPUs on every layer instead of taking turns; each card idles ~50% of a single-stream round today) | ~1.6x single-stream decode on paper | large: see below | BUILT on branch `tensor-parallel` (`--tp 1`, commit e56b292): output equals the pipeline's token for token, but a verify round takes 28.7 ms against 22.5 (GPU 20.4 vs 21.3 ms) and prompt reads 1,100 tok/s against 2,000. The profile (below) says why: the decode forward is latency-bound, not throughput-bound |
 
 ## Decode today, per forward on each GPU (~11 ms, node-level nsys)
 
@@ -42,6 +42,18 @@ the other works. Tensor parallelism splits every layer across both cards so both
 * **Cost**: every kernel launch site gets a row/column range, both engines' graphs run in lockstep with cross-
   device events, the expert cache's placement policy changes, parking / snapshots / batched lanes all follow.
   Prototype first: one layer's dense + MoE split across the two cards with the exchange, timed, before deciding.
+
+**Measured (2026-10-15, branch `tensor-parallel`).** Node-level nsys of TP decode, one conversation, 38 forwards:
+each device busy ~17 ms per forward with ~1,760 kernel launches (the same ~37 per layer as before, now for all 48
+layers on both devices); kernel time per device 19.2 ms for 48 half-width layers against 12.6 ms for 26
+full-width layers in the pipeline. Halving the matrices barely shortened the kernels: the dense GEMVs took 9.9 ms
+per device (pipeline: 10.7 ms for the whole model) because at 3 rows a GEMV is bound by its launch and ramp
+(~10-15 us whatever its size: `gemv_f_k` on the 48-row beta / alpha vectors takes 9.6 us); the hyper-connections,
+router, norms and PLE are replicated (~1 GB of each device's 2.5 GB per forward: hc_up alone is 6.5 MB of F16
+per block); the 96 exchanges cost 2.7 ms. Prompt reads lose because each device reads the whole chunk through
+all 48 layers with 2 x 21 MB exchanges per layer. Conclusion: tensor parallel pays only once the per-layer fixed
+costs shrink (far fewer launches per layer: stacked / grouped GEMVs, then a persistent per-layer kernel), and
+those same changes speed the pipeline up first. Kept on the branch, not merged.
 
 Alternatives that keep the pipeline and still fill the idle card: none for a single stream (the next window
 depends on the previous one's output). Two conversations already fill both cards (two lanes).
