@@ -51,6 +51,7 @@ add_library(bnk_core STATIC
   src/kernels/rfmt.cpp
   src/kernels/ops.cu
   src/kernels/moe.cu
+  src/kernels/moe_tc.cu
   src/kernels/qsa.cu
   src/engine/engine.cpp
   src/engine/mtp.cpp
@@ -100,6 +101,9 @@ target_compile_options(test_sampler_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK
 add_executable(bench_moe tests/bench_moe.cu)
 target_link_libraries(bench_moe PRIVATE bnk_core)
 target_compile_options(bench_moe PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(test_moe_tc tests/test_moe_tc.cu)
+target_link_libraries(test_moe_tc PRIVATE bnk_core)
+target_compile_options(test_moe_tc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
 add_executable(test_topk tests/test_topk.cu)
 target_link_libraries(test_topk PRIVATE bnk_core)
 target_compile_options(test_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)

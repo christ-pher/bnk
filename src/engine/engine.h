@@ -497,6 +497,7 @@ private:
     static constexpr int kCtxStep = 8192, kCtxBaseline = 16384;
     void prefill_staging_ensure(bool full);
     bool pf_full_ = false;   // this read stages whole layers (checked again before every chunk)
+    bool pf_tc_ = true;      // the routed experts of a chunk on the tensor cores (moe_tc; BNK_PF_TC=0: cuBLAS + list)
     void prefill_staging_shrink();
     struct {
         DevBuf<float> res, xn, lo, gpre, mixed, inj, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, rlog, w, sg, su,

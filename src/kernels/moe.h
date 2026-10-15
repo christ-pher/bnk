@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "kernels/gemv.h"
@@ -96,6 +97,24 @@ struct PfItem {
 // gu[pair][2F] = blob gate/up rows . x[tok]; h quantized per pair; D[pair][E] (fp16) = down . h
 void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const ActQ8 & xq, int E, int F,
               float * gu, int8_t * hq, float * hd, half * D, cudaStream_t st);
+
+// ---- prompt path, tensor cores (moe_tc.cu): an expert's tokens against its quantized rows, the weights unpacked
+// once per 64-token tile into fp16 fragments. Pairs (token, slot) are sorted by expert: an item is one expert's run
+// of pairs [p0, p0 + n), a block one 64-token tile of it (t0 = 0, 64, ...). The gate/up kernel reads pair p's
+// activation at x[perm[p]] (fp16) and writes h = silu(gate) * up to h[p][F]; the down kernel reads h[p] and writes
+// D[p][E] (fp16, as the grouped GEMM path did).
+struct TcItem {
+    const uint8_t * blob;     // the expert's blob on the device (cache slot or stage)
+    int32_t p0, n;            // its pairs
+};
+struct TcBlock {
+    int32_t item, t0;
+};
+constexpr int kTcTile = 64;   // tokens per block
+void moe_tc_gu(const TcItem * items, const TcBlock * blocks, int nblocks, const MoeLayerDesc & d, const half * x,
+               int64_t ldx, const int32_t * perm, half * h, int E, int F, cudaStream_t st);
+void moe_tc_down(const TcItem * items, const TcBlock * blocks, int nblocks, const MoeLayerDesc & d, const half * h,
+                 half * D, int E, int F, cudaStream_t st);
 
 // seq += 1 (first kernel of a forward)
 void bump_seq(uint32_t * seq, cudaStream_t st);

@@ -124,6 +124,7 @@ int main(int argc, char ** argv) {
         else if (a == "--vram-reserve-gib") opt.vram_reserve_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
+        else if (a == "--gemm-min-tokens") opt.gemm_min_tokens = std::stoi(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next()), adapt_set = true;
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next()), adapt_set = true;
         else if (a == "--park-gib") opt.park_gib = std::stod(next());
@@ -495,15 +496,19 @@ int main(int argc, char ** argv) {
             const auto cold = read_tokens(item.substr(0, bar));
             eng.reset();
             Generator g1(eng, eng.mtp(), gopt);
+            // BNK_PB_PROF=cold: the profiler's capture range covers the cold read instead of the follow-up
+            static const bool pcold = getenv("BNK_PB_PROF") && !strcmp(getenv("BNK_PB_PROF"), "cold");
+            if (pcold) cudaProfilerStart();
             double t0 = now_ms();
             g1.start(cold, SamplingParams{}, ckpt(cold));
             double t1 = now_ms();
+            if (pcold) cudaProfilerStop();
             printf("cold   %7zu tokens: %8.1f ms  %7.1f tok/s\n", cold.size(), t1 - t0, cold.size() / ((t1 - t0) / 1000));
             fflush(stdout);
             if (bar == std::string::npos) continue;
             const auto fu = read_tokens(item.substr(bar + 1));
             Generator g2(eng, eng.mtp(), gopt);
-            static const bool pprof = getenv("BNK_PB_PROF") != nullptr;   // nsys --capture-range=cudaProfilerApi
+            static const bool pprof = getenv("BNK_PB_PROF") && !pcold;   // nsys --capture-range=cudaProfilerApi
             if (pprof) cudaProfilerStart();
             t0 = now_ms();
             int tok = g2.start(fu, SamplingParams{}, ckpt(fu));

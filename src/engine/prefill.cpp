@@ -52,12 +52,17 @@ size_t Engine::prefill_carve(int N, bool dry_only) {
         carve(p.perm, (size_t) N * k); carve(p.inv, (size_t) N * k); carve(p.tok, N);
         carve(p.sg, (size_t) N * c.n_ff_shexp); carve(p.su, (size_t) N * c.n_ff_shexp); carve(p.sh, (size_t) N * c.n_ff_shexp);
         carve(p.sgate, N); carve(p.shared, (size_t) N * E); carve(p.moe, (size_t) N * E);
-        carve(p.xg, (size_t) N * k * E); carve(p.gu, (size_t) N * k * 2 * F); carve(p.hh, (size_t) N * k * F);
+        // the tensor-core expert path reads the chunk's input (fp16, [N][E]) by pair and keeps no fp16 gate/up
+        // products; the grouped-GEMM / list paths gather it per pair ([N k][E]) and need their intermediates
+        const bool tc = pf_tc_;
+        carve(p.xg, tc ? (size_t) N * E : (size_t) N * k * E); carve(p.gu, tc ? 0 : (size_t) N * k * 2 * F);
+        carve(p.hh, (size_t) N * k * F);
         carve(p.dd, (size_t) (N * k + 1) * E);   // + a zero row for pairs computed elsewhere
         carve(p.cpu, (size_t) N * E);
         if (qsa_on_) { carve(p.ik, (size_t) N * c.idx_dim); carve(p.iq, (size_t) N * c.idx_heads * c.idx_dim); }
-        carve(p.xq, (size_t) N * E); carve(p.xd, (size_t) N * E / 32);
-        carve(p.hq, (size_t) N * k * F); carve(p.hd, (size_t) N * k * F / 32); carve(p.gu32, (size_t) N * k * 2 * F);
+        carve(p.xq, tc ? 0 : (size_t) N * E); carve(p.xd, tc ? 0 : (size_t) N * E / 32);
+        carve(p.hq, tc ? 0 : (size_t) N * k * F); carve(p.hd, tc ? 0 : (size_t) N * k * F / 32);
+        carve(p.gu32, tc ? 0 : (size_t) N * k * 2 * F);
         carve(p.items, (size_t) (2 * (N * k + c.n_expert)) * sizeof(PfItem));
         if (c.ple_layer >= 0 && owns(c.ple_layer)) {
             const int ph = c.ple_heads();
@@ -89,9 +94,9 @@ void Engine::prefill_alloc(int N) {
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_items, (size_t) p.max_items * sizeof(PfItem), 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_x, (size_t) N * E * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_cpu, (size_t) N * E * 4, 0));
-    // fp16 copies of a group of experts' gate/up/down
+    // fp16 copies of a group of experts' gate/up/down (the grouped-GEMM path)
     p.wexp_experts = 32;
-    p.wexp.alloc((size_t) p.wexp_experts * 3 * F * E);
+    if (!pf_tc_) p.wexp.alloc((size_t) p.wexp_experts * 3 * F * E);
     if (c.ple_layer >= 0 && owns(c.ple_layer))
         CUDA_CHECK(cudaHostAlloc((void **) &p.ple_rows, (size_t) N * c.ple_heads() * model_.ple_table->row_bytes(),
                                  cudaHostAllocMapped));
@@ -421,15 +426,15 @@ void Engine::pf_moe(int il, int N) {
     CUDA_CHECK(cudaMemcpyAsync(p.perm.p, p.h_perm, (size_t) P * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(p.inv.p, p.h_inv, (size_t) P * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemsetAsync(p.dd.p + (size_t) P * E, 0, (size_t) E * 2, st_));
-    gather_rows_f16(p.mixed, E, p.perm, P, p.xg, st_);
+    if (pf_tc_) f32_to_f16(p.mixed, p.xg, (int64_t) N * E, st_);   // the chunk's input, read by pair through perm
+    else gather_rows_f16(p.mixed, E, p.perm, P, p.xg, st_);
     if (!cpu_tasks.empty()) {
         CUDA_CHECK(cudaMemcpyAsync(p.h_x, p.mixed.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaMemcpyAsync(p.h_w, p.w.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaEventRecord(p.xready, st_));
     }
 
-    // the experts on the GPU: fp16 copies of a group, then two grouped GEMMs (resident ones first).
-    // Resident experts are R-layout cache slots; staged ones the host store's ggml blobs.
+    // the experts on the GPU. Resident experts are R-layout cache slots; staged ones the host store's ggml blobs.
     const MoeLayerDesc d = cache_.desc(il);
     MoeLayerDesc ds = d;   // the stage's view
     {
@@ -441,6 +446,40 @@ void Engine::pf_moe(int il, int N) {
         ds.grow = ggml_row_size((ggml_type) Lw.gate_type, E);
         ds.drow = ggml_row_size((ggml_type) Lw.down_type, F);
     }
+    auto src_of = [&](int e) {
+        const int sl = cache_.slot_of(il, e);
+        return sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
+    };
+    if (pf_tc_) {
+        // Tensor cores: every expert's run of pairs in 64-token tiles, one launch each for gate/up and down;
+        // resident (R layout) and staged (ggml) experts in separate launches. Items and blocks go through the
+        // pinned item buffer: items of both kinds first, then their blocks.
+        const int ne = c.n_expert, max_blocks = P / kTcTile + ne + 1;
+        TcItem * h_it[2] = {(TcItem *) p.h_items, (TcItem *) p.h_items + ne};
+        TcBlock * h_bl[2] = {(TcBlock *) ((TcItem *) p.h_items + 2 * ne), nullptr};
+        h_bl[1] = h_bl[0] + max_blocks;
+        const size_t bytes = (size_t) 2 * ne * sizeof(TcItem) + (size_t) 2 * max_blocks * sizeof(TcBlock);
+        if (bytes > (size_t) p.max_items * sizeof(PfItem)) throw std::runtime_error("prefill: item buffer too small");
+        int n_it[2] = {0, 0}, n_bl[2] = {0, 0};
+        for (int e = 0; e < ne; ++e) {
+            if (!cnt[e] || on_cpu[e]) continue;
+            const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
+            h_it[kind][n_it[kind]] = TcItem{src_of(e), off[e], cnt[e]};
+            for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) h_bl[kind][n_bl[kind]++] = TcBlock{n_it[kind], t0};
+            ++n_it[kind];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(p.items.p, p.h_items, bytes, cudaMemcpyHostToDevice, st_));
+        const TcItem * d_it[2] = {(const TcItem *) p.items.p, (const TcItem *) p.items.p + ne};
+        const TcBlock * d_bl[2] = {(const TcBlock *) ((const TcItem *) p.items.p + 2 * ne), nullptr};
+        d_bl[1] = d_bl[0] + max_blocks;
+        for (int kind = 0; kind < 2; ++kind) {
+            if (!n_bl[kind]) continue;
+            if (kind == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
+            moe_tc_gu(d_it[kind], d_bl[kind], n_bl[kind], kind ? ds : d, p.xg, E, p.perm, p.hh, E, F, st_);
+        }
+        for (int kind = 0; kind < 2; ++kind)
+            if (n_bl[kind]) moe_tc_down(d_it[kind], d_bl[kind], n_bl[kind], kind ? ds : d, p.hh, p.dd, E, F, st_);
+    } else {
     const size_t gu_elems = (size_t) 2 * F * E, dn_elems = (size_t) E * F;
     std::vector<int> group;
     auto flush = [&]() {
@@ -476,10 +515,6 @@ void Engine::pf_moe(int il, int N) {
             swiglu_f16(yg[i], (half *) hx[i], n[i], F, st_);
         gemm_.grouped_h(wd, hx, yd, n, E, F);
         group.clear();
-    };
-    auto src_of = [&](int e) {
-        const int sl = cache_.slot_of(il, e);
-        return sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
     };
     for (int pass = 0; pass < 2; ++pass) {   // 0: resident, 1: staged (after their copy)
         if (pass == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
@@ -517,6 +552,7 @@ void Engine::pf_moe(int il, int N) {
         moe_list(dev, n_items[0], d, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
         moe_list(dev + half_cap, n_items[1], ds, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
     }
+    }   // !pf_tc_
     CUDA_CHECK(cudaEventRecord(p.used[il & 1], st_));
     // the CPU part runs here while the GPU works through the queue
     const float * extra = nullptr;

@@ -21,6 +21,23 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **Prompt-path experts on the tensor cores** (2026-10-15, `src/kernels/moe_tc.cu`): nsys on a cold 32K read showed
+  61% of GPU 0's busy time in the routed experts' grouped GEMM path: `cublasGemmGroupedBatchedEx` runs one kernel
+  per expert (64 us for a 1280 x 2560 x ~40 product, ~4 TFLOPS) after two `dequant_r_k` launches per expert (an
+  fp16 copy of every used expert through HBM, ~8 GB per layer and chunk); a 603-token follow-up spent ~70% of its
+  GPU time there. Now one launch per layer computes h = silu(gate x) up for every (expert, 64-token tile, 64-row
+  tile) and one the down products: the quantized sub-blocks are unpacked once per tile into fp16 `mma.m8n8k4`
+  fragments (as the decode GEMV, `kernels/mma.cuh`), the tile's activations are staged in shared memory (double
+  buffered, the next step's loaded during the products, the next weights prefetched into L1). The fp16 gate/up,
+  int8 activation and fp16 expert copies leave the prompt arena (-~0.5 GiB at 4,096-token chunks, so long reads
+  evict fewer experts), and `wexp` (314 MiB) is not allocated. `tests/test_moe_tc.cu` checks every expert format
+  against a host reference (relative rms error ~5e-4: the fp16 rounding). `BNK_PF_TC=0` restores the old path.
+  Also: a pipelined read now takes even chunks, at least two, so a short turn overlaps the two GPUs
+  (`BNK_PIPE_SPLIT`, `BNK_PIPE_PARTS`). Measured with `bnk pbench` (server settings): cold 4K read 1,289 -> 1,996
+  tok/s, cold 32K 1,873 -> 2,782, 603-token follow-up 775 -> 613 ms. Not kept: 128-thread blocks (two per SM:
+  slower, each block stages its own tile), the dp4a list kernels for every expert (`--gemm-min-tokens 1e6`:
+  follow-up +13% but 32K reads -10%).
+
 * **GPU efficiency, part 1** (2026-10-14): (a) the dp4a GEMV at 5-8 rows was bound by instruction issue (the dot
   product and its scales repeated per row): `gemv_mma_k` unpacks each sub-block once into fp16 registers and uses
   the tensor cores (`mma.m8n8k4`), 8 rows per warp, quad pairs on consecutive sub-blocks, K split over a block's

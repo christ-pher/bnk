@@ -442,6 +442,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     }
     if (last_ && !opt.mtp.empty())
         mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
+    pf_tc_ = !getenv("BNK_PF_TC") || atoi(getenv("BNK_PF_TC")) != 0;
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
     pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
@@ -1503,6 +1504,18 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     // several stages: chunk k+1 on the first stage while the worker runs chunk k through the others
     static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
     if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
+    // Chunks of even size, at least two: a read that fits one chunk would run through the stages one after the
+    // other (each GPU idle while the other works), and a read of a chunk and a bit would leave the second stage a
+    // tiny last chunk to overlap with (603-token follow-up turns on two V100s: 678 -> 581 ms split in two). Shorter
+    // reads stay whole (each chunk pays for its dense weights' dequantization). BNK_PIPE_SPLIT=0 turns it off, N
+    // sets the shortest read split.
+    static const int split_min = getenv("BNK_PIPE_SPLIT") ? atoi(getenv("BNK_PIPE_SPLIT")) : 256;
+    static const int min_parts = getenv("BNK_PIPE_PARTS") ? atoi(getenv("BNK_PIPE_PARTS")) : 2;
+    int chunk = pf_max_;
+    if (next_ && pipe && split_min > 0 && pf_max_ > 0 && n >= split_min && n >= 2 * opt_.prefill_min) {
+        const int parts = std::max(min_parts, (n + pf_max_ - 1) / pf_max_);
+        chunk = std::max(opt_.prefill_min, (n + parts - 1) / parts);
+    }
     size_t handed = 0;     // tokens given to the later stages so far
     bool posted = false;   // a chunk is with the worker (its progress not reported yet)
     int buf = 0;
@@ -1525,7 +1538,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
         if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
-            const int N = (int) std::min<size_t>(pf_max_, left);
+            const int N = (int) std::min<size_t>(chunk, left);
             const int32_t * tk = tokens.data() + i;
             const double c0 = now_ms();
             prefill_chunk_here(tk, N, buf);
