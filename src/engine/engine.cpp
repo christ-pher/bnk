@@ -1446,7 +1446,13 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     // Every stage reads the same chunks: the largest layout all of them fit.
     const int n = (int) tokens.size();
     if (pf_base_ > 0) {
-        const int want = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
+        int want = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
+        // several GPUs: the pipeline is full only from the second chunk on, so a read in few big chunks leaves the
+        // GPUs taking turns. Smaller chunks for shorter reads, bigger ones (more efficient per token) for long ones
+        // (two V100s, cold reads: 16K 1,374 -> 1,616 tok/s with 4,096-token chunks; 8,192 stays best from ~48K)
+        static const bool pipe_chunks = !getenv("BNK_PIPE_CHUNKS") || atoi(getenv("BNK_PIPE_CHUNKS")) != 0;
+        if (next_ && pipe_chunks && want > pf_base_)
+            want = n < 4 * pf_base_ ? pf_base_ : n < 24 * pf_base_ ? std::min(want, 2 * pf_base_) : want;
         // smaller chunks when VRAM is short (long contexts in every slot): slower, but the read goes through;
         // conversations are moved off the GPU only when even the smallest layout does not fit
         auto fits = [&](int N) {
