@@ -463,7 +463,7 @@ expert cache starts warm after the first session.
   "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
-  "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", "--max-tokens", "32768", "--slots", "2"],
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", "--max-tokens", "32768", "--slots", "3"],
   "engine_args": ["--threads", "24"]
 }
 ```

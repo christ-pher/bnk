@@ -1,16 +1,13 @@
 {
-  "notes": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S (ISTA DASLab). Sampling is the model file's own recommendation. Speculation tuned on this machine (5 prompts x 2-3 runs, sampled): draft 4 / cutoff 0.8 decodes ~58 tok/s vs ~50 with the engine defaults (3 / 0.5); at temperature 1.0 low-confidence drafts are mostly rejected, so a higher cutoff saves verify work.",
+  "notes": "Qwen3.8-Flash-Next GSQ-RCO IQ3_S (ISTA DASLab). Sampling is the model file's own recommendation. Speculation tuned on this machine (5 prompts x 2-3 runs, sampled): draft 4 / cutoff 0.8 decodes ~58 tok/s vs ~50 with the engine defaults (3 / 0.5); at temperature 1.0 low-confidence drafts are mostly rejected, so a higher cutoff saves verify work. Slots: 3 since 2026-10-15 (two GPUs): the 2-slot limit came from one card's VRAM; with the layers split over two cards, three agents with 172-180K-token contexts (4 turns x 600 tokens) ran 269 s against 341 s with 2 slots (24.2 vs 21.1 tok/s overall), reads after the first turn 1.0 vs 1.3 s. Draft 6 / cutoff 0.6 re-tested on two GPUs the same day: no gain over 4 / 0.8 at temperature 1.0 or 0.",
   "aliases": ["iq3_s"],
   "source": {
     "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
     "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
-    "files": [
-      "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
-      "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"
-    ]
+    "files": ["IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf", "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"]
   },
   "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
-  "server_args": ["--model-id", "Qwen3.8-Flash-Next", "--max-tokens", "32768", "--slots", "2"]
+  "server_args": ["--model-id", "Qwen3.8-Flash-Next", "--max-tokens", "32768", "--slots", "3"]
 }
