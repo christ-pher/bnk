@@ -437,8 +437,7 @@ void MtpLayer::enqueue(int n, bool draft) {
     silu_mul(sg_, su_, sh_, c.n_ff_shexp, st_);
     gemv_auto(sh_down_, sh_, c.n_ff_shexp, 1, shared_, E, false, act_, st_);
     gemv_auto(sh_gate_inp_, mixed_, E, 1, sgate_, 1, false, act_, st_);
-    sigmoid_inplace(sgate_, 1, st_);
-    moe_reduce(moes_, msg_, shared_, sgate_, y_, 1, c.n_expert_used, E, st_);
+    moe_reduce(moes_, msg_, shared_, sgate_, y_, 1, c.n_expert_used, E, st_, nullptr, true);
     hc_combine(RL, y_, inj2_, 1, c.hc, E, st_);
     // keep the residual for the next step, then the final mixer and the (draft) head
     if (L > 0) copy_f32(R_, RL, HC, st_);
@@ -626,8 +625,7 @@ void MtpLayer::enqueue_multi(const std::vector<MItem> & items) {
     silu_mul(dsg_, dsu_, dsh_, (int64_t) S * c.n_ff_shexp, st_);
     gemv_auto(sh_down_, dsh_, c.n_ff_shexp, S, dshared_, E, false, act_, st_);
     gemv_auto(sh_gate_inp_, dmix_, E, S, dsgate_, 1, false, act_, st_);
-    sigmoid_inplace(dsgate_, S, st_);
-    moe_reduce(moes_, msg_, dshared_, dsgate_, dy_, S, c.n_expert_used, E, st_);
+    moe_reduce(moes_, msg_, dshared_, dsgate_, dy_, S, c.n_expert_used, E, st_, nullptr, true);
     hc_combine(Dres_, dy_, dinj2_, S, c.hc, E, st_);
     hc_pre(hc_mix_, Dres_, S, false, dsample_, nullptr);
     const QMat & head = n_dvocab_ ? dhead_ : main_->output;

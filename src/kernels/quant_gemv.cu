@@ -21,10 +21,12 @@ void bnk_unsupported_format(int fmt) {
 }
 
 // ------------------------------------------------------------------------------ activation quantize
-// One warp per 32-value block: d = amax/127, q = round(x/d).
-__global__ void quantize_act_k(const float * __restrict__ x, int64_t ldx, int64_t cols, int8_t * __restrict__ q,
-                               float * __restrict__ d, int16_t * __restrict__ sums, half * __restrict__ h,
-                               int64_t cols_pad, int nblk_total) {
+// One warp per 32-value block: d = amax/127, q = round(x/d). PRO: the value is x (0), silu(x * scale) (1), or
+// silu(x) * x2 (2), computed on the way (the elementwise kernel it replaces ran as its own launch).
+template <int PRO>
+__global__ void quantize_act_k(const float * __restrict__ x, const float * __restrict__ x2, float scale, int64_t ldx,
+                               int64_t cols, int8_t * __restrict__ q, float * __restrict__ d,
+                               int16_t * __restrict__ sums, half * __restrict__ h, int64_t cols_pad, int nblk_total) {
     const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (gw >= nblk_total) return;
@@ -32,7 +34,13 @@ __global__ void quantize_act_k(const float * __restrict__ x, int64_t ldx, int64_
     const int t = gw / nb;
     const int64_t b = gw % nb;
     const int64_t c = b * 32 + lane;
-    const float v = c < cols ? x[t * ldx + c] : 0.f;
+    float v = c < cols ? x[t * ldx + c] : 0.f;
+    if constexpr (PRO == 1) {
+        v *= scale;
+        v = v / (1.f + __expf(-v));
+    } else if constexpr (PRO == 2) {
+        v = v / (1.f + __expf(-v)) * (c < cols ? x2[t * ldx + c] : 0.f);
+    }
     float amax = fabsf(v);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
@@ -50,13 +58,73 @@ __global__ void quantize_act_k(const float * __restrict__ x, int64_t ldx, int64_
     }
 }
 
-void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s) {
+template <int PRO>
+static void quantize_launch(const float * x, const float * x2, float scale, int64_t ldx, int T, int64_t cols, ActQ8 & a,
+                            cudaStream_t s) {
     a.T = T;
     a.cols = cols;
     a.cols_pad = (cols + 31) / 32 * 32;
     const int nblk = (int) (T * (a.cols_pad / 32));
     const int threads = 256;
-    quantize_act_k<<<(nblk * 32 + threads - 1) / threads, threads, 0, s>>>(x, ldx, cols, a.q, a.d, a.s, a.h, a.cols_pad, nblk);
+    quantize_act_k<PRO><<<(nblk * 32 + threads - 1) / threads, threads, 0, s>>>(x, x2, scale, ldx, cols, a.q, a.d, a.s, a.h,
+                                                                             a.cols_pad, nblk);
+}
+
+void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s) {
+    quantize_launch<0>(x, nullptr, 1.f, ldx, T, cols, a, s);
+}
+void quantize_act_silu(const float * x, float scale, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s) {
+    quantize_launch<1>(x, nullptr, scale, ldx, T, cols, a, s);
+}
+void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s) {
+    quantize_launch<2>(g, u, 1.f, ldx, T, cols, a, s);
+}
+
+// y[t][h][:] = rmsnorm(o[t][h][:]) * w * sigmoid(z[t][h][:]) quantized straight away: a block per (t, h) of S = 128
+// values (4 warps, a sub-block each); the sum of squares over the 4 warps through shared memory.
+__global__ void quantize_gated_norm_k(const float * __restrict__ o, const float * __restrict__ z,
+                                      const float * __restrict__ w, float eps, int8_t * __restrict__ q,
+                                      float * __restrict__ d, int16_t * __restrict__ sums, half * __restrict__ h,
+                                      int64_t cols_pad, int H) {
+    __shared__ float sh[4];
+    const int r = blockIdx.x, t = r / H, hh = r % H;   // (t, h)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int i = warp * 32 + lane;
+    const float x = o[(int64_t) r * 128 + i];
+    float ss = x * x;
+#pragma unroll
+    for (int of = 16; of > 0; of >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, of);
+    if (lane == 0) sh[warp] = ss;
+    __syncthreads();
+    const float inv = rsqrtf((sh[0] + sh[1] + sh[2] + sh[3]) / 128.f + eps);
+    const float zz = z[(int64_t) r * 128 + i];
+    const float v = x * inv * w[i] / (1.f + __expf(-zz));
+    float amax = fabsf(v);
+#pragma unroll
+    for (int of = 16; of > 0; of >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, of));
+    const float dd = amax / 127.f;
+    const float id = dd > 0.f ? 1.f / dd : 0.f;
+    const int qi = __float2int_rn(v * id);
+    const int64_t c = (int64_t) hh * 128 + i, nb = cols_pad / 32, b = c / 32;
+    q[t * cols_pad + c] = (int8_t) qi;
+    if (h) h[t * cols_pad + c] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
+    if (lane == 0) d[t * nb + b] = dd;
+    if (sums) {
+        int sm = qi;
+#pragma unroll
+        for (int of = 8; of > 0; of >>= 1) sm += __shfl_xor_sync(0xffffffff, sm, of);
+        if ((lane & 15) == 0) sums[(t * nb + b) * 2 + (lane >> 4)] = (int16_t) sm;
+    }
+}
+
+bool quantize_gated_norm(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
+                         cudaStream_t s) {
+    if (S != 128) return false;
+    a.T = T;
+    a.cols = (int64_t) H * S;
+    a.cols_pad = a.cols;
+    quantize_gated_norm_k<<<T * H, 128, 0, s>>>(o, z, w, eps, a.q, a.d, a.s, a.h, a.cols_pad, H);
+    return true;
 }
 
 // ------------------------------------------------------------------------------ dp4a GEMV
@@ -302,7 +370,7 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
     else launch_dp4a<8>(W, *a, T, y, ldy, accumulate, s);
 }
 
-static bool use_ref_gemv() {
+bool use_ref_gemv() {
     static int v = -1;
     if (v < 0) { const char * e = getenv("BNK_GEMV_REF"); v = e && *e == '1'; }
     return v == 1;

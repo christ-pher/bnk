@@ -50,7 +50,10 @@ struct EngineOptions {
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
-    int prefill_chunk_max = 8192;    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile)
+    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile). 4,096 since the experts moved to
+    // the tensor cores: 8,192-token chunks evicted experts that then streamed back every chunk, and left the
+    // pipeline fewer chunks to overlap (two V100s, cold reads: 64K 2,587 -> 2,901 tok/s, 128K 1,375 -> 2,905)
+    int prefill_chunk_max = 4096;
     // Between prompts the prompt path keeps a layout for prefill_small tokens and up to stage_small_mib of PCIe
     // staging; more is borrowed from the expert cache for bigger reads. Smaller values give decoding a bigger cache
     // but slow down each turn: on an 80K-token agent conversation with Orca, 512 / 256 MiB gave +1.6% decode speed

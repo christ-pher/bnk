@@ -799,8 +799,14 @@ void Engine::hc_pre(const HcWeights & w, int T, bool want_inject) {
     if (side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, fork(1));
     gemv_q(w.down, act_, xn_, HC, T, lo_, c.hc_rank, st_);
     if (want_inject && !side) gemv_q(w.inject, act_, xn_, HC, T, inj_, c.hc, st_);
-    silu_scale(lo_, (int64_t) T * c.hc_rank, 1.f / c.hc, st_);
-    gemv_auto(w.up, lo_, c.hc_rank, T, gpre_, HC, false, act_, st_);
+    // silu(lo / hc) inside the quantization pass of w.up's input (one launch instead of two)
+    if (!is_float_format(w.up.type) && !use_ref_gemv()) {
+        quantize_act_silu(lo_, 1.f / c.hc, c.hc_rank, T, c.hc_rank, act_, st_);
+        gemv(w.up, &act_, nullptr, 0, T, gpre_, HC, false, st_);
+    } else {
+        silu_scale(lo_, (int64_t) T * c.hc_rank, 1.f / c.hc, st_);
+        gemv_auto(w.up, lo_, c.hc_rank, T, gpre_, HC, false, act_, st_);
+    }
     // mixed and its quantization (mixact_, for the attention / DeltaNet / MoE that follow) in one pass
     if (fuse) {
         hc_mix_q(xn_, gpre_, mixed_, T, c.hc, E, mixact_, st_);
@@ -900,10 +906,16 @@ void Engine::gdn(int il, int T) {
                        S, w.commit ? w.T : 0, st_);
     }
     dbg(st_, il, "conv_output_silu", co, (size_t) T * C);
-    gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
     dbg(st_, il, "attn_output", gdn_o_, (size_t) T * nv * S);
-    dbg(st_, il, "final_output", gdn_n_, (size_t) T * nv * S);
-    gemv_auto(L.ssm_out, gdn_n_, nv * S, T, out_, E, false, act_, st_);
+    // the gated norm inside the quantization pass of ssm_out's input (one launch instead of two)
+    if (!is_float_format(L.ssm_out.type) && !use_ref_gemv() && !getenv("BNK_DUMP_DIR") &&
+        quantize_gated_norm(gdn_o_, z_, F(L.ssm_norm), T, nv, S, c.rms_eps, act_, st_)) {
+        gemv(L.ssm_out, &act_, nullptr, 0, T, out_, E, false, st_);
+    } else {
+        gated_rmsnorm(gdn_o_, z_, F(L.ssm_norm), gdn_n_, T, nv, S, c.rms_eps, st_);
+        dbg(st_, il, "final_output", gdn_n_, (size_t) T * nv * S);
+        gemv_auto(L.ssm_out, gdn_n_, nv * S, T, out_, E, false, act_, st_);
+    }
     dbg(st_, il, "linear_attn_out", out_, (size_t) T * E);
     for (const Win & w : wins_)
         if (w.commit) shift_rows(w.q->conv_buf[il], C, w.T, K - 1, st_);
@@ -1088,10 +1100,15 @@ void Engine::moe(int il, int T) {
         cudaStream_t sb = fork(0);
         gemv_q(L.sh_gate, mixact_, mixed_, E, T, sg_, FF, sb);
         gemv_q(L.sh_up, mixact_, mixed_, E, T, su_, FF, sb);
-        silu_mul(sg_, su_, sh_, (int64_t) T * FF, sb);
-        gemv_auto(L.sh_down, sh_, FF, T, shared_out_, E, false, act_, sb);
+        // silu(gate) * up inside the quantization pass of sh_down's input; the gate's sigmoid in moe_reduce
+        if (!is_float_format(L.sh_down.type) && !use_ref_gemv()) {
+            quantize_act_silu_mul(sg_, su_, FF, T, FF, act_, sb);
+            gemv(L.sh_down, &act_, nullptr, 0, T, shared_out_, E, false, sb);
+        } else {
+            silu_mul(sg_, su_, sh_, (int64_t) T * FF, sb);
+            gemv_auto(L.sh_down, sh_, FF, T, shared_out_, E, false, act_, sb);
+        }
         gemv_q(L.shexp_gate_inp, mixact_, mixed_, E, T, sgate_, 1, sb);
-        sigmoid_inplace(sgate_, T, sb);
     }
     gemv_q(L.router, mixact_, mixed_, E, T, rlogits_, c.n_expert, st_);
     // the experts' choice and the hit list in one launch (BNK_FUSE_PLAN=0: two)
@@ -1124,7 +1141,7 @@ void Engine::moe(int il, int T) {
     }
     moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
     join(0);
-    moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_, &d_par_->seq);   // (waits for the CPU too)
+    moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_, &d_par_->seq, true);   // (waits for the CPU too)
 }
 
 void Engine::head(int T) {
@@ -1504,13 +1521,13 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     // several stages: chunk k+1 on the first stage while the worker runs chunk k through the others
     static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
     if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
-    // Chunks of even size, at least two: a read that fits one chunk would run through the stages one after the
-    // other (each GPU idle while the other works), and a read of a chunk and a bit would leave the second stage a
-    // tiny last chunk to overlap with (603-token follow-up turns on two V100s: 678 -> 581 ms split in two). Shorter
-    // reads stay whole (each chunk pays for its dense weights' dequantization). BNK_PIPE_SPLIT=0 turns it off, N
-    // sets the shortest read split.
+    // Chunks of even size: a read of a chunk and a bit would leave the later stages a tiny last chunk to overlap
+    // with (2,100 tokens: 1,050 + 1,050 rather than 2,048 + 52). A read that fits one chunk stays whole: with the
+    // experts on the tensor cores, a 603-token follow-up split in two measured 617-631 ms against 604 ms whole
+    // (each chunk pays for its dense weights' dequantization); BNK_PIPE_PARTS=2 splits it anyway (it was worth
+    // 14% with the grouped-GEMM expert path). BNK_PIPE_SPLIT=0 turns the even sizing off, N sets the shortest read.
     static const int split_min = getenv("BNK_PIPE_SPLIT") ? atoi(getenv("BNK_PIPE_SPLIT")) : 256;
-    static const int min_parts = getenv("BNK_PIPE_PARTS") ? atoi(getenv("BNK_PIPE_PARTS")) : 2;
+    static const int min_parts = getenv("BNK_PIPE_PARTS") ? atoi(getenv("BNK_PIPE_PARTS")) : 1;
     int chunk = pf_max_;
     if (next_ && pipe && split_min > 0 && pf_max_ > 0 && n >= split_min && n >= 2 * opt_.prefill_min) {
         const int parts = std::max(min_parts, (n + pf_max_ - 1) / pf_max_);

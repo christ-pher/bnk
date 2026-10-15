@@ -39,11 +39,21 @@ struct ActQ8 {
 
 // Quantize x [T][ldx] (fp32) into `a` (whose buffers hold at least T*cols_pad values).
 void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s);
+// ... of silu(x * scale), and of silu(g) * u (the elementwise step folded into the quantization pass)
+void quantize_act_silu(const float * x, float scale, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s);
+void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s);
+// ... of rmsnorm(o[t][h]) * w * sigmoid(z[t][h]) over T x H heads of S values (gated_rmsnorm folded in); false
+// when S is not 128 (then run gated_rmsnorm and quantize_act)
+bool quantize_gated_norm(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
+                         cudaStream_t s);
 
 // y[t*ldy + r] (+)= W[r,:] . x_t   for r < W.rows, t < T.
 //   quantized W: x comes from `a` (quantize_act first); float W: x comes from `x`/ldx.
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T,
           float * y, int64_t ldy, bool accumulate, cudaStream_t s);
+
+// BNK_GEMV_REF=1: the reference dp4a kernel for every quantized GEMV (debugging)
+bool use_ref_gemv();
 
 // Convenience: quantizes into `scratch` when W needs it.
 void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy,

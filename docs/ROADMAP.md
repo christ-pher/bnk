@@ -32,11 +32,22 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
   int8 activation and fp16 expert copies leave the prompt arena (-~0.5 GiB at 4,096-token chunks, so long reads
   evict fewer experts), and `wexp` (314 MiB) is not allocated. `tests/test_moe_tc.cu` checks every expert format
   against a host reference (relative rms error ~5e-4: the fp16 rounding). `BNK_PF_TC=0` restores the old path.
-  Also: a pipelined read now takes even chunks, at least two, so a short turn overlaps the two GPUs
-  (`BNK_PIPE_SPLIT`, `BNK_PIPE_PARTS`). Measured with `bnk pbench` (server settings): cold 4K read 1,289 -> 1,996
-  tok/s, cold 32K 1,873 -> 2,782, 603-token follow-up 775 -> 613 ms. Not kept: 128-thread blocks (two per SM:
+  Also: a pipelined read now takes chunks of even size (2,100 tokens: 1,050 + 1,050, not 2,048 + 52); splitting a
+  one-chunk follow-up in two was worth 14% with the old expert path but not with this one (604 ms whole vs 617-631
+  split), so it is opt-in (`BNK_PIPE_PARTS=2`; `BNK_PIPE_SPLIT=0` turns the even sizing off). Long prompts now read in chunks of 4,096 tokens, not 8,192: the bigger layout evicted experts that streamed back
+  over PCIe every chunk (35 GB per 64K read) and left a 128K read at 1,375 tok/s. Measured with `bnk pbench`
+  (server settings): cold reads 4K 1,289 -> 2,000 tok/s, 32K 1,873 -> 2,752, 64K 2,059 -> 2,901, 128K 1,955 ->
+  2,905; 603-token follow-up 775 -> 605 ms; decode unchanged. Not kept: 128-thread blocks (two per SM:
   slower, each block stages its own tile), the dp4a list kernels for every expert (`--gemm-min-tokens 1e6`:
-  follow-up +13% but 32K reads -10%).
+  follow-up +13% but 32K reads -10%), and a variant whose quad pairs split the tokens instead of K (4 accumulator
+  tiles per thread, the weights shared by shuffles, two blocks per SM at 128 registers): with the spills its
+  cap forces, the IQ2_S / IQ3_XXS layers of GPU 0 ran 3x slower. ncu on the kept kernel: 8 warps per SM, issue
+  slots 40% busy, 4.9 cycles per issued instruction (latency-bound, not tensor- or memory-bound), so the next
+  step is a register diet without spills.
+* **Decode: fewer launches per layer** (2026-10-15): silu(lo / hc), silu(gate) * up and the DeltaNet gated norm
+  run inside the quantization pass of the GEMV that follows them (`quantize_act_silu`, `quantize_act_silu_mul`,
+  `quantize_gated_norm`), and the shared expert's gate sigmoid inside `moe_reduce` (`raw_gate`): 5 launches fewer
+  per layer. Greedy output unchanged token for token.
 
 * **GPU efficiency, part 1** (2026-10-14): (a) the dp4a GEMV at 5-8 rows was bound by instruction issue (the dot
   product and its scales repeated per row): `gemv_mma_k` unpacks each sub-block once into fp16 registers and uses

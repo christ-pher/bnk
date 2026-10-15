@@ -506,7 +506,7 @@ void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStre
 
 __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __restrict__ part, MoeMsg * msg,
                              const float * __restrict__ shared, const float * __restrict__ sgate,
-                             float * __restrict__ out, int E, int k, const uint32_t * seq) {
+                             float * __restrict__ out, int E, int k, const uint32_t * seq, int raw_gate) {
     // seq: moe_wait's work first (the CPU's answer when the layer had misses; block 0 keeps the timestamps), which
     // saves its launch
     if (seq) {
@@ -538,7 +538,8 @@ __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __
     __syncthreads();
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= E) return;
-    float acc = shared[(size_t) t * E + r] * sgate[t];
+    const float sg = sgate[t];
+    float acc = shared[(size_t) t * E + r] * (raw_gate ? 1.f / (1.f + __expf(-sg)) : sg);
     for (int q = 0; q < k; ++q)
         if (s_ent[q] >= 0) acc += s_w[q] * part[((size_t) s_ent[q] * kMaxWindow + t) * E + r];
     if (hits->n_miss > 0) acc += ((volatile float *) msg->out(E))[(size_t) t * E + r];
@@ -546,9 +547,9 @@ __global__ void moe_reduce_k(const HitList * __restrict__ hits, const float * __
 }
 
 void moe_reduce(const MoeScratch & s, MoeMsg * msg, const float * shared, const float * sgate, float * out, int T,
-                int k, int E, cudaStream_t st, const uint32_t * wait_seq) {
+                int k, int E, cudaStream_t st, const uint32_t * wait_seq, bool raw_gate) {
     if (k > 32) { fprintf(stderr, "moe_reduce: k %d > 32\n", k); abort(); }
-    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E, k, wait_seq);
+    moe_reduce_k<<<dim3((E + 255) / 256, T), 256, 0, st>>>(s.hits, s.part, msg, shared, sgate, out, E, k, wait_seq, raw_gate ? 1 : 0);
 }
 
 }  // namespace bnk
