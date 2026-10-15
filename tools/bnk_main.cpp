@@ -424,6 +424,89 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    if (mode == "pbench") {
+        // prompt reads as the server does them (a snapshot where the last turn begins), after a warm-up read of
+        // --tokens-file. BNK_PB_FILES: "cold.txt|follow.txt,..." (follow: cold's tokens plus a new turn; optional);
+        // each pair is read from scratch, then its follow-up with the context cached, then --max-new tokens decoded.
+        const int32_t im = env_int("BNK_PB_IM_START", 248045);
+        auto ckpt = [&](const std::vector<int32_t> & p) {
+            for (size_t i = p.size(); i-- > 1;)
+                if (p[i] == im) return (int) i;
+            return -1;
+        };
+        Generator gen(eng, eng.mtp(), gopt);
+        gen.prefill(prompt);   // warm-up: workspaces, graphs, cuBLAS
+        const char * files = getenv("BNK_PB_FILES");
+        std::string fl = files ? files : "";
+        for (size_t a0 = 0, b; a0 < fl.size(); a0 = b + 1) {
+            b = fl.find(',', a0);
+            if (b == std::string::npos) b = fl.size();
+            const std::string item = fl.substr(a0, b - a0);
+            const size_t bar = item.find('|');
+            const auto cold = read_tokens(item.substr(0, bar));
+            eng.reset();
+            Generator g1(eng, eng.mtp(), gopt);
+            double t0 = now_ms();
+            g1.start(cold, SamplingParams{}, ckpt(cold));
+            double t1 = now_ms();
+            printf("cold   %7zu tokens: %8.1f ms  %7.1f tok/s\n", cold.size(), t1 - t0, cold.size() / ((t1 - t0) / 1000));
+            fflush(stdout);
+            if (bar == std::string::npos) continue;
+            const auto fu = read_tokens(item.substr(bar + 1));
+            Generator g2(eng, eng.mtp(), gopt);
+            static const bool pprof = getenv("BNK_PB_PROF") != nullptr;   // nsys --capture-range=cudaProfilerApi
+            if (pprof) cudaProfilerStart();
+            t0 = now_ms();
+            int tok = g2.start(fu, SamplingParams{}, ckpt(fu));
+            t1 = now_ms();
+            if (pprof) cudaProfilerStop();
+            printf("follow %7zu new:    %8.1f ms  %7.1f tok/s\n", fu.size() - cold.size(), t1 - t0,
+                   (fu.size() - cold.size()) / ((t1 - t0) / 1000));
+            std::vector<int> out{tok};
+            const int64_t m0 = eng.times.misses, sw0 = eng.cache_swaps();
+            const double t2 = now_ms();
+            while ((int) out.size() < max_new && out.back() != c.eos_token)
+                for (int t : g2.next()) out.push_back(t);
+            const double t3 = now_ms();
+            const auto & gs = g2.stats;
+            if (max_new > 1)
+                printf("decode %7zu tokens: %8.1f ms  %7.1f tok/s  %.2f tok/round, verify %.2f draft %.2f ms/round\n",
+                       out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000),
+                       (double) gs.emitted / std::max<int64_t>(1, gs.rounds), gs.verify_ms / std::max<int64_t>(1, gs.rounds),
+                       gs.draft_ms / std::max<int64_t>(1, gs.rounds));
+            printf("       expert misses %lld, cache swaps %lld\n", (long long) (eng.times.misses - m0),
+                   (long long) (eng.cache_swaps() - sw0));
+            fflush(stdout);
+            // BNK_PB_DRAFTS="4:0.8,6:0.5": the same turn decoded again with other speculation settings (from the
+            // snapshot where it starts)
+            const char * dr = getenv("BNK_PB_DRAFTS");
+            for (std::string ds = dr ? dr : ""; !ds.empty();) {
+                const size_t cm = ds.find(',');
+                const std::string one = ds.substr(0, cm);
+                ds = cm == std::string::npos ? "" : ds.substr(cm + 1);
+                GenOptions go = gopt;
+                go.max_draft = std::stoi(one.substr(0, one.find(':')));
+                go.min_p = std::stof(one.substr(one.find(':') + 1));
+                Generator g3(eng, eng.mtp(), go);
+                std::vector<int> o3{g3.start(fu, SamplingParams{}, ckpt(fu))};
+                const int64_t n0 = eng.times.misses;
+                const double a0 = now_ms();
+                while ((int) o3.size() < max_new && o3.back() != c.eos_token)
+                    for (int t : g3.next()) o3.push_back(t);
+                const double a1 = now_ms();
+                const auto & s3 = g3.stats;
+                printf("  draft %d / %.2f: %7.1f tok/s  %.2f tok/round, verify %.2f draft %.2f ms/round%s\n", go.max_draft,
+                       go.min_p, (o3.size() - 1) / ((a1 - a0) / 1000), (double) s3.emitted / std::max<int64_t>(1, s3.rounds),
+                       s3.verify_ms / std::max<int64_t>(1, s3.rounds), s3.draft_ms / std::max<int64_t>(1, s3.rounds),
+                       o3 == out ? "" : " (tokens differ)");
+                printf("       expert misses %lld\n", (long long) (eng.times.misses - n0));
+                fflush(stdout);
+            }
+        }
+        print_stages(eng);
+        return 0;
+    }
+
     Generator gen(eng, eng.mtp(), gopt);
     const double t0 = now_ms();
     int tok = gen.prefill(prompt);
