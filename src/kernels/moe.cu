@@ -646,10 +646,97 @@ __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict
     }
 }
 
+// One row's dot products with N of an item's tokens (activations at a + idx_i * sa, scales at s + idx_i * ss): LPR
+// lanes per row stride over its sub-blocks, then reduce.
+template <int FMT, int LPR, int N>
+__device__ __forceinline__ void list_dots(const uint8_t * row, const ROff & o, int nb, int sub, const int64_t (&idx)[4],
+                                          const int8_t * a, int64_t sa, const float * s, int64_t ss, float (&acc)[4]) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) acc[i] = 0.f;
+    for (int sb = sub; sb < nb; sb += LPR) {
+        Unpacked u;
+        unpack_sm<FMT>(row, o, sb, u);
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const int4 * ap = (const int4 *) (a + idx[i] * sa + sb * 32);
+            acc[i] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, __ldg(ap), __ldg(ap + 1), __ldg(s + idx[i] * ss + sb));
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+#pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1) acc[i] += __shfl_xor_sync(0xffffffff, acc[i], off);
+    }
+}
+
+// The R-layout (resident) list items, as the decode kernels run their hits: LPR lanes per row, up to 4 tokens per
+// pass. GU: gate and up rows (nrows 2F over E columns) into gu; else down rows (E over F) into D.
+template <int FMT, int LPR, bool GU>
+__global__ void __launch_bounds__(256) moe_list_r_k(const PfItem * __restrict__ items, size_t off, size_t rowb, int F,
+                                                    int nrows, int ncols, const int8_t * __restrict__ a, int64_t sa,
+                                                    const float * __restrict__ s, int64_t ss, float * __restrict__ gu,
+                                                    half * __restrict__ D, ROff ro) {
+    const PfItem & it = items[blockIdx.x];
+    rt_tables_load<FMT>();
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, sub = lane % LPR;
+    const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, nrows - 1);   // all lanes shuffle
+    const uint8_t * row = GU ? it.blob + (r < F ? (size_t) r * rowb : off + (size_t) (r - F) * rowb)
+                             : it.blob + off + (size_t) r * rowb;
+    const int n = it.n, nb = ncols / 32;
+    for (int p0 = 0; p0 < n; p0 += 4) {
+        const int m = min(4, n - p0);
+        int64_t idx[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) idx[i] = GU ? it.tok[p0 + min(i, m - 1)] : it.pair[p0 + min(i, m - 1)];
+        float acc[4];
+        switch (m) {   // block-uniform
+            case 1: list_dots<FMT, LPR, 1>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            case 2: list_dots<FMT, LPR, 2>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            case 3: list_dots<FMT, LPR, 3>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            default: list_dots<FMT, LPR, 4>(row, ro, nb, sub, idx, a, sa, s, ss, acc);
+        }
+        if (sub == 0 && r0 < nrows) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                if (i < m) {
+                    const size_t pr = it.pair[p0 + i];
+                    if constexpr (GU) gu[pr * 2 * F + r] = acc[i];
+                    else D[pr * nrows + r] = __float2half(acc[i]);
+                }
+        }
+    }
+}
+
 void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const ActQ8 & xq, int E, int F, float * gu,
               int8_t * hq, float * hd, half * D, cudaStream_t st) {
     if (n_items <= 0) return;
     const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
+    static const bool old_list = getenv("BNK_LIST_OLD") != nullptr;
+    if (d.rlay && !old_list) {
+        auto gk = [&]<int FMT>() {
+            auto L = [&]<int LPR>() {
+                constexpr int rows = 8 * (32 / LPR);
+                moe_list_r_k<FMT, LPR, true><<<dim3(n_items, (2 * F + rows - 1) / rows), 256, 0, st>>>(
+                    items, d.gate_bytes, d.grow, F, 2 * F, E, xq.q, xq.cols_pad, xq.d, xq.cols_pad / 32, gu, nullptr, go);
+            };
+            L.template operator()<8>();   // 4 and 16 measured the same
+        };
+        BNK_DISPATCH_R(d.gate_type, gk);
+        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+        auto dk = [&]<int FMT>() {
+            auto L = [&]<int LPR>() {
+                constexpr int rows = 8 * (32 / LPR);
+                moe_list_r_k<FMT, LPR, false><<<dim3(n_items, (E + rows - 1) / rows), 256, 0, st>>>(
+                    items, d.gate_bytes + d.up_bytes, d.drow, F, E, F, hq, F, hd, F / 32, nullptr, D, dof);
+            };
+            L.template operator()<4>();   // 2 and 8 measured the same or slower
+        };
+        BNK_DISPATCH_R(d.down_type, dk);
+        check_launch("moe_list_r");
+        return;
+    }
     auto g = [&]<int FMT>() {
         if (d.rlay)
             moe_gu_list_k<FMT, true><<<dim3(n_items, (2 * F + 7) / 8), 256, 0, st>>>(items, d.gate_bytes, d.grow, F, E,
