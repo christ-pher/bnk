@@ -83,10 +83,37 @@ struct Model {
 
     bool repack_ = true;  // R layouts for dense quant matrices
     bool hc_q8_ = true;   // BF16 hyper-connection / PLE projections as Q8_0
+    // Tensor parallelism: this device holds slice tp_rank of tp_n of every layer. Row-split projections keep rows
+    // [rank * rows / n, +rows / n) (per head / head group / shared-expert column), column-split ones (the
+    // projections back to the model width: attn_output, ssm_out, ffn_down_shexp, output's rows) the matching
+    // input columns, so every device's product is a partial sum of the full one. The hyper-connections, router,
+    // norms, embeddings and PLE are whole on every device. tp_slices() below lists each matrix's rule.
+    int tp_n = 1, tp_rank = 0;
+    // local shapes under the split (equal to the model's when tp_n == 1)
+    int n_head_l() const { return cfg.n_head / tp_n; }
+    int n_head_kv_l() const { return cfg.n_head_kv / tp_n; }
+    int ssm_vheads_l() const { return cfg.ssm_vheads / tp_n; }
+    int ssm_groups_l() const { return cfg.ssm_groups / tp_n; }
+    int conv_channels_l() const { return 2 * ssm_groups_l() * cfg.ssm_state + ssm_vheads_l() * cfg.ssm_state; }
+    int n_ff_shexp_l() const { return cfg.n_ff_shexp / tp_n; }
+    int n_vocab_l() const { return (cfg.n_vocab + tp_n - 1) / tp_n; }   // the output head's rows on this device
+    int vocab0() const { return tp_rank * n_vocab_l(); }
+    // this device's experts: e % tp_n == tp_rank
+    bool expert_local(int e) const { return tp_n == 1 || e % tp_n == tp_rank; }
 
 private:
     std::vector<void *> device_allocs_;
-    QMat upload(const std::string & name, bool required = true);
+    struct Slice {   // row ranges and column ranges of a tensor (empty: every row / column), in order
+        std::vector<std::pair<int64_t, int64_t>> rows, cols;
+    };
+    QMat upload(const std::string & name, bool required = true, const Slice * slice = nullptr);
+    QMat upload_data(const std::string & name, const uint8_t * data, int type, int64_t rows, int64_t cols,
+                     size_t row_bytes);
+    Slice slice_rows(int64_t rows_per_rank) const;   // rows [rank * r, +r)
+    Slice slice_cols(int64_t cols_per_rank) const;   // columns [rank * c, +c)
+    // the DeltaNet value heads of this rank's key groups (head h belongs to group h % groups): heads
+    // {j * groups + rank * gl + i}, as ranges of `width` rows (or columns) each
+    std::vector<std::pair<int64_t, int64_t>> gdn_head_ranges(int64_t width) const;
     void expert_src(int il);
 };
 

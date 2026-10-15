@@ -133,6 +133,7 @@ int main(int argc, char ** argv) {
         else if (a == "--slots") opt.slots = std::stoi(next());
         else if (a == "--gpus") { const std::string v = next(); opt.gpus = v == "all" ? std::vector<int>{-1} : int_list(v); }
         else if (a == "--split") opt.split = int_list(next());
+        else if (a == "--tp") opt.tp = std::stoi(next()) != 0;   // tensor parallel over the two GPUs
         else if (a == "--solo") solo = true;
         else if (a == "--pipe") pipe = true;   // multi on two GPUs: two lanes in flight (Engine::forward_pipe)
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }

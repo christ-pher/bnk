@@ -27,7 +27,7 @@ size_t Engine::prefill_arena_bytes(int N) { return prefill_carve(N, true); }
 // The arena's layout for chunks of N tokens: its size (dry), or map it and point every buffer into it.
 size_t Engine::prefill_carve(int N, bool dry_only) {
     const Config & c = model_.cfg;
-    const int E = c.n_embd, HC = c.hc_dim(), C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state;
+    const int E = c.n_embd, HC = c.hc_dim(), C = C_, VI = nv_ * c.ssm_state;
     const int F = c.n_ff_exp, k = c.n_expert_used;
     auto & p = pf_;
     size_t off = 0;
@@ -43,14 +43,14 @@ size_t Engine::prefill_carve(int N, bool dry_only) {
         carve(p.lo, (size_t) N * c.hc_rank); carve(p.gpre, (size_t) N * HC); carve(p.mixed, (size_t) N * E);
         carve(p.inj, (size_t) N * c.hc); carve(p.out, (size_t) N * E);
         carve(p.conv, (size_t) (N + c.ssm_conv - 1) * C); carve(p.co, (size_t) N * C); carve(p.z, (size_t) N * VI);
-        carve(p.g, (size_t) N * c.ssm_vheads); carve(p.b, (size_t) N * c.ssm_vheads); carve(p.o, (size_t) N * VI);
+        carve(p.g, (size_t) N * nv_); carve(p.b, (size_t) N * nv_); carve(p.o, (size_t) N * VI);
         carve(p.n, (size_t) N * VI);
-        carve(p.qfull, (size_t) N * c.n_head * c.head_dim * 2); carve(p.k, (size_t) N * c.n_head_kv * c.head_dim);
-        carve(p.v, (size_t) N * c.n_head_kv * c.head_dim); carve(p.q, (size_t) N * c.n_head * c.head_dim);
-        carve(p.ao, (size_t) N * c.n_head * c.head_dim);
+        carve(p.qfull, (size_t) N * H_ * c.head_dim * 2); carve(p.k, (size_t) N * Hkv_ * c.head_dim);
+        carve(p.v, (size_t) N * Hkv_ * c.head_dim); carve(p.q, (size_t) N * H_ * c.head_dim);
+        carve(p.ao, (size_t) N * H_ * c.head_dim);
         carve(p.rlog, (size_t) N * c.n_expert); carve(p.w, (size_t) N * k); carve(p.ids, (size_t) N * k);
         carve(p.perm, (size_t) N * k); carve(p.inv, (size_t) N * k); carve(p.tok, N);
-        carve(p.sg, (size_t) N * c.n_ff_shexp); carve(p.su, (size_t) N * c.n_ff_shexp); carve(p.sh, (size_t) N * c.n_ff_shexp);
+        carve(p.sg, (size_t) N * FF_); carve(p.su, (size_t) N * FF_); carve(p.sh, (size_t) N * FF_);
         carve(p.sgate, N); carve(p.shared, (size_t) N * E); carve(p.moe, (size_t) N * E);
         // the tensor-core expert path reads the chunk's input (fp16, [N][E]) by pair and keeps no fp16 gate/up
         // products; the grouped-GEMM / list paths gather it per pair ([N k][E]) and need their intermediates
@@ -59,6 +59,7 @@ size_t Engine::prefill_carve(int N, bool dry_only) {
         carve(p.hh, (size_t) N * k * F);
         carve(p.dd, (size_t) (N * k + 1) * E);   // + a zero row for pairs computed elsewhere
         carve(p.cpu, (size_t) N * E);
+        carve(p.tpt, tp() ? (size_t) N * E : 0);   // the peer's partial sums, on their way in
         if (qsa_on_) { carve(p.ik, (size_t) N * c.idx_dim); carve(p.iq, (size_t) N * c.idx_heads * c.idx_dim); }
         carve(p.xq, tc ? 0 : (size_t) N * E); carve(p.xd, tc ? 0 : (size_t) N * E / 32);
         carve(p.hq, tc ? 0 : (size_t) N * k * F); carve(p.hd, tc ? 0 : (size_t) N * k * F / 32);
@@ -104,6 +105,10 @@ void Engine::prefill_alloc(int N) {
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_perm, (size_t) N * k * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_inv, (size_t) N * k * 4, 0));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_w, (size_t) N * k * 4, 0));
+    if (tp())
+        for (int pt = 0; pt < 2; ++pt)
+            for (int pr = 0; pr < 2; ++pr)
+                CUDA_CHECK(cudaHostAlloc((void **) &tp_pfh_[pt][pr], (size_t) N * E * 4, cudaHostAllocPortable));
     CUDA_CHECK(cudaStreamCreateWithFlags(&p.copy, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&p.xready, cudaEventDisableTiming | cudaEventBlockingSync));
     for (int i = 0; i < 2; ++i) {
@@ -189,7 +194,7 @@ void Engine::pf_stage_layer(int il) {
     std::fill(idx.begin(), idx.end(), -1);
     std::vector<int> list;
     for (int e = 0; e < c.n_expert; ++e)
-        if (cache_.slot_of(il, e) < 0) list.push_back(e);
+        if (cache_.slot_of(il, e) == -1) list.push_back(e);
     pf_stage_list(il, list);
 }
 
@@ -276,7 +281,7 @@ void Engine::pf_ple(int il, int N) {
 void Engine::pf_gdn(int il, int N) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    const int E = c.n_embd, C = C_, K = c.ssm_conv, S = c.ssm_state, nv = nv_, nk = nk_;
     auto & p = pf_;
     CUDA_CHECK(cudaMemcpyAsync(p.conv.p, cur_->conv_buf[il].p, (size_t) (K - 1) * C * 4, cudaMemcpyDeviceToDevice, st_));
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
@@ -285,8 +290,8 @@ void Engine::pf_gdn(int il, int N) {
     gemm_.run_h(L.ssm_beta, gemm_.xbuf(), E, N, p.b, nv);
     gemm_.run_h(L.ssm_alpha, gemm_.xbuf(), E, N, p.g, nv);
     gdn_conv(p.conv, F(L.ssm_conv1d), p.co, N, C, K, st_);
-    gdn_prep(p.co, N, C, c.ssm_groups, nv, S, p.g, p.b, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-    gdn_recurrence(p.co, C, p.g, p.b, cur_->ssm_state[il], p.o, N, c.ssm_groups, nv, S, N, st_);
+    gdn_prep(p.co, N, C, nk, nv, S, p.g, p.b, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
+    gdn_recurrence(p.co, C, p.g, p.b, cur_->ssm_state[il], p.o, N, nk, nv, S, N, st_);
     gated_rmsnorm(p.o, p.z, F(L.ssm_norm), p.n, N, nv, S, c.rms_eps, st_);
     gemm_.run(L.ssm_out, p.n, nv * S, N, p.out, E);
     CUDA_CHECK(cudaMemcpyAsync(cur_->conv_buf[il].p, p.conv.p + (size_t) N * C, (size_t) (K - 1) * C * 4,
@@ -296,7 +301,7 @@ void Engine::pf_gdn(int il, int N) {
 void Engine::pf_attn(int il, int N) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
+    const int E = c.n_embd, H = H_, Hkv = Hkv_, D = c.head_dim;
     auto & p = pf_;
     const int pos0 = pos() - N;
     auto attention_prefill_rows = [&](int t0, int t1) {
@@ -360,7 +365,7 @@ void Engine::pf_attn(int il, int N) {
 void Engine::pf_moe(int il, int N) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, k = c.n_expert_used, F = c.n_ff_exp, FF = c.n_ff_shexp;
+    const int E = c.n_embd, k = c.n_expert_used, F = c.n_ff_exp, FF = FF_;
     auto & p = pf_;
     // routing
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
@@ -389,12 +394,13 @@ void Engine::pf_moe(int il, int N) {
 
     // where each used expert runs: VRAM cache, PCIe stage, or the CPU pool
     const size_t blob = store_->blob_bytes(il);
-    std::vector<char> on_cpu(c.n_expert, 0);
+    std::vector<char> on_cpu(c.n_expert, 0), remote(c.n_expert, 0);   // remote: the peer's expert (tensor parallel)
+    for (int e = 0; e < c.n_expert; ++e) remote[e] = cache_.slot_of(il, e) == -2;
     if (!p.prefetch) {
         std::fill(p.stage_idx[il].begin(), p.stage_idx[il].end(), -1);
         std::vector<int> nr;
         for (int e = 0; e < c.n_expert; ++e)
-            if (cnt[e] && cache_.slot_of(il, e) < 0) nr.push_back(e);
+            if (cnt[e] && cache_.slot_of(il, e) == -1) nr.push_back(e);
         std::sort(nr.begin(), nr.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
         // the most-used go over PCIe while that is cheaper than leaving them to the CPU
         const double t_pcie = opt_.pcie_us_per_mb * blob / 1e6;
@@ -420,7 +426,7 @@ void Engine::pf_moe(int il, int N) {
         const int e = p.h_ids[i];
         const int pos = fill[e]++;
         p.h_perm[pos] = i / k;
-        p.h_inv[i] = on_cpu[e] ? P : pos;       // CPU pairs read the zero row
+        p.h_inv[i] = on_cpu[e] || remote[e] ? P : pos;   // CPU pairs (and the peer's) read the zero row
         if (on_cpu[e]) cpu_tasks.push_back({i / k, i % k, e, 0.f});
     }
     CUDA_CHECK(cudaMemcpyAsync(p.perm.p, p.h_perm, (size_t) P * 4, cudaMemcpyHostToDevice, st_));
@@ -462,7 +468,7 @@ void Engine::pf_moe(int il, int N) {
         if (bytes > (size_t) p.max_items * sizeof(PfItem)) throw std::runtime_error("prefill: item buffer too small");
         int n_it[2] = {0, 0}, n_bl[2] = {0, 0};
         for (int e = 0; e < ne; ++e) {
-            if (!cnt[e] || on_cpu[e]) continue;
+            if (!cnt[e] || on_cpu[e] || remote[e]) continue;
             const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
             h_it[kind][n_it[kind]] = TcItem{src_of(e), off[e], cnt[e]};
             for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) h_bl[kind][n_bl[kind]++] = TcBlock{n_it[kind], t0};
@@ -519,7 +525,7 @@ void Engine::pf_moe(int il, int N) {
     for (int pass = 0; pass < 2; ++pass) {   // 0: resident, 1: staged (after their copy)
         if (pass == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
         for (int e = 0; e < c.n_expert; ++e) {
-            if (!cnt[e] || on_cpu[e] || cnt[e] < opt_.gemm_min_tokens) continue;
+            if (!cnt[e] || on_cpu[e] || remote[e] || cnt[e] < opt_.gemm_min_tokens) continue;
             if ((cache_.slot_of(il, e) >= 0) != (pass == 0)) continue;
             group.push_back(e);
             if ((int) group.size() == p.wexp_experts) flush();
@@ -531,7 +537,7 @@ void Engine::pf_moe(int il, int N) {
     int n_items[2] = {0, 0};
     const int half_cap = p.max_items / 2;
     for (int e = 0; e < c.n_expert; ++e) {
-        if (!cnt[e] || on_cpu[e] || cnt[e] >= opt_.gemm_min_tokens) continue;
+        if (!cnt[e] || on_cpu[e] || remote[e] || cnt[e] >= opt_.gemm_min_tokens) continue;
         const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
         for (int j0 = 0; j0 < cnt[e]; j0 += kMaxWindow) {
             PfItem & it = p.h_items[kind * half_cap + n_items[kind]++];
@@ -572,7 +578,92 @@ void Engine::pf_moe(int il, int N) {
     moe_gather_sum(p.dd, p.inv, p.w, N, k, E, p.shared, p.sgate, extra, p.moe, st_);
 }
 
+void Engine::pf_layer_attn_part(int il, int N) {
+    const Config & c = model_.cfg;
+    const LayerWeights & L = model_.layers[il];
+    auto & p = pf_;
+    if (il == c.ple_layer) pf_ple(il, N);
+    pf_hc_pre(L.hc_attn, N, true);
+    if (L.attn) pf_attn(il, N); else pf_gdn(il, N);
+    if (tp()) tp_send(p.out, N, 0, il, true);
+}
+
+void Engine::pf_layer_attn_finish(int il, int N) {
+    const Config & c = model_.cfg;
+    auto & p = pf_;
+    if (tp()) tp_recv(p.out, N, 0, il, true);
+    hc_combine(p.res, p.out, p.inj, N, c.hc, c.n_embd, st_);
+}
+
+void Engine::pf_layer_moe_part(int il, int N) {
+    const Config & c = model_.cfg;
+    const LayerWeights & L = model_.layers[il];
+    auto & p = pf_;
+    pf_hc_pre(L.hc_ffn, N, true);
+    pf_moe(il, N);
+    if (tp()) tp_send(p.moe, N, 1, il, true);
+}
+
+void Engine::pf_layer_moe_finish(int il, int N) {
+    const Config & c = model_.cfg;
+    auto & p = pf_;
+    if (tp()) tp_recv(p.moe, N, 1, il, true);
+    hc_combine(p.res, p.moe, p.inj, N, c.hc, c.n_embd, st_);
+}
+
+// A prompt chunk on both devices (tensor parallel): each device's part of every layer on its own stream, the
+// all-reduces ordering the streams against each other; the head on the last token on both (their rows).
+void Engine::prefill_chunk_tp(const int32_t * tokens, int N) {
+    const double t0 = now_ms();
+    Engine * e[2] = {this, peer_};
+    const Config & c = model_.cfg;
+    const int E = c.n_embd, HC = c.hc_dim();
+    for (Engine * x : e) {
+        DeviceScope ds(x->dev_);
+        x->join_commit_here();
+        x->staging_fit();
+        if (N < 1 || N > x->pf_max_) throw std::runtime_error("prefill_chunk: bad size");
+        if (x->cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
+        if (x->pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
+        const int pos0 = x->pos();
+        x->cur_->history.insert(x->cur_->history.end(), tokens, tokens + N);
+        *x->h_par_ = WinParams{pos0, N, ++x->seq_, 0};
+        CUDA_CHECK(cudaMemcpyAsync(x->d_par_, x->h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, x->st_));
+        CUDA_CHECK(cudaMemcpyAsync(x->pf_.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, x->st_));
+        dequant_gather(x->model_.tok_embd, x->pf_.tok, N, x->pf_.x, x->st_);
+        hc_init(x->pf_.x, x->pf_.res, N, c.hc, E, x->st_);
+        x->pf_.prefetch = x->pf_full_ && N >= opt_.prefetch_min;
+        if (x->pf_.prefetch) x->pf_stage_layer(0);
+    }
+    for (int il = 0; il < c.n_layer; ++il) {
+        for (Engine * x : e) {
+            DeviceScope ds(x->dev_);
+            if (x->pf_.prefetch && il + 1 < c.n_layer) x->pf_stage_layer(il + 1);
+            x->pf_layer_attn_part(il, N);
+        }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->pf_layer_attn_finish(il, N); }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->pf_layer_moe_part(il, N); }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->pf_layer_moe_finish(il, N); }
+    }
+    for (Engine * x : e) {
+        DeviceScope ds(x->dev_);
+        CUDA_CHECK(cudaMemcpyAsync(x->res_.p, x->pf_.res.p + (size_t) (N - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, x->st_));
+        x->head(1);
+    }
+    for (Engine * x : e) {
+        DeviceScope ds(x->dev_);
+        CUDA_CHECK(cudaStreamSynchronize(x->st_));
+        x->last_T = 1;
+    }
+    pf_ms_ += now_ms() - t0;
+    pf_tokens_ += N;
+    pstats.ms += now_ms() - t0;
+    pstats.tokens += N;
+    pstats.chunks++;
+}
+
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
+    if (tp()) return prefill_chunk_tp(tokens, N);
     const double t0 = now_ms();
     for (Engine * s = this; s; s = s->next_.get()) s->prefill_chunk_here(tokens, N);
     pstats.ms += now_ms() - t0;

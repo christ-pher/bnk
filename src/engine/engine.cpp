@@ -266,18 +266,27 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
     }
     for (int d : gpus)
         if (d < 0 || d >= count) throw std::runtime_error("no CUDA device " + std::to_string(d) + " (" + std::to_string(count) + " visible)");
-    const std::vector<int> bounds = gpus.size() > 1 ? plan_split(path, opt, gpus) : std::vector<int>{0, -1};
+    const bool tp = opt.tp && gpus.size() > 1;
+    if (opt.tp && gpus.size() != 2) throw std::runtime_error("tensor parallel needs exactly two GPUs");
+    const std::vector<int> bounds = tp ? std::vector<int>{0, -1, 0, -1}
+                                       : gpus.size() > 1 ? plan_split(path, opt, gpus) : std::vector<int>{0, -1};
     Engine * s = this, * prev = nullptr;
     for (size_t k = 0; k < gpus.size(); ++k) {
         s->head_ = this;
         s->dev_ = gpus[k];
-        s->l0_ = bounds[k];
-        s->l1_ = bounds[k + 1];
-        s->last_ = k + 1 == gpus.size();
+        s->l0_ = tp ? 0 : bounds[k];
+        s->l1_ = tp ? -1 : bounds[k + 1];
+        s->last_ = tp || k + 1 == gpus.size();
         s->store_ = &own_store_;
         s->cpu_ = &own_cpu_;
-        if (opt.verbose && gpus.size() > 1)
-            fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
+        if (tp) {
+            s->tp_n_ = (int) gpus.size();
+            s->tp_rank_ = (int) k;
+        }
+        if (opt.verbose && gpus.size() > 1) {
+            if (tp) fprintf(stderr, "bnk: slice %zu of %zu: GPU %d, every layer (tensor parallel)\n", k + 1, gpus.size(), s->dev_);
+            else fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
+        }
         EngineOptions so = opt;
         if (!opt.stage_cache_gib.empty()) {
             if (opt.stage_cache_gib.size() != gpus.size())
@@ -285,7 +294,10 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             so.expert_cache_gib = opt.stage_cache_gib[k];
         }
         s->load_stage(path, so);
-        if (prev) {
+        if (prev && tp) {
+            prev->peer_ = s;
+            s->peer_ = prev;
+        } else if (prev) {
             for (int l = 0; l < kLanes; ++l) prev->xfer_out_[l] = s->xfer_in_[l];
             prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
             prev->pf_xfer_out_[1] = s->pf_xfer_in_[1];
@@ -320,8 +332,16 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaEventCreate(&ev_t0_));
     CUDA_CHECK(cudaEventCreate(&ev_t1_));
     // the drafter embeds its tokens and shares the head: the last stage holds the embeddings too when it drafts
+    model_.tp_n = tp_n_;
+    model_.tp_rank = tp_rank_;
     model_.load(path, opt.verbose, opt.ple_gguf, l0_, l1_, first() || (last_ && !opt.mtp.empty()), last_);
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
+    H_ = model_.n_head_l(); Hkv_ = model_.n_head_kv_l(); nv_ = model_.ssm_vheads_l(); nk_ = model_.ssm_groups_l();
+    C_ = model_.conv_channels_l(); FF_ = model_.n_ff_shexp_l(); V0_ = model_.vocab0();
+    V_ = std::min(model_.cfg.n_vocab - V0_, model_.n_vocab_l());
+    if (tp() && (model_.cfg.n_head % tp_n_ || model_.cfg.n_head_kv % tp_n_ || model_.cfg.ssm_groups % tp_n_ ||
+                 model_.cfg.ssm_vheads % tp_n_ || model_.cfg.n_ff_shexp % tp_n_ || model_.cfg.n_expert % tp_n_))
+        throw std::runtime_error("tensor parallel: the model's heads, key groups, shared expert or experts do not split evenly");
     if (head) {
         layer_routed.assign(model_.cfg.n_layer, 0);
         layer_misses.assign(model_.cfg.n_layer, 0);
@@ -333,17 +353,28 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     const int W = kMaxWindow, E = c.n_embd, HC = c.hc_dim();
     x_.alloc(W * E); res_.alloc(W * HC); xn_.alloc(W * HC); lo_.alloc(W * c.hc_rank);
     gpre_.alloc(W * HC); mixed_.alloc(W * E); inj_.alloc(W * c.hc); out_.alloc(W * E);
-    const int C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state;
-    conv_out_.alloc(W * C); z_.alloc(W * VI); alpha_.alloc(W * c.ssm_vheads); beta_.alloc(W * c.ssm_vheads);
+    const int C = C_, VI = nv_ * c.ssm_state;
+    conv_out_.alloc(W * C); z_.alloc(W * VI); alpha_.alloc(W * nv_); beta_.alloc(W * nv_);
     gdn_o_.alloc(W * VI); gdn_n_.alloc(W * VI);
-    qfull_.alloc(W * c.n_head * c.head_dim * 2); k_.alloc(W * c.n_head_kv * c.head_dim);
-    v_.alloc(W * c.n_head_kv * c.head_dim); q_.alloc(W * c.n_head * c.head_dim);
-    attn_o_.alloc(W * c.n_head * c.head_dim);
-    attn_scratch_.alloc(attention_scratch_floats(W, c.n_head, c.head_dim, opt.max_ctx));
+    qfull_.alloc(W * H_ * c.head_dim * 2); k_.alloc(W * Hkv_ * c.head_dim);
+    v_.alloc(W * Hkv_ * c.head_dim); q_.alloc(W * H_ * c.head_dim);
+    attn_o_.alloc(W * H_ * c.head_dim);
+    attn_scratch_.alloc(attention_scratch_floats(W, H_, c.head_dim, opt.max_ctx));
     rlogits_.alloc(W * c.n_expert); rw_.alloc(W * c.n_expert_used); rids_.alloc(W * c.n_expert_used);
-    sg_.alloc(W * c.n_ff_shexp); su_.alloc(W * c.n_ff_shexp); sh_.alloc(W * c.n_ff_shexp); sgate_.alloc(W);
+    sg_.alloc(W * FF_); su_.alloc(W * FF_); sh_.alloc(W * FF_); sgate_.alloc(W);
     shared_out_.alloc(W * E); moe_out_.alloc(W * E);
-    if (last_) logits_.alloc((size_t) W * c.n_vocab);
+    if (last_) logits_.alloc((size_t) W * V_);
+    if (tp()) {   // the exchange buffers of decode windows (prompt chunks': prefill_alloc)
+        tp_tmp_.alloc((size_t) std::max(W, opt.prefill_chunk_max) * E);
+        for (int pt = 0; pt < 2; ++pt)
+            for (int pr = 0; pr < 2; ++pr) {
+                CUDA_CHECK(cudaHostAlloc((void **) &tp_h_[pt][pr], (size_t) W * E * 4, cudaHostAllocPortable));
+                CUDA_CHECK(cudaEventCreateWithFlags(&tp_ev_[pt][pr], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&tp_pfev_[pt][pr], cudaEventDisableTiming));
+            }
+        CUDA_CHECK(cudaEventCreateWithFlags(&tp_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&tp_join_, cudaEventDisableTiming));
+    }
     argmax_dev_.alloc(W);
     const int64_t maxcols = std::max<int64_t>(HC, 16384);
     actq_.alloc(W * maxcols); actd_.alloc(W * maxcols / 32);
@@ -393,7 +424,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
-            kv_cell_bytes += 2 * (size_t) c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
+            kv_cell_bytes += 2 * (size_t) Hkv_ * kv_row_halves(c.head_dim) * sizeof(half);
             if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
                 kv_cell_bytes += c.idx_dim * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
                 qsa_on_ = true;
@@ -402,10 +433,10 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
             // the second lane only for a pipeline (two batches in flight)
             for (int l = 0; l < (first() && last_ ? 1 : kLanes); ++l) {
                 gdn_co_[l][il].alloc((size_t) W * C);
-                gdn_g_[l][il].alloc((size_t) W * c.ssm_vheads);
-                gdn_b_[l][il].alloc((size_t) W * c.ssm_vheads);
+                gdn_g_[l][il].alloc((size_t) W * nv_);
+                gdn_b_[l][il].alloc((size_t) W * nv_);
             }
-            state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) c.ssm_vheads * c.ssm_state * c.ssm_state) * 4;
+            state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) nv_ * c.ssm_state * c.ssm_state) * 4;
         }
     }
     // the conversation slots: address space for every one, VRAM for the KV only as a conversation uses it
@@ -419,7 +450,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (qsa_on_) {
         int r = 0;
         for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
-        qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
+        qsh_ = QsaShape{H_, Hkv_, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
                         c.rope_base, c.rms_eps};
         max_blocks_ = opt.max_ctx / r + 1;
         ik_.alloc(W * c.idx_dim); iq_.alloc(W * c.idx_heads * c.idx_dim);
@@ -428,7 +459,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (opt.verbose)
         fprintf(stderr, "bnk: %scontext %d: %.0f KiB of %sKV per token (%.2f GiB when full, mapped as used), "
                         "recurrent state %.2f GiB, %d CPU expert threads%s\n",
-                first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
+                tp() ? ("slice " + std::to_string(tp_rank_) + ": ").c_str() : first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
                 opt.max_ctx, kv_cell_bytes / 1024.0, opt.kv8 ? "8-bit " : "", (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
                 state_bytes / 1073741824.0, cpu_->threads(),
                 seqs_.size() > 1 ? (", " + std::to_string(seqs_.size()) + " conversation slots").c_str() : "");
@@ -440,8 +471,11 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         route_dev_.alloc((size_t) c.n_layer * kMaxWindow * c.n_expert_used);
         cpu_us_.assign(c.n_layer, 0.f);
     }
-    if (last_ && !opt.mtp.empty())
+    if (last_ && !opt.mtp.empty() && (!tp() || tp_rank_ == tp_n_ - 1)) {
+        // (tensor parallel: the drafter's head must come from the draft vocabulary; this device's output rows are a slice)
+        if (tp() && opt.draft_vocab.empty()) throw std::runtime_error("tensor parallel with MTP needs --draft-vocab");
         mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
+    }
     pf_tc_ = !getenv("BNK_PF_TC") || atoi(getenv("BNK_PF_TC")) != 0;
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
@@ -515,7 +549,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
 
 void Engine::alloc_seq(Seq & q) {
     const Config & c = model_.cfg;
-    const int W = kMaxWindow, C = c.conv_channels(), HC = c.hc_dim();
+    const int W = kMaxWindow, C = C_, HC = c.hc_dim();
     q.conv_buf.resize(c.n_layer);
     q.ssm_state.resize(c.n_layer);
     q.kraw.resize(c.n_layer);
@@ -529,7 +563,7 @@ void Engine::alloc_seq(Seq & q) {
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
             // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
-            const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * kv_row_halves(c.head_dim);
+            const size_t kv = (size_t) opt_.max_ctx * Hkv_ * kv_row_halves(c.head_dim);
             q.kv_k[il].reserve(kv * sizeof(half), &budget_, "KV cache");
             q.kv_v[il].reserve(kv * sizeof(half), &budget_, "KV cache");
             q.kc[il].view(q.kv_k[il].as<half>(), kv);
@@ -544,7 +578,7 @@ void Engine::alloc_seq(Seq & q) {
             }
         } else {
             q.conv_buf[il].alloc((size_t) (c.ssm_conv - 1 + W) * C);
-            q.ssm_state[il].alloc((size_t) c.ssm_vheads * c.ssm_state * c.ssm_state);
+            q.ssm_state[il].alloc((size_t) nv_ * c.ssm_state * c.ssm_state);
         }
     }
     if (c.ple_layer >= 0 && owns(c.ple_layer)) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
@@ -877,7 +911,7 @@ void Engine::ple(int il, int T) {
 void Engine::gdn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    const int E = c.n_embd, C = C_, K = c.ssm_conv, S = c.ssm_state, nv = nv_, nk = nk_;
     quantize_mixed(T);
     float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
     {   // beta / alpha (needed at the prep) and the gate (at the norm) beside wqkv and its copies
@@ -901,8 +935,8 @@ void Engine::gdn(int il, int T) {
     for (const Win & w : wins_) {
         float * cw = co + (size_t) w.r0 * C, * gw = gg + (size_t) w.r0 * nv, * bw = gb + (size_t) w.r0 * nv;
         gdn_conv(w.q->conv_buf[il], F(L.ssm_conv1d), cw, w.T, C, K, st_);
-        gdn_prep(cw, w.T, C, c.ssm_groups, nv, S, gw, bw, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
-        gdn_recurrence(cw, C, gw, bw, w.q->ssm_state[il], gdn_o_.p + (size_t) w.r0 * nv * S, w.T, c.ssm_groups, nv,
+        gdn_prep(cw, w.T, C, nk, nv, S, gw, bw, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
+        gdn_recurrence(cw, C, gw, bw, w.q->ssm_state[il], gdn_o_.p + (size_t) w.r0 * nv * S, w.T, nk, nv,
                        S, w.commit ? w.T : 0, st_);
     }
     dbg(st_, il, "conv_output_silu", co, (size_t) T * C);
@@ -924,13 +958,13 @@ void Engine::gdn(int il, int T) {
 // Keep the first c rows of the last verify window: replay the delta rule over them and shift the histories.
 void Engine::enqueue_commit(int cnt) {
     const Config & c = model_.cfg;
-    const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    const int C = C_, K = c.ssm_conv, S = c.ssm_state, nv = nv_;
     const size_t r0 = (size_t) cur_->last_r0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) continue;
         const int ln = cur_->last_lane;
         gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv, cur_->ssm_state[il],
-                       nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+                       nullptr, cnt, nk_, nv, S, cnt, st_);
     }
     if (n_gdn_) shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
     if (cur_->ple_hist.p) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
@@ -1002,7 +1036,7 @@ void Engine::commit_here(int cnt) {
 void Engine::attn(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
+    const int E = c.n_embd, H = H_, Hkv = Hkv_, D = c.head_dim;
     quantize_mixed(T);
     const bool qsa = wins_[0].q->kraw[il].p != nullptr;
     if (qsa) {   // the indexer's projections beside q / k / v
@@ -1091,7 +1125,7 @@ void Engine::predict_stats(int il, int T) {
 void Engine::moe(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
-    const int E = c.n_embd, k = c.n_expert_used, FF = c.n_ff_shexp;
+    const int E = c.n_embd, k = c.n_expert_used, FF = FF_;
     const MoeLayerDesc d = cache_.desc(il);
     quantize_mixed(T);
     // the shared expert (and its gate) needs only mixed / mixact: beside the routed experts (act_ is its own: the
@@ -1147,10 +1181,10 @@ void Engine::moe(int il, int T) {
 void Engine::head(int T) {
     const Config & c = model_.cfg;
     hc_pre(model_.hc_head, T, false);
-    gemv_auto(model_.output, mixed_, c.n_embd, T, logits_, c.n_vocab, false, act_, st_);
+    gemv_auto(model_.output, mixed_, c.n_embd, T, logits_, V_, false, act_, st_);
 }
 
-void Engine::layer_forward(int il, int T) {
+void Engine::layer_attn_part(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
     if (il == c.ple_layer) {   // the PLE adds into res_: a pending combine first
@@ -1160,6 +1194,12 @@ void Engine::layer_forward(int il, int T) {
     }
     hc_pre(L.hc_attn, T, true);
     if (L.attn) attn(il, T); else gdn(il, T);
+    if (tp()) tp_send(out_, T, 0, il, false);   // the heads' partial sums: out to the peer
+}
+
+void Engine::layer_attn_finish(int il, int T) {
+    const Config & c = model_.cfg;
+    if (tp()) tp_recv(out_, T, 0, il, false);   // ... and the peer's in
     // the combines go into the next norm's pass (hc_pre) where one follows: after the attention always, after the
     // MoE unless this is the stage's last layer (the residual leaves the stage) or layers are being dumped
     static const bool defer = (!getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0) && !getenv("BNK_DUMP_DIR");
@@ -1167,10 +1207,25 @@ void Engine::layer_forward(int il, int T) {
     if (dfr) pend_out_ = out_;
     else hc_combine(res_, out_, inj_, T, c.hc, c.n_embd, st_);
     dbg(st_, il, "hc_combine", res_, (size_t) T * c.hc_dim());
+}
+
+void Engine::layer_moe_part(int il, int T) {
+    const Config & c = model_.cfg;
+    const LayerWeights & L = model_.layers[il];
+    static const bool defer = (!getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0) && !getenv("BNK_DUMP_DIR");
+    const bool dfr = defer && !head_->dump_all;
     hc_pre(L.hc_ffn, T, true);
     dbg(st_, il, "hc_mixed_ffn", mixed_, (size_t) T * c.n_embd);
     dbg(st_, il, "hc_inject_ffn", inj_, (size_t) T * c.hc);
     moe(il, T);
+    if (tp()) tp_send(moe_out_, T, 1, il, false);   // the experts' partial sums: out to the peer
+}
+
+void Engine::layer_moe_finish(int il, int T) {
+    const Config & c = model_.cfg;
+    static const bool defer = (!getenv("BNK_FUSE_QUANT") || atoi(getenv("BNK_FUSE_QUANT")) != 0) && !getenv("BNK_DUMP_DIR");
+    const bool dfr = defer && !head_->dump_all;
+    if (tp()) tp_recv(moe_out_, T, 1, il, false);
     dbg(st_, il, "ffn_out", moe_out_, (size_t) T * c.n_embd);
     if (dfr && il + 1 < l1_) pend_out_ = moe_out_;
     else hc_combine(res_, moe_out_, inj_, T, c.hc, c.n_embd, st_);
@@ -1184,9 +1239,74 @@ void Engine::layer_forward(int il, int T) {
     }
 }
 
+void Engine::layer_forward(int il, int T) {
+    layer_attn_part(il, T);
+    layer_attn_finish(il, T);
+    layer_moe_part(il, T);
+    layer_moe_finish(il, T);
+}
+
+// The all-reduce with the peer (tensor parallel), in two phases so that each device records its event before
+// the other waits for it: tp_send copies this device's partial sum of buf [rows][E] out to the pinned buffer of
+// (point, layer parity) and marks it; tp_recv, queued after the peer's tp_send, waits for the peer's mark,
+// copies its rows in and adds them. Afterwards both devices hold the sum. The pair of buffers per point keeps a
+// layer's copy out from overwriting what the peer still reads. Captured into the forward's graph like any work.
+void Engine::tp_send(const float * buf, int rows, int point, int il, bool prompt) {
+    const int par = il & 1;
+    float * mine = prompt ? tp_pfh_[point][par] : tp_h_[point][par];
+    cudaEvent_t ev = prompt ? tp_pfev_[point][par] : tp_ev_[point][par];
+    CUDA_CHECK(cudaMemcpyAsync(mine, buf, (size_t) rows * model_.cfg.n_embd * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaEventRecord(ev, st_));
+}
+
+void Engine::tp_recv(float * buf, int rows, int point, int il, bool prompt) {
+    const int E = model_.cfg.n_embd, par = il & 1;
+    const float * theirs = prompt ? peer_->tp_pfh_[point][par] : peer_->tp_h_[point][par];
+    cudaEvent_t pev = prompt ? peer_->tp_pfev_[point][par] : peer_->tp_ev_[point][par];
+    float * tmp = prompt ? pf_.tpt.p : tp_tmp_.p;
+    CUDA_CHECK(cudaStreamWaitEvent(st_, pev, 0));
+    CUDA_CHECK(cudaMemcpyAsync(tmp, theirs, (size_t) rows * E * 4, cudaMemcpyHostToDevice, st_));
+    add_scaled(buf, tmp, nullptr, 1, rows * E, st_);
+}
+
+// Both devices' layers, exchange by exchange: each device's part of a layer is queued on its own stream (the
+// peer's joins this engine's capture through the fork event and leaves through the join event), and the
+// all-reduces order the two streams against each other. Called on the first engine.
+void Engine::enqueue_forward_tp(int T) {
+    Engine * e[2] = {this, peer_};
+    const Config & c = model_.cfg;
+    const size_t rows = (size_t) T * c.hc_dim() * 4;
+    (void) rows;
+    CUDA_CHECK(cudaEventRecord(tp_fork_, st_));
+    {
+        DeviceScope ds(peer_->dev_);
+        CUDA_CHECK(cudaStreamWaitEvent(peer_->st_, tp_fork_, 0));
+    }
+    for (Engine * x : e) {
+        DeviceScope ds(x->dev_);
+        CUDA_CHECK(cudaMemcpyAsync(x->d_par_, x->h_par_, x->wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, x->st_));
+        dequant_gather(x->model_.tok_embd, x->h_tok_, T, x->x_, x->st_);
+        hc_init(x->x_, x->res_, T, c.hc, c.n_embd, x->st_);
+        x->pend_out_ = nullptr;
+    }
+    for (int il = 0; il < c.n_layer; ++il) {
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->layer_attn_part(il, T); }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->layer_attn_finish(il, T); }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->layer_moe_part(il, T); }
+        for (Engine * x : e) { DeviceScope ds(x->dev_); x->layer_moe_finish(il, T); }
+    }
+    for (Engine * x : e) { DeviceScope ds(x->dev_); x->head(T); }
+    {
+        DeviceScope ds(peer_->dev_);
+        CUDA_CHECK(cudaEventRecord(peer_->tp_join_, peer_->st_));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_join_, 0));
+}
+
 // This stage's part of a forward: the token embeddings (first stage) or the previous stage's residual rows, its
 // layers, then the head (last stage) or the residual rows out to the next stage.
 void Engine::enqueue_forward(int T) {
+    if (tp()) return enqueue_forward_tp(T);
     const Config & c = model_.cfg;
     const size_t rows = (size_t) T * c.hc_dim() * 4;
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, st_));
@@ -1230,7 +1350,38 @@ void Engine::write_route_log(int T, int pos0, bool commit_all, double t0, double
     std::fill(cpu_us_.begin(), cpu_us_.end(), 0.f);
 }
 
+// (tensor parallel: both devices' mailboxes layer by layer; a layer's exchange waits for both devices' parts,
+// so neither device's next layer may be served before the other's current one)
+void Engine::service_cpu_tp(uint32_t seq, int T) {
+    const Config & c = model_.cfg;
+    const int E = c.n_embd;
+    Engine * e[2] = {this, peer_};
+    for (int il = 0; il < c.n_layer; ++il)
+        for (Engine * x : e) {
+            MoeMsg * m = x->msg(il);
+            const double t0 = now_ms();
+            while (__atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE) != x->seq_) __builtin_ia32_pause();
+            head_->times.wait_ms += now_ms() - t0;
+            const int n = m->n_miss;
+            head_->times.misses += n;
+            head_->layer_misses[il] += n;
+            if (x == this) {
+                head_->times.routed += (int64_t) T * c.n_expert_used;
+                head_->layer_routed[il] += (int64_t) T * c.n_expert_used;
+            }
+            if (n > 0) {
+                x->tasks_.clear();
+                for (int i = 0; i < n; ++i) x->tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
+                cpu_->run(il, T, m->x(), x->tasks_, m->out(E));
+            }
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            m->seq_done = m->seq_req;
+        }
+    (void) seq;
+}
+
 void Engine::service_cpu(uint32_t seq, int T) {
+    if (tp()) return service_cpu_tp(seq, T);
     const Config & c = model_.cfg;
     const int E = c.n_embd;
     for (int il = l0_; il < l1_; ++il) {
@@ -1277,6 +1428,25 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
     // (each stage's after the one before), and the host answers the CPU experts of each stage's layers in turn
     // while the GPUs work through them. Nothing may wait on a launched graph before its CPU part is answered: a
     // capture (which can synchronize its stream, e.g. when the expert cache gives up VRAM) comes first.
+    if (tp()) {
+        // the peer books the same windows first (its buffers are read by the capture); the first engine's graph
+        // holds both devices' work, the host answers both devices' CPU experts layer by layer
+        peer_->fwd_prepare(batch);
+        fwd_prepare(batch);
+        fwd_launch(nullptr);
+        fwd_service();
+        fwd_end();
+        {
+            DeviceScope ds(peer_->dev_);
+            for (const Win & w : peer_->wins_) w.q->pending_T = w.commit ? 0 : w.T;
+            if (opt_.adapt_every > 0 && peer_->fwd_count_ % opt_.adapt_every == 0)
+                peer_->cache_.adapt(peer_->counts_, peer_->st_, opt_.adapt_swaps);
+            ++peer_->fwd_count_;
+        }
+        times.total_ms += now_ms() - t0;
+        times.calls++;
+        return;
+    }
     for (Engine * s = this; s; s = s->next_.get()) s->fwd_prepare(batch);
     cudaEvent_t after = nullptr;
     for (Engine * s = this; s; s = s->next_.get()) {
@@ -1330,6 +1500,7 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     ple_gather();
     fwd_graph_ = opt_.use_graphs && !head_->dump_all;
     fwd_exec_ = nullptr;
+    if (tp() && peer_ && this != head_) return;   // the peer's part is captured / run by the first engine
     if (fwd_graph_) {
         FwdGraph & fg = fwd_graphs_[key];
         if (!fg.exec) {
@@ -1381,7 +1552,7 @@ void Engine::fwd_launch(cudaEvent_t after) {
 
 void Engine::forward_pipe(const std::vector<BatchWin> & first_in, int first_lane, const std::vector<BatchWin> & second_in,
                           int second_lane) {
-    if (stages() != 2) throw std::runtime_error("forward_pipe: needs a pipeline of two GPUs");
+    if (stages() != 2 || tp()) throw std::runtime_error("forward_pipe: needs a pipeline of two GPUs");
     if (!first_in.empty() && !second_in.empty() && first_lane == second_lane)
         throw std::runtime_error("forward_pipe: the two batches need different lanes");
     auto sorted = [](std::vector<BatchWin> b) {
@@ -1520,7 +1691,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     Engine * t = tail();
     // several stages: chunk k+1 on the first stage while the worker runs chunk k through the others
     static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
-    if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
+    if (next_ && pipe && !tp() && !worker_) worker_ = std::make_unique<Worker>();
     // Chunks of even size: a read of a chunk and a bit would leave the later stages a tiny last chunk to overlap
     // with (2,100 tokens: 1,050 + 1,050 rather than 2,048 + 52). A read that fits one chunk stays whole: with the
     // experts on the tensor cores, a 603-token follow-up split in two measured 617-631 ms against 604 ms whole
@@ -1529,7 +1700,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     static const int split_min = getenv("BNK_PIPE_SPLIT") ? atoi(getenv("BNK_PIPE_SPLIT")) : 256;
     static const int min_parts = getenv("BNK_PIPE_PARTS") ? atoi(getenv("BNK_PIPE_PARTS")) : 1;
     int chunk = pf_max_;
-    if (next_ && pipe && split_min > 0 && pf_max_ > 0 && n >= split_min && n >= 2 * opt_.prefill_min) {
+    if (next_ && pipe && !tp() && split_min > 0 && pf_max_ > 0 && n >= split_min && n >= 2 * opt_.prefill_min) {
         const int parts = std::max(min_parts, (n + pf_max_ - 1) / pf_max_);
         chunk = std::max(opt_.prefill_min, (n + parts - 1) / parts);
     }
@@ -1554,7 +1725,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     while (i < tokens.size()) try {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
-        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
+        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe && !tp()) {
             const int N = (int) std::min<size_t>(chunk, left);
             const int32_t * tk = tokens.data() + i;
             const double c0 = now_ms();
@@ -1607,32 +1778,76 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
 }
 
 int Engine::argmax(int t) {
-    if (next_) return next_->argmax(t);
-    DeviceScope ds(dev_);
-    argmax_rows(logits_.p + (size_t) t * model_.cfg.n_vocab, 1, model_.cfg.n_vocab, argmax_dev_, st_);
     int32_t r;
-    CUDA_CHECK(cudaMemcpyAsync(&r, argmax_dev_.p, 4, cudaMemcpyDeviceToHost, st_));
-    CUDA_CHECK(cudaStreamSynchronize(st_));
+    argmax_all(1, &r, t);
     return r;
 }
 
 void Engine::argmax_all(int T, int32_t * out, int row0) {
+    if (tp()) {   // each device's best of its rows, the larger logit wins (ties: the lower id)
+        Engine * e[2] = {this, peer_};
+        int32_t id[2][kMaxWindow];
+        float val[2][kMaxWindow];
+        for (int g = 0; g < 2; ++g) {
+            DeviceScope ds(e[g]->dev_);
+            argmax_rows(e[g]->logits_.p + (size_t) row0 * e[g]->V_, T, e[g]->V_, e[g]->argmax_dev_, e[g]->st_);
+            CUDA_CHECK(cudaMemcpyAsync(id[g], e[g]->argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, e[g]->st_));
+            CUDA_CHECK(cudaStreamSynchronize(e[g]->st_));
+            for (int t = 0; t < T; ++t)
+                CUDA_CHECK(cudaMemcpy(&val[g][t], e[g]->logits_.p + (size_t) (row0 + t) * e[g]->V_ + id[g][t], 4, cudaMemcpyDeviceToHost));
+        }
+        for (int t = 0; t < T; ++t)
+            out[t] = val[1][t] > val[0][t] ? id[1][t] + peer_->V0_ : id[0][t] + V0_;
+        return;
+    }
     if (next_) return next_->argmax_all(T, out, row0);
     DeviceScope ds(dev_);
-    argmax_rows(logits_.p + (size_t) row0 * model_.cfg.n_vocab, T, model_.cfg.n_vocab, argmax_dev_, st_);
+    argmax_rows(logits_.p + (size_t) row0 * V_, T, V_, argmax_dev_, st_);
     CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp) {
+    if (tp()) {   // each device's K largest of its rows and its normalizer, merged on the host
+        std::vector<int32_t> id((size_t) 2 * T * K);
+        std::vector<float> va((size_t) 2 * T * K);
+        std::vector<double> zz((size_t) 2 * T);
+        Engine * e[2] = {this, peer_};
+        for (int g = 0; g < 2; ++g)
+            e[g]->topk_rows_local(row0, T, K, id.data() + (size_t) g * T * K, va.data() + (size_t) g * T * K,
+                                  z ? zz.data() + (size_t) g * T : nullptr, temp);
+        std::vector<int> ord(2 * K);
+        for (int t = 0; t < T; ++t) {
+            const int32_t * i0 = id.data() + (size_t) t * K, * i1 = id.data() + (size_t) (T + t) * K;
+            const float * v0 = va.data() + (size_t) t * K, * v1 = va.data() + (size_t) (T + t) * K;
+            for (int j = 0; j < 2 * K; ++j) ord[j] = j;
+            auto val = [&](int j) { return j < K ? v0[j] : v1[j - K]; };
+            auto gid = [&](int j) { return j < K ? i0[j] + V0_ : i1[j - K] + peer_->V0_; };
+            std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int a, int b) {
+                return val(a) > val(b) || (val(a) == val(b) && gid(a) < gid(b));
+            });
+            for (int j = 0; j < K; ++j) { ids[(size_t) t * K + j] = gid(ord[j]); vals[(size_t) t * K + j] = val(ord[j]); }
+            if (z) {   // each half's sum is relative to its own maximum (the largest of its K)
+                float m0 = v0[0], m1 = v1[0];
+                for (int j = 1; j < K; ++j) { m0 = std::max(m0, v0[j]); m1 = std::max(m1, v1[j]); }
+                const float m = std::max(m0, m1);
+                z[t] = zz[t] * std::exp((double) (m0 - m) / temp) + zz[T + t] * std::exp((double) (m1 - m) / temp);
+            }
+        }
+        return;
+    }
     if (next_) return next_->topk_rows_host(row0, T, K, ids, vals, z, temp);
+    topk_rows_local(row0, T, K, ids, vals, z, temp);
+}
+
+void Engine::topk_rows_local(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp) {
     DeviceScope ds(dev_);
     if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
     if (!topk_ids_.p) {
         topk_ids_.alloc((size_t) kMaxWindow * kTopkMax);
         topk_vals_.alloc((size_t) kMaxWindow * kTopkMax);
     }
-    const int V = model_.cfg.n_vocab;
+    const int V = V_;
     topk_rows(logits_.p + (size_t) row0 * V, T, V, K, topk_ids_, topk_vals_, st_);
     CUDA_CHECK(cudaMemcpyAsync(ids, topk_ids_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(vals, topk_vals_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
@@ -1645,10 +1860,19 @@ void Engine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals,
 }
 
 void Engine::logits_rows_host(int T, float * out, int row0) {
+    if (tp()) {   // the two halves of every row side by side
+        Engine * e[2] = {this, peer_};
+        for (int g = 0; g < 2; ++g) {
+            DeviceScope ds(e[g]->dev_);
+            for (int t = 0; t < T; ++t)
+                CUDA_CHECK(cudaMemcpy(out + (size_t) t * model_.cfg.n_vocab + e[g]->V0_, e[g]->logits_.p + (size_t) (row0 + t) * e[g]->V_,
+                                      (size_t) e[g]->V_ * 4, cudaMemcpyDeviceToHost));
+        }
+        return;
+    }
     if (next_) return next_->logits_rows_host(T, out, row0);
     DeviceScope ds(dev_);
-    CUDA_CHECK(cudaMemcpy(out, logits_.p + (size_t) row0 * model_.cfg.n_vocab, (size_t) T * model_.cfg.n_vocab * 4,
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(out, logits_.p + (size_t) row0 * V_, (size_t) T * V_ * 4, cudaMemcpyDeviceToHost));
 }
 
 void Engine::set_mtp_pending(const float * R_row_dev, int cell) {
@@ -1661,11 +1885,8 @@ void Engine::set_mtp_pending(const float * R_row_dev, int cell) {
 }
 
 std::vector<float> Engine::logits_host(int t) {
-    if (next_) return next_->logits_host(t);
-    DeviceScope ds(dev_);
     std::vector<float> v(model_.cfg.n_vocab);
-    CUDA_CHECK(cudaMemcpy(v.data(), logits_.p + (size_t) t * model_.cfg.n_vocab, v.size() * 4,
-                          cudaMemcpyDeviceToHost));
+    logits_rows_host(1, v.data(), t);
     return v;
 }
 

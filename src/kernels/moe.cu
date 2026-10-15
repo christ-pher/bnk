@@ -53,7 +53,7 @@ __device__ __forceinline__ void moe_plan_body(const int32_t * ids, const float *
     for (int q = 0; first && q < j; ++q) first = s_e[q] != e;
     if (in) {
         s_first[j] = first;
-        s_miss[j] = valid && sl < 0;
+        s_miss[j] = valid && sl == -1;   // -2: another device's expert (tensor parallel), neither hit nor miss
     }
     __syncthreads();
     // exclusive prefix sums (n <= 128: one warp walks it)

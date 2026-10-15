@@ -83,6 +83,10 @@ struct EngineOptions {
     // same id twice runs two stages on one GPU (for testing the split on a single card; cap expert_cache_gib).
     std::vector<int> gpus;           // {-1}: every GPU of compute capability 7.0+
     std::vector<int> split;          // first layer of every stage after the first (empty: balanced by memory)
+    // Tensor parallel: every layer split across the GPUs (heads, key groups, shared-expert columns, the experts
+    // by number, the output head's rows) instead of a layer pipeline; the partial sums of each layer are added
+    // through pinned host memory. Both GPUs work on every forward (one conversation keeps both busy).
+    bool tp = false;
     std::vector<double> stage_cache_gib;   // expert_cache_gib per stage (empty: expert_cache_gib for every one)
 };
 
@@ -146,6 +150,7 @@ public:
     static constexpr int kLanes = 2;
     void forward_pipe(const std::vector<BatchWin> & first, int first_lane, const std::vector<BatchWin> & second,
                       int second_lane);
+    bool tp() const { return tp_n_ > 1; }   // tensor parallel (then forward_pipe is unavailable)
     int row0_of(int slot) const;   // where that slot's rows started in the last forward
     void commit(int c);
     // The commit (the DeltaNet recurrence over the kept rows) runs on its own stream, overlapping the drafter;
@@ -214,6 +219,7 @@ public:
     static constexpr int kTopkMax = 1024;
     // z (optional): each row's sum of exp((logit - max) / temp) within 30 nats of its max (Sampler::distribution_head)
     void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z = nullptr, float temp = 1.f);
+    void topk_rows_local(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp);   // this device's rows
     void set_mtp_pending(const float * R_row_dev, int cell);
     const Config & cfg() const { return model_.cfg; }
     const Model & model() const { return model_; }
@@ -239,6 +245,35 @@ private:
     bool last_ = true;
     Engine * head_ = this;
     std::unique_ptr<Engine> next_;
+    // ---- tensor parallel: this engine holds slice tp_rank_ of tp_n_ of every layer (next_ is the other slice,
+    // peer_ the other engine). Local shapes (the model's when tp_n_ == 1): heads, KV heads, DeltaNet value heads
+    // and key groups and conv channels, shared-expert hidden size, output rows [V0_, V0_ + V_).
+    int tp_n_ = 1, tp_rank_ = 0;
+    Engine * peer_ = nullptr;
+    int H_ = 0, Hkv_ = 0, nv_ = 0, nk_ = 0, C_ = 0, FF_ = 0, V_ = 0, V0_ = 0;
+    // The all-reduce of a layer's partial sums with the peer, in stream order: this engine's rows go out to its
+    // pinned buffer, an event marks them, the peer's rows come in after the peer's event, and are added. Buffers
+    // and events per exchange point (0: after the attention / DeltaNet, 1: after the MoE) and layer parity, so a
+    // layer's copy out never overwrites what the peer still reads. Decode windows (W rows) and prompt chunks
+    // (up to pf_cap_ rows) have their own.
+    float * tp_h_[2][2] = {}, * tp_pfh_[2][2] = {};
+    cudaEvent_t tp_ev_[2][2] = {}, tp_pfev_[2][2] = {};
+    DevBuf<float> tp_tmp_;
+    cudaEvent_t tp_fork_ = nullptr, tp_join_ = nullptr;   // the peer's stream in and out of this engine's capture
+    void tp_send(const float * buf, int rows, int point, int il, bool prompt);
+    void tp_recv(float * buf, int rows, int point, int il, bool prompt);
+    // a decode forward's layers on both engines, exchange by exchange (captured into one graph by the first)
+    void enqueue_forward_tp(int T);
+    void layer_attn_part(int il, int T);     // PLE, attention HC, attention / DeltaNet, the partial sums out
+    void layer_attn_finish(int il, int T);   // the peer's partial sums in, the (deferred) combine
+    void layer_moe_part(int il, int T);      // MoE HC, MoE, the partial sums out
+    void layer_moe_finish(int il, int T);    // the peer's in, the (deferred) combine
+    void service_cpu_tp(uint32_t seq, int T);
+    void prefill_chunk_tp(const int32_t * tokens, int N);
+    void pf_layer_attn_part(int il, int N);
+    void pf_layer_attn_finish(int il, int N);
+    void pf_layer_moe_part(int il, int N);
+    void pf_layer_moe_finish(int il, int N);
     Engine * tail() { return next_ ? next_->tail() : this; }
     bool first() const { return l0_ == 0; }
     bool owns(int il) const { return il >= l0_ && il < l1_; }
@@ -519,6 +554,7 @@ private:
         bool prefetch = false;                    // this chunk streams every non-resident expert ahead
         float * h_x = nullptr, * h_cpu = nullptr; // pinned: the chunk's MoE input, the CPU experts' output
         DevBuf<float> cpu;                        // [N][E] the CPU part on the device
+        DevBuf<float> tpt;                        // [N][E] the peer's partial sums (tensor parallel)
         DevBuf<float> ik, iq, scores;             // QSA for prompt rows
         DevBuf<int32_t> sel, nsel;
         DevBuf<int8_t> xq, hq;                    // list path: the chunk's input quantized; h per pair

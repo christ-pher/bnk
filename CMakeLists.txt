@@ -101,6 +101,8 @@ target_compile_options(test_sampler_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK
 add_executable(bench_moe tests/bench_moe.cu)
 target_link_libraries(bench_moe PRIVATE bnk_core)
 target_compile_options(bench_moe PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(test_tpgraph tests/test_tpgraph.cu)
+target_link_libraries(test_tpgraph PRIVATE CUDA::cudart)
 add_executable(bench_xfer tests/bench_xfer.cu)
 target_link_libraries(bench_xfer PRIVATE CUDA::cudart)
 add_executable(bench_gemm tests/bench_gemm.cu)

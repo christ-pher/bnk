@@ -27,6 +27,8 @@ public:
     // Fills up to `budget` bytes of VRAM following `rank` (completed with every remaining pair). Each layer's
     // slots live in an elastic region charged to `vb`, so the cache can later shrink() and grow().
     // A pipeline stage (several GPUs) caches only layers [l0, l1) (l1 < 0: every layer).
+    // Under tensor parallelism (m.tp_n > 1) only the device's experts (m.expert_local) get slots; the others are
+    // marked -2 in slot_of (the plan kernel skips them: neither a hit nor a CPU miss).
     void init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s, bool verbose,
               VramBudget * vb, int l0 = 0, int l1 = -1);
     // The per-layer slot counts init() would choose, without allocating.
@@ -44,7 +46,7 @@ public:
     // the old expert is unmapped at once, the new one only when its copy finishes)
     int unmapped(int il) const {
         int n = 0;
-        for (int e = 0; e < n_expert_; ++e) n += slot_of_host_[(size_t) il * n_expert_ + e] < 0;
+        for (int e = 0; e < n_expert_; ++e) n += slot_of_host_[(size_t) il * n_expert_ + e] == -1;
         return n;
     }
     // VRAM bytes of one expert of layer il (R-layout rows)

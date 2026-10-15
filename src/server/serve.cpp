@@ -524,7 +524,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
     // back to one batch per round.
     // Measured on two V100s (3 conversations, MTP): 131 -> 159 tok/s together, and each conversation's tokens are
     // exactly its tokens decoded alone (batched rounds are not: expert sums follow the batch's routing)
-    static const bool pipe_decode = eng.stages() == 2 &&
+    static const bool pipe_decode = eng.stages() == 2 && !eng.tp() &&
                                     (getenv("BNK_PIPE_DECODE") ? atoi(getenv("BNK_PIPE_DECODE")) != 0
                                                                : eng.device() != eng.last_device());
     struct Lane { std::vector<Active *> reqs; std::vector<Engine::BatchWin> wins; };

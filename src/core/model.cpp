@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include "core/model.h"
 
@@ -89,12 +90,71 @@ Config load_config(const GgufModel & g) {
     return c;
 }
 
-QMat Model::upload(const std::string & name, bool required) {
+Model::Slice Model::slice_rows(int64_t r) const {
+    Slice s;
+    s.rows.emplace_back((int64_t) tp_rank * r, (int64_t) (tp_rank + 1) * r);
+    return s;
+}
+
+Model::Slice Model::slice_cols(int64_t c) const {
+    Slice s;
+    s.cols.emplace_back((int64_t) tp_rank * c, (int64_t) (tp_rank + 1) * c);
+    return s;
+}
+
+std::vector<std::pair<int64_t, int64_t>> Model::gdn_head_ranges(int64_t width) const {
+    const int G = cfg.ssm_groups, Gl = ssm_groups_l(), per = cfg.ssm_vheads / G;
+    std::vector<std::pair<int64_t, int64_t>> r;
+    for (int j = 0; j < per; ++j)
+        r.emplace_back((int64_t) (j * G + tp_rank * Gl) * width, (int64_t) (j * G + (tp_rank + 1) * Gl) * width);
+    return r;
+}
+
+// A tensor, or the rows / columns of it this device keeps (the column range must fall on the format's block
+// boundaries, which the head / group splits of this model do), through the conversions below.
+QMat Model::upload(const std::string & name, bool required, const Slice * slice) {
     const TensorRef * t = gguf.find(name);
     if (!t) {
         if (required) throw std::runtime_error("missing tensor " + name);
         return QMat{};
     }
+    if (!slice || (slice->rows.empty() && slice->cols.empty()))
+        return upload_data(name, t->data, (int) t->type, t->nrows(), t->ne[0], t->row_bytes());
+    const int64_t blk = ggml_blck_size((ggml_type) t->type), ts = ggml_type_size((ggml_type) t->type);
+    std::vector<std::pair<int64_t, int64_t>> cols = slice->cols;
+    if (cols.empty()) cols.emplace_back(0, t->ne[0]);
+    size_t rb = 0;
+    int64_t ncols = 0;
+    for (auto [c0, c1] : cols) {
+        if (c0 % blk || c1 % blk || c1 > t->ne[0] || c1 < c0)
+            throw std::runtime_error(name + ": a column slice off the format's block boundary");
+        rb += (size_t) ((c1 - c0) / blk) * ts;
+        ncols += c1 - c0;
+    }
+    std::vector<std::pair<int64_t, int64_t>> ranges = slice->rows;
+    if (ranges.empty()) ranges.emplace_back(0, t->nrows());
+    int64_t rows = 0;
+    for (auto [a, b] : ranges) {
+        if (a < 0 || b > t->nrows() || b < a) throw std::runtime_error(name + ": a row slice out of range");
+        rows += b - a;
+    }
+    std::vector<uint8_t> buf(rb * rows);
+    size_t o = 0;
+    for (auto [a, b] : ranges)
+        for (int64_t r = a; r < b; ++r)
+            for (auto [c0, c1] : cols) {
+                const size_t n = (size_t) ((c1 - c0) / blk) * ts;
+                memcpy(buf.data() + o, t->data + (size_t) r * t->row_bytes() + (size_t) (c0 / blk) * ts, n);
+                o += n;
+            }
+    return upload_data(name, buf.data(), (int) t->type, rows, ncols, rb);
+}
+
+QMat Model::upload_data(const std::string & name, const uint8_t * data, int type_, int64_t nrows, int64_t ne0,
+                        size_t row_bytes) {
+    struct { const uint8_t * data; int type; int64_t nrows_, ne0_; size_t rb; int64_t nrows() const { return nrows_; }
+             int64_t ne[1]; size_t row_bytes() const { return rb; } } tt{data, type_, nrows, ne0, row_bytes, {ne0}};
+    const auto * t = &tt;
     void * d = nullptr;
     // token embeddings stay in ggml layout (gathered by row); every other matrix is repacked when possible
     const bool repack = repack_ && name != "token_embd.weight";
@@ -182,10 +242,13 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         L.hc_attn = hcw(b + "hc_attn", true);
         L.hc_ffn = hcw(b + "hc_ffn", true);
         if (L.attn) {
-            L.wq = upload(b + "attn_q.weight");
-            L.wk = upload(b + "attn_k.weight");
-            L.wv = upload(b + "attn_v.weight");
-            L.wo = upload(b + "attn_output.weight");
+            // heads [rank H/n, +H/n) and KV heads likewise; attn_output's input columns are those heads
+            const Slice qs = slice_rows((int64_t) n_head_l() * c.head_dim * 2), ks = slice_rows((int64_t) n_head_kv_l() * c.head_dim);
+            const Slice os = slice_cols((int64_t) n_head_l() * c.head_dim);
+            L.wq = upload(b + "attn_q.weight", true, &qs);
+            L.wk = upload(b + "attn_k.weight", true, &ks);
+            L.wv = upload(b + "attn_v.weight", true, &ks);
+            L.wo = upload(b + "attn_output.weight", true, &os);
             L.q_norm = upload(b + "attn_q_norm.weight");
             L.k_norm = upload(b + "attn_k_norm.weight");
             L.idx_q = upload(b + "indexer.q_proj.weight", false);
@@ -193,14 +256,28 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
             L.idx_q_norm = upload(b + "indexer.q_norm.weight", false);
             L.idx_k_norm = upload(b + "indexer.k_norm.weight", false);
         } else {
-            L.wqkv = upload(b + "attn_qkv.weight");
-            L.wgate = upload(b + "attn_gate.weight");
-            L.ssm_beta = upload(b + "ssm_beta.weight");
-            L.ssm_alpha = upload(b + "ssm_alpha.weight");
-            L.ssm_out = upload(b + "ssm_out.weight");
-            L.ssm_conv1d = upload(b + "ssm_conv1d.weight");
-            L.ssm_dt = upload(b + "ssm_dt.bias");
-            L.ssm_a = upload(b + "ssm_a");
+            // key groups [rank G/n, +G/n) with their value heads: the conv channels are [q of the groups][k of the
+            // groups][v of the heads], three row ranges of attn_qkv and of the conv weights
+            // (value head h uses key group h % G, so the rank's value heads interleave: gdn_head_ranges)
+            const int S = c.ssm_state, G = c.ssm_groups, Gl = ssm_groups_l();
+            Slice cs;
+            cs.rows.emplace_back((int64_t) tp_rank * Gl * S, (int64_t) (tp_rank + 1) * Gl * S);
+            cs.rows.emplace_back((int64_t) G * S + (int64_t) tp_rank * Gl * S, (int64_t) G * S + (int64_t) (tp_rank + 1) * Gl * S);
+            for (auto [a, b] : gdn_head_ranges(S)) cs.rows.emplace_back((int64_t) 2 * G * S + a, (int64_t) 2 * G * S + b);
+            Slice gs, hs, os;
+            gs.rows = gdn_head_ranges(S);
+            hs.rows = gdn_head_ranges(1);
+            os.cols = gdn_head_ranges(S);
+            L.wqkv = upload(b + "attn_qkv.weight", true, &cs);
+            L.wgate = upload(b + "attn_gate.weight", true, &gs);
+            L.ssm_beta = upload(b + "ssm_beta.weight", true, &hs);
+            L.ssm_alpha = upload(b + "ssm_alpha.weight", true, &hs);
+            L.ssm_out = upload(b + "ssm_out.weight", true, &os);
+            L.ssm_conv1d = upload(b + "ssm_conv1d.weight", true, &cs);   // [C][K]: a row per channel
+            Slice vs;                                                      // per-head vectors
+            vs.cols = gdn_head_ranges(1);
+            L.ssm_dt = upload(b + "ssm_dt.bias", true, &vs);
+            L.ssm_a = upload(b + "ssm_a", true, &vs);
             L.ssm_norm = upload(b + "ssm_norm.weight");
         }
         if (il == c.ple_layer) {
@@ -213,14 +290,19 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         }
         L.router = upload(b + "ffn_gate_inp.weight");
         L.shexp_gate_inp = upload(b + "ffn_gate_inp_shexp.weight");
-        L.sh_gate = upload(b + "ffn_gate_shexp.weight");
-        L.sh_up = upload(b + "ffn_up_shexp.weight");
-        L.sh_down = upload(b + "ffn_down_shexp.weight");
+        // the shared expert's hidden columns [rank F/n, +F/n)
+        const Slice fs = slice_rows(n_ff_shexp_l()), fcs = slice_cols(n_ff_shexp_l());
+        L.sh_gate = upload(b + "ffn_gate_shexp.weight", true, &fs);
+        L.sh_up = upload(b + "ffn_up_shexp.weight", true, &fs);
+        L.sh_down = upload(b + "ffn_down_shexp.weight", true, &fcs);
         expert_src(il);
     }
     if (head) {
         hc_head = hcw("output_hc", false);
-        output = upload("output.weight");
+        // the vocabulary's rows [rank V/n, +V/n) (the last device's slice is shorter when V does not divide)
+        Slice vs;
+        vs.rows.emplace_back((int64_t) vocab0(), std::min<int64_t>(c.n_vocab, (int64_t) vocab0() + n_vocab_l()));
+        output = upload("output.weight", true, &vs);
     }
     if (embd) tok_embd = upload("token_embd.weight");
     if (c.ple_layer >= l0 && c.ple_layer < l1) {
@@ -240,7 +322,8 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         }
     }
     if (verbose) {
-        if (l0 == 0 && l1 == c.n_layer) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
+        if (tp_n > 1) fprintf(stderr, "bnk: slice %d of %d: dense weights in VRAM: %.2f GiB\n", tp_rank, tp_n, vram_dense_bytes / 1073741824.0);
+        else if (l0 == 0 && l1 == c.n_layer) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
         else fprintf(stderr, "bnk: layers %d-%d: dense weights in VRAM: %.2f GiB\n", l0, l1 - 1, vram_dense_bytes / 1073741824.0);
     }
 }
