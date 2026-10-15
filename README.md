@@ -55,6 +55,25 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### What the tensor-core prompt path changed (2026-10-15, two V100s)
+
+The routed experts of a prompt chunk run on the tensor cores in one launch per layer (`src/kernels/moe_tc.cu`:
+the quantized sub-blocks unpacked once per 64-token tile into fp16 fragments), instead of an fp16 copy of every
+used expert through HBM and one small cuBLAS kernel per expert; long prompts read in 4,096-token chunks. The
+LocalMaxxing context sweep (`/opt/benchmarks/bnk_bench.py`, batch 1, cold read then a ~512-token follow-up turn):
+
+| depth | cold read, before -> after | follow-up turn wait, before -> after | decode |
+|---|---|---|---|
+| 4K | 1,283 -> **1,948 tok/s** | 729 -> **600 ms** | unchanged |
+| 16K | 1,639 -> **2,430** | 743 -> **588** | unchanged |
+| 32K | 1,861 -> **2,741** | 771 -> **603** | unchanged |
+| 64K | 2,059 -> **2,874** | 838 -> **621** | unchanged |
+| 128K | 1,955 -> **2,875** | 953 -> **752** | unchanged |
+| 256K | 2,109 -> **2,653** | 1,160 -> **946** | unchanged |
+
+Greedy output is unchanged token for token; `tests/test_moe_tc.cu` checks the kernel against a host reference
+on every expert format. What was tried and not kept, and what is next: `docs/ROADMAP.md`, `docs/PLAN.md`.
+
 ### What v0.1.3 changed
 
 A fix for agent workloads with more conversations than slots, where v0.1.2 could fail requests after a while with
