@@ -646,11 +646,17 @@ __global__ void __launch_bounds__(256) moe_down_list_k(const PfItem * __restrict
     }
 }
 
+#ifndef BNK_LIST_PASS
+#define BNK_LIST_PASS 8
+#endif
+constexpr int kListPass = BNK_LIST_PASS;   // tokens per pass over a row
+
 // One row's dot products with N of an item's tokens (activations at a + idx_i * sa, scales at s + idx_i * ss): LPR
 // lanes per row stride over its sub-blocks, then reduce.
 template <int FMT, int LPR, int N>
-__device__ __forceinline__ void list_dots(const uint8_t * row, const ROff & o, int nb, int sub, const int64_t (&idx)[4],
-                                          const int8_t * a, int64_t sa, const float * s, int64_t ss, float (&acc)[4]) {
+__device__ __forceinline__ void list_dots(const uint8_t * row, const ROff & o, int nb, int sub, const int64_t (&idx)[kListPass],
+                                          const int8_t * a, int64_t sa, const float * s, int64_t ss,
+                                          float (&acc)[kListPass]) {
 #pragma unroll
     for (int i = 0; i < N; ++i) acc[i] = 0.f;
     for (int sb = sub; sb < nb; sb += LPR) {
@@ -685,23 +691,104 @@ __global__ void __launch_bounds__(256) moe_list_r_k(const PfItem * __restrict__ 
     const uint8_t * row = GU ? it.blob + (r < F ? (size_t) r * rowb : off + (size_t) (r - F) * rowb)
                              : it.blob + off + (size_t) r * rowb;
     const int n = it.n, nb = ncols / 32;
-    for (int p0 = 0; p0 < n; p0 += 4) {
-        const int m = min(4, n - p0);
-        int64_t idx[4];
+    for (int p0 = 0; p0 < n; p0 += kListPass) {
+        const int m = min(kListPass, n - p0);
+        int64_t idx[kListPass];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) idx[i] = GU ? it.tok[p0 + min(i, m - 1)] : it.pair[p0 + min(i, m - 1)];
-        float acc[4];
+        for (int i = 0; i < kListPass; ++i) idx[i] = GU ? it.tok[p0 + min(i, m - 1)] : it.pair[p0 + min(i, m - 1)];
+        float acc[kListPass];
         switch (m) {   // block-uniform
             case 1: list_dots<FMT, LPR, 1>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
             case 2: list_dots<FMT, LPR, 2>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
             case 3: list_dots<FMT, LPR, 3>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
-            default: list_dots<FMT, LPR, 4>(row, ro, nb, sub, idx, a, sa, s, ss, acc);
+#if BNK_LIST_PASS > 4
+            case 4: list_dots<FMT, LPR, 4>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            case 5: list_dots<FMT, LPR, 5>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            case 6: list_dots<FMT, LPR, 6>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+            case 7: list_dots<FMT, LPR, 7>(row, ro, nb, sub, idx, a, sa, s, ss, acc); break;
+#endif
+            default: list_dots<FMT, LPR, kListPass>(row, ro, nb, sub, idx, a, sa, s, ss, acc);
         }
         if (sub == 0 && r0 < nrows) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < kListPass; ++i)
                 if (i < m) {
                     const size_t pr = it.pair[p0 + i];
+                    if constexpr (GU) gu[pr * 2 * F + r] = acc[i];
+                    else D[pr * nrows + r] = __float2half(acc[i]);
+                }
+        }
+    }
+}
+
+// list_dots over activations staged in shared memory (token i's row at xs + i * ncols, scales at ds + i * nb)
+template <int FMT, int LPR, int N>
+__device__ __forceinline__ void list_dots_s(const uint8_t * row, const ROff & o, int nb, int sub, const int8_t * xs,
+                                            const float * ds, float (&acc)[kMaxWindow]) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) acc[i] = 0.f;
+    for (int sb = sub; sb < nb; sb += LPR) {
+        Unpacked u;
+        unpack_sm<FMT>(row, o, sb, u);
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const int4 * ap = (const int4 *) (xs + (size_t) i * nb * 32 + sb * 32);
+            acc[i] += qdot_sub<FMT, RT<FMT>::HAS_MIN>(u, ap[0], ap[1], ds[i * nb + sb]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+#pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1) acc[i] += __shfl_xor_sync(0xffffffff, acc[i], off);
+    }
+}
+
+// moe_list_r_k with the item's activations (all its tokens, one pass) copied to shared memory once per block, and
+// each block walking RIT row groups: the activations were re-read from L1/L2 by every row (32 B per token per
+// sub-block against ~14 B of weights), which held the kernel to ~250 GB/s of weights.
+template <int FMT, int LPR, bool GU, int RIT>
+__global__ void __launch_bounds__(256) moe_list_s_k(const PfItem * __restrict__ items, size_t off, size_t rowb, int F,
+                                                    int nrows, int ncols, const int8_t * __restrict__ a, int64_t sa,
+                                                    const float * __restrict__ s, int64_t ss, float * __restrict__ gu,
+                                                    half * __restrict__ D, ROff ro) {
+    extern __shared__ int4 list_smem[];
+    const PfItem & it = items[blockIdx.x];
+    const int n = it.n, nb = ncols / 32;
+    int8_t * xs = (int8_t *) list_smem;
+    float * ds = (float *) (xs + (size_t) kMaxWindow * ncols);
+    rt_tables_load<FMT>();
+    for (int i = 0; i < n; ++i) {
+        const int64_t src = GU ? it.tok[i] : it.pair[i];
+        const int4 * g = (const int4 *) (a + src * sa);
+        int4 * d = (int4 *) (xs + (size_t) i * ncols);
+        for (int j = threadIdx.x; j < ncols / 16; j += blockDim.x) d[j] = __ldg(g + j);
+        for (int j = threadIdx.x; j < nb; j += blockDim.x) ds[i * nb + j] = __ldg(s + src * ss + j);
+    }
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, sub = lane % LPR;
+    for (int g = 0; g < RIT; ++g) {
+        const int r0 = (blockIdx.y * RIT + g) * (8 * RPW) + warp * RPW + lane / LPR;
+        if ((blockIdx.y * RIT + g) * (8 * RPW) >= nrows) break;   // block-uniform
+        const int r = min(r0, nrows - 1);   // all lanes shuffle
+        const uint8_t * row = GU ? it.blob + (r < F ? (size_t) r * rowb : off + (size_t) (r - F) * rowb)
+                                 : it.blob + off + (size_t) r * rowb;
+        float acc[kMaxWindow];
+        switch (n) {   // block-uniform
+            case 1: list_dots_s<FMT, LPR, 1>(row, ro, nb, sub, xs, ds, acc); break;
+            case 2: list_dots_s<FMT, LPR, 2>(row, ro, nb, sub, xs, ds, acc); break;
+            case 3: list_dots_s<FMT, LPR, 3>(row, ro, nb, sub, xs, ds, acc); break;
+            case 4: list_dots_s<FMT, LPR, 4>(row, ro, nb, sub, xs, ds, acc); break;
+            case 5: list_dots_s<FMT, LPR, 5>(row, ro, nb, sub, xs, ds, acc); break;
+            case 6: list_dots_s<FMT, LPR, 6>(row, ro, nb, sub, xs, ds, acc); break;
+            case 7: list_dots_s<FMT, LPR, 7>(row, ro, nb, sub, xs, ds, acc); break;
+            default: list_dots_s<FMT, LPR, kMaxWindow>(row, ro, nb, sub, xs, ds, acc);
+        }
+        if (sub == 0 && r0 < nrows) {
+#pragma unroll
+            for (int i = 0; i < kMaxWindow; ++i)
+                if (i < n) {
+                    const size_t pr = it.pair[i];
                     if constexpr (GU) gu[pr * 2 * F + r] = acc[i];
                     else D[pr * nrows + r] = __float2half(acc[i]);
                 }
@@ -714,6 +801,26 @@ void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const A
     if (n_items <= 0) return;
     const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
     static const bool old_list = getenv("BNK_LIST_OLD") != nullptr;
+    // BNK_LIST_SMEM=0: activations read from global memory (moe_list_r_k)
+    static const bool list_smem = !getenv("BNK_LIST_SMEM") || atoi(getenv("BNK_LIST_SMEM")) != 0;
+    const size_t smem_gu = (size_t) kMaxWindow * (E + E / 32 * 4), smem_dn = (size_t) kMaxWindow * (F + F / 32 * 4);
+    if (d.rlay && !old_list && list_smem && smem_gu <= 32768 && E % 16 == 0 && F % 16 == 0) {
+        auto gk = [&]<int FMT>() {
+            constexpr int LPR = 8, RIT = 4, rows = 8 * (32 / LPR) * RIT;
+            moe_list_s_k<FMT, LPR, true, RIT><<<dim3(n_items, (2 * F + rows - 1) / rows), 256, smem_gu, st>>>(
+                items, d.gate_bytes, d.grow, F, 2 * F, E, xq.q, xq.cols_pad, xq.d, xq.cols_pad / 32, gu, nullptr, go);
+        };
+        BNK_DISPATCH_R(d.gate_type, gk);
+        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+        auto dk = [&]<int FMT>() {
+            constexpr int LPR = 4, RIT = 4, rows = 8 * (32 / LPR) * RIT;
+            moe_list_s_k<FMT, LPR, false, RIT><<<dim3(n_items, (E + rows - 1) / rows), 256, smem_dn, st>>>(
+                items, d.gate_bytes + d.up_bytes, d.drow, F, E, F, hq, F, hd, F / 32, nullptr, D, dof);
+        };
+        BNK_DISPATCH_R(d.down_type, dk);
+        check_launch("moe_list_s");
+        return;
+    }
     if (d.rlay && !old_list) {
         auto gk = [&]<int FMT>() {
             auto L = [&]<int LPR>() {
