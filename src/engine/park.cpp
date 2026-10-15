@@ -59,6 +59,30 @@ size_t Engine::parked_bytes() const {
     return b + (next_ ? next_->parked_bytes() : 0);
 }
 
+size_t Engine::spare_bytes() const {
+    size_t b = ck_spare_.size() * const_cast<Engine *>(this)->state_floats() * 4;
+    for (const auto & s : spare_) b += s.cap;
+    return b + (next_ ? next_->spare_bytes() : 0);
+}
+
+// Pinned RAM handed back stays pinned for the next park while parked and spare buffers together are within the
+// parking budget (pinning in a request costs ~0.2 s per GiB in the engine): conversations taking turns, and new
+// ones replacing old, then park without pinning anything.
+void Engine::trim_spares(size_t extra) {
+    const size_t limit = (size_t) (opt_.park_gib * 1073741824.0);
+    while (!spare_.empty() || ck_spare_.size() > (size_t) kMaxCheckpoints) {
+        if (head_->parked_bytes() + head_->spare_bytes() + extra <= limit) return;
+        if (ck_spare_.size() > (size_t) kMaxCheckpoints) {
+            ck_free(ck_spare_.back());
+            ck_spare_.pop_back();
+            continue;
+        }
+        auto it = std::min_element(spare_.begin(), spare_.end(), [](const Pinned & a, const Pinned & b) { return a.cap < b.cap; });
+        unpin_host(it->p, it->cap);
+        spare_.erase(it);
+    }
+}
+
 uint8_t * Engine::pinned_take(size_t bytes, size_t * cap) {
     size_t best = spare_.size();
     for (size_t i = 0; i < spare_.size(); ++i)   // the smallest that fits
@@ -72,11 +96,11 @@ uint8_t * Engine::pinned_take(size_t bytes, size_t * cap) {
     // room for the conversation to grow before the buffer stops fitting it
     const size_t step = 256ull << 20;
     *cap = (bytes + bytes / 4 + step - 1) / step * step;
+    trim_spares(*cap);   // none fits: the smallest spares make way within the budget
     uint8_t * p = nullptr;
-    while (cudaHostAlloc((void **) &p, *cap, 0) != cudaSuccess) {
-        cudaGetLastError();
+    while (!(p = (uint8_t *) pin_host(*cap))) {
         if (spare_.empty()) return nullptr;
-        CUDA_CHECK(cudaFreeHost(spare_.back().p));   // too little RAM to pin: give the spares back first
+        unpin_host(spare_.back().p, spare_.back().cap);   // too little RAM to pin: give the spares back first
         spare_.pop_back();
     }
     return p;
@@ -84,11 +108,7 @@ uint8_t * Engine::pinned_take(size_t bytes, size_t * cap) {
 
 void Engine::pinned_give(uint8_t * p, size_t cap) {
     spare_.push_back({p, cap});
-    if (spare_.size() > 2) {   // keep the two biggest
-        auto it = std::min_element(spare_.begin(), spare_.end(), [](const Pinned & a, const Pinned & b) { return a.cap < b.cap; });
-        CUDA_CHECK(cudaFreeHost(it->p));
-        spare_.erase(it);
-    }
+    trim_spares();
 }
 
 float * Engine::ck_take() {
@@ -97,15 +117,23 @@ float * Engine::ck_take() {
         ck_spare_.pop_back();
         return p;
     }
-    float * p = nullptr;
-    CUDA_CHECK(cudaHostAlloc((void **) &p, state_floats() * 4, 0));
+    return ck_alloc();
+}
+
+float * Engine::ck_alloc() {
+    float * p = (float *) pin_host(state_floats() * 4);
+    if (!p) throw std::runtime_error("cannot pin host RAM for a snapshot");
     return p;
+}
+
+void Engine::ck_free(float * p) {
+    if (p) unpin_host(p, state_floats() * 4);
 }
 
 void Engine::ck_give(float * p) {
     if (!p) return;
-    if (ck_spare_.size() < (size_t) kMaxCheckpoints) ck_spare_.push_back(p);
-    else CUDA_CHECK(cudaFreeHost(p));
+    ck_spare_.push_back(p);
+    trim_spares();
 }
 
 void Engine::drop_parked(size_t i) {
@@ -162,12 +190,18 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
         park_stats.evictions++;
     }
     const uint64_t id = ++park_age_;
-    for (Engine * s = this; s; s = s->next_.get())
-        if (!s->park_copy(id, move_ckpts)) {
-            drop_parked_id(id);   // the stages that did park it
-            if (opt_.verbose) fprintf(stderr, "bnk: could not pin %.2f GiB to park a conversation\n", bytes / 1073741824.0);
-            return;
-        }
+    // every stage's copies in flight together (each GPU on its own link), then waited for
+    bool ok = true;
+    for (Engine * s = this; s && ok; s = s->next_.get()) ok = s->park_copy(id, move_ckpts);
+    for (Engine * s = this; s; s = s->next_.get()) {
+        DeviceScope ds(s->dev_);
+        CUDA_CHECK(cudaStreamSynchronize(s->st_));
+    }
+    if (!ok) {
+        drop_parked_id(id);   // the stages that did park it
+        if (opt_.verbose) fprintf(stderr, "bnk: could not pin %.2f GiB to park a conversation\n", bytes / 1073741824.0);
+        return;
+    }
     park_stats.parks++;
     park_stats.park_ms += now_ms() - t0;
     if (opt_.verbose)
@@ -175,7 +209,8 @@ void Engine::park(uint64_t keep, bool move_ckpts) {
                 (bytes + ck_bytes) / 1073741824.0, now_ms() - t0, parked_.size(), parked_bytes() / 1073741824.0);
 }
 
-// This stage's copy of the live conversation, entry `id` (false: no pinned memory for it).
+// This stage's copy of the live conversation, entry `id` (false: no pinned memory for it). The device-to-host
+// copies are left in flight on st_: the caller synchronizes.
 bool Engine::park_copy(uint64_t id, bool move_ckpts) {
     DeviceScope ds(dev_);
     join_commit_here();
@@ -208,7 +243,6 @@ bool Engine::park_copy(uint64_t id, bool move_ckpts) {
         }
         p.ckpts.push_back(c);
     }
-    CUDA_CHECK(cudaStreamSynchronize(st_));
     p.history = cur_->history;
     p.mtp_cell = cur_->mtp_cell;
     p.bytes = bytes + ck_bytes;
@@ -232,7 +266,8 @@ void Engine::restore(size_t i) {
         throw;
     }
     restoring_ = 0;
-    for (Engine * s = this; s; s = s->next_.get()) s->restore_copy(id);
+    for (Engine * s = this; s; s = s->next_.get()) s->restore_copy(id, false);   // every stage's copies in flight
+    for (Engine * s = this; s; s = s->next_.get()) s->restore_copy(id, true);
     park_stats.restores++;
     park_stats.restore_ms += now_ms() - t0;
     if (opt_.verbose)
@@ -240,23 +275,27 @@ void Engine::restore(size_t i) {
                 parked_.size());
 }
 
-void Engine::restore_copy(uint64_t id) {
+// finish false: starts the host-to-device copies; true: waits for them and makes the entry the live state
+void Engine::restore_copy(uint64_t id, bool finish) {
     DeviceScope ds(dev_);
     size_t i = parked_.size();
     for (size_t j = 0; j < parked_.size(); ++j)
         if (parked_[j].used == id) i = j;
     if (i == parked_.size()) throw std::runtime_error("restore: a pipeline stage lost the parked conversation");
     Parked & p = parked_[i];
-    const int n = (int) p.history.size();
-    size_t off = 0;
-    each_ctx(n, [&](void * d, size_t b) {
-        CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, b, cudaMemcpyHostToDevice, st_));
-        off += b;
-    });
-    each_state([&](float * d, size_t f) {
-        CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, f * 4, cudaMemcpyHostToDevice, st_));
-        off += f * 4;
-    });
+    if (!finish) {
+        const int n = (int) p.history.size();
+        size_t off = 0;
+        each_ctx(n, [&](void * d, size_t b) {
+            CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, b, cudaMemcpyHostToDevice, st_));
+            off += b;
+        });
+        each_state([&](float * d, size_t f) {
+            CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, f * 4, cudaMemcpyHostToDevice, st_));
+            off += f * 4;
+        });
+        return;
+    }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     cur_->history = std::move(p.history);
     cur_->mtp_cell = p.mtp_cell;

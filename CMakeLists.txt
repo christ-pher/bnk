@@ -42,6 +42,7 @@ add_library(bnk_core STATIC
   src/core/model.cpp
   src/core/expert_cache.cpp
   src/core/vmem.cpp
+  src/core/pinned.cpp
   src/cpu/expert_pool.cpp
   src/cpu/kernels.cpp
   src/cpu/mdot.cpp

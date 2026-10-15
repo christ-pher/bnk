@@ -88,7 +88,7 @@ Engine::~Engine() {
     cudaSetDevice(dev_);
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts)
-            if (k.host) cudaFreeHost(k.host);
+            ck_free(k.host);
         for (auto & gl : q->commit_graphs) for (auto & gm : gl) for (auto & g : gm) if (g) cudaGraphExecDestroy(g);
     }
     for (auto & kv : fwd_graphs_) cudaGraphExecDestroy(kv.second.exec);
@@ -500,7 +500,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     for (auto & q : seqs_)
         while ((int) q->ckpts.size() < kMaxCheckpoints) {
             q->ckpts.emplace_back();
-            CUDA_CHECK(cudaHostAlloc((void **) &q->ckpts.back().host, ck, 0));
+            q->ckpts.back().host = ck_alloc();
         }
     if (opt.verbose)
         fprintf(stderr, "bnk: layers %d-%d: snapshots %d x %d slots x %.0f MiB pinned\n", l0_, l1_ - 1, kMaxCheckpoints,
@@ -677,15 +677,13 @@ void Engine::checkpoint_here() {
     if (p == 0) return;
     for (auto & k : cur_->ckpts)
         if (k.pos == p) { k.age = ++ckpt_age_; return; }
-    size_t floats = 0;
-    each_state([&](float *, size_t n) { floats += n; });
     Checkpoint * slot = nullptr;
     for (auto & k : cur_->ckpts)
         if (k.pos < 0) { slot = &k; break; }
     if (!slot && (int) cur_->ckpts.size() < kMaxCheckpoints) {
         cur_->ckpts.emplace_back();
         slot = &cur_->ckpts.back();
-        CUDA_CHECK(cudaHostAlloc((void **) &slot->host, floats * 4, 0));
+        slot->host = ck_take();
     }
     if (!slot)  // the least recently used one goes
         slot = &*std::min_element(cur_->ckpts.begin(), cur_->ckpts.end(), [](const Checkpoint & a, const Checkpoint & b) { return a.age < b.age; });

@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 
 #include "core/expert_cache.h"
+#include "core/pinned.h"
 #include "core/vmem.h"
 #include "core/model.h"
 #include "core/util.h"
@@ -197,6 +198,7 @@ public:
         }
     }
     size_t parked_bytes() const;
+    size_t spare_bytes() const;   // pinned buffers kept for reuse, every stage
     struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; } park_stats;
     const std::vector<int32_t> & history() const { return cur_->history; }
     int max_ctx() const { return opt_.max_ctx; }
@@ -391,21 +393,24 @@ private:
     };
     std::vector<Parked> parked_;
     uint64_t park_age_ = 0;
-    // Pinned buffers are kept for reuse: pinning costs ~0.3 s per GiB, and conversations taking turns hand the
-    // same few buffers around (a restore frees what the next park needs).
+    // Pinned buffers (pin_host) are kept for reuse: pinning still costs ~50 ms per GiB, and conversations taking
+    // turns hand the same few buffers around (a restore frees what the next park needs).
     struct Pinned { uint8_t * p; size_t cap; };
     std::vector<Pinned> spare_;          // conversation buffers
     std::vector<float *> ck_spare_;      // snapshot buffers (all state_floats() long)
     uint8_t * pinned_take(size_t bytes, size_t * cap);
     void pinned_give(uint8_t * p, size_t cap);
     float * ck_take();
+    float * ck_alloc();   // a new snapshot buffer (throws when RAM cannot be pinned)
+    void ck_free(float * p);
     void ck_give(float * p);
+    void trim_spares(size_t extra = 0);   // spares beyond the parking budget (less `extra`) go back to the OS
     // move_ckpts: the live snapshots go along instead of being copied (the live state is replaced next).
     // Decided on the first stage (park), carried out on every stage (park_copy: one entry each, in step)
     void park(uint64_t keep = 0, bool move_ckpts = false);
     bool park_copy(uint64_t id, bool move_ckpts);
     size_t park_bytes_here(int n);   // this stage's live state for n cells (context + recurrent)
-    void restore_copy(uint64_t id);
+    void restore_copy(uint64_t id, bool finish);
     // VRAM for `need` more bytes on this stage when its expert cache has nothing left to give: idle conversations
     // (largest first) are parked in host RAM and their context unmapped, on every stage. False when that is not
     // enough either.
