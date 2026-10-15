@@ -338,7 +338,7 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     thinking = "<think>" in tail and "</think>" not in tail
     if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
         text, thinking = text + "\n</think>\n\n", False
-    return S.tok.encode(text), thinking
+    return S.tok.encode_chat(text), thinking
 
 
 # ------------------------------------------------------------------------------------------- HTTP

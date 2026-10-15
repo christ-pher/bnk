@@ -7,9 +7,28 @@ import json
 import os
 import pickle
 
+import threading
+
 import regex
 
 from .gguf_meta import read_metadata
+
+RECENT_PROMPTS = 8   # rendered prompts kept for encode_chat (a conversation's next turn shares most of its text)
+
+
+def _common_chars(a: str, b: str) -> int:
+    """Length of the common prefix of two strings (slice compares run in C)."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n   # a[:lo] == b[:lo], a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 # llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 expression (the tokenizer.json original, with (?i:) expanded)
 QWEN35 = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
@@ -44,6 +63,8 @@ class Tokenizer:
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
         self.pre = regex.compile(QWEN35)
         self.cache: dict[str, list[int]] = {}
+        self._recent: list = []
+        self._recent_lock = threading.Lock()
         self.ids = specials
         self.token_bytes = [self._bytes_of(i) for i in range(len(tokens))]
 
@@ -77,11 +98,15 @@ class Tokenizer:
         d = dict(self.__dict__)
         d.pop("special_re", None)
         d.pop("pre", None)
+        d.pop("_recent_lock", None)
         d["cache"] = {}
+        d["_recent"] = []
         return d
 
     def __setstate__(self, d):
         self.__dict__.update(d)
+        self._recent = []
+        self._recent_lock = threading.Lock()
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
         self.pre = regex.compile(QWEN35)
 
@@ -121,15 +146,49 @@ class Tokenizer:
     def encode(self, text: str, parse_special: bool = True) -> list[int]:
         if not parse_special or not self.special:
             return self._encode_plain(text)
-        out, pos = [], 0
+        return self._encode_marked(text)[0]
+
+    def _encode_marked(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
+        """The tokens, and (character, token) offsets just past each special token: text is encoded segment by
+        segment between special tokens, so the tokens of text[:c] for such a c are exactly the first t tokens."""
+        out, pos, marks = [], 0, []
         for m in self.special_re.finditer(text):
             if m.start() > pos:
                 out.extend(self._encode_plain(text[pos:m.start()]))
             out.append(self.special[m.group(0)])
             pos = m.end()
+            marks.append((pos, len(out)))
         if pos < len(text):
             out.extend(self._encode_plain(text[pos:]))
-        return out
+        return out, marks
+
+    def encode_chat(self, text: str) -> list[int]:
+        """encode(text), reusing a recent prompt's tokens up to the last special token inside the text they share:
+        a conversation's next turn re-renders every earlier message, and encoding all of it again cost ~0.5-0.7 s
+        per turn at 256K tokens."""
+        best, best_c = None, 0
+        with self._recent_lock:
+            for e in self._recent:
+                c = _common_chars(e[0], text)
+                if c > best_c:
+                    best, best_c = e, c
+        start, keep, prev_marks = 0, 0, []
+        if best is not None:
+            for i in range(len(best[2]) - 1, -1, -1):
+                if best[2][i][0] <= best_c:
+                    start, keep = best[2][i]
+                    prev_marks = best[2][:i + 1]
+                    break
+        if start:
+            ids, marks = self._encode_marked(text[start:])
+            ids = best[1][:keep] + ids
+            marks = prev_marks + [(c + start, t + keep) for c, t in marks]
+        else:
+            ids, marks = self._encode_marked(text)
+        with self._recent_lock:
+            self._recent.insert(0, (text, ids, marks))
+            del self._recent[RECENT_PROMPTS:]
+        return ids
 
     # ----------------------------------------------------------------- decode
     def _bytes_of(self, i: int) -> bytes:
