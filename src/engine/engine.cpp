@@ -491,6 +491,20 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
                     pf_small_, pf_base_, pf_big_, pf_.stage_bytes / 1073741824.0);
     }
     reset_here();
+    // every slot's snapshot buffers pinned now: pinning one during a request cost its turn ~60 ms per GPU. The
+    // drafter's input row is part of a snapshot, so it exists from the start (else the size would change later)
+    if (mtp_.loaded())
+        for (auto & q : seqs_)
+            if (!q->mtp_R) CUDA_CHECK(cudaMalloc(&q->mtp_R, (size_t) c.hc_dim() * 4));
+    const size_t ck = state_floats() * 4;
+    for (auto & q : seqs_)
+        while ((int) q->ckpts.size() < kMaxCheckpoints) {
+            q->ckpts.emplace_back();
+            CUDA_CHECK(cudaHostAlloc((void **) &q->ckpts.back().host, ck, 0));
+        }
+    if (opt.verbose)
+        fprintf(stderr, "bnk: layers %d-%d: snapshots %d x %d slots x %.0f MiB pinned\n", l0_, l1_ - 1, kMaxCheckpoints,
+                (int) seqs_.size(), ck / 1048576.0);
 }
 
 void Engine::alloc_seq(Seq & q) {
