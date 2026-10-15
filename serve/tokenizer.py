@@ -63,6 +63,8 @@ class Tokenizer:
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
         self.pre = regex.compile(QWEN35)
         self.cache: dict[str, list[int]] = {}
+        self.wcache: dict[str, list[int]] = {}
+        self.byte_table = {i: c for i, c in self.byte_enc.items()}
         self._recent: list = []
         self._recent_lock = threading.Lock()
         self.ids = specials
@@ -100,11 +102,14 @@ class Tokenizer:
         d.pop("pre", None)
         d.pop("_recent_lock", None)
         d["cache"] = {}
+        d["wcache"] = {}
         d["_recent"] = []
         return d
 
     def __setstate__(self, d):
         self.__dict__.update(d)
+        self.wcache = {}
+        self.byte_table = {i: c for i, c in self.byte_enc.items()}
         self._recent = []
         self._recent_lock = threading.Lock()
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
@@ -137,10 +142,16 @@ class Tokenizer:
         return out
 
     def _encode_plain(self, text: str) -> list[int]:
-        out = []
-        for m in self.pre.finditer(text):
-            w = "".join(self.byte_enc[b] for b in m.group(0).encode("utf-8"))
-            out.extend(self._bpe(w))
+        # the cache is keyed by the word as written: a hit skips the byte mapping too (most words, after the first
+        # few requests); the mapping itself is a str.translate over the word's UTF-8 bytes read as Latin-1
+        out, wcache, bpe, table = [], self.wcache, self._bpe, self.byte_table
+        for w in self.pre.findall(text):
+            ids = wcache.get(w)
+            if ids is None:
+                ids = bpe(w.encode("utf-8").decode("latin-1").translate(table))
+                if len(wcache) < 200000:
+                    wcache[w] = ids
+            out += ids
         return out
 
     def encode(self, text: str, parse_special: bool = True) -> list[int]:
