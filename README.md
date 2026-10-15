@@ -243,7 +243,11 @@ about 10% of the GPU time of an 80K-token read (`tests/bench_qsa_attn.cu` times 
 address space for their maximum and map physical memory in 2 MiB pages only as needed. All of them draw on one
 budget whose remainder is the expert cache. When a conversation grows or a long prompt arrives, the cache gives up
 its coldest slots (moving hot experts out of the freed pages first); afterwards it grows back. A 256K context
-therefore costs nothing until it is used.
+therefore costs nothing until it is used. The K/V cells are 8-bit by default (a fp16 scale per 32 values, as
+q8_0; `BNK_KV8=0` keeps fp16): 9 instead of 14 KiB per token per GPU, so 256K tokens take 2.2 rather than 3.6 GiB
+of each card's expert cache, and a parked conversation 25-40% less RAM. Its effect on the output is within what
+reordering the kernels' sums does (`bnk nll` with `BNK_NLL_REF`: KL 0.015 from fp16 at 64K tokens, against
+0.011-0.012 for the older attention and expert kernels).
 
 **Prompt processing.** Prompts are processed in chunks (2K tokens, or 8K for long prompts) with tensor-core
 GEMMs: resident experts run as grouped GEMMs, non-resident ones stream over PCIe one layer ahead into
@@ -414,6 +418,7 @@ expert cache starts warm after the first session.
 | Environment | |
 |---|---|
 | `BNK_SLOTS=3` | conversations decoded at once |
+| `BNK_KV8=0` | fp16 K/V cache instead of 8-bit (more VRAM per token, the exact numerics of earlier versions) |
 | `BNK_PARK_GIB=24`, `BNK_SLICE_S=10` | host RAM for parked conversations, and the time slice when requests wait for a slot; `0` turns either off |
 | `BNK_READ_SHARE=0.5` | while a prompt is read, the other requests decode for this share of each chunk's time (`0`: reads block them) |
 | `BNK_DRAFT_BATCH=0` | draft for each conversation on its own instead of in one batched pass |
@@ -482,11 +487,13 @@ longer freezes every other agent.
 build/bnk run   --model M --tokens-file ids.csv --max-new 200 --mtp mtp.gguf   # generate, with timings
 build/bnk multi --model M --slots 3 --tokens-file a.csv,b.csv,c.csv --max-new 200 [--solo]
                                                                                # several conversations batched
-build/bnk check --model M --tokens-file ids.csv --ref ref/prefix              # vs llama.cpp, layer by layer
+build/bnk check --model M --tokens-file ids.csv --ref ref/prefix              # vs llama.cpp, layer by layer (BNK_KV8=0)
 build/bnk pdump --model M --tokens-file ids.csv --ref out.bin                 # process a prompt, write its logits
 ```
 
 `BNK_SPLIT=N` makes `pdump` time only the tokens after the first N (a follow-up turn at depth),
+`BNK_NLL_SKIP=N` makes `nll` read the first N tokens as a prompt and score the rest, `BNK_NLL_DUMP=file` /
+`BNK_NLL_REF=file` save a run's top-64 log-probabilities / report another run's KL divergence from them,
 `BNK_PROFILE_DECODE=1` limits an `nsys --capture-range=cudaProfilerApi` profile of `bnk run` to decoding, and
 `BNK_ROUTE_LOG=file` records every decode step's routing and timing for `tools/batch_sim.py`.
 
@@ -536,8 +543,8 @@ third_party/   ggml (CPU backend: quantization formats, GGUF), MIT
 * Batched decoding shares at most 8 rows per step between the conversations, so each one verifies fewer drafts
   than alone (3 conversations: ~2.7 rows each).
 * A prompt being read shares the GPU with the others' decoding, so it takes longer while others are active.
-* Decoding slows as the context fills: the KV cache takes VRAM from the expert cache (up to 7 GiB per conversation
-  at 256K).
+* Decoding slows as the context fills: the KV cache takes VRAM from the expert cache (up to 4.3 GiB per
+  conversation at 256K, 7 GiB with `BNK_KV8=0`).
 * The thinking-loop guard catches exact repetition, not paraphrased loops.
 * Only sm_70 is built and tested; other GPUs would need their own tuning (and CUDA 13 no longer targets V100).
 * With several GPUs the layers run on one GPU after the other: one conversation's decode does not get faster than

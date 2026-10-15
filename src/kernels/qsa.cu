@@ -8,6 +8,8 @@
 
 #include "core/util.h"
 #include "kernels/qsa.h"
+#include "kernels/kvq.cuh"
+#include "kernels/ops.h"
 
 namespace bnk {
 
@@ -400,6 +402,7 @@ __device__ __forceinline__ int qsa_cell(int i, const int32_t * sel, int nsel, in
 
 constexpr int kQsaSplits = 64;
 
+template <bool Q8>
 __global__ void qsa_attn_partial_k(const float * q, const half * kc, const half * vc, const int32_t * sel,
                                    const int32_t * n_sel, int H, int Hkv, int D, int r, int K, const int * pos0p,
                                    float scale, float * part_o, float * part_ml, int nsplit) {
@@ -422,7 +425,7 @@ __global__ void qsa_attn_partial_k(const float * q, const half * kc, const half 
     float m = -FLT_MAX, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = k0 + w; i < k1; i += 8) {
         const int key = ns == 0 ? i : qsa_cell(i, sl, ns, r, tail_start);
-        const uint4 kraw = *(const uint4 *) (kc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 kraw = kv_load8<Q8>(kc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * k2 = (const half2 *) &kraw;
         float sdot = 0.f;
 #pragma unroll
@@ -434,7 +437,7 @@ __global__ void qsa_attn_partial_k(const float * q, const half * kc, const half 
         const float mn = fmaxf(m, sdot);
         const float corr = __expf(m - mn), p = __expf(sdot - mn);
         l = l * corr + p;
-        const uint4 vraw = *(const uint4 *) (vc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 vraw = kv_load8<Q8>(vc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * v2 = (const half2 *) &vraw;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -497,12 +500,13 @@ void qsa_attention(const float * q, const half * kc, const half * vc, const floa
     const int ns = kQsaSplits;
     float * part_o = scratch;
     float * part_ml = scratch + (size_t) T * sh.H * ns * sh.D;
-    qsa_attn_partial_k<<<dim3(T * sh.H, ns), 256, 0, s>>>(q, kc, vc, sel, n_sel, sh.H, sh.Hkv, sh.D, sh.ratio,
+    (kv_q8() ? qsa_attn_partial_k<true> : qsa_attn_partial_k<false>)<<<dim3(T * sh.H, ns), 256, 0, s>>>(q, kc, vc, sel, n_sel, sh.H, sh.Hkv, sh.D, sh.ratio,
                                                           sh.top_blocks, pos0, scale, part_o, part_ml, ns);
     qsa_attn_combine_k<<<T * sh.H, sh.D, 0, s>>>(part_o, part_ml, qfull_gate, out, sh.H, sh.D, ns);
 }
 
 // prompt rows: one warp per (t, h)
+template <bool Q8>
 __global__ void qsa_attn_prefill_k(const float * q, const half * kc, const half * vc, const float * qfull,
                                    const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1, int H,
                                    int Hkv, int D, int r, int K, int pos0, float scale) {
@@ -522,7 +526,7 @@ __global__ void qsa_attn_prefill_k(const float * q, const half * kc, const half 
     float m = -FLT_MAX, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = 0; i < n_keys; ++i) {
         const int key = ns == 0 ? i : qsa_cell(i, sl, ns, r, tail_start);
-        const uint4 kraw = *(const uint4 *) (kc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 kraw = kv_load8<Q8>(kc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * k2 = (const half2 *) &kraw;
         float sdot = 0.f;
 #pragma unroll
@@ -534,7 +538,7 @@ __global__ void qsa_attn_prefill_k(const float * q, const half * kc, const half 
         const float mn = fmaxf(m, sdot);
         const float corr = __expf(m - mn), p = __expf(sdot - mn);
         l = l * corr + p;
-        const uint4 vraw = *(const uint4 *) (vc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 vraw = kv_load8<Q8>(vc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * v2 = (const half2 *) &vraw;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -556,6 +560,7 @@ __global__ void qsa_attn_prefill_k(const float * q, const half * kc, const half 
 constexpr int QA_KT = 32;   // keys per tile
 constexpr int QA_D = 256;   // head dim this kernel is built for
 constexpr int QA_LD = QA_D + 8;
+template <bool Q8>
 __global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, const half * kc, const half * vc,
                                                               const float * qfull, const int32_t * sel,
                                                               const int32_t * n_sel, float * out, int t0, int H,
@@ -597,7 +602,7 @@ __global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, co
         for (int i = tid; i < QA_KT * QA_D / 8; i += 128) {
             const int k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
             const int c = cells[k];
-            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? *(const uint4 *) (kc + ((int64_t) c * Hkv + hk) * QA_D + d8)
+            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? kv_load8<Q8>(kc, (int64_t) c * Hkv + hk, QA_D, d8)
                                                      : make_uint4(0, 0, 0, 0);
         }
         __syncthreads();
@@ -620,7 +625,7 @@ __global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, co
         for (int i = tid; i < QA_KT * QA_D / 8; i += 128) {
             const int k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
             const int c = cells[k];
-            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? *(const uint4 *) (vc + ((int64_t) c * Hkv + hk) * QA_D + d8)
+            *(uint4 *) &KVs[k * QA_LD + d8] = c >= 0 ? kv_load8<Q8>(vc, (int64_t) c * Hkv + hk, QA_D, d8)
                                                      : make_uint4(0, 0, 0, 0);
         }
         {
@@ -694,7 +699,7 @@ __global__ void __launch_bounds__(128) qsa_attn_prefill_tc_k(const float * q, co
 // The R rows' G heads are the M = R * G rows of the wmma tiles (MT tiles of 16). Per tile of 32 keys: S = Q K^T,
 // masked online softmax, O += P V with O in accumulator fragments (rescaled through a per-warp scratch tile when a
 // row's maximum grows). Every row must be sparse (n_sel > 0); R * 4 <= 32 (the per-entry cell masks are 32 bits).
-template <int R, int MT>
+template <int R, int MT, bool Q8>
 __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q, const half * kc, const half * vc,
                                                                 const float * qfull, const int32_t * sel,
                                                                 const int32_t * n_sel, float * out, int t0, int t1,
@@ -844,7 +849,7 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
         for (int j = 0; j < PIECES; ++j) {
             const int i = tid + 256 * j, k = i / (QA_D / 8), d8 = (i % (QA_D / 8)) * 8;
             const int c = cells[b][k];
-            reg[j] = c >= 0 ? *(const uint4 *) (src + ((int64_t) c * Hkv + hk) * QA_D + d8) : make_uint4(0, 0, 0, 0);
+            reg[j] = c >= 0 ? kv_load8<Q8>(src, (int64_t) c * Hkv + hk, QA_D, d8) : make_uint4(0, 0, 0, 0);
         }
     };
     auto put = [&](const uint4 * reg) {
@@ -854,18 +859,52 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
             *(uint4 *) &KVs[k * QA_LD + d8] = reg[j];
         }
     };
+    // 8-bit cells: 16 values (one 16-byte load, inside one scale's 32) and their scale per piece, half the loads
+    // of 8 at a time; turned into halves when stored to the tile
+    constexpr int QP = KT * QA_D / 16 / 256;
+    constexpr int64_t QROW = QA_D / 2 + QA_D / 32;
+    uint4 kq[QP], vq[QP];
+    half ks[QP], vs[QP];
+    auto fetch_q = [&](const half * src, int b, uint4 * qr, half * sr) {
+#pragma unroll
+        for (int j = 0; j < QP; ++j) {
+            const int i = tid + 256 * j, k = i / (QA_D / 16), d16 = (i % (QA_D / 16)) * 16;
+            const int c = cells[b][k];
+            if (c >= 0) {
+                const int8_t * r = (const int8_t *) (src + ((int64_t) c * Hkv + hk) * QROW);
+                qr[j] = *(const uint4 *) (r + d16);
+                sr[j] = ((const half *) (r + QA_D))[d16 >> 5];
+            } else {
+                qr[j] = make_uint4(0, 0, 0, 0);
+                sr[j] = __float2half(0.f);
+            }
+        }
+    };
+    auto put_q = [&](const uint4 * qr, const half * sr) {
+#pragma unroll
+        for (int j = 0; j < QP; ++j) {
+            const int i = tid + 256 * j, k = i / (QA_D / 16), d16 = (i % (QA_D / 16)) * 16;
+            const half2 s2 = __half2half2(sr[j]);
+            *(uint4 *) &KVs[k * QA_LD + d16] = kv_dequant8(make_uint2(qr[j].x, qr[j].y), s2);
+            *(uint4 *) &KVs[k * QA_LD + d16 + 8] = kv_dequant8(make_uint2(qr[j].z, qr[j].w), s2);
+        }
+    };
+    auto fetch_k = [&](int b) { if constexpr (Q8) fetch_q(kc, b, kq, ks); else fetch(kc, b, kreg); };
+    auto fetch_v = [&](int b) { if constexpr (Q8) fetch_q(vc, b, vq, vs); else fetch(vc, b, vreg); };
+    auto put_k = [&]() { if constexpr (Q8) put_q(kq, ks); else put(kreg); };
+    auto put_v = [&]() { if constexpr (Q8) put_q(vq, vs); else put(vreg); };
     const int n_tiles = (n_keys + KT - 1) / KT;
     tile_cells(0, 0);
     if (n_tiles > 1) tile_cells(KT, 1);
     __syncthreads();
-    fetch(kc, 0, kreg);
-    fetch(vc, 0, vreg);
-    put(kreg);
+    fetch_k(0);
+    fetch_v(0);
+    put_k();
     __syncthreads();
     for (int it = 0; it < n_tiles; ++it) {
         const int cb = it & 1, nbuf = cb ^ 1;
         const bool more = it + 1 < n_tiles;
-        if (more) fetch(kc, nbuf, kreg);   // the next keys, in flight during this tile
+        if (more) fetch_k(nbuf);   // the next keys, in flight during this tile
         if (tid < MT) need_s[tid] = 0;
         // S[M][32]: one 16 x 16 tile per warp
         for (int tt = warp; tt < MT * 2 * SPLIT; tt += NW) {
@@ -883,7 +922,7 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
             wmma::store_matrix_sync(Ss + (sp * M + mi * 16) * KT + ni * 16, sf, KT, wmma::mem_row_major);
         }
         __syncthreads();
-        put(vreg);   // this tile's values (fetched during the previous one)
+        put_v();   // this tile's values (fetched during the previous one)
         // the masked softmax update (4 threads per row, 8 keys each)
         for (int row = tid >> 2; row < M; row += 64) {
             const int sub = tid & 3, rr = row / G;
@@ -919,7 +958,7 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
             }
         }
         __syncthreads();
-        if (more) fetch(vc, nbuf, vreg);   // the next values, in flight during P V
+        if (more) fetch_v(nbuf);   // the next values, in flight during P V
         // O += P V: this warp's output tiles (m tile, 16 dims)
         float * sw = scr + warp * 256;
 #pragma unroll
@@ -946,7 +985,7 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
         }
         __syncthreads();
         if (more) {
-            put(kreg);
+            put_k();
             if (it + 2 < n_tiles) tile_cells((it + 2) * KT, cb);
         }
         __syncthreads();
@@ -971,8 +1010,8 @@ __global__ void __launch_bounds__(256) qsa_attn_prefill_multi_k(const float * q,
     }
 }
 
-template <int R, int MT>
-static void launch_multi(const float * q, const half * kc, const half * vc, const float * qfull_gate,
+template <int R, int MT, bool Q8>
+static void launch_multi_q(const float * q, const half * kc, const half * vc, const float * qfull_gate,
                          const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1, const QsaShape & sh,
                          int pos0, float scale, cudaStream_t s) {
     constexpr int M = 16 * MT;
@@ -984,20 +1023,28 @@ static void launch_multi(const float * q, const half * kc, const half * vc, cons
     int dev = 0;
     cudaGetDevice(&dev);
     if (!attr[dev & 63]) {
-        CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_prefill_multi_k<R, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_prefill_multi_k<R, MT, Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int) bytes));
         attr[dev & 63] = true;
         if (getenv("BNK_QSA_INFO")) {
             cudaFuncAttributes fa;
             int nb = 0;
-            CUDA_CHECK(cudaFuncGetAttributes(&fa, qsa_attn_prefill_multi_k<R, MT>));
-            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, qsa_attn_prefill_multi_k<R, MT>, 256, bytes));
+            CUDA_CHECK(cudaFuncGetAttributes(&fa, qsa_attn_prefill_multi_k<R, MT, Q8>));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, qsa_attn_prefill_multi_k<R, MT, Q8>, 256, bytes));
             fprintf(stderr, "qsa multi R=%d: %d registers, %zu + %zu bytes shared, %d blocks per SM\n", R, fa.numRegs,
                     (size_t) fa.sharedSizeBytes, bytes, nb);
         }
     }
-    qsa_attn_prefill_multi_k<R, MT><<<dim3((t1 - t0 + R - 1) / R, sh.Hkv), 256, bytes, s>>>(
+    qsa_attn_prefill_multi_k<R, MT, Q8><<<dim3((t1 - t0 + R - 1) / R, sh.Hkv), 256, bytes, s>>>(
         q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv, sh.ratio, sh.top_blocks, pos0, scale);
+}
+
+template <int R, int MT>
+static void launch_multi(const float * q, const half * kc, const half * vc, const float * qfull_gate,
+                         const int32_t * sel, const int32_t * n_sel, float * out, int t0, int t1, const QsaShape & sh,
+                         int pos0, float scale, cudaStream_t s) {
+    if (kv_q8()) launch_multi_q<R, MT, true>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s);
+    else launch_multi_q<R, MT, false>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh, pos0, scale, s);
 }
 
 bool qsa_attention_prefill_multi(int rows, const float * q, const half * kc, const half * vc,
@@ -1020,7 +1067,7 @@ void qsa_attention_prefill(const float * q, const half * kc, const half * vc, co
     if (warps <= 0) return;
     static const bool old = getenv("BNK_QSA_OLD") != nullptr;
     if (!old && sh.D == QA_D && sh.H / sh.Hkv <= 16) {
-        qsa_attn_prefill_tc_k<<<dim3(t1 - t0, sh.Hkv), 128, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, sh.H,
+        (kv_q8() ? qsa_attn_prefill_tc_k<true> : qsa_attn_prefill_tc_k<false>)<<<dim3(t1 - t0, sh.Hkv), 128, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, sh.H,
                                                                    sh.Hkv, sh.ratio, sh.top_blocks, pos0, scale);
         return;
     }
@@ -1032,7 +1079,7 @@ void qsa_attention_prefill_ref(const float * q, const half * kc, const half * vc
                                const QsaShape & sh, int pos0, float scale, cudaStream_t s) {
     const int warps = (t1 - t0) * sh.H;
     if (warps <= 0) return;
-    qsa_attn_prefill_k<<<(warps + 7) / 8, 256, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv,
+    (kv_q8() ? qsa_attn_prefill_k<true> : qsa_attn_prefill_k<false>)<<<(warps + 7) / 8, 256, 0, s>>>(q, kc, vc, qfull_gate, sel, n_sel, out, t0, t1, sh.H, sh.Hkv,
                                                        sh.D, sh.ratio, sh.top_blocks, pos0, scale);
 }
 

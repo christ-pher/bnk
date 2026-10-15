@@ -220,7 +220,7 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     actq_.alloc(W * 4 * HC); actd_.alloc(W * 4 * HC / 32);
     act_.q = actq_; act_.d = actd_;
     // K/V cells per conversation slot: address space for the whole context, mapped as it grows (ensure_ctx)
-    const size_t kv = (size_t) max_ctx * c.n_head_kv * c.head_dim;
+    const size_t kv = (size_t) max_ctx * c.n_head_kv * kv_row_halves(c.head_dim);
     slots_ = std::vector<Slot>(std::max(1, slots));
     if (sparse_) max_blocks_ = max_ctx / qsh_.ratio + 1;
     for (Slot & sl : slots_) {
@@ -255,7 +255,7 @@ void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, c
     memset((void *) msg_, 0, MoeMsg::bytes(E));
     CUDA_CHECK(cudaHostAlloc((void **) &h_io_, 64, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &h_prob_, 64, cudaHostAllocMapped));
-    kv_cell_bytes_ = (size_t) c.n_head_kv * c.head_dim * sizeof(half);
+    kv_cell_bytes_ = (size_t) c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
     // optional draft vocabulary: the head rows of a token subset
     if (!draft_vocab.empty()) {
         FILE * f = fopen(draft_vocab.c_str(), "rb");

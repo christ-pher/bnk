@@ -149,6 +149,7 @@ int64_t Engine::cache_swaps() const { return cache_.swaps_done + (next_ ? next_-
 // the largest share of a GPU's free memory, so with room for everything each GPU keeps its layers' experts
 // resident, and otherwise both fall short alike (the CPU computes the rest as on one GPU).
 std::vector<int> Engine::plan_split(const std::string & path, const EngineOptions & opt, const std::vector<int> & gpus) {
+    kv_set_q8(opt.kv8);
     const int S = (int) gpus.size();
     GgufModel g;
     g.open(path);
@@ -181,7 +182,7 @@ std::vector<int> Engine::plan_split(const std::string & path, const EngineOption
     }
     for (int il = 0; il < L; ++il)
         if (c.is_attn(il)) {
-            double cell = 4.0 * c.n_head_kv * c.head_dim;
+            double cell = 4.0 * c.n_head_kv * kv_row_halves(c.head_dim);
             if (c.compress_ratio[il] > 0) cell += 2.0 * c.idx_dim + 4.0 * c.idx_dim / c.compress_ratio[il];
             lay[il] += cell * opt.max_ctx;
         }
@@ -300,6 +301,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
 
 void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     opt_ = opt;
+    kv_set_q8(opt.kv8);
     const bool head = head_ == this;
     CUDA_CHECK(cudaSetDevice(dev_));
     // a second stage on the same GPU finds its context already made (the flag is the default on 64-bit anyway)
@@ -391,7 +393,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
-            kv_cell_bytes += 2 * (size_t) c.n_head_kv * c.head_dim * sizeof(half);
+            kv_cell_bytes += 2 * (size_t) c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
             if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
                 kv_cell_bytes += c.idx_dim * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
                 qsa_on_ = true;
@@ -424,10 +426,10 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         qsa_scores_.alloc((size_t) W * max_blocks_); qsa_sel_.alloc((size_t) W * (c.idx_top_k / r)); qsa_nsel_.alloc(W);
     }
     if (opt.verbose)
-        fprintf(stderr, "bnk: %scontext %d: %.0f KiB of KV per token (%.2f GiB when full, mapped as used), "
+        fprintf(stderr, "bnk: %scontext %d: %.0f KiB of %sKV per token (%.2f GiB when full, mapped as used), "
                         "recurrent state %.2f GiB, %d CPU expert threads%s\n",
                 first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
-                opt.max_ctx, kv_cell_bytes / 1024.0, (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
+                opt.max_ctx, kv_cell_bytes / 1024.0, opt.kv8 ? "8-bit " : "", (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
                 state_bytes / 1073741824.0, cpu_->threads(),
                 seqs_.size() > 1 ? (", " + std::to_string(seqs_.size()) + " conversation slots").c_str() : "");
 
@@ -523,7 +525,7 @@ void Engine::alloc_seq(Seq & q) {
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
             // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
-            const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * c.head_dim;
+            const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * kv_row_halves(c.head_dim);
             q.kv_k[il].reserve(kv * sizeof(half), &budget_, "KV cache");
             q.kv_v[il].reserve(kv * sizeof(half), &budget_, "KV cache");
             q.kc[il].view(q.kv_k[il].as<half>(), kv);
@@ -593,7 +595,7 @@ void Engine::map_ctx(int cells) {
             if (b.reserved()) need += vmem_round(std::min(bytes, b.reserved())) - std::min(vmem_round(std::min(bytes, b.reserved())), b.mapped());
         };
         for (int il = 0; il < c.n_layer; ++il) {
-            const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
+            const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
             add(cur_->kv_k[il], kv);
             add(cur_->kv_v[il], kv);
             if (cur_->kv_raw[il].reserved()) {
@@ -607,7 +609,7 @@ void Engine::map_ctx(int cells) {
     }
     for (int il = 0; il < c.n_layer; ++il) {
         if (!cur_->kv_k[il].reserved()) continue;
-        const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
+        const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
         if (grow) {
             cur_->kv_k[il].ensure(kv);
             cur_->kv_v[il].ensure(kv);

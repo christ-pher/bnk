@@ -7,6 +7,7 @@
 // RAM (28 KiB per token: ~0.15 s each way for 50K tokens over PCIe) and brings it back when that conversation's
 // next request arrives; the request then proceeds exactly as if it had never been away.
 #include "engine/engine.h"
+#include "kernels/ops.h"
 
 #include <algorithm>
 #include <cstring>
@@ -42,7 +43,7 @@ template <typename F> void Engine::each_ctx(int cells, F && f) {
     const Config & c = model_.cfg;
     for (int il = 0; il < c.n_layer; ++il) {
         if (!cur_->kc[il].p) continue;
-        const size_t kv = (size_t) cells * c.n_head_kv * c.head_dim * sizeof(half);
+        const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
         f((void *) cur_->kc[il].p, kv);
         f((void *) cur_->vc[il].p, kv);
         if (cur_->kraw[il].p) {

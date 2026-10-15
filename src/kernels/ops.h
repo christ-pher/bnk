@@ -51,6 +51,11 @@ void gated_rmsnorm(const float * o, const float * z, const float * w, float * y,
                    cudaStream_t s);
 
 // ---- full attention
+// The K/V cache cell format, process-wide (set before any cache is sized): fp16, or 8-bit with a fp16 scale per 32
+// values (kernels/kvq.cuh). The cache is a half array of kv_row_halves(D) halves per (cell, KV head) row.
+void kv_set_q8(bool on);
+bool kv_q8();
+inline int64_t kv_row_halves(int D) { return kv_q8() ? D / 2 + D / 32 : D; }
 // From qfull [T][H][2*D] (q|gate per head) and k/v [T][Hkv][D]: normalizes, rotates (NeoX, n_rot dims) and
 // writes q [T][H][D] and the cache rows at positions pos0+t.
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,

@@ -1,6 +1,7 @@
 // bnk command line: run a tokenized prompt, greedy decode, and compare against llama.cpp dumps.
 //   bnk run   --model M.gguf --tokens-file F [--max-new N] [--ctx N] [--threads N]
 //   bnk check --model M.gguf --tokens-file F --ref PREFIX   (per-layer residual + logits vs llama_ref)
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -81,7 +82,8 @@ int main(int argc, char ** argv) {
     setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
     if (argc < 2) {
         fprintf(stderr, "usage: bnk run|check|nll --model M --tokens-file F [--max-new N] [--ctx N] [--threads N] [--ref P]\n"
-                        "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n");
+                        "           [--gpus 0,1 [--split L]]   (several GPUs: a pipeline, layers split between them)\n"
+                        "           [--kv8 0]   (fp16 K/V cache instead of 8-bit; BNK_KV8=0 likewise)\n");
         return 1;
     }
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
@@ -89,6 +91,7 @@ int main(int argc, char ** argv) {
     int max_new = 32;
     GenOptions gopt;
     EngineOptions opt;
+    opt.kv8 = env_int("BNK_KV8", 1) != 0;   // 8-bit K/V by default; --kv8 wins
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -125,6 +128,7 @@ int main(int argc, char ** argv) {
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next()), adapt_set = true;
         else if (a == "--park-gib") opt.park_gib = std::stod(next());
         else if (a == "--park-min") opt.park_min = std::stoi(next());
+        else if (a == "--kv8") opt.kv8 = std::stoi(next()) != 0;
         else if (a == "--slots") opt.slots = std::stoi(next());
         else if (a == "--gpus") { const std::string v = next(); opt.gpus = v == "all" ? std::vector<int>{-1} : int_list(v); }
         else if (a == "--split") opt.split = int_list(next());
@@ -150,13 +154,24 @@ int main(int argc, char ** argv) {
 
     if (mode == "nll") {
         // teacher-forced negative log-likelihood of the tokens through the decode path, in windows of BNK_NLL_T
-        // (default 5) rows: how well the model predicts a text, for comparing kernel variants
+        // (default 5) rows: how well the model predicts a text, for comparing kernel variants. BNK_NLL_SKIP=N reads
+        // the first N tokens as a prompt first and scores the rest (the predictions at that depth)
         const int T = std::max(1, std::min(env_int("BNK_NLL_T", 5), (int) kMaxWindow));
         const int V = c.n_vocab;
         std::vector<float> lg((size_t) T * V);
         double nll = 0;
         int64_t n = 0, top1 = 0;
-        for (size_t i = 0; i + 1 < prompt.size(); i += T) {
+        const size_t skip = std::min(prompt.size() - 1, (size_t) env_int("BNK_NLL_SKIP", 0));
+        if (skip) eng.prefill(std::vector<int32_t>(prompt.begin(), prompt.begin() + skip));
+        // BNK_NLL_DUMP=F writes every row's top 64 log-probabilities; BNK_NLL_REF=F reads such a file and reports the
+        // KL divergence from it (over those 64 tokens), a finer measure of a variant than the NLL
+        constexpr int KT = 64;
+        FILE * dump = getenv("BNK_NLL_DUMP") ? fopen(getenv("BNK_NLL_DUMP"), "wb") : nullptr;
+        FILE * reff = getenv("BNK_NLL_REF") ? fopen(getenv("BNK_NLL_REF"), "rb") : nullptr;
+        double kl_sum = 0, kl_max = 0;
+        int64_t top1_same = 0;
+        std::vector<int> kl_hist(6, 0);
+        for (size_t i = skip; i + 1 < prompt.size(); i += T) {
             const int t = (int) std::min<size_t>(T, prompt.size() - 1 - i);
             eng.forward(prompt.data() + i, t);
             eng.logits_rows_host(t, lg.data());
@@ -171,11 +186,45 @@ int main(int argc, char ** argv) {
                 for (int v = 0; v < V; ++v) z += std::exp((double) row[v] - mx);
                 nll += std::log(z) - ((double) row[want] - mx);
                 top1 += am == want;
+                const double lz = std::log(z) + mx;
+                if (dump) {
+                    std::vector<int> id(V);
+                    for (int v = 0; v < V; ++v) id[v] = v;
+                    std::partial_sort(id.begin(), id.begin() + KT, id.end(), [&](int a, int b) { return row[a] > row[b]; });
+                    for (int j = 0; j < KT; ++j) {
+                        const float lp = (float) (row[id[j]] - lz);
+                        fwrite(&id[j], 4, 1, dump);
+                        fwrite(&lp, 4, 1, dump);
+                    }
+                }
+                if (reff) {
+                    int id[KT];
+                    float lp[KT];
+                    for (int j = 0; j < KT; ++j)
+                        if (fread(&id[j], 4, 1, reff) != 1 || fread(&lp[j], 4, 1, reff) != 1) id[j] = -1;
+                    double kl = 0;
+                    for (int j = 0; j < KT; ++j)
+                        if (id[j] >= 0) kl += std::exp((double) lp[j]) * ((double) lp[j] - ((double) row[id[j]] - lz));
+                    kl_sum += kl;
+                    kl_max = std::max(kl_max, kl);
+                    top1_same += id[0] == am;
+                    const double edges[5] = {1e-4, 1e-3, 1e-2, 1e-1, 1};
+                    int b = 0;
+                    while (b < 5 && kl >= edges[b]) ++b;
+                    kl_hist[b]++;
+                }
                 ++n;
             }
         }
         printf("nll %.5f per token over %lld tokens (windows of %d), ppl %.4f, top-1 %.2f%%\n", nll / n, (long long) n, T,
                std::exp(nll / n), 100.0 * top1 / n);
+        if (dump) fclose(dump);
+        if (reff) {
+            fclose(reff);
+            printf("KL from the reference: mean %.5f, max %.4f; same top-1 %.2f%%; rows by KL <1e-4 %d, <1e-3 %d, <1e-2 %d, "
+                   "<0.1 %d, <1 %d, more %d\n", kl_sum / n, kl_max, 100.0 * top1_same / n, kl_hist[0], kl_hist[1],
+                   kl_hist[2], kl_hist[3], kl_hist[4], kl_hist[5]);
+        }
         return 0;
     }
 

@@ -72,6 +72,9 @@ struct EngineOptions {
     // instead of its prompt being read again. 0 = off (one conversation at a time, as before).
     double park_gib = 0;
     int park_min = 2048;             // conversations shorter than this are not worth parking
+    // K/V cache cells in 8 bits (a fp16 scale per 32 values, as q8_0): 1,088 instead of 2,048 bytes per cell and
+    // attention layer, so long contexts leave the expert cache more VRAM
+    bool kv8 = false;
     int slots = 1;                   // conversations held on the GPU at once (batched decoding when > 1)
     // Pipeline over several GPUs: their CUDA device ids, one stage each (empty: the current device alone). The
     // same id twice runs two stages on one GPU (for testing the split on a single card; cap expert_cache_gib).

@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "kernels/ops.h"
+#include "kernels/kvq.cuh"
 #include "kernels/route.cuh"
 
 namespace bnk {
@@ -499,7 +500,12 @@ void gated_rmsnorm(const float * o, const float * z, const float * w, float * y,
 }
 
 // ------------------------------------------------------------------------------------------- attention
+static bool g_kv_q8 = false;
+void kv_set_q8(bool on) { g_kv_q8 = on; }
+bool kv_q8() { return g_kv_q8; }
+
 // grid (T, H + Hkv), block D threads
+template <bool Q8>
 __global__ void attn_prep_k(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,
                             float * q, half * kc, half * vc, int H, int Hkv, int D, int n_rot, float base,
                             const int * pos0p, float eps) {
@@ -528,20 +534,22 @@ __global__ void attn_prep_k(const float * qfull, const float * k, const float * 
     if (isq) {
         q[((int64_t) t * H + h) * D + i] = r;
     } else {
-        const int64_t row = ((int64_t) (pos0 + t) * Hkv + hk) * D + i;
-        kc[row] = __float2half(r);
-        vc[row] = __float2half(v[((int64_t) t * Hkv + hk) * D + i]);
+        const int64_t row = (int64_t) (pos0 + t) * Hkv + hk;
+        kv_store<Q8>(kc, row, D, i, r);
+        kv_store<Q8>(vc, row, D, i, v[((int64_t) t * Hkv + hk) * D + i]);
     }
 }
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn, float * q,
                half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base, const int * pos0,
                float eps, cudaStream_t s) {
-    attn_prep_k<<<dim3(T, H + Hkv), D, 0, s>>>(qfull, k, v, qn, kn, q, kcache, vcache, H, Hkv, D, n_rot, base, pos0,
-                                                eps);
+    if (kv_q8() && D % 32 != 0) { fprintf(stderr, "attn_prep: 8-bit KV needs a head dim divisible by 32\n"); abort(); }
+    (kv_q8() ? attn_prep_k<true> : attn_prep_k<false>)<<<dim3(T, H + Hkv), D, 0, s>>>(
+        qfull, k, v, qn, kn, q, kcache, vcache, H, Hkv, D, n_rot, base, pos0, eps);
 }
 
 // Split-KV flash decoding. grid (T*H, nsplit), 256 threads = 8 warps; each warp takes keys in turn.
 // lane holds dims [lane*8, lane*8+8) of D=256.
+template <bool Q8>
 __global__ void attn_partial_k(const float * q, const half * kc, const half * vc, int H, int Hkv, int D,
                                const int * pos0p, float scale, float * part_o, float * part_ml, int nsplit) {
     const int th = blockIdx.x;
@@ -560,8 +568,7 @@ __global__ void attn_partial_k(const float * q, const half * kc, const half * vc
     for (int d = 0; d < 8; ++d) qv[d] = qp[d] * scale;
     float m = -FLT_MAX, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int key = k0 + w; key < k1; key += 8) {
-        const half * kp = kc + ((int64_t) key * Hkv + hk) * D + lane * 8;
-        const uint4 kraw = *(const uint4 *) kp;
+        const uint4 kraw = kv_load8<Q8>(kc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * k2 = (const half2 *) &kraw;
         float sdot = 0.f;
 #pragma unroll
@@ -573,7 +580,7 @@ __global__ void attn_partial_k(const float * q, const half * kc, const half * vc
         const float mn = fmaxf(m, sdot);
         const float corr = __expf(m - mn), p = __expf(sdot - mn);
         l = l * corr + p;
-        const uint4 vraw = *(const uint4 *) (vc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 vraw = kv_load8<Q8>(vc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * v2 = (const half2 *) &vraw;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -639,11 +646,12 @@ void attention(const float * q, const half * kcache, const half * vcache, const 
     const int ns = kAttnSplits;
     float * part_o = scratch;
     float * part_ml = scratch + (size_t) T * H * ns * D;
-    attn_partial_k<<<dim3(T * H, ns), 256, 0, s>>>(q, kcache, vcache, H, Hkv, D, pos0, scale, part_o, part_ml, ns);
+    (kv_q8() ? attn_partial_k<true> : attn_partial_k<false>)<<<dim3(T * H, ns), 256, 0, s>>>(q, kcache, vcache, H, Hkv, D, pos0, scale, part_o, part_ml, ns);
     attn_combine_k<<<T * H, D, 0, s>>>(part_o, part_ml, qfull_gate, out, H, D, ns);
 }
 
 // One warp per (t, h); D = 256 (8 dims per lane). Online softmax over the causal keys, then the output gate.
+template <bool Q8>
 __global__ void attn_prefill_k(const float * q, const half * kc, const half * vc, const float * qfull, float * out,
                                int T, int H, int Hkv, int D, int pos0, float scale) {
     const int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -657,7 +665,7 @@ __global__ void attn_prefill_k(const float * q, const half * kc, const half * vc
     float m = -FLT_MAX, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const int n_kv = pos0 + t + 1;
     for (int key = 0; key < n_kv; ++key) {
-        const uint4 kraw = *(const uint4 *) (kc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 kraw = kv_load8<Q8>(kc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * k2 = (const half2 *) &kraw;
         float s = 0.f;
 #pragma unroll
@@ -669,7 +677,7 @@ __global__ void attn_prefill_k(const float * q, const half * kc, const half * vc
         const float mn = fmaxf(m, s);
         const float corr = __expf(m - mn), p = __expf(s - mn);
         l = l * corr + p;
-        const uint4 vraw = *(const uint4 *) (vc + ((int64_t) key * Hkv + hk) * D + lane * 8);
+        const uint4 vraw = kv_load8<Q8>(vc, (int64_t) key * Hkv + hk, D, lane * 8);
         const half2 * v2 = (const half2 *) &vraw;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -688,7 +696,7 @@ void attention_prefill(const float * q, const half * kcache, const half * vcache
                        float * out, int T, int H, int Hkv, int D, int pos0, float scale, cudaStream_t s) {
     if (D != 256) { fprintf(stderr, "attention_prefill: head dim %d unsupported\n", D); abort(); }
     const int warps = T * H;
-    attn_prefill_k<<<(warps + 7) / 8, 256, 0, s>>>(q, kcache, vcache, qfull_gate, out, T, H, Hkv, D, pos0, scale);
+    (kv_q8() ? attn_prefill_k<true> : attn_prefill_k<false>)<<<(warps + 7) / 8, 256, 0, s>>>(q, kcache, vcache, qfull_gate, out, T, H, Hkv, D, pos0, scale);
 }
 
 // ------------------------------------------------------------------------------------------- routing
