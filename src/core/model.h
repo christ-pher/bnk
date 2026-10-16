@@ -97,6 +97,7 @@ struct Model {
 
 private:
     std::vector<void *> device_allocs_;
+    std::vector<void *> host_allocs_;   // page-locked host copies read by the GPU over PCIe (the token table)
     QMat upload(const std::string & name, bool required = true);
     QMat upload_data(const std::string & name, const uint8_t * data, int type, int64_t rows, int64_t cols,
                      size_t row_bytes);

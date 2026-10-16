@@ -18,6 +18,8 @@ Restart=on-failure
 RestartSec=15
 # Freeing ~100 GB of RAM and the GPU takes a while.
 TimeoutStopSec=90
+# The n-gram table (27-29 GB) is locked in RAM at load (a row whose page was evicted costs a disk read per token).
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=default.target

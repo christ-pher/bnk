@@ -11,6 +11,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 
 namespace bnk {
 
@@ -392,6 +393,50 @@ void iq4_nl_rows(const block_iq4_nl * x, int nb, const block_q8_0 * const * y, f
     for (int t = 0; t < NT; ++t) s[t] = hsum8(_mm256_add_ps(acc[0][t], acc[1][t]));
 }
 
+// ---------------------------------------------------------------------------------------------- NVFP4 x Q8_0
+// A 64-weight block holds four 16-weight sub-blocks (UE4M3 scale each; byte i of a sub-block's 8 code bytes is
+// element i in the low nibble, i + 8 in the high one) and pairs with two Q8_0 blocks. The codes go through the
+// doubled-e2m1 table (kvalues_fp4) and the halved scales (ggml's convention), so the products are the weights'.
+static float ue4m3h_tab[128];
+static const float * ue4m3h_table() {
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 128; ++i) ue4m3h_tab[i] = ggml_ue4m3_to_fp32((uint8_t) i);
+        init = true;
+    }
+    return ue4m3h_tab;
+}
+
+template <int NT>
+void nvfp4_rows(const block_nvfp4 * x, int nb, const block_q8_0 * const * y, float * s) {
+    const float * uh = ue4m3h_table();
+    const __m128i lut = _mm_loadu_si128((const __m128i *) kvalues_fp4);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+#pragma GCC unroll 2
+        for (int h = 0; h < 2; ++h) {   // the block's two 32-weight halves = y blocks 2 ib + h
+            const __m128i q = _mm_loadu_si128((const __m128i *) (x[ib].qs + 16 * h));
+            const __m128i vlo = _mm_shuffle_epi8(lut, _mm_and_si128(q, m4b));                      // A0-7 | B0-7
+            const __m128i vhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), m4b));  // A8-15 | B8-15
+            const __m256i w = _mm256_set_m128i(_mm_unpackhi_epi64(vlo, vhi), _mm_unpacklo_epi64(vlo, vhi));
+            const __m256i aw = _mm256_sign_epi8(w, w);
+            const float dA = uh[x[ib].d[2 * h] & 0x7f], dB = uh[x[ib].d[2 * h + 1] & 0x7f];
+            for (int t = 0; t < NT; ++t) {
+                const block_q8_0 & yb = y[t][2 * ib + h];
+                const __m256i a = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) yb.qs), w);
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, a), ones);   // 0-3: A, 4-7: B
+                const float yd = fp16(yb.d);
+                const __m256 sc = _mm256_set_m128(_mm_set1_ps(dB * yd), _mm_set1_ps(dA * yd));
+                acc[t] = _mm256_fmadd_ps(sc, _mm256_cvtepi32_ps(p), acc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < NT; ++t) s[t] = hsum8(acc[t]);
+}
+
 template <typename BX, typename BY, void (*K1)(const BX *, int, const BY * const *, float *),
           void (*K2)(const BX *, int, const BY * const *, float *), void (*K3)(const BX *, int, const BY * const *, float *),
           void (*K4)(const BX *, int, const BY * const *, float *)>
@@ -414,7 +459,7 @@ void dispatch(const void * row, int nb, const void * const * y, int T, float * s
 bool mdot_supported(int type) {
     return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
-           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q5_K;
+           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q5_K || type == GGML_TYPE_NVFP4;
 }
 
 void mdot(int type, int n, const void * row, const void * const * y, int T, float * s) {
@@ -442,6 +487,9 @@ void mdot(int type, int n, const void * row, const void * const * y, int T, floa
             break;
         case GGML_TYPE_Q5_K:
             dispatch<block_q5_K, block_q8_K, q5_k_rows<1>, q5_k_rows<2>, q5_k_rows<3>, q5_k_rows<4>>(row, n / QK_K, y, T, s);
+            break;
+        case GGML_TYPE_NVFP4:
+            dispatch<block_nvfp4, block_q8_0, nvfp4_rows<1>, nvfp4_rows<2>, nvfp4_rows<3>, nvfp4_rows<4>>(row, n / QK_NVFP4, y, T, s);
             break;
         default: break;
     }

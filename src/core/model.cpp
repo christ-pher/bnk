@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include <cuda_runtime.h>
+#include <sys/mman.h>
 
 #include "core/util.h"
 #include "ggml.h"
@@ -106,15 +107,39 @@ QMat Model::upload_data(const std::string & name, const uint8_t * data, int type
     void * d = nullptr;
     // token embeddings stay in ggml layout (gathered by row); every other matrix is repacked when possible
     const bool repack = repack_ && name != "token_embd.weight";
+    // The token table is gathered by row, a few KB per token: it reads as well from page-locked host memory over
+    // PCIe, and that keeps its 0.3-1.2 GiB of VRAM for the expert cache (BNK_EMBD_HOST=0 keeps it on the GPU).
+    static const bool embd_host = !getenv("BNK_EMBD_HOST") || atoi(getenv("BNK_EMBD_HOST")) != 0;
+    if (embd_host && name == "token_embd.weight") {
+        const size_t bytes = (size_t) t->nrows() * t->row_bytes();
+        void * h = nullptr;
+        if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess)
+            throw std::runtime_error("cudaHostAlloc failed (token table)");
+        memcpy(h, t->data, bytes);
+        void * dp = nullptr;
+        if (cudaHostGetDevicePointer(&dp, h, 0) != cudaSuccess) throw std::runtime_error("no device pointer for the token table");
+        host_allocs_.push_back(h);
+        QMat m;
+        m.type = (int) t->type;
+        m.rows = t->nrows();
+        m.cols = t->ne[0];
+        m.row_bytes = t->row_bytes();
+        m.data = dp;
+        return m;
+    }
     // BF16 hyper-connection / PLE projections become Q8_0: half the bytes and the dp4a path (the router and
     // the small vectors keep their precision)
     static const std::string which = getenv("BNK_HCQ8") ? getenv("BNK_HCQ8") : "down,inject,ple";
     auto sel = [&](const char * part, const char * key) {
         return which.find(key) != std::string::npos && name.find(part) != std::string::npos;
     };
-    const bool to_q8 = hc_q8_ && t->type == GGML_TYPE_BF16 && t->ne[0] % 32 == 0 && t->nrows() >= 4 &&
-                       (sel("_down", "down") || sel("_up.", "up") || sel("_inject", "inject") ||
-                        sel("ple_key", "ple") || sel("ple_value", "ple"));
+    // ... and so does a BF16 output head (1.2 GiB as F16, 0.65 as Q8_0; the 248K-row GEMV reads half the bytes).
+    // BNK_HEAD_Q8=0 keeps it F16.
+    static const bool head_q8 = !getenv("BNK_HEAD_Q8") || atoi(getenv("BNK_HEAD_Q8")) != 0;
+    const bool to_q8 = t->type == GGML_TYPE_BF16 && t->ne[0] % 32 == 0 && t->nrows() >= 4 &&
+                       ((hc_q8_ && (sel("_down", "down") || sel("_up.", "up") || sel("_inject", "inject") ||
+                                    sel("ple_key", "ple") || sel("ple_value", "ple"))) ||
+                        (head_q8 && name == "output.weight"));
     if (to_q8) {
         const int64_t rows = t->nrows(), cols = t->ne[0];
         std::vector<float> f((size_t) rows * cols);
@@ -195,6 +220,7 @@ bool Model::stack(const std::string & na, const std::string & nb, QMat & a, QMat
 
 Model::~Model() {
     for (void * p : device_allocs_) cudaFree(p);
+    for (void * p : host_allocs_) cudaFreeHost(p);
 }
 
 void Model::load(const std::string & path, bool verbose, const std::string & ple_path, int first, int end, bool embd,
@@ -300,6 +326,28 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
                 throw std::runtime_error("the PLE table in " + ple_path + " does not match the model's PLE metadata");
             if (verbose) fprintf(stderr, "bnk: PLE table (%.2f GiB, %s) from %s\n", ple_table->nbytes / 1073741824.0,
                                  ggml_type_name(ple_table->type), ple_path.c_str());
+        }
+        // The table is read by rows at hashed positions (16 rows per token): a row whose page the page cache has
+        // dropped costs a synchronous 4 KiB disk read, and a new turn's rows are mostly new (measured: a 603-token
+        // turn 610 -> 1,160 ms, a 4K prompt with every row cold several seconds). Pull the whole table into RAM
+        // and lock it there, unless BNK_PLE_LOCK=0 (then it is only advised). mlock needs RLIMIT_MEMLOCK (root or
+        // LimitMEMLOCK=infinity in the service unit); if it fails the pages are still populated, just evictable.
+        if (!getenv("BNK_PLE_LOCK") || atoi(getenv("BNK_PLE_LOCK")) != 0) {
+            const double t0 = now_ms();
+            const size_t pg = 4096;
+            const uintptr_t a = (uintptr_t) ple_table->data & ~(pg - 1);
+            const size_t len = (uintptr_t) ple_table->data + ple_table->nbytes - a;
+            madvise((void *) a, len, MADV_WILLNEED);
+            const bool locked = mlock((const void *) a, len) == 0;
+            if (!locked) {   // populate by touching one byte per page (readahead does the rest)
+                volatile uint8_t sink = 0;
+                for (size_t o = 0; o < len; o += pg) sink += ((const volatile uint8_t *) a)[o];
+                (void) sink;
+            }
+            if (verbose) fprintf(stderr, "bnk: PLE table %s in RAM (%.1f GiB, %.1f s)\n", locked ? "locked" : "populated (mlock refused)",
+                                 len / 1073741824.0, (now_ms() - t0) / 1000.0);
+        } else {
+            ple_src->advise(*ple_table, MADV_RANDOM);
         }
         // a global scale beside the table (NVFP4: the checkpoint's weight_scale_2)
         if (const TensorRef * ps = ple_src->find("per_layer_token_embd.scale")) {
