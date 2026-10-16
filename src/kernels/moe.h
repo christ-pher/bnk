@@ -53,6 +53,9 @@ struct MoeLayerDesc {
     int gate_type, down_type;
     size_t grow, drow;        // row bytes of gate/up rows and of down rows
     int rlay = 0;             // slots hold R-layout rows (rfmt.h) rather than ggml blocks
+    // NVFP4 experts: per-expert fp32 global scales (device [n_expert], null when the format has none). sgate
+    // multiplies the gate rows before the silu; wmul = up x down scale, folded into the routing weights.
+    const float * sgate = nullptr, * wmul = nullptr;
     uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};  // R field offsets of gate/up and down rows
 };
 
@@ -92,6 +95,7 @@ void moe_debug_reset(cudaStream_t st);
 struct PfItem {
     const uint8_t * blob;     // the expert's blob on the device (cache slot or stage)
     int32_t n;                // tokens in this item (<= 8)
+    int32_t expert;
     int32_t tok[kMaxWindow];  // rows of the chunk's quantized input
     int32_t pair[kMaxWindow]; // output rows (sorted pair positions)
 };
@@ -107,6 +111,7 @@ void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const A
 struct TcItem {
     const uint8_t * blob;     // the expert's blob on the device (cache slot or stage)
     int32_t p0, n;            // its pairs
+    int32_t expert;
 };
 struct TcBlock {
     int32_t item, t0;

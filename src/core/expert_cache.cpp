@@ -476,6 +476,8 @@ MoeLayerDesc ExpertCache::desc(int il) const {
     d.grow = gl.row_bytes;
     d.drow = dl.row_bytes;
     d.rlay = 1;
+    d.sgate = L.exp_sgate_dev;
+    d.wmul = L.exp_wmul_dev;
     const uint32_t g5[5] = {gl.off_a, gl.off_b, gl.off_c, gl.off_d, gl.off_e}, d5[5] = {dl.off_a, dl.off_b, dl.off_c, dl.off_d, dl.off_e};
     for (int i = 0; i < 5; ++i) { d.go[i] = g5[i]; d.dof[i] = d5[i]; }
     return d;

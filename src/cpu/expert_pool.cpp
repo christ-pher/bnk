@@ -225,9 +225,10 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             }
             const int mine = r_end - std::max(b, gi * 2 * F);
             if (rows_done_[gi].fetch_add(mine, std::memory_order_acq_rel) + mine == 2 * F) {
+                const float sg = L.exp_sgate.empty() ? 1.f : L.exp_sgate[tasks[grp[0]].expert];
                 for (int k = 0; k < n; ++k) {
                     float * gu = gu_.data() + (size_t) grp[k] * 2 * F;
-                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r]) * gu[F + r];
+                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r];
                     if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + grp[k] * hrow));
                     else hfrom(gu, hq_.data() + grp[k] * hrow, F);
                 }

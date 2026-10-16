@@ -75,10 +75,11 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
                                                    size_t off, size_t rowb, int nrows, int ncols,
                                                    const half * __restrict__ x, int64_t ldx,
                                                    const int32_t * __restrict__ perm, half * __restrict__ out,
-                                                   int64_t ldo, ROff ro) {
+                                                   int64_t ldo, ROff ro, const float * __restrict__ sgate) {
     __shared__ __align__(16) half xs[2][kTcTile * kTcLd];
     const TcBlock bk = blocks[blockIdx.x];
     const TcItem it = items[bk.item];
+    const float sg = (GU && sgate) ? sgate[it.expert] : 1.f;   // NVFP4 gate scale, before the silu
     const int p0 = it.p0 + bk.t0;                   // the tile's first pair
     const int n = min(kTcTile, it.n - bk.t0);       // its tokens
     const int ngrp = (n + 7) >> 3;                  // token groups of 8
@@ -208,7 +209,7 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
             if constexpr (GU) {
                 const int row = blockIdx.y * kTcRows + warp * 8 + rr;
                 if (row < nrows) {
-                    const float gv = c[0][g8][i], uv = c[1][g8][i];
+                    const float gv = c[0][g8][i] * sg, uv = c[1][g8][i];
                     o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
                 }
             } else {
@@ -230,12 +231,12 @@ void moe_tc_gu(const TcItem * items, const TcBlock * blocks, int nblocks, const 
     const dim3 grid(nblocks, F / kTcRows);
     if (d.rlay) {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, true, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go);
+            moe_tc_k<FMT, true, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.sgate);
         };
         BNK_DISPATCH_R(d.gate_type, f);
     } else {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, false, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go);
+            moe_tc_k<FMT, false, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.sgate);
         };
         BNK_DISPATCH_DP4A(d.gate_type, f);
     }
@@ -251,12 +252,12 @@ void moe_tc_down(const TcItem * items, const TcBlock * blocks, int nblocks, cons
     const dim3 grid(nblocks, E / (2 * kTcRows));
     if (d.rlay) {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, true, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof);
+            moe_tc_k<FMT, true, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, nullptr);
         };
         BNK_DISPATCH_R(d.down_type, f);
     } else {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, false, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof);
+            moe_tc_k<FMT, false, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, nullptr);
         };
         BNK_DISPATCH_DP4A(d.down_type, f);
     }

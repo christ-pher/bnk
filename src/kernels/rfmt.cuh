@@ -272,6 +272,26 @@ template <> struct RT<QT_Q2_0> {
     }
 };
 
+// NVFP4 R rows: 16 code bytes per sub-block (byte j: element j low, j + 16 high, as IQ4_NL) and two UE4M3 scales,
+// one per 16 elements.
+template <> struct RT<QT_NVFP4> {
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * row, const ROff & o, int sb, Unpacked & u) {
+        const uint4 q = *(const uint4 *) (row + o.a + 16 * sb);
+        const uint32_t dd = *(const uint16_t *) (row + o.b + 2 * sb);
+        u.d0 = ue4m3h(dd & 0xff);
+        u.d1 = ue4m3h(dd >> 8);
+        u.m0 = u.m1 = 0.f;
+        const uint32_t x[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int2 v = lut16(x[i], kvalues_fp4);
+            u.w[i] = v.x;
+            u.w[4 + i] = v.y;
+        }
+    }
+};
+
 // unpack through the shared-memory tables when the format has one (rt_tables_load first)
 template <int FMT, typename = void> struct RTHasTable { static constexpr bool value = false; };
 template <int FMT> struct RTHasTable<FMT, decltype((void) RT<FMT>::HAS_TABLE)> { static constexpr bool value = RT<FMT>::HAS_TABLE; };
@@ -316,6 +336,7 @@ __device__ __forceinline__ void rt_tables_load() {
         case QT_IQ4_XS: F.template operator()<QT_IQ4_XS>(); break;   \
         case QT_Q8_0: F.template operator()<QT_Q8_0>(); break;       \
         case QT_Q2_0: F.template operator()<QT_Q2_0>(); break;       \
+        case QT_NVFP4: F.template operator()<QT_NVFP4>(); break;     \
         default: bnk_unsupported_format(fmt);                        \
     }
 

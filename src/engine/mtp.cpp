@@ -428,7 +428,7 @@ void MtpLayer::enqueue(int n, bool draft) {
     hc_pre(hc_mlp_, RL, 1, true, mixed_, inj2_);
     // MoE: every expert resident
     gemv_auto(router_, mixed_, E, 1, rlog_, c.n_expert, false, act_, st_);
-    route_topk(rlog_, 1, c.n_expert, c.n_expert_used, ids_, rw_, c.expert_weights_scale, st_);
+    route_topk(rlog_, 1, c.n_expert, c.n_expert_used, ids_, rw_, c.expert_weights_scale, nullptr, st_);
     moe_plan(ids_, rw_, 1, c.n_expert_used, moe_, moes_, msg_, mixed_, E, seq_dev_, nullptr, st_);
     quantize_act(mixed_, E, 1, E, act_, st_);
     moe_hits(moe_, moes_, act_, 1, c.n_expert_used, E, c.n_ff_exp, st_);
@@ -616,7 +616,7 @@ void MtpLayer::enqueue_multi(const std::vector<MItem> & items) {
     hc_combine(Dres_, dbo_, dinj_, S, c.hc, E, st_);
     hc_pre(hc_mlp_, Dres_, S, true, dmix_, dinj2_);
     gemv_auto(router_, dmix_, E, S, drlog_, c.n_expert, false, act_, st_);
-    route_topk(drlog_, S, c.n_expert, c.n_expert_used, dids_, drw_, c.expert_weights_scale, st_);
+    route_topk(drlog_, S, c.n_expert, c.n_expert_used, dids_, drw_, c.expert_weights_scale, nullptr, st_);
     moe_plan(dids_, drw_, S, c.n_expert_used, moe_, moes_, msg_, dmix_, E, seq_dev_, nullptr, st_);
     quantize_act(dmix_, E, S, E, act_, st_);
     moe_hits(moe_, moes_, act_, S, c.n_expert_used, E, c.n_ff_exp, st_);

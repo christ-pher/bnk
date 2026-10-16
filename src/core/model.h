@@ -66,6 +66,10 @@ struct LayerWeights {
     int gate_type = 0, up_type = 0, down_type = 0;
     size_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;   // per expert
     const uint8_t * gate_src = nullptr, * up_src = nullptr, * down_src = nullptr;  // mmap, expert 0
+    // NVFP4 experts: fp32 global scale per expert matrix (`blk.N.ffn_*_exps.scale`, written by llama.cpp's
+    // converter). Host: the gate scales (CPU expert path); device: gate scales and up x down (kernels, moe.h).
+    std::vector<float> exp_sgate;
+    const float * exp_sgate_dev = nullptr, * exp_wmul_dev = nullptr;
 };
 
 struct Model {

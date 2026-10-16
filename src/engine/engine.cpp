@@ -1086,7 +1086,7 @@ void Engine::predict_stats(int il, int T) {
             pred_w_.alloc((size_t) kMaxWindow * 32);
         }
         gemv_q(model_.layers[il + 1].router, mixact_, mixed_, c.n_embd, T, pred_logits_, c.n_expert, st_);
-        route_topk(pred_logits_, T, c.n_expert, P, pred_ids_, pred_w_, 1.f, st_);
+        route_topk(pred_logits_, T, c.n_expert, P, pred_ids_, pred_w_, 1.f, nullptr, st_);
         prev.resize((size_t) T * P);
         CUDA_CHECK(cudaMemcpyAsync(prev.data(), pred_ids_.p, prev.size() * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -1133,7 +1133,7 @@ void Engine::moe(int il, int T) {
         moe_route_plan(rlogits_, c.n_expert, c.expert_weights_scale, rids_, rw_, T, k, d, moes_, msg(il), mixed_, E,
                        &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
     } else {
-        route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
+        route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, d.wmul, st_);
         moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert,
                  st_);
     }

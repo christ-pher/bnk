@@ -71,8 +71,9 @@ void attention_prefill(const float * q, const half * kcache, const half * vcache
                        float * out, int T, int H, int Hkv, int D, int pos0, float scale, cudaStream_t s);
 
 // ---- MoE routing: softmax over n_exp, top-k, renormalized weights
+// wmul (optional, device [n_exp]): per-expert multiplier on the weights (NVFP4 global scales, moe.h MoeLayerDesc)
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,
-                cudaStream_t s);
+                const float * wmul, cudaStream_t s);
 void sigmoid_inplace(float * x, int64_t n, cudaStream_t s);
 
 // ---- PLE

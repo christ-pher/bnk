@@ -128,9 +128,9 @@ template <int PER>
 __global__ void __launch_bounds__(256) moe_route_plan_k(const float * logits, int n_exp, float w_scale, int32_t * ids,
                                                         float * w, int T, int k, const int32_t * slot_of,
                                                         HitList * hits, MoeMsg * msg, const float * x, int E,
-                                                        const uint32_t * seq, uint32_t * counts) {
+                                                        const uint32_t * seq, uint32_t * counts, const float * wmul) {
     const int t = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (t < T) route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, t, lane);
+    if (t < T) route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, wmul, t, lane);
     __syncthreads();   // the ids / weights (global, this block's writes) for the plan
     moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
 }
@@ -144,10 +144,10 @@ void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * id
     }
     if (n_exp <= 512)
         moe_route_plan_k<16><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
-                                               counts_layer);
+                                               counts_layer, d.wmul);
     else
         moe_route_plan_k<32><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
-                                               counts_layer);
+                                               counts_layer, d.wmul);
 }
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
@@ -198,13 +198,14 @@ __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hit
 
 // grid (kMaxRouted, W); block F threads (F % 32 == 0): h = silu(g)*u quantized per 32
 __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __restrict__ gu, int F,
-                          int8_t * __restrict__ hq, float * __restrict__ hd) {
+                          int8_t * __restrict__ hq, float * __restrict__ hd, const float * __restrict__ sgate) {
     const int ent = blockIdx.x, t = blockIdx.y;
     if (ent >= hits->n || !(hits->e[ent].mask & (1u << t))) return;
     const size_t base = (size_t) ent * kMaxWindow + t;
     const float * g = gu + base * 2 * F;
+    const float sg = sgate ? sgate[hits->e[ent].expert] : 1.f;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
-        const float gv = g[r];
+        const float gv = g[r] * sg;
         const float h = gv / (1.f + __expf(-gv)) * g[F + r];
         float d;
         const int8_t q = quant_lane(h, d);
@@ -396,7 +397,7 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
         }
     };
     BNK_DISPATCH_R(d.gate_type, gu);
-    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd);
+    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.sgate);
     auto dn = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
@@ -452,7 +453,7 @@ static void hits_launch(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq
                                                                          F, E, xq.q, xq.d, xq.cols_pad, s.gu);
     };
     BNK_DISPATCH_DP4A(d.gate_type, gu);
-    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd);
+    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.sgate);
     auto dn = [&]<int FMT>() {
         moe_down_k<FMT, NT><<<dim3(maxent, (E + 7) / 8), 256, 0, st>>>(s.hits, d.base, d.blob,
                                                                       d.gate_bytes + d.up_bytes, d.drow, F, E, s.hq,
@@ -596,13 +597,14 @@ __global__ void __launch_bounds__(256) moe_gu_list_k(const PfItem * __restrict__
 
 // grid (items, 8 tokens); F threads
 __global__ void moe_act_list_k(const PfItem * __restrict__ items, const float * __restrict__ gu, int F,
-                               int8_t * __restrict__ hq, float * __restrict__ hd) {
+                               int8_t * __restrict__ hq, float * __restrict__ hd, const float * __restrict__ sgate) {
     const PfItem & it = items[blockIdx.x];
     if ((int) blockIdx.y >= it.n) return;
     const size_t pr = it.pair[blockIdx.y];
     const float * g = gu + pr * 2 * F;
+    const float sg = sgate ? sgate[it.expert] : 1.f;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
-        const float gv = g[r];
+        const float gv = g[r] * sg;
         const float h = gv / (1.f + __expf(-gv)) * g[F + r];
         float d;
         const int8_t q = quant_lane(h, d);
@@ -812,7 +814,7 @@ void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const A
                 items, d.gate_bytes, d.grow, F, 2 * F, E, xq.q, xq.cols_pad, xq.d, xq.cols_pad / 32, gu, nullptr, go);
         };
         BNK_DISPATCH_R(d.gate_type, gk);
-        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd, d.sgate);
         auto dk = [&]<int FMT>() {
             constexpr int LPR = 4, RIT = 4, rows = 8 * (32 / LPR) * RIT;
             moe_list_s_k<FMT, LPR, false, RIT><<<dim3(n_items, (E + rows - 1) / rows), 256, smem_dn, st>>>(
@@ -832,7 +834,7 @@ void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const A
             L.template operator()<8>();   // 4 and 16 measured the same
         };
         BNK_DISPATCH_R(d.gate_type, gk);
-        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+        moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd, d.sgate);
         auto dk = [&]<int FMT>() {
             auto L = [&]<int LPR>() {
                 constexpr int rows = 8 * (32 / LPR);
@@ -854,7 +856,7 @@ void moe_list(const PfItem * items, int n_items, const MoeLayerDesc & d, const A
                                                                                     xq.q, xq.d, xq.cols_pad, gu, go);
     };
     BNK_DISPATCH_DP4A(d.gate_type, g);
-    moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd);
+    moe_act_list_k<<<dim3(n_items, kMaxWindow), F <= 1024 ? F : 1024, 0, st>>>(items, gu, F, hq, hd, d.sgate);
     auto dn = [&]<int FMT>() {
         if (d.rlay)
             moe_down_list_k<FMT, true><<<dim3(n_items, (E + 7) / 8), 256, 0, st>>>(items, d.gate_bytes + d.up_bytes,

@@ -20,7 +20,7 @@ namespace bnk {
 enum : int {
     QT_F32 = 0, QT_F16 = 1, QT_Q4_0 = 2, QT_Q8_0 = 8, QT_Q2_K = 10, QT_Q3_K = 11, QT_Q4_K = 12,
     QT_Q5_K = 13, QT_Q6_K = 14, QT_IQ2_XXS = 16, QT_IQ2_XS = 17, QT_IQ3_XXS = 18, QT_IQ4_NL = 20,
-    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_Q2_0 = 42,
+    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_NVFP4 = 40, QT_Q2_0 = 42,
 };
 
 // Loads that only assume 2-byte alignment (most ggml block sizes are not multiples of 4).
@@ -50,6 +50,15 @@ __device__ __forceinline__ int2 lut16(uint32_t q4, const int8_t * table) {
         tmp[i] = __byte_perm(lo, hi, sel >> sh);
     }
     return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// UE4M3 (unsigned e4m3, bias 7, 0x7F = nan) to float, halved: ggml pairs NVFP4's scales with the doubled e2m1
+// table (kvalues_fp4), so d * code is the weight. Bit-exact with ggml_ue4m3_to_fp32.
+__device__ __forceinline__ float ue4m3h(uint32_t x) {
+    x &= 0x7F;
+    const uint32_t e = x >> 3, m = x & 7;
+    if (x == 0x7F) return 0.f;
+    return e ? __uint_as_float(((e + 119u) << 23) | (m << 20)) : (float) m * 9.765625e-4f;
 }
 
 struct Unpacked {
@@ -294,6 +303,28 @@ template <> struct QTraits<QT_Q2_0> {
     }
 };
 
+// NVFP4 (ggml block of 64: 4 UE4M3 scales, then 4 x 8 bytes of e2m1 codes; in each 16-block byte i holds element
+// i in the low nibble and element i + 8 in the high one). A 32-sub-block is two 16-blocks with their own scales.
+template <> struct QTraits<QT_NVFP4> {
+    static constexpr int QK = 64, BYTES = 36;
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * b, int s, Unpacked & u) {
+        u.d0 = ue4m3h(b[2 * s]);
+        u.d1 = ue4m3h(b[2 * s + 1]);
+        u.m0 = u.m1 = 0.f;
+        const uint8_t * q = b + 4 + 16 * s;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int2 v0 = lut16(ld32a2(q + 8 * h), kvalues_fp4);      // elements 0-3 (low) and 8-11 (high)
+            const int2 v1 = lut16(ld32a2(q + 8 * h + 4), kvalues_fp4);  // elements 4-7 and 12-15
+            u.w[4 * h + 0] = v0.x;
+            u.w[4 * h + 1] = v1.x;
+            u.w[4 * h + 2] = v0.y;
+            u.w[4 * h + 3] = v1.y;
+        }
+    }
+};
+
 template <int T>
 __device__ __forceinline__ void unpack_sub(const uint8_t * row, int sb, Unpacked & u) {
     using Q = QTraits<T>;
@@ -306,7 +337,7 @@ __device__ __forceinline__ void unpack_sub(const uint8_t * row, int sb, Unpacked
 __host__ __device__ constexpr bool is_dp4a_format(int t) {
     return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ2_XXS ||
            t == QT_IQ2_XS || t == QT_IQ3_XXS ||
-           t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0;
+           t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0 || t == QT_NVFP4;
 }
 __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
 
@@ -325,6 +356,7 @@ __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t
         case QT_IQ4_XS: F.template operator()<QT_IQ4_XS>(); break;   \
         case QT_Q8_0: F.template operator()<QT_Q8_0>(); break;       \
         case QT_Q2_0: F.template operator()<QT_Q2_0>(); break;       \
+        case QT_NVFP4: F.template operator()<QT_NVFP4>(); break;     \
         default: bnk_unsupported_format(fmt);                        \
     }
 

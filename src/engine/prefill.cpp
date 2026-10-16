@@ -365,7 +365,7 @@ void Engine::pf_moe(int il, int N) {
     // routing
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.router, gemm_.xbuf(), E, N, p.rlog, c.n_expert);
-    route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, st_);
+    route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, L.exp_wmul_dev, st_);
     // the shared expert meanwhile
     gemm_.run_h(L.sh_gate, gemm_.xbuf(), E, N, p.sg, FF);
     gemm_.run_h(L.sh_up, gemm_.xbuf(), E, N, p.su, FF);
@@ -464,7 +464,7 @@ void Engine::pf_moe(int il, int N) {
         for (int e = 0; e < ne; ++e) {
             if (!cnt[e] || on_cpu[e]) continue;
             const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
-            h_it[kind][n_it[kind]] = TcItem{src_of(e), off[e], cnt[e]};
+            h_it[kind][n_it[kind]] = TcItem{src_of(e), off[e], cnt[e], e};
             for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) h_bl[kind][n_bl[kind]++] = TcBlock{n_it[kind], t0};
             ++n_it[kind];
         }
@@ -536,6 +536,7 @@ void Engine::pf_moe(int il, int N) {
         for (int j0 = 0; j0 < cnt[e]; j0 += kMaxWindow) {
             PfItem & it = p.h_items[kind * half_cap + n_items[kind]++];
             it.blob = src_of(e);
+            it.expert = e;
             it.n = std::min(kMaxWindow, cnt[e] - j0);
             for (int j = 0; j < it.n; ++j) {
                 it.pair[j] = off[e] + j0 + j;

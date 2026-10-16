@@ -316,6 +316,30 @@ void Model::expert_src(int il) {
     L.up_bytes = u.nbytes / c.n_expert;
     L.down_bytes = d.nbytes / c.n_expert;
     L.gate_src = g.data; L.up_src = u.data; L.down_src = d.data;
+    // per-expert global scales (NVFP4): absent means 1
+    const TensorRef * sg = gguf.find(b + "ffn_gate_exps.scale"), * su = gguf.find(b + "ffn_up_exps.scale"),
+                    * sd = gguf.find(b + "ffn_down_exps.scale");
+    if (sg || su || sd) {
+        auto read = [&](const TensorRef * t, std::vector<float> & v) {
+            v.assign(c.n_expert, 1.f);
+            if (!t) return;
+            if (t->type != GGML_TYPE_F32 || t->ne[0] != c.n_expert)
+                throw std::runtime_error("expert scale tensor " + t->name + ": expected F32[" + std::to_string(c.n_expert) + "]");
+            memcpy(v.data(), t->data, (size_t) c.n_expert * 4);
+        };
+        std::vector<float> vu, vd, wm(c.n_expert);
+        read(sg, L.exp_sgate); read(su, vu); read(sd, vd);
+        for (int e = 0; e < c.n_expert; ++e) wm[e] = vu[e] * vd[e];
+        auto up = [&](const std::vector<float> & v) {
+            void * p = nullptr;
+            if (cudaMalloc(&p, v.size() * 4) != cudaSuccess) throw std::runtime_error("cudaMalloc failed (expert scales)");
+            cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice);
+            device_allocs_.push_back(p);
+            return (const float *) p;
+        };
+        L.exp_sgate_dev = up(L.exp_sgate);
+        L.exp_wmul_dev = up(wm);
+    }
 }
 
 }  // namespace bnk

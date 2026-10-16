@@ -18,8 +18,10 @@ __device__ __forceinline__ float rt_warp_sum(float v) {
 }
 
 template <int PER>   // n_exp / 32 values per lane (rounded up); one warp, token t
+// wmul (optional, [n_exp]) multiplies the weight of expert e by wmul[e] after the renormalization: the per-expert
+// global scales of NVFP4 up / down matrices ride on the routing weight (both are linear in the expert's output).
 __device__ __forceinline__ void route_topk_warp(const float * logits, int n_exp, int k, int32_t * ids, float * w,
-                                                float w_scale, int t, int lane) {
+                                                float w_scale, const float * wmul, int t, int lane) {
     const float * lg = logits + (int64_t) t * n_exp;
     float v[PER];
     float mx = -FLT_MAX;
@@ -62,7 +64,7 @@ __device__ __forceinline__ void route_topk_warp(const float * logits, int n_exp,
     if (lane < k) {
         const float sc = (w_scale != 0.f ? w_scale : 1.f) / wsum;
         ids[t * k + lane] = myid;
-        w[t * k + lane] = myw * sc;
+        w[t * k + lane] = myw * sc * (wmul ? wmul[myid] : 1.f);
     }
 }
 

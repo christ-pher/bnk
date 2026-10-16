@@ -529,7 +529,7 @@ QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size
     m.rows = rows;
     m.cols = cols;
     void * d = nullptr;
-    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0) ? 32 : type == QT_Q2_0 ? 64 : 256;
+    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0) ? 32 : (type == QT_Q2_0 || type == QT_NVFP4) ? 64 : 256;
     if (repack && r_supported(type) && cols % need == 0) {
         const RLayout L = r_layout(type, cols);
         std::vector<uint8_t> buf(L.row_bytes * rows);
