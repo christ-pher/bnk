@@ -72,16 +72,37 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
   release keeps every expert resident (46.8 GiB) and decodes at 105-120 tok/s; expect NVFP4 between the two, at
   better quality.
 
+## Status (2026-10-16)
+
+* The checkpoint converts in ~15 minutes (shards 1-15 of the Hub snapshot in `~/.cache/huggingface`, output
+  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4.gguf`, 75.2 GB: experts NVFP4 63.3 GiB + scales, dense Q8_0 2.9
+  GiB, BF16 3.6 GiB; the converter holds ~70 GB of RAM). `test_dequant` on its real tensors is bit-exact in both
+  layouts; `test_moe_tc` on layer 0 (scales applied) is within 3e-4 of the fp32 reference.
+* It runs on the two V100s through `configs/Qwen3.8-Flash-Next-NVFP4.json` (alias `nvfp4`) with
+  `BNK_PLE_GGUF=<IQ3_S first shard>` for the n-gram table: 74% of the experts resident per card (24.5 / 22.7 GiB
+  caches), greedy output coherent, the first 8 tokens of the 4K follow-up equal to the IQ3_S release's, drafts
+  accepted 37/48. First run, uniform expert ranking: 56 tok/s decode with 22% expert misses on the CPU, 4,700-token
+  cold read 481 tok/s (stage 0 streams the non-resident experts). The learned routing counts (`--counts`, written
+  by the server) should bring the misses to the ~8% CYBER-FROST sees at 65% residency.
+* Two bugs found on the way, both fixed: the global scales cannot ride on the routing weights (the prompt path
+  stores the unscaled fp16 products: overflow), so they are applied inside the expert kernels; and the loader
+  only converted BF16 to F16 for widths that are multiples of 32, which left the PLE conv taps (4 per row) as
+  BF16 for a kernel that reads raw fp16: the n-gram injection came out ~23x too large (the IQ3_S release stores
+  that tensor as F16, so it never showed). Found with the layer dumps (`BNK_DUMP_DIR` / `BNK_DUMP_LAYER`) compared
+  between the two models: layer 0 agreed to 0.97-0.99 correlation everywhere, layer 1 did not.
+
 ## Plan
 
 1. ~~NVFP4 weight format in the kernels, bit-exact test~~ (done).
-2. Convert the checkpoint (`tools/convert_nvfp4.py --no-ple`), validate the GGUF with `test_dequant` on a real
-   expert tensor and `test_moe_tc`.
-3. Loader: read `.scale`, build the per-layer gate / up-down scale arrays; apply them (above). `BNK_EXACT`, batched
-   lanes and parking need no change (the scales are per expert, not per token).
-4. First run with `--ple-gguf <IQ3_S shard 2>` (the base model's IQ4_NL table): greedy coherence, `bnk nll`
-   against the IQ3_S release, decode / prompt speed on the LocalMaxxing sweep.
+2. ~~Convert the checkpoint, validate the GGUF~~ (done).
+3. ~~Loader and kernels: the per-expert scales~~ (done).
+4. ~~First run with the IQ3_S release's table~~ (done). Next: a server run to learn the routing counts, then the
+   LocalMaxxing sweep (`/opt/benchmarks/bnk_bench.py`) and `bnk nll` against the IQ3_S release for the quality
+   difference; re-tune `--draft` / `--min-p` for this model.
 5. The PLE table in NVFP4: bnk type `NVFP4_16` (16-wide blocks: 1 UE4M3 + 8 bytes) for `per_layer_token_embd`,
-   written by a small numpy converter from the 128 shards (`dequant_gather` only, no GEMV); saves 2 GB over IQ4_NL
-   and uses the model's own (possibly distilled) table.
-6. Optional: native MXFP8 type for the dense weights; the MTP head from this checkpoint (NVFP4 experts).
+   written by a small numpy converter from the 6 table shards (`dequant_gather` only, no GEMV); saves 2 GB over
+   IQ4_NL and uses the model's own (possibly distilled) table. Disk: the table shards are 27 GB and the conversion
+   another 27 GB; the 15 expert shards (68 GB) can go once the GGUF is accepted.
+6. Optional: native MXFP8 type for the dense weights (Q8_0 doubles their bytes: 2.9 vs the release's ~2 GiB per
+   card, and the output head is BF16 1.2 GiB, Q6_K in the release); the MTP head from this checkpoint (NVFP4
+   experts) in place of bnk's Q2_0 one built from the base model.
