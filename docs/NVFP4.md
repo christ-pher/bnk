@@ -82,8 +82,10 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
   `BNK_PLE_GGUF=<IQ3_S first shard>` for the n-gram table: 74% of the experts resident per card (24.5 / 22.7 GiB
   caches), greedy output coherent, the first 8 tokens of the 4K follow-up equal to the IQ3_S release's, drafts
   accepted 37/48. First run, uniform expert ranking: 56 tok/s decode with 22% expert misses on the CPU, 4,700-token
-  cold read 481 tok/s (stage 0 streams the non-resident experts). The learned routing counts (`--counts`, written
-  by the server) should bring the misses to the ~8% CYBER-FROST sees at 65% residency.
+  cold read 481 tok/s (stage 0 streams the non-resident experts). With the routing counts of that same prompt
+  (`--counts`, a second pass): **98.8 tok/s**, 2.8% misses, drafts accepted 44/49 (the IQ3_S release, every expert
+  resident: 105-120). A ranking learned on one prompt flatters the miss rate; the server's counts over real traffic
+  are the honest number.
 * Two bugs found on the way, both fixed: the global scales cannot ride on the routing weights (the prompt path
   stores the unscaled fp16 products: overflow), so they are applied inside the expert kernels; and the loader
   only converted BF16 to F16 for widths that are multiples of 32, which left the PLE conv taps (4 per row) as
