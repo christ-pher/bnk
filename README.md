@@ -55,6 +55,28 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### What v0.3.1 changed: faster turns on both models
+
+A performance sweep measured with the LocalMaxxing context sweep (`-c 16`), details in `docs/PERF-2026-10-16.md`:
+
+| | FP4-Local v0.3.0 | v0.3.1 | IQ3_S v0.3.0 | v0.3.1 |
+|---|---|---|---|---|
+| 4K / 16K cold read | 1,186 / 1,935 tok/s | **1,337 / 2,067** | 1,948 / 2,430 | **1,990 / 2,465** |
+| decode at 4K / 16K | 105 / 97 tok/s | **114 / 119** | 105-122 | **121 / 129** |
+| follow-up turn wait at 4K / 16K | 1.2 / 1.2 s | **0.94 / 0.99 s** | 0.60 / 0.59 s | **0.56 / 0.58 s** |
+
+* The n-gram PLE table is locked in RAM at load (`BNK_PLE_LOCK=0` only advises it). Its rows are read at hashed
+  positions out of a 27-29 GB file mapping; a row whose page the cache had dropped was a disk read, which made a
+  follow-up turn take 600 ms or 1,150 ms depending on what else had used the page cache. The service unit sets
+  `LimitMEMLOCK=infinity`.
+* The token embedding table lives in page-locked host memory (`BNK_EMBD_HOST=0` keeps it on the GPU) and a BF16
+  output head becomes Q8_0 at load (`BNK_HEAD_Q8=0`): 1.2-1.9 GiB per card back to the expert cache. FP4-Local goes
+  from 72% to 75 / 79% of its experts resident, so its reads copy less over PCIe and its decode runs fewer experts
+  on the CPU.
+* NVFP4 experts on the CPU use a multi-row AVX2 kernel, 1.45x ggml's per-token dot product, bit-identical to it.
+
+Output on the IQ3_S release is unchanged token for token.
+
 ### What v0.3.0 changed: NVFP4 models on the V100s
 
 NVIDIA's FP4 release of this model, [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)
