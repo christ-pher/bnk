@@ -71,17 +71,41 @@ _TOOL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</t
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
 
 
-def parse_tool_calls(text: str):
-    """-> (content without the calls, [OpenAI tool_call dicts])."""
+def _param_types(tools) -> dict:
+    """{function name: {parameter: JSON-schema type}} from a request's tools (OpenAI `function.parameters` or
+    Anthropic `input_schema`)."""
+    out = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        schema = fn.get("parameters") or fn.get("input_schema") or {}
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if fn.get("name") and isinstance(props, dict):
+            out[fn["name"]] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
+    return out
+
+
+def parse_tool_calls(text: str, tools=None):
+    """-> (content without the calls, [OpenAI tool_call dicts]). The model writes each argument as plain text
+    between <parameter> tags; the request's tool schema says which are strings (kept as text, even when the text
+    happens to be JSON, e.g. a file's content) and which are structured (parsed from JSON). Without a schema for
+    a parameter, JSON is tried first, text is the fallback."""
     calls = []
+    types = _param_types(tools)
     for m in _TOOL_RE.finditer(text):
         args = {}
+        name = m.group(1).strip()
         for p in _PARAM_RE.finditer(m.group(2)):
             raw = p.group(2)
+            pname = p.group(1).strip()
+            if types.get(name, {}).get(pname) == "string":
+                args[pname] = raw
+                continue
             try:
-                args[p.group(1).strip()] = json.loads(raw)
+                args[pname] = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
-                args[p.group(1).strip()] = raw
+                args[pname] = raw
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": m.group(1).strip(), "arguments": json.dumps(args, ensure_ascii=False)}})
     content = _TOOL_RE.sub("", text).strip() if calls else text
@@ -92,7 +116,8 @@ class OutputParser:
     """Streams model text into (kind, text) pieces: kind is 'reasoning' or 'content'. Tool-call markup is held
     back from the content stream and parsed at the end."""
 
-    def __init__(self, thinking: bool):
+    def __init__(self, thinking: bool, tools=None):
+        self.tools = tools   # the request's tool schemas: they type the parsed arguments
         self.mode = "reasoning" if thinking else "content"
         self.buf = ""
         self.content_all = ""
@@ -158,7 +183,7 @@ class OutputParser:
             else:
                 self.content_all += self.buf
             self.buf = ""
-        content, calls = parse_tool_calls(self.content_all)
+        content, calls = parse_tool_calls(self.content_all, self.tools)
         return out, content.strip() if calls else self.content_all, calls
 
 

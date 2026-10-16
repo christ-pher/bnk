@@ -114,7 +114,7 @@ def sampling_from(body: dict) -> dict:
     return p
 
 
-def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], thinking: bool, emit):
+def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], thinking: bool, emit, tools=None):
     """Drives one engine request. `emit(kind, text)` receives reasoning/content pieces as they decode.
     Returns (content, reasoning, tool_calls, finish_reason, usage, timings).
 
@@ -129,7 +129,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     generated so far). The engine parks its conversation meanwhile, so coming back costs well under a second and
     one long generation no longer holds every other agent up."""
     dec = StreamDecoder(S.tok)
-    parser = OutputParser(thinking)
+    parser = OutputParser(thinking, tools)
     guard = ThinkingLoopGuard() if (thinking and S.args.think_guard) else None
     force_at = int(os.environ.get("BNK_THINK_GUARD_TEST", "0"))   # testing: report a loop after N thinking tokens
     text_so_far = ""
@@ -530,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
         model = S.model_id
         if not body.get("stream"):
             content, reasoning, calls, finish, usage, timings = run(prompt, params, max_tokens, stops, thinking,
-                                                                    lambda k, t: None)
+                                                                    lambda k, t: None, tools=body.get("tools"))
             msg = {"role": "assistant", "content": content if (content or not calls) else None}
             if reasoning:
                 msg["reasoning_content"] = reasoning
@@ -550,7 +550,8 @@ class Handler(BaseHTTPRequestHandler):
             key = "reasoning_content" if kind == "reasoning" else "content"
             self._sse({**base, "choices": [{"index": 0, "delta": {key: txt}, "finish_reason": None}]})
 
-        content, reasoning, calls, finish, usage, timings = run(prompt, params, max_tokens, stops, thinking, emit)
+        content, reasoning, calls, finish, usage, timings = run(prompt, params, max_tokens, stops, thinking, emit,
+                                                                tools=body.get("tools"))
         if calls:
             self._sse({**base, "choices": [{"index": 0, "delta": {"tool_calls": [
                 {"index": i, **c} for i, c in enumerate(calls)]}, "finish_reason": None}]})
@@ -654,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
         stop_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
         if not body.get("stream"):
             content, reasoning, calls, finish, usage, _ = run(prompt, params, max_tokens, stops, thinking,
-                                                              lambda k, t: None)
+                                                              lambda k, t: None, tools=body.get("tools"))
             return self._json(200, {"id": mid, "type": "message", "role": "assistant", "model": S.model_id,
                                     "content": to_blocks(content, reasoning, calls),
                                     "stop_reason": stop_map.get(finish, "end_turn"), "stop_sequence": None,
@@ -682,7 +683,8 @@ class Handler(BaseHTTPRequestHandler):
                                                                                               "text": txt}
             self._sse({"type": "content_block_delta", "index": st["idx"], "delta": delta}, "content_block_delta")
 
-        content, reasoning, calls, finish, usage, _ = run(prompt, params, max_tokens, stops, thinking, emit)
+        content, reasoning, calls, finish, usage, _ = run(prompt, params, max_tokens, stops, thinking, emit,
+                                                          tools=body.get("tools"))
         if st["kind"] is not None:
             self._sse({"type": "content_block_stop", "index": st["idx"]}, "content_block_stop")
         for c in calls:
