@@ -37,6 +37,10 @@ struct DeviceScope {
     DeviceScope & operator=(const DeviceScope &) = delete;
 };
 
+inline double env_double(const char * name, double def) {
+    const char * v = getenv(name);
+    return v && *v ? atof(v) : def;
+}
 inline int env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v && *v ? atoi(v) : def;

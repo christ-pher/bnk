@@ -398,8 +398,12 @@ void Engine::pf_moe(int il, int N) {
             if (cnt[e] && cache_.slot_of(il, e) < 0) nr.push_back(e);
         std::sort(nr.begin(), nr.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
         // the most-used go over PCIe while that is cheaper than leaving them to the CPU
-        const double t_pcie = opt_.pcie_us_per_mb * blob / 1e6;
-        const double t_tok = opt_.cpu_us_per_expert_token * blob / (2.2e6);
+        // (BNK_PCIE_US_PER_MB / BNK_CPU_US_PER_EXPERT_TOKEN override the constants; measured 2026-10-16 on FP4-Local:
+        // a lower CPU cost sends more of a short turn to the CPU and makes it slower, 914 -> 1,035 ms at 10 us)
+        static const double pcie_us = env_double("BNK_PCIE_US_PER_MB", opt_.pcie_us_per_mb);
+        static const double cpu_us = env_double("BNK_CPU_US_PER_EXPERT_TOKEN", opt_.cpu_us_per_expert_token);
+        const double t_pcie = pcie_us * blob / 1e6;
+        const double t_tok = cpu_us * blob / (2.2e6);
         double cpu_total = 0;
         for (int e : nr) cpu_total += cnt[e] * t_tok;
         size_t n_pcie = 0;
