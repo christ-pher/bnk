@@ -55,6 +55,28 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### What v0.3.0 changed: NVFP4 models on the V100s
+
+NVIDIA's FP4 release of this model, [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)
+(ModelOpt NVFP4 experts, MXFP8 dense weights, quantization-aware distilled: GPQA 91.5 against 92.2 for BF16), runs
+on the two V100s, cards whose silicon has no FP4 or FP8 arithmetic at all. A weight format is only bits: bnk decodes
+NVFP4 (e2m1 codes with an e4m3 scale per 16 weights) to int8 or fp16 in registers inside its existing quantized
+kernels, as it does for the IQ formats, and the products run on the V100's own fp16 tensor cores and `dp4a`. Every
+weight is the checkpoint's, bit for bit: the routed experts (NVFP4, with their per-expert global scales), the
+n-gram table (NVFP4, as a 16-wide block type), embeddings, routers and norms (BF16 / F32). The dense MXFP8
+projections are stored as Q8_0, the one re-quantization. `docs/NVFP4.md` has the design and the measurements.
+
+| Two V100s, 4K-token follow-up, drafting | FP4-Local (NVFP4) | IQ3_S release |
+|---|---|---|
+| Experts | 63.3 GiB, 74% resident per card, the rest on the CPU | 46.8 GiB, all resident |
+| Decode, ranked expert cache | 93-99 tok/s | 105-120 tok/s |
+| Drafts accepted | 41-44 of 49 | similar |
+
+Converting it is two commands (`tools/convert_nvfp4.py`, which drives llama.cpp's converter and decodes the
+checkpoint's compressed expert scales, and `tools/convert_ple_nvfp4.py` for the table; about 20 minutes, 70 GB of
+RAM, 105 GB of disk for the two GGUFs) and the config `fp4-local`. Any NVFP4 GGUF of this architecture loads: the
+format is in every path (decode, the tensor-core prompt path, the CPU experts, the VRAM cache).
+
 ### What the tensor-core prompt path changed (2026-10-15, two V100s)
 
 The routed experts of a prompt chunk run on the tensor cores in one launch per layer (`src/kernels/moe_tc.cu`:
@@ -301,7 +323,8 @@ under 5% repetition, well below the 55% trigger.
 bnk runs any GGUF of the `qwen4exp` architecture (Qwen3.8-Flash-Next and fine-tunes): 48 layers (36 gated DeltaNet
 + 12 QSA full-attention), 512 routed experts (top 10) plus a shared expert, hyper-connections (4 streams), the
 per-layer n-gram embedding. Expert formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K,
-Q5_K, Q6_K, Q8_0. Files that also carry an MTP block (`nextn_predict_layers`) load their trunk.
+Q5_K, Q6_K, Q8_0, NVFP4 (with llama.cpp's per-expert `.scale` tensors; `docs/NVFP4.md`). Files that also carry an
+MTP block (`nextn_predict_layers`) load their trunk.
 
 Each model is one file in `configs/`: its settings and the Hugging Face files it comes from. `./run.sh` lists
 exactly these models, and `./models.sh` manages them:
@@ -318,6 +341,7 @@ exactly these models, and `./models.sh` manages them:
 |---|---|---|
 | `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
 | `cyber-frost` | [peasantsmith CYBER-FROST-3.8-PS-GUFF Q5_K_M](https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF) (Blackfrost-AI's cybersecurity fine-tune) | 112.5 GB, 1 file; needs ~110 GB of RAM |
+| `fp4-local` | [nvidia Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (NVFP4, quantization-aware distilled), converted locally with `tools/convert_nvfp4.py` and `tools/convert_ple_nvfp4.py` (`docs/NVFP4.md`) | 75 GB + 29 GB table, two local GGUFs; the config's paths point at them |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
 `$HF_HUB_CACHE`), the same place `hf download` uses, so a model already downloaded with `hf` is found as it is. With
