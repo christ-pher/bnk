@@ -81,6 +81,7 @@ struct Model {
     QMat output, tok_embd;
     GgufModel ple_gguf;                                    // --ple-gguf: holds the PLE table when the model has none
     const TensorRef * ple_table = nullptr;                 // host (mmap), [ple_dim, rows]
+    float ple_scale = 1.f;                                 // its global scale (NVFP4: per_layer_token_embd.scale)
     size_t vram_dense_bytes = 0;
 
     // dense weights to VRAM (the current device); ple_path supplies per_layer_token_embd.weight when the model file

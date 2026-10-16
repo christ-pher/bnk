@@ -226,6 +226,15 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// bnk: one NVFP4 sub-block on its own (QK_NVFP4_SUB weights): a UE4M3 scale and 8 code bytes, byte i holding
+// element i (low nibble) and element i + 8 (high), as inside block_nvfp4
+#define QK_NVFP4_16 16
+typedef struct {
+    uint8_t d;                    // UE4M3 scale
+    uint8_t qs[QK_NVFP4_16/2];    // packed 4-bit E2M1 values
+} block_nvfp4_16;
+static_assert(sizeof(block_nvfp4_16) == 1 + QK_NVFP4_16/2, "wrong nvfp4_16 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

@@ -260,6 +260,7 @@ void Engine::pf_ple(int il, int N) {
         head_->times.ple_ms += now_ms() - t0;
     }
     QMat rows{p.ple_rows, (int) tab.type, (int64_t) N * ph, tab.ne[0], rb};
+    rows.scale = model_.ple_scale;
     dequant_rows(rows, 0, (int64_t) N * ph, p.ple_emb, st_);
     const int D = ph * c.ple_dim;
     gemm_.run(L.ple_key, p.ple_emb, D, N, p.ple_key, HC);

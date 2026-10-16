@@ -15,7 +15,7 @@
 namespace bnk {
 
 enum : int { F_Q8_0 = 8, F_Q4_K = 12, F_Q5_K = 13, F_Q6_K = 14, F_IQ2_XXS = 16, F_IQ2_XS = 17, F_IQ3_XXS = 18,
-             F_IQ4_NL = 20, F_IQ3_S = 21, F_IQ2_S = 22, F_IQ4_XS = 23, F_NVFP4 = 40, F_Q2_0 = 42 };
+             F_IQ4_NL = 20, F_IQ3_S = 21, F_IQ2_S = 22, F_IQ4_XS = 23, F_NVFP4 = 40, F_Q2_0 = 42, F_NVFP4_16 = 43 };
 
 // NVFP4: sub-block sb is half (sb % 2) of ggml block sb / 2 (36 bytes: 4 UE4M3 scales, 32 code bytes). Its two
 // 16-blocks (byte i: element i low, i + 8 high) become one nibble slot (byte j: element j low, j + 16 high).
@@ -29,6 +29,19 @@ BNK_HD static inline void rfmt_nvfp4_sb(const uint8_t * s, uint8_t * A, uint8_t 
     }
     B[2 * sb] = blk[2 * (sb % 2)];
     B[2 * sb + 1] = blk[2 * (sb % 2) + 1];
+}
+
+// NVFP4_16 (9-byte blocks of 16: scale, 8 codes): the same R row as NVFP4
+BNK_HD static inline void rfmt_nvfp4_16_sb(const uint8_t * s, uint8_t * A, uint8_t * B, int sb) {
+    const uint8_t * b0 = s + (size_t) sb * 18, * b1 = b0 + 9;
+    const uint8_t * q0 = b0 + 1, * q1 = b1 + 1;
+    uint8_t * a = A + 16 * sb;
+    for (int j = 0; j < 8; ++j) {
+        a[j] = (uint8_t) ((q0[j] & 15) | ((q1[j] & 15) << 4));
+        a[8 + j] = (uint8_t) ((q0[j] >> 4) | (q1[j] & 0xF0));
+    }
+    B[2 * sb] = b0[0];
+    B[2 * sb + 1] = b1[0];
 }
 
 BNK_HD static inline void rfmt_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
@@ -176,6 +189,9 @@ BNK_HD static inline void rfmt_repack_row(const RLayout & L, const uint8_t * s, 
         case F_NVFP4:
             for (int sb = 0; sb < n; ++sb) rfmt_nvfp4_sb(s, A, B, sb);
             break;
+        case F_NVFP4_16:
+            for (int sb = 0; sb < n; ++sb) rfmt_nvfp4_16_sb(s, A, B, sb);
+            break;
     }
 }
 
@@ -307,6 +323,7 @@ BNK_HD static inline void rfmt_repack_sb(const RLayout & L, const uint8_t * s, u
             }
             break;
         case F_NVFP4: rfmt_nvfp4_sb(s, A, B, sb); break;
+        case F_NVFP4_16: rfmt_nvfp4_16_sb(s, A, B, sb); break;
     }
 }
 

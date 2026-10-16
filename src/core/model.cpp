@@ -288,16 +288,23 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         // the PLE table may live in another GGUF (--ple-gguf): a fine-tune that left it untouched can share the
         // base quant's copy instead of storing another 28.8 GB. The model's own table wins when it has one.
         ple_table = gguf.find("per_layer_token_embd.weight");
+        const GgufModel * ple_src = &gguf;
         if (!ple_table) {
             if (ple_path.empty())
                 throw std::runtime_error("per_layer_token_embd.weight is not in the model; pass --ple-gguf FILE");
             ple_gguf.open(ple_path);
             ple_table = &ple_gguf.get("per_layer_token_embd.weight");
+            ple_src = &ple_gguf;
             const uint64_t rows = c.ple_offset[c.ple_heads() - 1] + c.ple_vocab[c.ple_heads() - 1];
             if (ple_table->ne[0] != c.ple_dim || (uint64_t) ple_table->ne[1] < rows)
                 throw std::runtime_error("the PLE table in " + ple_path + " does not match the model's PLE metadata");
             if (verbose) fprintf(stderr, "bnk: PLE table (%.2f GiB, %s) from %s\n", ple_table->nbytes / 1073741824.0,
                                  ggml_type_name(ple_table->type), ple_path.c_str());
+        }
+        // a global scale beside the table (NVFP4: the checkpoint's weight_scale_2)
+        if (const TensorRef * ps = ple_src->find("per_layer_token_embd.scale")) {
+            if (ps->type != GGML_TYPE_F32 || ps->nbytes != 4) throw std::runtime_error("per_layer_token_embd.scale: expected one F32");
+            memcpy(&ple_scale, ps->data, 4);
         }
     }
     if (verbose) {

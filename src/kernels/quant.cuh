@@ -20,7 +20,7 @@ namespace bnk {
 enum : int {
     QT_F32 = 0, QT_F16 = 1, QT_Q4_0 = 2, QT_Q8_0 = 8, QT_Q2_K = 10, QT_Q3_K = 11, QT_Q4_K = 12,
     QT_Q5_K = 13, QT_Q6_K = 14, QT_IQ2_XXS = 16, QT_IQ2_XS = 17, QT_IQ3_XXS = 18, QT_IQ4_NL = 20,
-    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_NVFP4 = 40, QT_Q2_0 = 42,
+    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_NVFP4 = 40, QT_Q2_0 = 42, QT_NVFP4_16 = 43,
 };
 
 // Loads that only assume 2-byte alignment (most ggml block sizes are not multiples of 4).
@@ -325,6 +325,30 @@ template <> struct QTraits<QT_NVFP4> {
     }
 };
 
+// NVFP4_16 (bnk, ggml type 43): 16-wide blocks of 1 UE4M3 scale + 8 code bytes, for rows that are not a multiple
+// of 64 (the PLE table: 160). A 32-wide sub-block is two consecutive blocks.
+template <> struct QTraits<QT_NVFP4_16> {
+    static constexpr int QK = 32, BYTES = 18;
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * b, int, Unpacked & u) {
+        u.d0 = ue4m3h(b[0]);
+        u.d1 = ue4m3h(b[9]);
+        u.m0 = u.m1 = 0.f;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t * q = b + 1 + 9 * h;   // odd offsets: byte loads
+            const uint32_t x0 = q[0] | (q[1] << 8) | (q[2] << 16) | ((uint32_t) q[3] << 24);
+            const uint32_t x1 = q[4] | (q[5] << 8) | (q[6] << 16) | ((uint32_t) q[7] << 24);
+            const int2 v0 = lut16(x0, kvalues_fp4);
+            const int2 v1 = lut16(x1, kvalues_fp4);
+            u.w[4 * h + 0] = v0.x;
+            u.w[4 * h + 1] = v1.x;
+            u.w[4 * h + 2] = v0.y;
+            u.w[4 * h + 3] = v1.y;
+        }
+    }
+};
+
 template <int T>
 __device__ __forceinline__ void unpack_sub(const uint8_t * row, int sb, Unpacked & u) {
     using Q = QTraits<T>;
@@ -337,7 +361,8 @@ __device__ __forceinline__ void unpack_sub(const uint8_t * row, int sb, Unpacked
 __host__ __device__ constexpr bool is_dp4a_format(int t) {
     return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ2_XXS ||
            t == QT_IQ2_XS || t == QT_IQ3_XXS ||
-           t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0 || t == QT_NVFP4;
+           t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0 || t == QT_NVFP4 ||
+           t == QT_NVFP4_16;
 }
 __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
 
@@ -357,6 +382,7 @@ __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t
         case QT_Q8_0: F.template operator()<QT_Q8_0>(); break;       \
         case QT_Q2_0: F.template operator()<QT_Q2_0>(); break;       \
         case QT_NVFP4: F.template operator()<QT_NVFP4>(); break;     \
+        case QT_NVFP4_16: F.template operator()<QT_NVFP4_16>(); break; \
         default: bnk_unsupported_format(fmt);                        \
     }
 

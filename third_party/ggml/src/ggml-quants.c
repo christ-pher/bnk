@@ -416,6 +416,38 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+void dequantize_row_nvfp4_16(const block_nvfp4_16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4_16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = ggml_ue4m3_to_fp32(x[i].d);
+        for (int j = 0; j < qk/2; ++j) {
+            y[i*qk + j       ] = kvalues_mxfp4[x[i].qs[j] & 0x0F] * d;
+            y[i*qk + j + qk/2] = kvalues_mxfp4[x[i].qs[j] >>   4] * d;
+        }
+    }
+}
+
+void quantize_row_nvfp4_16_ref(const float * GGML_RESTRICT x, block_nvfp4_16 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4_16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) if (amax < fabsf(xb[j])) amax = fabsf(xb[j]);
+        const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f);
+        y[i].d = ue;
+        const float d = ggml_ue4m3_to_fp32(ue);
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(xb[j       ], d);
+            const uint8_t x1 = best_index_mxfp4(xb[j + qk/2], d);
+            y[i].qs[j] = x0 | (x1 << 4);
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -5562,6 +5594,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
             } break;
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_NVFP4_16:
             {
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);

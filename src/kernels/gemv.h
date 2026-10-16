@@ -23,6 +23,8 @@ struct QMat {
     size_t row_bytes = 0;
     int layout = 0;               // 0: ggml blocks, 1: R layout (rfmt.h)
     uint32_t r_off[5] = {0, 0, 0, 0, 0};
+    float scale = 1.f;            // multiplies every dequantized value (dequant_rows / gather only: a matrix-wide
+                                  // global scale, e.g. NVFP4's)
     bool valid() const { return data != nullptr; }
 };
 

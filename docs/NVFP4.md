@@ -93,6 +93,16 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
   that tensor as F16, so it never showed). Found with the layer dumps (`BNK_DUMP_DIR` / `BNK_DUMP_LAYER`) compared
   between the two models: layer 0 agreed to 0.97-0.99 correlation everywhere, layer 1 did not.
 
+* **The n-gram table in NVFP4** (later the same day): `tools/convert_ple_nvfp4.py` packs the 128 table shards into
+  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4-ple.gguf` (28.8 GB, 2 minutes, numpy only) as bnk's
+  `GGML_TYPE_NVFP4_16` (type 43: one UE4M3 byte + 8 code bytes per 16 weights, added to the vendored ggml with its
+  reference dequantizer), plus `per_layer_token_embd.scale` (the checkpoint's `weight_scale_2`, applied by the
+  gather through `QMat::scale`). Self-check: the packed rows decode to the checkpoint's values exactly;
+  `test_dequant` (`BNK_TEST_PLE=1`) bit-exact against ggml in both layouts; the table correlates 0.992 with the
+  base model's (the distillation barely touched it). The config's `ple_gguf` makes `./run.sh nvfp4` pick it up.
+  Run with the ranked cache: 93.6 tok/s, drafts 41/49, 0.17% misses; the first 37 tokens equal the borrowed-table
+  run's. Nothing from the IQ3_S release is used any more.
+
 ## Plan
 
 1. ~~NVFP4 weight format in the kernels, bit-exact test~~ (done).
@@ -101,10 +111,8 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
 4. ~~First run with the IQ3_S release's table~~ (done). Next: a server run to learn the routing counts, then the
    LocalMaxxing sweep (`/opt/benchmarks/bnk_bench.py`) and `bnk nll` against the IQ3_S release for the quality
    difference; re-tune `--draft` / `--min-p` for this model.
-5. The PLE table in NVFP4: bnk type `NVFP4_16` (16-wide blocks: 1 UE4M3 + 8 bytes) for `per_layer_token_embd`,
-   written by a small numpy converter from the 6 table shards (`dequant_gather` only, no GEMV); saves 2 GB over
-   IQ4_NL and uses the model's own (possibly distilled) table. Disk: the table shards are 27 GB and the conversion
-   another 27 GB; the 15 expert shards (68 GB) can go once the GGUF is accepted.
+5. ~~The PLE table in NVFP4~~ (done, above). The checkpoint shards still in the Hugging Face cache (15 to 21,
+   ~32 GB) are no longer needed.
 6. Optional: native MXFP8 type for the dense weights (Q8_0 doubles their bytes: 2.9 vs the release's ~2 GiB per
    card, and the output head is BF16 1.2 GiB, Q6_K in the release); the MTP head from this checkpoint (NVFP4
    experts) in place of bnk's Q2_0 one built from the base model.

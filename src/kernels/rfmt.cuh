@@ -292,6 +292,8 @@ template <> struct RT<QT_NVFP4> {
     }
 };
 
+template <> struct RT<QT_NVFP4_16> : RT<QT_NVFP4> {};   // the same R row
+
 // unpack through the shared-memory tables when the format has one (rt_tables_load first)
 template <int FMT, typename = void> struct RTHasTable { static constexpr bool value = false; };
 template <int FMT> struct RTHasTable<FMT, decltype((void) RT<FMT>::HAS_TABLE)> { static constexpr bool value = RT<FMT>::HAS_TABLE; };
@@ -337,6 +339,7 @@ __device__ __forceinline__ void rt_tables_load() {
         case QT_Q8_0: F.template operator()<QT_Q8_0>(); break;       \
         case QT_Q2_0: F.template operator()<QT_Q2_0>(); break;       \
         case QT_NVFP4: F.template operator()<QT_NVFP4>(); break;     \
+        case QT_NVFP4_16: F.template operator()<QT_NVFP4_16>(); break; \
         default: bnk_unsupported_format(fmt);                        \
     }
 

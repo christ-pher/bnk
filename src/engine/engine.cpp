@@ -864,6 +864,7 @@ void Engine::ple(int il, int T) {
     const int E = c.n_embd, HC = c.hc_dim(), ph = c.ple_heads();
     const TensorRef & tab = *model_.ple_table;
     QMat rows{h_ple_rows_, (int) tab.type, (int64_t) T * ph, tab.ne[0], tab.row_bytes()};
+    rows.scale = model_.ple_scale;
     dequant_rows(rows, 0, (int64_t) T * ph, ple_emb_, st_);
     const int D = ph * c.ple_dim;
     if (!is_float_format(L.ple_key.type)) quantize_act(ple_emb_, D, T, D, act_, st_);

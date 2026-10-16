@@ -443,7 +443,7 @@ __device__ __forceinline__ void store32(const Unpacked & u, O * o) {
 
 template <int FMT, typename O = float>
 __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, const int32_t * __restrict__ ids,
-                          int64_t r0, int n, int64_t cols, O * __restrict__ out) {
+                          int64_t r0, int n, int64_t cols, O * __restrict__ out, float scale) {
     const int64_t nsb = cols / 32;
     const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (int64_t) n * nsb) return;
@@ -458,18 +458,19 @@ __global__ void dequant_k(const uint8_t * __restrict__ W, size_t row_bytes, cons
         for (int k = 0; k < 4; ++k) {
             load8<FMT>(row, sb * 32 + 8 * k, w);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) o[8 * k + j] = cvt_out<O>(w[j]);
+            for (int j = 0; j < 8; ++j) o[8 * k + j] = cvt_out<O>(w[j] * scale);
         }
     } else {
         Unpacked u;
         unpack_sub<FMT>(row, sb, u);
+        u.d0 *= scale; u.d1 *= scale; u.m0 *= scale; u.m1 *= scale;
         store32<O>(u, o);
     }
 }
 
 template <int FMT, typename O = float>
 __global__ void dequant_r_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, const int32_t * __restrict__ ids,
-                            int64_t r0, int n, int64_t cols, O * __restrict__ out) {
+                            int64_t r0, int n, int64_t cols, O * __restrict__ out, float scale) {
     const int64_t nsb = cols / 32;
     const int64_t gid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (int64_t) n * nsb) return;
@@ -478,6 +479,7 @@ __global__ void dequant_r_k(const uint8_t * __restrict__ W, size_t row_bytes, RO
     const int64_t r = ids ? ids[i] : r0 + i;
     Unpacked u;
     RT<FMT>::unpack(W + (size_t) r * row_bytes, o, sb, u);
+    u.d0 *= scale; u.d1 *= scale; u.m0 *= scale; u.m1 *= scale;
     store32<O>(u, out + (int64_t) i * cols + sb * 32);
 }
 
@@ -488,7 +490,7 @@ static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int 
         const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
         auto f = [&]<int FMT>() {
             dequant_r_k<FMT, O><<<(int) ((total + 127) / 128), 128, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o,
-                                                                           ids, r0, n, W.cols, out);
+                                                                           ids, r0, n, W.cols, out, W.scale);
         };
         BNK_DISPATCH_R(W.type, f);
         return;
@@ -497,7 +499,7 @@ static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int 
     const int threads = 128;
     const int grid = (int) ((total + threads - 1) / threads);
     const uint8_t * w = (const uint8_t *) W.data;
-    auto f = [&]<int FMT>() { dequant_k<FMT, O><<<grid, threads, 0, s>>>(w, W.row_bytes, ids, r0, n, W.cols, out); };
+    auto f = [&]<int FMT>() { dequant_k<FMT, O><<<grid, threads, 0, s>>>(w, W.row_bytes, ids, r0, n, W.cols, out, W.scale); };
     switch (W.type) {
         case QT_F32: f.template operator()<QT_F32>(); break;
         case QT_F16: f.template operator()<QT_F16>(); break;
@@ -529,7 +531,7 @@ QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size
     m.rows = rows;
     m.cols = cols;
     void * d = nullptr;
-    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0) ? 32 : (type == QT_Q2_0 || type == QT_NVFP4) ? 64 : 256;
+    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0 || type == QT_NVFP4_16) ? 32 : (type == QT_Q2_0 || type == QT_NVFP4) ? 64 : 256;
     if (repack && r_supported(type) && cols % need == 0) {
         const RLayout L = r_layout(type, cols);
         std::vector<uint8_t> buf(L.row_bytes * rows);

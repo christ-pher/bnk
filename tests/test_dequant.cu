@@ -86,7 +86,7 @@ int main(int argc, char ** argv) {
         m.open(argv[i]);
         std::map<int, const TensorRef *> one;  // first tensor of each format (skip PLE table / huge ones first)
         for (const auto & t : m.tensors()) {
-            if (t.name.find("per_layer_token_embd") != std::string::npos) continue;
+            if (t.name.find("per_layer_token_embd") != std::string::npos && !getenv("BNK_TEST_PLE")) continue;
             if (t.ne[0] % 32 || t.ne[0] < 64) continue;
             if (!one.count(t.type)) one[t.type] = &t;
         }

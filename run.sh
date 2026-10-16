@@ -51,7 +51,7 @@ elif [[ -t 1 ]]; then
 else
   choice="iq3_s"   # non-interactive with no argument: the default
 fi
-PLE="${BNK_PLE_GGUF:-}"
+PLE="${BNK_PLE_GGUF:-}"   # or the config's "ple_gguf" (a model whose n-gram table is a separate GGUF), read below
 if [[ "$choice" == *.gguf ]]; then
   MODEL="$choice"; NAME="$(basename "$choice" .gguf)"
   [[ -f "$MODEL" ]] || { echo "model not found: $MODEL"; exit 1; }
@@ -110,6 +110,10 @@ if [[ -n "$MTP" && -n "$DRAFT_VOCAB" && ! -f "$DRAFT_VOCAB" ]]; then
   "$HERE/.venv/bin/python" "$HERE/tools/draft_vocab.py" --gguf "$MODEL" --out "$DRAFT_VOCAB" >/dev/null
 fi
 
+if [[ -z "$PLE" && -f "$HERE/configs/$NAME.json" ]]; then
+  PLE=$("$HERE/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ple_gguf",""))' "$HERE/configs/$NAME.json")
+  [[ -n "$PLE" && ! -f "$PLE" ]] && { echo "the PLE table $PLE (configs/$NAME.json) is missing" >&2; exit 1; }
+fi
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 # per-model tuning: sampling defaults, speculation, the thinking-loop guard (configs/<name>.json)
