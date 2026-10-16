@@ -225,10 +225,12 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             }
             const int mine = r_end - std::max(b, gi * 2 * F);
             if (rows_done_[gi].fetch_add(mine, std::memory_order_acq_rel) + mine == 2 * F) {
-                const float sg = L.exp_sgate.empty() ? 1.f : L.exp_sgate[tasks[grp[0]].expert];
+                // NVFP4 global scales (model.h): gate and up here, down on the output rows below
+                const int ex0 = tasks[grp[0]].expert;
+                const float sg = L.exp_sgate.empty() ? 1.f : L.exp_sgate[ex0], su = L.exp_sup.empty() ? 1.f : L.exp_sup[ex0];
                 for (int k = 0; k < n; ++k) {
                     float * gu = gu_.data() + (size_t) grp[k] * 2 * F;
-                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r];
+                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r] * su;
                     if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + grp[k] * hrow));
                     else hfrom(gu, hq_.data() + grp[k] * hrow, F);
                 }
@@ -267,7 +269,8 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 } else {
                     for (int k = 0; k < n; ++k) td->vec_dot(F, &vals[k], 0, w, 0, hs[k], 0, 1);
                 }
-                for (int k = 0; k < n; ++k) tv[grp[k]] = vals[k];
+                const float sd = L.exp_sdown.empty() ? 1.f : L.exp_sdown[tasks[grp[0]].expert];
+                for (int k = 0; k < n; ++k) tv[grp[k]] = vals[k] * sd;
             }
             for (int t = 0; t < T; ++t) out[(size_t) t * E + r] = 0.f;
             for (int i = 0; i < nt; ++i) out[(size_t) tasks[i].t * E + r] += tasks[i].w * tv[i];

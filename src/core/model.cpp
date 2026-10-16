@@ -131,7 +131,11 @@ QMat Model::upload_data(const std::string & name, const uint8_t * data, int type
     // tensor cores read directly when several tokens go through them; kept BF16 if a value is out of range
     static const bool keep_bf16 = getenv("BNK_KEEP_BF16") != nullptr;
     // (not the router: its fp32 path picks the experts, and stays exact)
-    if (!keep_bf16 && t->type == GGML_TYPE_BF16 && t->nrows() >= 2 && t->ne[0] % 32 == 0 &&
+    // (the PLE conv taps are read as raw fp16 by their kernel, whatever their width: 4 per row)
+    const bool must_f16 = name.find("ple_conv1d") != std::string::npos;
+    if (must_f16 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)
+        throw std::runtime_error(name + ": expected F16 or BF16, got " + ggml_type_name((ggml_type) t->type));
+    if ((!keep_bf16 || must_f16) && t->type == GGML_TYPE_BF16 && t->nrows() >= 2 && (t->ne[0] % 32 == 0 || must_f16) &&
         (name.find("ffn_gate_inp") == std::string::npos || getenv("BNK_ROUTER_F16"))) {
         const int64_t n = t->nrows() * t->ne[0];
         std::vector<float> f((size_t) n);
@@ -327,9 +331,7 @@ void Model::expert_src(int il) {
                 throw std::runtime_error("expert scale tensor " + t->name + ": expected F32[" + std::to_string(c.n_expert) + "]");
             memcpy(v.data(), t->data, (size_t) c.n_expert * 4);
         };
-        std::vector<float> vu, vd, wm(c.n_expert);
-        read(sg, L.exp_sgate); read(su, vu); read(sd, vd);
-        for (int e = 0; e < c.n_expert; ++e) wm[e] = vu[e] * vd[e];
+        read(sg, L.exp_sgate); read(su, L.exp_sup); read(sd, L.exp_sdown);
         auto up = [&](const std::vector<float> & v) {
             void * p = nullptr;
             if (cudaMalloc(&p, v.size() * 4) != cudaSuccess) throw std::runtime_error("cudaMalloc failed (expert scales)");
@@ -337,8 +339,9 @@ void Model::expert_src(int il) {
             device_allocs_.push_back(p);
             return (const float *) p;
         };
-        L.exp_sgate_dev = up(L.exp_sgate);
-        L.exp_wmul_dev = up(wm);
+        L.exp_scales.gate = up(L.exp_sgate);
+        L.exp_scales.up = up(L.exp_sup);
+        L.exp_scales.down = up(L.exp_sdown);
     }
 }
 

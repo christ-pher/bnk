@@ -75,11 +75,13 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
                                                    size_t off, size_t rowb, int nrows, int ncols,
                                                    const half * __restrict__ x, int64_t ldx,
                                                    const int32_t * __restrict__ perm, half * __restrict__ out,
-                                                   int64_t ldo, ROff ro, const float * __restrict__ sgate) {
+                                                   int64_t ldo, ROff ro, ExpScales es) {
     __shared__ __align__(16) half xs[2][kTcTile * kTcLd];
     const TcBlock bk = blocks[blockIdx.x];
     const TcItem it = items[bk.item];
-    const float sg = (GU && sgate) ? sgate[it.expert] : 1.f;   // NVFP4 gate scale, before the silu
+    // NVFP4 global scales: gate and up before the silu product, down on its product (all stored as fp16)
+    const float sg = (GU && es.gate) ? es.gate[it.expert] : 1.f, su = (GU && es.up) ? es.up[it.expert] : 1.f;
+    const float sd = (!GU && es.down) ? es.down[it.expert] : 1.f;
     const int p0 = it.p0 + bk.t0;                   // the tile's first pair
     const int n = min(kTcTile, it.n - bk.t0);       // its tokens
     const int ngrp = (n + 7) >> 3;                  // token groups of 8
@@ -209,14 +211,14 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
             if constexpr (GU) {
                 const int row = blockIdx.y * kTcRows + warp * 8 + rr;
                 if (row < nrows) {
-                    const float gv = c[0][g8][i] * sg, uv = c[1][g8][i];
+                    const float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
                     o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
                 }
             } else {
 #pragma unroll
                 for (int g = 0; g < 2; ++g) {
                     const int row = blockIdx.y * 2 * kTcRows + g * kTcRows + warp * 8 + rr;
-                    if (row < nrows) o[row] = __float2half(c[g][g8][i]);
+                    if (row < nrows) o[row] = __float2half(c[g][g8][i] * sd);
                 }
             }
         }
@@ -231,12 +233,12 @@ void moe_tc_gu(const TcItem * items, const TcBlock * blocks, int nblocks, const 
     const dim3 grid(nblocks, F / kTcRows);
     if (d.rlay) {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, true, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.sgate);
+            moe_tc_k<FMT, true, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.scales);
         };
         BNK_DISPATCH_R(d.gate_type, f);
     } else {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, false, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.sgate);
+            moe_tc_k<FMT, false, true><<<grid, kTcThreads, 0, st>>>(items, blocks, d.gate_bytes, d.grow, F, E, x, ldx, perm, h, F, go, d.scales);
         };
         BNK_DISPATCH_DP4A(d.gate_type, f);
     }
@@ -252,12 +254,12 @@ void moe_tc_down(const TcItem * items, const TcBlock * blocks, int nblocks, cons
     const dim3 grid(nblocks, E / (2 * kTcRows));
     if (d.rlay) {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, true, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, nullptr);
+            moe_tc_k<FMT, true, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, d.scales);
         };
         BNK_DISPATCH_R(d.down_type, f);
     } else {
         auto f = [&]<int FMT>() {
-            moe_tc_k<FMT, false, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, nullptr);
+            moe_tc_k<FMT, false, false><<<grid, kTcThreads, 0, st>>>(items, blocks, off, d.drow, E, F, h, F, nullptr, D, E, dof, d.scales);
         };
         BNK_DISPATCH_DP4A(d.down_type, f);
     }

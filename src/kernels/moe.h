@@ -45,6 +45,14 @@ struct HitList {
                                     // token's experts in its own routing order, whatever else the window holds)
 };
 
+// NVFP4 experts: the fp32 global scale of each expert's gate / up / down matrix (device [n_expert]; all null for
+// formats without one). ggml's NVFP4 blocks hold the weights without it, ~16,000x their true size, so the kernels
+// apply it where an expert's output is formed: gate before the silu, up with it, down on the int8 h (its fp32
+// per-32 scale carries the magnitude) or on the tensor-core down product before its fp16 store.
+struct ExpScales {
+    const float * gate = nullptr, * up = nullptr, * down = nullptr;
+};
+
 struct MoeLayerDesc {
     const int32_t * slot_of;  // [n_expert] device, -1 = not resident
     const uint8_t * base;     // the layer's slot region (device)
@@ -53,9 +61,7 @@ struct MoeLayerDesc {
     int gate_type, down_type;
     size_t grow, drow;        // row bytes of gate/up rows and of down rows
     int rlay = 0;             // slots hold R-layout rows (rfmt.h) rather than ggml blocks
-    // NVFP4 experts: per-expert fp32 global scales (device [n_expert], null when the format has none). sgate
-    // multiplies the gate rows before the silu; wmul = up x down scale, folded into the routing weights.
-    const float * sgate = nullptr, * wmul = nullptr;
+    ExpScales scales;         // NVFP4 experts' per-matrix global scales (null when the format has none)
     uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};  // R field offsets of gate/up and down rows
 };
 

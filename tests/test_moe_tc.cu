@@ -65,6 +65,21 @@ int main(int argc, char ** argv) {
     d.rlay = 1;
     const uint32_t g5[5] = {gl.off_a, gl.off_b, gl.off_c, gl.off_d, gl.off_e}, d5[5] = {dl.off_a, dl.off_b, dl.off_c, dl.off_d, dl.off_e};
     for (int i = 0; i < 5; ++i) { d.go[i] = g5[i]; d.dof[i] = d5[i]; }
+    // NVFP4: the per-expert global scales (side tensors) go to the kernels and into the reference weights
+    std::vector<float> sc[3];
+    const char * scn[3] = {"ffn_gate_exps.scale", "ffn_up_exps.scale", "ffn_down_exps.scale"};
+    const float * dsc[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i) {
+        const TensorRef * t = g.find(b + scn[i]);
+        sc[i].assign(NE, 1.f);
+        if (!t) continue;
+        memcpy(sc[i].data(), t->data, NE * 4);
+        float * p;
+        CUDA_CHECK(cudaMalloc(&p, NE * 4));
+        CUDA_CHECK(cudaMemcpy(p, sc[i].data(), NE * 4, cudaMemcpyHostToDevice));
+        dsc[i] = p;
+    }
+    if (dsc[0]) { d.scales.gate = dsc[0]; d.scales.up = dsc[1]; d.scales.down = dsc[2]; printf("per-expert global scales applied\n"); }
 
     // the experts' fp32 weights (ggml's own dequantization) for the reference
     std::vector<std::vector<float>> wg(NE), wu(NE), wd(NE);
@@ -75,6 +90,9 @@ int main(int argc, char ** argv) {
         tr->to_float(gt.data + (size_t) e * gsz, wg[e].data(), (int64_t) F * E);
         tr->to_float(ut.data + (size_t) e * gsz, wu[e].data(), (int64_t) F * E);
         trd->to_float(dt.data + (size_t) e * dsz, wd[e].data(), (int64_t) E * F);
+        for (auto & v : wg[e]) v *= sc[0][e];
+        for (auto & v : wu[e]) v *= sc[1][e];
+        for (auto & v : wd[e]) v *= sc[2][e];
     }
 
     // routing: token t picks expert (t * 7 + t / 3) % NE, with the first expert getting a burst (several tiles)
@@ -90,7 +108,7 @@ int main(int argc, char ** argv) {
     std::vector<TcBlock> blocks;
     for (int e = 0; e < NE; ++e) {
         if (!cnt[e]) continue;
-        items.push_back(TcItem{base + e * blob, off[e], cnt[e]});
+        items.push_back(TcItem{base + e * blob, off[e], cnt[e], e});
         for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) blocks.push_back(TcBlock{(int) items.size() - 1, t0});
     }
     // random input, fp16 (as pf_moe converts mixed)

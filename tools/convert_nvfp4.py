@@ -113,6 +113,8 @@ ple_row_dim: int | None = None
 csf_scales: set[str] = set()
 # the csf exception lists are U32, which the converter's safetensors dtype map leaves out
 LazyTorchTensor._dtype_str_map["U32"] = torch.uint32
+LazyTorchTensor._dtype_map[torch.uint32] = np.uint32
+LazyTorchTensor._dtype_byteswap_map[torch.uint32] = np.uint32
 orig_index = ModelBase.index_tensors
 
 

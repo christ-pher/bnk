@@ -702,16 +702,15 @@ void attention_prefill(const float * q, const half * kcache, const half * vcache
 // ------------------------------------------------------------------------------------------- routing
 // one warp per token, n_exp <= 1024: softmax over all experts, top-k by repeated warp argmax
 template <int PER>
-__global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale,
-                             const float * wmul) {
-    route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, wmul, blockIdx.x, threadIdx.x);
+__global__ void route_topk_k(const float * logits, int n_exp, int k, int32_t * ids, float * w, float w_scale) {
+    route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, blockIdx.x, threadIdx.x);
 }
 void route_topk(const float * logits, int T, int n_exp, int k, int32_t * ids, float * w, float w_scale,
-                const float * wmul, cudaStream_t s) {
+                cudaStream_t s) {
     if (n_exp > 1024 || k > 32) { fprintf(stderr, "route_topk: unsupported shape\n"); abort(); }
-    if (n_exp <= 256) route_topk_k<8><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale, wmul);
-    else if (n_exp <= 512) route_topk_k<16><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale, wmul);
-    else route_topk_k<32><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale, wmul);
+    if (n_exp <= 256) route_topk_k<8><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    else if (n_exp <= 512) route_topk_k<16><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
+    else route_topk_k<32><<<T, 32, 0, s>>>(logits, n_exp, k, ids, w, w_scale);
 }
 
 // ------------------------------------------------------------------------------------------- PLE

@@ -443,6 +443,10 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (last_ && !opt.mtp.empty())
         mtp_.load(opt.mtp, model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
     pf_tc_ = !getenv("BNK_PF_TC") || atoi(getenv("BNK_PF_TC")) != 0;
+    // NVFP4 experts carry their global scales outside the blocks; only the tensor-core prompt path applies them
+    // (the cuBLAS path's fp16 copies of the unscaled weights would overflow)
+    for (const auto & L : model_.layers)
+        if (L.exp_scales.gate && !pf_tc_) { fprintf(stderr, "bnk: NVFP4 experts: BNK_PF_TC=0 ignored\n"); pf_tc_ = true; break; }
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
     pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
@@ -863,8 +867,11 @@ void Engine::ple(int il, int T) {
     dequant_rows(rows, 0, (int64_t) T * ph, ple_emb_, st_);
     const int D = ph * c.ple_dim;
     if (!is_float_format(L.ple_key.type)) quantize_act(ple_emb_, D, T, D, act_, st_);
+    dbg(st_, il, "ple_emb", ple_emb_.p, (size_t) T * D);
     gemv_q(L.ple_key, act_, ple_emb_, D, T, ple_key_, HC, st_);
     gemv_q(L.ple_value, act_, ple_emb_, D, T, ple_val_, E, st_);
+    dbg(st_, il, "ple_key", ple_key_.p, (size_t) T * HC);
+    dbg(st_, il, "ple_val", ple_val_.p, (size_t) T * E);
     const int hist = (c.ple_conv - 1) * c.ple_ngram;
     for (const Win & w : wins_) {
         const size_t o = (size_t) w.r0 * HC;
@@ -875,6 +882,8 @@ void Engine::ple(int il, int T) {
                      c.ple_conv, c.ple_ngram, st_);
         if (w.commit) shift_rows(w.q->ple_hist, HC, w.T, hist, st_);
     }
+    dbg(st_, il, "ple_gated", ple_gated_.p, (size_t) T * HC);
+    dbg(st_, il, "ple_res", res_.p, (size_t) T * HC);
 }
 
 void Engine::gdn(int il, int T) {
@@ -1086,7 +1095,7 @@ void Engine::predict_stats(int il, int T) {
             pred_w_.alloc((size_t) kMaxWindow * 32);
         }
         gemv_q(model_.layers[il + 1].router, mixact_, mixed_, c.n_embd, T, pred_logits_, c.n_expert, st_);
-        route_topk(pred_logits_, T, c.n_expert, P, pred_ids_, pred_w_, 1.f, nullptr, st_);
+        route_topk(pred_logits_, T, c.n_expert, P, pred_ids_, pred_w_, 1.f, st_);
         prev.resize((size_t) T * P);
         CUDA_CHECK(cudaMemcpyAsync(prev.data(), pred_ids_.p, prev.size() * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -1133,7 +1142,7 @@ void Engine::moe(int il, int T) {
         moe_route_plan(rlogits_, c.n_expert, c.expert_weights_scale, rids_, rw_, T, k, d, moes_, msg(il), mixed_, E,
                        &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
     } else {
-        route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, d.wmul, st_);
+        route_topk(rlogits_, T, c.n_expert, k, rids_, rw_, c.expert_weights_scale, st_);
         moe_plan(rids_, rw_, T, k, d, moes_, msg(il), mixed_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert,
                  st_);
     }

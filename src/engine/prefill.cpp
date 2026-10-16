@@ -365,7 +365,7 @@ void Engine::pf_moe(int il, int N) {
     // routing
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.router, gemm_.xbuf(), E, N, p.rlog, c.n_expert);
-    route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, L.exp_wmul_dev, st_);
+    route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, st_);
     // the shared expert meanwhile
     gemm_.run_h(L.sh_gate, gemm_.xbuf(), E, N, p.sg, FF);
     gemm_.run_h(L.sh_up, gemm_.xbuf(), E, N, p.su, FF);
