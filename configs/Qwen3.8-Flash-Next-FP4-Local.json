@@ -1,10 +1,11 @@
 {
   "notes": "nvidia/Qwen3.8-Flash-Next-FP4-Local (ModelOpt NVFP4 experts, MXFP8 dense, quantization-aware distilled) converted by tools/convert_nvfp4.py --no-ple (NVFP4 experts with their per-expert scales, dense weights as Q8_0) plus the n-gram PLE table packed by tools/convert_ple_nvfp4.py as bnk's 16-wide NVFP4 type (ple_gguf below; run.sh passes it as --ple-gguf). Every weight is the checkpoint's own, bit for bit; the dense MXFP8 matrices are the one re-quantization (Q8_0). Sampling as the Qwen release recommends; speculation settings copied from the IQ3_S config (not yet re-tuned for this model).",
   "aliases": [
+    "fp4-local",
     "nvfp4"
   ],
   "source": {
-    "path": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4.gguf"
+    "path": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local.gguf"
   },
   "sampling": {
     "temperature": 1.0,
@@ -25,5 +26,5 @@
     "--slots",
     "3"
   ],
-  "ple_gguf": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4-ple.gguf"
+  "ple_gguf": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local-ple.gguf"
 }

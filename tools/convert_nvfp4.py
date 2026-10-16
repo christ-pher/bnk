@@ -200,6 +200,6 @@ def tensor_force_quant(self, name, new_name, bid, n_dims):
 ModelBase.tensor_force_quant = tensor_force_quant
 
 sys.argv = ["convert_hf_to_gguf.py", str(staging), "--outfile", args.out, "--outtype", "bf16", "--no-mtp",
-            "--model-name", "Qwen3.8-Flash-Next-NVFP4"] + (["--dry-run"] if args.dry_run else [])
+            "--model-name", "Qwen3.8-Flash-Next-FP4-Local"] + (["--dry-run"] if args.dry_run else [])
 print("bnk: running", " ".join(sys.argv), flush=True)
 runpy.run_path(str(LLAMA_CPP / "convert_hf_to_gguf.py"), run_name="__main__")

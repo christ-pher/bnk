@@ -75,10 +75,10 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
 ## Status (2026-10-16)
 
 * The checkpoint converts in ~15 minutes (shards 1-15 of the Hub snapshot in `~/.cache/huggingface`, output
-  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4.gguf`, 75.2 GB: experts NVFP4 63.3 GiB + scales, dense Q8_0 2.9
+  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local.gguf`, 75.2 GB: experts NVFP4 63.3 GiB + scales, dense Q8_0 2.9
   GiB, BF16 3.6 GiB; the converter holds ~70 GB of RAM). `test_dequant` on its real tensors is bit-exact in both
   layouts; `test_moe_tc` on layer 0 (scales applied) is within 3e-4 of the fp32 reference.
-* It runs on the two V100s through `configs/Qwen3.8-Flash-Next-NVFP4.json` (alias `nvfp4`) with
+* It runs on the two V100s through `configs/Qwen3.8-Flash-Next-FP4-Local.json` (alias `nvfp4`) with
   `BNK_PLE_GGUF=<IQ3_S first shard>` for the n-gram table: 74% of the experts resident per card (24.5 / 22.7 GiB
   caches), greedy output coherent, the first 8 tokens of the 4K follow-up equal to the IQ3_S release's, drafts
   accepted 37/48. First run, uniform expert ranking: 56 tok/s decode with 22% expert misses on the CPU, 4,700-token
@@ -94,7 +94,7 @@ fp16 unpack) is the exact follow-up if `bnk nll` shows a difference.
   between the two models: layer 0 agreed to 0.97-0.99 correlation everywhere, layer 1 did not.
 
 * **The n-gram table in NVFP4** (later the same day): `tools/convert_ple_nvfp4.py` packs the 128 table shards into
-  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-NVFP4-ple.gguf` (28.8 GB, 2 minutes, numpy only) as bnk's
+  `~/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local-ple.gguf` (28.8 GB, 2 minutes, numpy only) as bnk's
   `GGML_TYPE_NVFP4_16` (type 43: one UE4M3 byte + 8 code bytes per 16 weights, added to the vendored ggml with its
   reference dequantizer), plus `per_layer_token_embd.scale` (the checkpoint's `weight_scale_2`, applied by the
   gather through `QMat::scale`). Self-check: the packed rows decode to the checkpoint's values exactly;
