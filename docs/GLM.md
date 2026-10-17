@@ -125,6 +125,7 @@ Measured with `bnk run` on the two V100s, a 90 GiB arena, the routing counts of 
 | File-tier experts read in slices by every pool thread, 16 disk threads | **14.2** | 58 | 160 (3 x 3,712) |
 | Double-buffered disk stage, the biggest layout from the first chunk | | 68 (1 chunk) | 166 (2 x 5,568) |
 | A layout sized to the prompt, the stages' caches regrown concurrently | 11-14 | **110-116** (1 chunk) | **170** (2 x 5,568) |
+| 192 GB of RAM: every expert in the arena (130.8 GiB), no disk tier | **16.9** (steady) | **225** (12.4 s) | |
 
 What was learned:
 
@@ -164,17 +165,19 @@ What was learned:
 Where it stands: decode is bound by the CPU pool's 30-60 ms per token for the ~100-135 missed experts (the
 GPU stages' own work is ~30 ms); the forward's floor without misses would be ~35 ms (28 tok/s). Prompts are
 bound by the model file and the arena streaming through the GPUs: ~12-14 s per chunk per stage, so long prompts
-read at ~170-300 tok/s. The arena size (`--ram-gib`: 100 GiB in the config, 90 in these runs) trims both.
+read at ~170-300 tok/s. The arena size (`--ram-gib`; 90 GiB in these runs on 128 GB of RAM) trims both; see the RAM note below.
 
 ## Status and next steps
 
 * 2026-10-17: converts, loads on both V100s, decodes correctly (eager and graph mode), the prompt path validated;
-  decode 9-14 tok/s, prompts 110 tok/s (2.8K, one chunk) to ~170 tok/s (11K) with the ranking from the counts
-  file; served by `./run.sh glm` (config `configs/GLM-5.3-Flash-FP4-Local.json`: 100 GiB arena, 2 slots, 8 GiB
+  on 128 GB decode 9-14 tok/s, prompts 110 tok/s (2.8K, one chunk) to ~170 tok/s (11K); on 192 GB (every expert
+  in RAM) decode 16.9 tok/s and the 2.8K prompt at 225 tok/s, with the ranking from the counts file; served by `./run.sh glm` (config `configs/GLM-5.3-Flash-FP4-Local.json`: 100 GiB arena, 2 slots, 8 GiB
   of parking, 4 adaptive swaps per update).
 * RAM: the experts outside the GPUs are 127.5 GiB. With 160 GB the whole model fits in RAM (tight: 8 GiB of parking,
-  little page cache); 192 GB is comfortable (more parking, a page cache); more buys no speed. When the machine has
-  it, drop `--ram-gib 100` from the config's `engine_args`: the auto mode takes every expert when they fit.
+  little page cache); 192 GB is comfortable (more parking, a page cache); more buys no speed. The arena's auto size
+  is what the machine has available less 24 GiB of headroom (`BNK_RAM_HEADROOM_GIB`; `--ram-gib` sets it outright,
+  0 means every expert), so on 192 GB every expert is in RAM. The machine got 192 GB on 2026-10-17 (visible to the
+  container without a reboot).
 * Next: the MTP drafter from layer 45 (expected to pay little while decode is miss-bound: a window of k tokens
   multiplies the misses), a CPU NVFP4 kernel that beats the AVX2 dot (0.27 ms per expert now), and for prompts a
   smaller borrow per chunk (the 8K layout takes 11 GiB) or an incremental regrow; the server end to end
