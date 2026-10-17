@@ -56,10 +56,11 @@ struct EngineOptions {
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
-    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile). 4,096 since the experts moved to
-    // the tensor cores: 8,192-token chunks evicted experts that then streamed back every chunk, and left the
-    // pipeline fewer chunks to overlap (two V100s, cold reads: 64K 2,587 -> 2,901 tok/s, 128K 1,375 -> 2,905)
-    int prefill_chunk_max = 4096;
+    // chunk size for long prompts (borrows VRAM from the expert cache meanwhile); <= 0 auto: 4,096 since the
+    // experts moved to the tensor cores (8,192-token chunks evicted experts that then streamed back every chunk,
+    // and left the pipeline fewer chunks to overlap: two V100s, cold reads, 64K 2,587 -> 2,901 tok/s, 128K 1,375
+    // -> 2,905), 8,192 for glm5next (a chunk's cost is its expert staging, whatever its size)
+    int prefill_chunk_max = -1;
     // Between prompts the prompt path keeps a layout for prefill_small tokens and up to stage_small_mib of PCIe
     // staging; more is borrowed from the expert cache for bigger reads. Smaller values give decoding a bigger cache
     // but slow down each turn: on an 80K-token agent conversation with Orca, 512 / 256 MiB gave +1.6% decode speed
@@ -277,6 +278,7 @@ private:
     // layer's kernels; pf_moe waits for it before reading the stage (BNK_STAGE_SYNC=1: on the calling thread)
     std::unique_ptr<Worker> stage_worker_;
     void pf_stage_wait();
+    double pf_stage_wait_ms_ = 0;   // time spent waiting for the staging (BNK_PF_PROF)
     std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
     cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part

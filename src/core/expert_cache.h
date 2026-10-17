@@ -73,6 +73,7 @@ private:
     std::vector<size_t> sb_;               // slot bytes per layer
     std::vector<int> resident_l_;
     std::vector<float> rank_value_;        // [n_layer * n_expert]: from the initial ranking, hottest highest
+    std::vector<char> evicted_;            // [n_layer * n_expert]: evicted by shrink, not yet back (grow takes them first)
     float value(int il, int e) const;
     void finish_pending(cudaStream_t s, bool wait);
     std::vector<std::vector<int>> slot_expert_;

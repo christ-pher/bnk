@@ -111,12 +111,54 @@ the way: the dense MLP's 1,024-row pieces reused the GEMM's fp16 conversion buff
 input (rows past 1,024 were garbage), and the indexer scores (signed: the head weights have either sign) were
 compared as unsigned by the radix top-k.
 
+## Performance work (2026-10-17, evening)
+
+Measured with `bnk run` on the two V100s, a 90 GiB arena, the routing counts of earlier runs as the ranking
+(`--profile`), a 2,784-token README prompt (`readme2k`) and four copies of it (11,136 tokens).
+
+| Step | Decode (tok/s) | 2.8K prompt | 11K prompt |
+|---|---|---|---|
+| Uniform ranking, every miss through the file mapping | 0.36 | | |
+| Experts outside the arena `pread` into a pinned stage / scratch | 3.0 | 57 tok/s | |
+| Accumulated routing counts as the ranking (38% misses) | 10.3 | 60 | |
+| The prompt path stages the next layer on its own thread | 11.5 | 61 | |
+| File-tier experts read in slices by every pool thread, 16 disk threads | **14.2** | 58 | 160 (3 x 3,712) |
+| Double-buffered disk stage, the biggest layout from the first chunk | | 68 (1 chunk) | 166 (2 x 5,568) |
+
+What was learned:
+
+* **The CPU pool's cost was the file tier.** The per-layer profile (`BNK_SVC_PROF=1`, now with the file-read
+  count) showed a layer whose misses are all in the arena costs the CPU 0.7 ms (2.6 experts: 0.27 ms per 14 MB
+  expert, 24 threads), while each expert read from the model file cost 7.8 ms: 12% of the layer-forwards, 60% of
+  the CPU time. One thread read each expert; the NVMe gives 2.0 GB/s to one reader, 3.3 to four and 5.3 GB/s to
+  sixteen (measured with `dd iflag=direct`), so `ExpertStore::read_blob_part` now splits an expert's three ranges
+  across every thread of the pool (3.5 ms per file-tier expert) and the prompt path's disk stage uses 16 threads.
+* **GPUs reading missed experts over PCIe lose.** The hit kernels can read an arena expert straight from the
+  mapped page-locked memory (`--host-share`, `MoeLayerDesc::host_of`, the ggml-layout `moe_gu_k<.., HOST>`): it
+  works (the Paris prompt), but a 14 MB expert costs the GPU ~1 ms on PCIe against the CPU pool's 0.3 ms, and the
+  GPU time is on the critical path of its stage: a 0.5 share gave 6.4 tok/s against 11.5. Off by default, kept
+  as an option.
+* **The prompt path is expert staging, not compute.** Every non-resident expert of a layer (about 238 of 288,
+  3.3 GB) is copied to the GPU per chunk per stage: ~2.3 GB from the arena by DMA (12 GB/s) and ~1.1 GB from the
+  file (the NVMe, shared by both stages). `BNK_PF_PROF=1` now prints the wait for the staging: ~640 ms of a
+  700 ms MoE layer at 3,712 tokens, the GPU's own work ~55 ms. The disk stage is double-buffered (a wave's reads
+  overlap the previous wave's copies: 816 -> 694 ms per layer). Since a chunk's cost is fixed whatever its size,
+  glm5next takes the biggest prompt layout that fits from the first chunk (`prefill_chunk_max` auto: 8,192; a
+  prompt that fits one chunk gets a layout its own size, borrowing no more VRAM than needed), and the stages
+  regrow their caches concurrently after the prompt (the borrowed VRAM is refilled from the model file: the hottest
+  experts are not in the arena by design).
+* A dense layer has no expert slots: the cache's regrow skipped that and threw after a long prompt (fixed).
+
+Where it stands: decode is bound by the CPU pool's ~40 ms per token for the ~50-85 missed experts (plus the GPU
+stages' ~30 ms); the forward's floor without misses would be ~35 ms (28 tok/s). Prompts are bound by the model
+file and the arena streaming through the GPUs: ~18 s per chunk per stage, so long prompts read at ~170-300 tok/s
+and the arena size (`--ram-gib`: 100 GiB in the config, 90 in these runs) trims both.
+
 ## Status and next steps
 
-* 2026-10-17: converts, loads on both V100s, decodes correctly (eager and graph mode). Speed is not yet
-  measured with a routing ranking: a uniform ranking leaves ~80% of expert uses off the GPU and most of those in
-  the file-mapped tier.
-* Next: a routing ranking from real prompts (the counts file), the exclusive RAM tier, then measurements
-  (decode, prompt reads at 4K-32K), then the MTP drafter from layer 45, the server's GLM tool-call parser
-  (`<tool_call>name<arg_key>..`), thinking handling (`<think>` opens every turn), and the prompt-path kernels for
-  long contexts (the indexer score kernel is the per-row one; the absorbed products read kv_b per row).
+* 2026-10-17: converts, loads on both V100s, decodes correctly (eager and graph mode), the prompt path validated;
+  decode 14 tok/s, prompts 68 tok/s (2.8K, one chunk) to ~170 tok/s (11K) with the ranking from the counts file.
+* Next: the MTP drafter from layer 45 (expected to pay little while decode is miss-bound: a window of k tokens
+  multiplies the misses), a CPU NVFP4 kernel that beats the AVX2 dot (0.27 ms per expert now), and for prompts a
+  smaller borrow per chunk (the 8K layout takes 11 GiB) or an incremental regrow; the server end to end
+  (`./run.sh glm`, two slots, 8 GiB of parking).

@@ -208,7 +208,10 @@ void Engine::pf_stage_layer(int il) {
 }
 
 void Engine::pf_stage_wait() {
-    if (stage_worker_) stage_worker_->wait();
+    if (!stage_worker_) return;
+    const double t0 = now_ms();
+    stage_worker_->wait();
+    pf_stage_wait_ms_ += now_ms() - t0;
 }
 
 void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
@@ -657,6 +660,11 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
         pf_moe(il, N);
         hc_combine(p.res, p.moe, p.inj, N, c.hc, E, st_);
         if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
+    }
+    if (getenv("BNK_VMEM_LOG")) {
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        fprintf(stderr, "bnk: layers %d-%d: chunk of %d done: driver free %zu MiB (%s)\n", l0_, l1_ - 1, N, fr >> 20, budget_.describe().c_str());
     }
     if (last_) {   // the head on the last token, through the decode buffers (row 0)
         CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));

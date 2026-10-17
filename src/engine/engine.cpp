@@ -345,6 +345,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaEventCreate(&ev_t1_));
     // the drafter embeds its tokens and shares the head: the last stage holds the embeddings too when it drafts
     model_.load(path, opt.verbose, opt.ple_gguf, l0_, l1_, first() || (last_ && !opt.mtp.empty()), last_);
+    if (opt_.prefill_chunk_max <= 0) opt_.prefill_chunk_max = model_.cfg.is_glm() ? 8192 : 4096;   // auto
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
     if (head) {
         layer_routed.assign(model_.cfg.n_layer, 0);
@@ -401,7 +402,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         for (float *& b : xfer_in_) CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) W * HC * 4, cudaHostAllocPortable));
         if (opt.prefill_chunk > 0)
             for (float *& b : pf_xfer_in_)
-                CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) std::max(opt.prefill_chunk, opt.prefill_chunk_max) * HC * 4,
+                CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) std::max(opt.prefill_chunk, opt_.prefill_chunk_max) * HC * 4,
                                          cudaHostAllocPortable));
     }
 
@@ -477,7 +478,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
         if (L.exp_scales.gate && !pf_tc_) { fprintf(stderr, "bnk: NVFP4 experts: BNK_PF_TC=0 ignored\n"); pf_tc_ = true; break; }
     pf_base_ = opt.prefill_chunk;
     pf_small_ = std::min(opt.prefill_chunk, std::max(64, opt.prefill_small));
-    pf_big_ = std::max(opt.prefill_chunk, opt.prefill_chunk_max);
+    pf_big_ = std::max(opt.prefill_chunk, opt_.prefill_chunk_max);
     if (opt.prefill_chunk > 0) {
         prefill_alloc(pf_big_);
         pf_arena_.reserve(prefill_arena_bytes(pf_big_), &budget_, "prompt buffers");
@@ -491,7 +492,11 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     const size_t reserve = (size_t) (opt.vram_reserve_gib * 1073741824.0);
     budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
     budget_.set_reserve(reserve);
-    budget_.reclaim = [this](size_t need) { return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0; };
+    budget_.reclaim = [this](size_t need) {
+        if (getenv("BNK_VMEM_LOG"))
+            fprintf(stderr, "bnk: layers %d-%d: the budget asks the cache for %zu MiB (%s)\n", l0_, l1_ - 1, need >> 20, budget_.describe().c_str());
+        return cache_ready_ ? cache_.shrink(need, st_) : (size_t) 0;
+    };
     ensure_ctx_here(std::min(opt.max_ctx, kCtxBaseline));
     if (opt.prefill_chunk > 0) prefill_layout(pf_small_);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
@@ -677,11 +682,30 @@ void Engine::map_ctx(int cells) {
 // After a prompt: the prompt buffers go back to their baseline, the context keeps what it uses (plus a step),
 // and the expert tier takes the free bytes back.
 void Engine::rebalance() {
+    // the later stages regrow their caches on the worker while this one does (each from its own GPU; the file
+    // reads of one overlap the copies of the other)
+    if (next_ && worker_) {
+        worker_->post([this]() {
+            for (Engine * s = next_.get(); s; s = s->next_.get()) s->rebalance_here();
+        });
+        rebalance_here();
+        worker_->wait();
+        return;
+    }
     for (Engine * s = this; s; s = s->next_.get()) s->rebalance_here();
 }
 
 void Engine::rebalance_here() {
     DeviceScope ds(dev_);
+    static const bool vlog = getenv("BNK_VMEM_LOG") != nullptr;
+    auto state = [&](const char * when) {
+        if (!vlog) return;
+        fprintf(stderr, "bnk: layers %d-%d: %s: cache %.2f GiB, prompt arena %.2f GiB, stage %.2f + %.2f GiB, ctx %.2f GiB (%s)\n",
+                l0_, l1_ - 1, when, cache_.bytes() / 1073741824.0, pf_arena_.mapped() / 1073741824.0,
+                pf_stage_b_[0].mapped() / 1073741824.0, pf_stage_b_[1].mapped() / 1073741824.0,
+                kv_bytes_mapped() / 1073741824.0, budget_.describe().c_str());
+    };
+    state("after the prompt");
     if (pf_base_ > 0) {
         prefill_layout(pf_small_);
         prefill_staging_shrink();
@@ -697,7 +721,9 @@ void Engine::rebalance_here() {
         const size_t cap = (size_t) (opt_.expert_cache_gib * 1073741824.0);
         room = std::min(room, cap > cache_.bytes() ? cap - cache_.bytes() : 0);
     }
+    state("layout released");
     if (room > 0) cache_.grow(room, st_);
+    state("regrown");
 }
 
 int Engine::checkpoints() const {
@@ -1545,14 +1571,18 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     // small layout and stage; longer reads get bigger chunks and a stage that holds a whole layer's outside experts.
     // Every stage reads the same chunks: the largest layout all of them fit.
     const int n = (int) tokens.size();
+    const Config & c = model_.cfg;
     if (pf_base_ > 0) {
         int want = (pf_big_ > pf_base_ && n >= 2 * pf_base_) ? pf_big_ : n > pf_small_ ? pf_base_ : pf_small_;
         // several GPUs: the pipeline is full only from the second chunk on, so a read in few big chunks leaves the
         // GPUs taking turns. Smaller chunks for shorter reads, bigger ones (more efficient per token) for long ones
         // (two V100s, cold reads: 16K 1,374 -> 1,616 tok/s with 4,096-token chunks; 8,192 stays best from ~48K)
         static const bool pipe_chunks = !getenv("BNK_PIPE_CHUNKS") || atoi(getenv("BNK_PIPE_CHUNKS")) != 0;
-        if (next_ && pipe_chunks && want > pf_base_)
+        if (next_ && pipe_chunks && want > pf_base_ && !c.is_glm())
             want = n < 4 * pf_base_ ? pf_base_ : n < 24 * pf_base_ ? std::min(want, 2 * pf_base_) : want;
+        // glm5next: a chunk costs its layers' expert staging (3.3 GB per MoE layer, ~18 s per stage) whatever its
+        // size, so the biggest layout that fits wins from the first chunk (11K tokens: 3 x 3,712 -> 2 x 5,568)
+        if (c.is_glm() && pf_big_ > pf_base_ && n > pf_base_) want = std::min(pf_big_, (n + 63) / 64 * 64);   // one chunk when it fits, borrowing no more than it needs
         // smaller chunks when VRAM is short (long contexts in every slot): slower, but the read goes through;
         // conversations are moved off the GPU only when even the smallest layout does not fit
         auto fits = [&](int N) {
@@ -1581,6 +1611,12 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
             s->pf_full_ = n >= opt_.stage_full_min || std::min(lay, n) >= opt_.prefetch_min;
             s->staging_fit();
         }
+    }
+    if (getenv("BNK_VMEM_LOG")) {
+        budget_.make_room(0);
+        fprintf(stderr, "bnk: layers %d-%d: prompt layout %d: cache %.2f GiB, prompt arena %.2f GiB, stage %.2f + %.2f GiB (%s)\n",
+                l0_, l1_ - 1, pf_max_, cache_.bytes() / 1073741824.0, pf_arena_.mapped() / 1073741824.0,
+                pf_stage_b_[0].mapped() / 1073741824.0, pf_stage_b_[1].mapped() / 1073741824.0, budget_.describe().c_str());
     }
     Engine * t = tail();
     // several stages: chunk k+1 on the first stage while the worker runs chunk k through the others

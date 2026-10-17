@@ -394,6 +394,7 @@ void Engine::glm_pf_layer(int il, int N) {
     mhc_combine(p.res, p.out, gpf_.hcw, N, c.hc, E, st_);
     dbg(st_, il, "hc_combine", p.res, (size_t) N * c.hc_dim());
     t1 = tick();
+    const double w0 = pf_stage_wait_ms_;
     glm_pf_mhc_pre(L.hc_ffn_fn, L.hc_ffn_base, L.hc_ffn_scale, gpf_.hcw, N);
     rmsnorm_rows(p.mixed, F(L.ffn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
     dbg(st_, il, "ffn_in", p.xn, (size_t) N * E);
@@ -402,8 +403,8 @@ void Engine::glm_pf_layer(int il, int N) {
     mhc_combine(p.res, p.moe, gpf_.hcw, N, c.hc, E, st_);
     dbg(st_, il, "l_last", p.res, (size_t) N * c.hc_dim());
     t2 = tick();
-    if (prof) fprintf(stderr, "pf L%02d N=%d %s %.1f ms  %s %.1f ms\n", il, N, L.attn ? "mla" : "kda", t1 - t0,
-                      L.moe ? "moe" : "ffn", t2 - t1);
+    if (prof) fprintf(stderr, "pf L%02d N=%d %s %.1f ms  %s %.1f ms  stage %.1f ms\n", il, N, L.attn ? "mla" : "kda", t1 - t0,
+                      L.moe ? "moe" : "ffn", t2 - t1, pf_stage_wait_ms_ - w0);
 }
 
 }  // namespace bnk

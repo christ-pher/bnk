@@ -61,7 +61,8 @@ void ExpertStore::read_blob_part(int il, int e, uint8_t * dst, int part, int npa
 void ExpertStore::dstage_ensure() {
     if (dstage_) return;
     dstage_slots_ = std::max(1, env_int("BNK_DISK_STAGE", 32));
-    if (cudaHostAlloc((void **) &dstage_, (size_t) dstage_slots_ * max_blob_, cudaHostAllocPortable) != cudaSuccess)
+    // two halves: the threads read a wave into one while the other's copies to the GPU run
+    if (cudaHostAlloc((void **) &dstage_, (size_t) 2 * dstage_slots_ * max_blob_, cudaHostAllocPortable) != cudaSuccess)
         throw std::runtime_error("cannot allocate the disk stage");
 }
 
@@ -77,20 +78,26 @@ void ExpertStore::copy_batch_to_device(int il, const std::vector<int> & experts,
     if (disk.empty()) return;
     std::lock_guard<std::mutex> lk(dstage_mu_);
     dstage_ensure();
-    for (size_t w0 = 0; w0 < disk.size(); w0 += dstage_slots_) {
+    // waves of dstage_slots_ experts: wave i is read into half i & 1 while wave i - 1's copies run; a wave's copies
+    // are enqueued once the half's previous copies are done (the stream synchronized: an event would belong to one
+    // GPU, and the stage serves every stage)
+    int wave = 0;
+    for (size_t w0 = 0; w0 < disk.size(); w0 += dstage_slots_, ++wave) {
         const int n = (int) std::min<size_t>(dstage_slots_, disk.size() - w0);
         const int nth = std::min(disk_threads, n);
+        uint8_t * half = dstage_ + (size_t) (wave & 1) * dstage_slots_ * max_blob_;
         std::vector<std::thread> th;
         for (int t = 0; t < nth; ++t)
             th.emplace_back([&, t]() {   // every thread reads its slice of every expert of the wave
-                for (int j = 0; j < n; ++j) read_blob_part(il, experts[disk[w0 + j]], dstage_ + (size_t) j * max_blob_, t, nth);
+                for (int j = 0; j < n; ++j) read_blob_part(il, experts[disk[w0 + j]], half + (size_t) j * max_blob_, t, nth);
             });
         for (auto & x : th) x.join();
+        if (wave >= 2) CUDA_CHECK(cudaStreamSynchronize(s));   // this half's copies of wave - 2 (and all before)
         for (int j = 0; j < n; ++j)
-            CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) disk[w0 + j] * stride, dstage_ + (size_t) j * max_blob_, bb,
+            CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) disk[w0 + j] * stride, half + (size_t) j * max_blob_, bb,
                                        cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaStreamSynchronize(s));   // (an event would belong to one GPU; the stage serves every stage)
     }
+    CUDA_CHECK(cudaStreamSynchronize(s));   // the stage is free for the next caller once every copy is done
 }
 
 void ExpertStore::prepare(const Model & m) {

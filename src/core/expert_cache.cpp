@@ -374,9 +374,11 @@ size_t ExpertCache::shrink(size_t need, cudaStream_t s) {
             if (evict[sl]) holes.push_back(sl);
         for (int sl = nn; sl < n; ++sl)
             if (!evict[sl]) movers.push_back(sl);
+        if (evicted_.empty()) evicted_.assign((size_t) n_layer_ * n_expert_, 0);
         for (int sl = 0; sl < n; ++sl) {
             const int e = slot_expert_[l][sl];
             if (evict[sl] && e >= 0) {
+                evicted_[(size_t) l * n_expert_ + e] = 1;
                 slot_of_host_[(size_t) l * n_expert_ + e] = -1;
                 --resident_;
                 --resident_l_[l];
@@ -409,10 +411,14 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
     const int L = n_layer_;
     // per layer: its non-resident experts, hottest first
     std::vector<std::vector<std::pair<float, int>>> cand(L);
+    // the experts a shrink evicted come back first (a prompt's borrowed VRAM returns the cache to what it was:
+    // the ranking's or the adapted set, not whatever the routing score says right after the prompt)
+    int restored = 0;
     for (int l = l0_; l < l1_; ++l) {
+        if (!sb_[l]) continue;   // a dense layer has no experts to take
         for (int e = 0; e < n_expert_; ++e)
             if (slot_of_host_[(size_t) l * n_expert_ + e] < 0 && (busy_.empty() || !busy_[(size_t) l * n_expert_ + e]))
-                cand[l].push_back({-value(l, e), e});
+                cand[l].push_back({-value(l, e) - (!evicted_.empty() && evicted_[(size_t) l * n_expert_ + e] ? 1e6f : 0.f), e});
         std::sort(cand[l].begin(), cand[l].end());
     }
     std::vector<int> take(L, 0);
@@ -446,6 +452,7 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
         std::vector<int> sl, ex;
         for (int i = 0; i < take[l]; ++i) {
             const int e = cand[l][i].second;
+            if (!evicted_.empty() && evicted_[(size_t) l * n_expert_ + e]) { evicted_[(size_t) l * n_expert_ + e] = 0; ++restored; }
             slot_expert_[l].push_back(e);
             slot_of_host_[(size_t) l * n_expert_ + e] = n0 + i;
             sl.push_back(n0 + i);
@@ -458,7 +465,7 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
     CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_, slot_of_host_.data(), slot_of_host_.size() * 4, cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     if (getenv("BNK_VMEM_LOG") && done)
-        fprintf(stderr, "bnk: expert cache grew by %.2f GiB to %d experts\n", done / 1073741824.0, resident_);
+        fprintf(stderr, "bnk: expert cache grew by %.2f GiB to %d experts (%d of them evicted earlier)\n", done / 1073741824.0, resident_, restored);
     return done;
 }
 
