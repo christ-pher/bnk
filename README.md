@@ -55,6 +55,28 @@ All numbers were measured on the machine above. "Greedy" runs decode determinist
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
 
+### GLM-5.3-Flash on the two V100s (branch `glm-flash`, 2026-10-17)
+
+A model three times the size of the Qwen ones (160 GiB of experts against 128 GB of RAM and 64 GB of VRAM), run
+with every weight the checkpoint's own. The expert store has three tiers: the VRAM caches (the hottest sixth, by a
+ranking learned from routing counts), a page-locked RAM arena (`--ram-gib`), and the model file on the NVMe for the
+rest. The arena takes back what the GPUs drop, so a miss costs the CPU pool 0.3 ms when the expert is in RAM and
+4-7 ms when it is on disk; the disk tier is what the remaining RAM would remove (`docs/GLM.md` has the arithmetic:
+192 GB of RAM holds the whole model).
+
+| | GLM-5.3-Flash FP4-Local |
+|---|---|
+| Decode, greedy, 2.8K prompt | 14 tok/s over the first tokens, 9-11 tok/s averaged over a long answer (the disk tier) |
+| Decode, served (`./run.sh glm`, thinking on), a fresh topic | 7.4 tok/s at 50% misses: a topic the ranking has not seen routes to the disk tier |
+| 2.8K-token prompt | 110-116 tok/s (one chunk; 25 s) |
+| 11K-token prompt | 170 tok/s (two chunks of 5.6K; 65 s) |
+| Correctness | greedy output identical to an fp32 PyTorch forward of the HF modeling code on the same weights (`tools/glm_ref.py`), layer by layer within 1e-4 to 6e-3 |
+
+A prompt's cost is its expert streaming (3.3 GB per MoE layer per chunk through each GPU), not compute, so this
+model reads long prompts in the biggest chunks that fit (8,192 tokens). What was tried and lost: the GPUs reading
+missed experts over PCIe (1 ms each against the CPU's 0.3 ms), and more adaptive cache swaps (each costs a disk
+read and did not cut the misses).
+
 ### What v0.3.1 changed: faster turns on both models
 
 A performance sweep measured with the LocalMaxxing context sweep (`-c 16`), details in `docs/PERF-2026-10-16.md`:
@@ -344,7 +366,9 @@ under 5% repetition, well below the 55% trigger.
 
 bnk runs any GGUF of the `qwen4exp` architecture (Qwen3.8-Flash-Next and fine-tunes): 48 layers (36 gated DeltaNet
 + 12 QSA full-attention), 512 routed experts (top 10) plus a shared expert, hyper-connections (4 streams), the
-per-layer n-gram embedding. Expert formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K,
+per-layer n-gram embedding. It also runs `glm5next` (GLM-5.3-Flash: 45 layers of KDA linear attention and MLA
+with the DeepSeek sparse-attention indexer, 288 routed experts top-8 plus a shared one, mHC hyper-connections;
+`docs/GLM.md`), converted from NVIDIA's FP4-Local checkpoint by `tools/convert_glm_fp4.py`. Expert formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0, Q4_K,
 Q5_K, Q6_K, Q8_0, NVFP4 (with llama.cpp's per-expert `.scale` tensors; `docs/NVFP4.md`). Files that also carry an
 MTP block (`nextn_predict_layers`) load their trunk.
 
@@ -364,6 +388,7 @@ exactly these models, and `./models.sh` manages them:
 | `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
 | `cyber-frost` | [peasantsmith CYBER-FROST-3.8-PS-GUFF Q5_K_M](https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF) (Blackfrost-AI's cybersecurity fine-tune) | 112.5 GB, 1 file; needs ~110 GB of RAM |
 | `fp4-local` | [nvidia Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (NVFP4, quantization-aware distilled), converted locally with `tools/convert_nvfp4.py` and `tools/convert_ple_nvfp4.py` (`docs/NVFP4.md`) | 75 GB + 29 GB table, two local GGUFs; the config's paths point at them |
+| `glm` | [nvidia GLM-5.3-Flash-FP4-Local](https://huggingface.co/nvidia/GLM-5.3-Flash-FP4-Local) (320B total / 18B active, NVFP4 experts, quantization-aware distilled), converted locally with `tools/convert_glm_fp4.py` (`docs/GLM.md`) | 182 GB, one local GGUF; 160 GiB of experts: the GPUs cache a sixth, the RAM arena holds `--ram-gib` of the rest (100 GiB in the config), the remainder streams from the file |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
 `$HF_HUB_CACHE`), the same place `hf download` uses, so a model already downloaded with `hf` is found as it is. With

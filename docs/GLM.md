@@ -124,6 +124,7 @@ Measured with `bnk run` on the two V100s, a 90 GiB arena, the routing counts of 
 | The prompt path stages the next layer on its own thread | 11.5 | 61 | |
 | File-tier experts read in slices by every pool thread, 16 disk threads | **14.2** | 58 | 160 (3 x 3,712) |
 | Double-buffered disk stage, the biggest layout from the first chunk | | 68 (1 chunk) | 166 (2 x 5,568) |
+| A layout sized to the prompt, the stages' caches regrown concurrently | 11-14 | **110-116** (1 chunk) | **170** (2 x 5,568) |
 
 What was learned:
 
@@ -148,16 +149,32 @@ What was learned:
   regrow their caches concurrently after the prompt (the borrowed VRAM is refilled from the model file: the hottest
   experts are not in the arena by design).
 * A dense layer has no expert slots: the cache's regrow skipped that and threw after a long prompt (fixed).
+* **The arena is the GPU caches' second level now.** The arena was built without the GPU-resident experts, so an
+  expert a GPU dropped (an adaptive swap, or the shrink that lends VRAM to a long prompt's layout) lived in the
+  model file only, and every later miss on it cost a file read: decode drifted from 14 to 7 tok/s after a prompt.
+  `ExpertStore::put` writes a dropped expert into the arena's tail ring (its coldest tenth, cycled) from the model
+  file on a background thread, under a lock the CPU pool and the arena DMAs hold shared; the regrow after a prompt
+  takes the evicted experts back first. Adaptive swapping did not reduce this model's misses (the cache holds a
+  sixth of the experts; 16 swaps per update churned 6 per forward, each a file read): the config takes 4.
+* **What remains is the file tier itself.** With 90-100 GiB of arena, a fifth to a quarter of the experts stay in
+  the model file; as a generation's topic drifts, forwards that route to 30 of them cost 120-150 ms (the NVMe at
+  4-5 ms per sliced 14 MB read), so decode over a long answer averages 9-11 tok/s where the early tokens run at
+  14. More RAM (the arena) is the lever; so would be a ranking from a larger, more varied corpus of generations.
 
-Where it stands: decode is bound by the CPU pool's ~40 ms per token for the ~50-85 missed experts (plus the GPU
-stages' ~30 ms); the forward's floor without misses would be ~35 ms (28 tok/s). Prompts are bound by the model
-file and the arena streaming through the GPUs: ~18 s per chunk per stage, so long prompts read at ~170-300 tok/s
-and the arena size (`--ram-gib`: 100 GiB in the config, 90 in these runs) trims both.
+Where it stands: decode is bound by the CPU pool's 30-60 ms per token for the ~100-135 missed experts (the
+GPU stages' own work is ~30 ms); the forward's floor without misses would be ~35 ms (28 tok/s). Prompts are
+bound by the model file and the arena streaming through the GPUs: ~12-14 s per chunk per stage, so long prompts
+read at ~170-300 tok/s. The arena size (`--ram-gib`: 100 GiB in the config, 90 in these runs) trims both.
 
 ## Status and next steps
 
 * 2026-10-17: converts, loads on both V100s, decodes correctly (eager and graph mode), the prompt path validated;
-  decode 14 tok/s, prompts 68 tok/s (2.8K, one chunk) to ~170 tok/s (11K) with the ranking from the counts file.
+  decode 9-14 tok/s, prompts 110 tok/s (2.8K, one chunk) to ~170 tok/s (11K) with the ranking from the counts
+  file; served by `./run.sh glm` (config `configs/GLM-5.3-Flash-FP4-Local.json`: 100 GiB arena, 2 slots, 8 GiB
+  of parking, 4 adaptive swaps per update).
+* RAM: the experts outside the GPUs are 127.5 GiB. With 160 GB the whole model fits in RAM (tight: 8 GiB of parking,
+  little page cache); 192 GB is comfortable (more parking, a page cache); more buys no speed. When the machine has
+  it, drop `--ram-gib 100` from the config's `engine_args`: the auto mode takes every expert when they fit.
 * Next: the MTP drafter from layer 45 (expected to pay little while decode is miss-bound: a window of k tokens
   multiplies the misses), a CPU NVFP4 kernel that beats the AVX2 dot (0.27 ms per expert now), and for prompts a
   smaller borrow per chunk (the 8K layout takes 11 GiB) or an incremental regrow; the server end to end
