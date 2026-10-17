@@ -96,6 +96,7 @@ ExpertCache::~ExpertCache() {
     for (auto & p : pending_) cudaEventDestroy(p.done);
     if (copy_) cudaStreamDestroy(copy_);
     if (slot_of_dev_) cudaFree(slot_of_dev_);
+    if (host_of_dev_) cudaFree(host_of_dev_);
 }
 
 size_t ExpertCache::bytes() const {
@@ -461,11 +462,34 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
     return done;
 }
 
+void ExpertCache::set_host_experts(const ExpertStore & st, float share) {
+    host_share_ = share;
+    if (share <= 0.f) return;
+    std::vector<unsigned long long> h((size_t) n_layer_ * n_expert_, 0ull);
+    int n = 0;
+    for (int il = l0_; il < l1_; ++il)
+        for (int e = 0; e < n_expert_; ++e) {
+            h[(size_t) il * n_expert_ + e] = st.host_dev_ptr(il, e);
+            n += h[(size_t) il * n_expert_ + e] != 0;
+        }
+    if (!host_of_dev_) CUDA_CHECK(cudaMalloc(&host_of_dev_, h.size() * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemcpy(host_of_dev_, h.data(), h.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
+    if (getenv("BNK_VMEM_LOG")) fprintf(stderr, "bnk: %d host experts readable by the GPU (share %.2f)\n", n, share);
+}
+
 MoeLayerDesc ExpertCache::desc(int il) const {
     const LayerWeights & L = m_->layers[il];
     const Config & c = m_->cfg;
     const RLayout gl = r_layout(L.gate_type, c.n_embd), dl = r_layout(L.down_type, c.n_ff_exp);
     MoeLayerDesc d;
+    if (host_of_dev_ && host_share_ > 0.f) {
+        d.host_of = host_of_dev_ + (size_t) il * n_expert_;
+        d.host_share = host_share_;
+        d.h_gate_bytes = L.gate_bytes;
+        d.h_up_bytes = L.up_bytes;
+        d.h_grow = ggml_row_size((ggml_type) L.gate_type, c.n_embd);
+        d.h_drow = ggml_row_size((ggml_type) L.down_type, c.n_ff_exp);
+    }
     d.slot_of = slot_of_dev_ + (size_t) il * n_expert_;
     d.base = layer_base_[il];
     d.blob = slot_bytes(*m_, il);

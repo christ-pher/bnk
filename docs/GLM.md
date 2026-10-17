@@ -101,6 +101,16 @@ experts loaded on demand) on "The capital of France is": layer 0 (KDA, dense MLP
 error in every intermediate, layer 3 (MLA, MoE) to 3e-4 for the attention and 6e-3 for the MoE output (the int8
 activation path, as for Qwen); greedy decoding gives " Paris. France is" and the reference's top token is " Paris".
 
+## Validation of the prompt path (2026-10-17, later)
+
+`tools/glm_cmp.py` compares the reference's dumps with bnk's prompt-path dumps row by row. A 2,000-token prompt
+(one chunk, dense attention, two attention pieces) agrees at layer 3 to 2-3e-4 (attention) and 8e-4 (MoE: a few
+rows route differently at near-ties); a 2,500-token prompt (the DSA selection active for rows past 2,051, the
+reference implementing the k-pool indexer) agrees the same way, the worst sparse row at 7e-3. Two bugs found on
+the way: the dense MLP's 1,024-row pieces reused the GEMM's fp16 conversion buffer that held the next piece's
+input (rows past 1,024 were garbage), and the indexer scores (signed: the head weights have either sign) were
+compared as unsigned by the radix top-k.
+
 ## Status and next steps
 
 * 2026-10-17: converts, loads on both V100s, decodes correctly (eager and graph mode). Speed is not yet

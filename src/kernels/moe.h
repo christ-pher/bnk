@@ -22,6 +22,7 @@ struct alignas(64) MoeMsg {
     uint32_t pad1[15];
     int32_t n_miss;
     int32_t T;
+    int32_t n_host;           // misses the GPU computes from host memory (telemetry)
     int32_t miss_t[kMaxRouted];
     int32_t miss_e[kMaxRouted];
     float miss_w[kMaxRouted];
@@ -35,11 +36,13 @@ struct HitEntry {
     int32_t expert, slot;
     uint32_t mask;            // tokens of the window routed to this expert
     float w[kMaxWindow];      // their routing weights
+    unsigned long long blob;  // a host entry: the expert's ggml blob in page-locked host memory (read over PCIe)
 };
 struct HitList {
-    int32_t n;
+    int32_t n;                // resident entries e[0 .. n)
     int32_t n_miss;           // copy of the mailbox's, so device kernels need not read host memory
-    int32_t pad[2];
+    int32_t n_host;           // host entries e[n .. n + n_host): non-resident experts the GPU reads from host RAM
+    int32_t pad;
     HitEntry e[kMaxRouted];
     int32_t pair_ent[kMaxRouted];   // routed pair (t * k + slot) -> its hit entry, -1 for a miss (moe_reduce adds a
                                     // token's experts in its own routing order, whatever else the window holds)
@@ -64,6 +67,13 @@ struct MoeLayerDesc {
     int rlay = 0;             // slots hold R-layout rows (rfmt.h) rather than ggml blocks
     ExpScales scales;         // NVFP4 experts' per-matrix global scales (null when the format has none)
     uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};  // R field offsets of gate/up and down rows
+    // Non-resident experts in page-locked host RAM (the store's arena, mapped for the GPU): host_of[e] is the
+    // device pointer of expert e's ggml blob (0: not there). The plan sends up to host_share of a window's
+    // distinct misses that have one to the GPU (read over PCIe by the ggml-layout hit kernels; geometry below),
+    // the rest to the CPU pool.
+    const unsigned long long * host_of = nullptr;
+    float host_share = 0.f;
+    size_t h_gate_bytes = 0, h_up_bytes = 0, h_grow = 0, h_drow = 0;
 };
 
 // Repacks n ggml expert blobs (src, stride src_stride) into R-layout slots (dst pointers device array).

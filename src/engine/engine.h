@@ -49,6 +49,9 @@ struct EngineOptions {
     // host RAM for the routed experts (page-locked arena): < 0 auto (every expert when they fit, else as much as
     // the machine allows), 0 every expert; the rest stay in the model file's mapping (glm5next: 160 GiB of experts)
     double ram_gib = -1;
+    // of a decode window's missed experts that are in the arena, the share the GPU reads over PCIe (the hit
+    // kernels on the mapped arena) rather than the CPU pool computing them; < 0 auto (0: the CPU pool computes an arena expert in 0.3 ms, a PCIe read takes 1 ms)
+    double host_share = -1;
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
@@ -92,6 +95,7 @@ struct EngineOptions {
 struct StageTimes {
     double total_ms = 0, cpu_experts_ms = 0, ple_ms = 0, wait_ms = 0;
     int64_t misses = 0, routed = 0;
+    int64_t host_experts = 0;   // non-resident experts the GPU read from host RAM
     int calls = 0;
 };
 
@@ -269,6 +273,10 @@ private:
     };
     std::unique_ptr<Worker> worker_;
     std::unique_ptr<Worker> svc_;   // forward_pipe: answers the second stage's CPU experts meanwhile
+    // the prompt path's expert staging of the next layer (file reads, DMAs) on its own thread, overlapping this
+    // layer's kernels; pf_moe waits for it before reading the stage (BNK_STAGE_SYNC=1: on the calling thread)
+    std::unique_ptr<Worker> stage_worker_;
+    void pf_stage_wait();
     std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
     cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part

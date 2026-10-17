@@ -123,6 +123,7 @@ int main(int argc, char ** argv) {
         }
         else if (a == "--vram-reserve-gib") opt.vram_reserve_gib = std::stod(next());
         else if (a == "--ram-gib") opt.ram_gib = std::stod(next());
+        else if (a == "--host-share") opt.host_share = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--gemm-min-tokens") opt.gemm_min_tokens = std::stoi(next());
@@ -595,8 +596,8 @@ int main(int argc, char ** argv) {
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
     print_stages(eng);
-    printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
+    printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps; %.2f experts per forward read by the GPUs from host RAM\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
-           (long long) eng.cache_swaps());
+           (long long) eng.cache_swaps(), (double) tm.host_experts / std::max(1, tm.calls));
     return 0;
 }

@@ -195,7 +195,20 @@ void Engine::pf_stage_layer(int il) {
     std::vector<int> list;
     for (int e = 0; e < c.n_expert; ++e)
         if (cache_.slot_of(il, e) < 0) list.push_back(e);
-    pf_stage_list(il, list);
+    static const bool sync = env_int("BNK_STAGE_SYNC", 0) != 0;
+    if (sync) {
+        pf_stage_list(il, list);
+        return;
+    }
+    if (!stage_worker_) stage_worker_ = std::make_unique<Worker>();
+    stage_worker_->post([this, il, list]() {
+        DeviceScope ds(dev_);
+        pf_stage_list(il, list);
+    });
+}
+
+void Engine::pf_stage_wait() {
+    if (stage_worker_) stage_worker_->wait();
 }
 
 void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
@@ -486,7 +499,10 @@ void Engine::pf_moe(int il, int N) {
         d_bl[1] = d_bl[0] + max_blocks;
         for (int kind = 0; kind < 2; ++kind) {
             if (!n_bl[kind]) continue;
-            if (kind == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
+            if (kind == 1) {
+                if (p.prefetch) pf_stage_wait();
+                CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
+            }
             moe_tc_gu(d_it[kind], d_bl[kind], n_bl[kind], kind ? ds : d, p.xg, E, p.perm, p.hh, E, F, st_);
         }
         for (int kind = 0; kind < 2; ++kind)
@@ -529,7 +545,10 @@ void Engine::pf_moe(int il, int N) {
         group.clear();
     };
     for (int pass = 0; pass < 2; ++pass) {   // 0: resident, 1: staged (after their copy)
-        if (pass == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
+        if (pass == 1) {
+            if (p.prefetch) pf_stage_wait();
+            CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
+        }
         for (int e = 0; e < c.n_expert; ++e) {
             if (!cnt[e] || on_cpu[e] || cnt[e] < opt_.gemm_min_tokens) continue;
             if ((cache_.slot_of(il, e) >= 0) != (pass == 0)) continue;
@@ -620,11 +639,16 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
         CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_[buf], (size_t) N * HC * 4, cudaMemcpyHostToDevice, st_));
     }
     p.prefetch = pf_full_ && N >= opt_.prefetch_min;   // a whole layer ahead needs the full stage
+    // the next layer's staging is posted after this layer's kernels are enqueued: its file reads and DMAs run
+    // while the GPU works through them
     if (p.prefetch) pf_stage_layer(l0_);
     for (int il = l0_; il < l1_; ++il) {
         const LayerWeights & L = model_.layers[il];
-        if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
-        if (c.is_glm()) { glm_pf_layer(il, N); continue; }
+        if (c.is_glm()) {
+            glm_pf_layer(il, N);
+            if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
+            continue;
+        }
         if (il == c.ple_layer) pf_ple(il, N);
         pf_hc_pre(L.hc_attn, N, true);
         if (L.attn) pf_attn(il, N); else pf_gdn(il, N);
@@ -632,6 +656,7 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
         pf_hc_pre(L.hc_ffn, N, true);
         pf_moe(il, N);
         hc_combine(p.res, p.moe, p.inj, N, c.hc, E, st_);
+        if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
     }
     if (last_) {   // the head on the last token, through the decode buffers (row 0)
         CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, st_));

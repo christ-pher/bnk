@@ -29,11 +29,12 @@ void bump_seq(uint32_t * seq, cudaStream_t st) { bump_seq_k<<<1, 1, 0, st>>>(seq
 __device__ __forceinline__ void moe_plan_body(const int32_t * ids, const float * w, int T, int k,
                                                          const int32_t * slot_of, HitList * hits, MoeMsg * msg,
                                                          const float * x, int E, const uint32_t * seq,
-                                                         uint32_t * counts) {
+                                                         uint32_t * counts, const unsigned long long * host_of,
+                                                         float host_share) {
     __shared__ int s_e[kMaxRouted], s_sl[kMaxRouted];
-    __shared__ int s_first[kMaxRouted], s_miss[kMaxRouted];
+    __shared__ int s_first[kMaxRouted], s_miss[kMaxRouted], s_kind[kMaxRouted], s_cpu[kMaxRouted];
     __shared__ unsigned s_mask[kMaxRouted];
-    __shared__ int s_nh, s_nm;
+    __shared__ int s_nh, s_nm, s_nhost;
     const int n = T * k, j = threadIdx.x;
     const bool in = j < kMaxRouted;   // threads past kMaxRouted (a bigger block) only join the barriers
     const bool valid = j < n;
@@ -41,66 +42,95 @@ __device__ __forceinline__ void moe_plan_body(const int32_t * ids, const float *
     const int t = valid ? j / k : 0;
     const float wt = valid ? w[j] : 0.f;
     const int sl = valid ? slot_of[e] : -1;
+    const unsigned long long hb = (valid && sl < 0 && host_of && host_share > 0.f) ? host_of[e] : 0ull;
     if (valid && counts) atomicAdd(&counts[e], 1u);
     if (in) {
         s_e[j] = e;
         s_sl[j] = sl;
         s_mask[j] = 0;
+        s_kind[j] = !valid ? -1 : sl >= 0 ? 0 : hb ? 1 : 2;   // 0 resident, 1 host-eligible, 2 the CPU's
     }
     __syncthreads();
-    // is this pair its expert's first hit?
-    bool first = valid && sl >= 0;
+    // the first pair of each expert (entries are deduplicated by expert)
+    bool first = valid;
     for (int q = 0; first && q < j; ++q) first = s_e[q] != e;
-    if (in) {
-        s_first[j] = first;
-        s_miss[j] = valid && sl < 0;
+    // host-eligible experts: the first host_share of them (distinct, in pair order) go to the GPU
+    if (in && s_kind[j] == 1) {
+        int total = 0, q0 = 0;
+        while (s_e[q0] != e || s_kind[q0] != 1) ++q0;   // this expert's first pair
+        int rank = 0;
+        for (int q = 0; q < n; ++q) {
+            if (s_kind[q] != 1) continue;
+            bool f = true;
+            for (int r = 0; f && r < q; ++r) f = s_e[r] != s_e[q];
+            if (!f) continue;
+            total += 1;
+            if (q < q0) rank += 1;
+        }
+        const int take = (int) (host_share * total + 0.5f);
+        if (rank >= take) s_kind[j] = 2;   // beyond the share: the CPU's
     }
     __syncthreads();
-    // exclusive prefix sums (n <= 128: one warp walks it)
+    if (in) {
+        const int kd = s_kind[j];
+        s_first[j] = first && kd == 0;
+        s_miss[j] = first && kd == 1;
+        s_cpu[j] = valid && kd == 2;
+    }
+    __syncthreads();
+    // exclusive prefix sums (n <= 128: one warp walks it): resident entries, host entries, CPU misses
     if (j < 32) {
-        int fh = 0, fm = 0;
+        int fh = 0, fm = 0, fc = 0;
         for (int b = 0; b < kMaxRouted; b += 32) {
             const int q = b + j;
-            const int vf = s_first[q], vm = s_miss[q];
+            const int vf = s_first[q], vm = s_miss[q], vc = s_cpu[q];
             const unsigned bf = __ballot_sync(0xffffffff, vf), bm = __ballot_sync(0xffffffff, vm);
+            const unsigned bc = __ballot_sync(0xffffffff, vc);
             const unsigned lt = (1u << j) - 1;
             s_first[q] = fh + __popc(bf & lt);   // the entry a first pair creates
             s_miss[q] = fm + __popc(bm & lt);
+            s_cpu[q] = fc + __popc(bc & lt);
             fh += __popc(bf);
             fm += __popc(bm);
+            fc += __popc(bc);
         }
         if (j == 0) {
             s_nh = fh;
-            s_nm = fm;
+            s_nhost = fm;
+            s_nm = fc;
         }
     }
     __syncthreads();
-    // every hit pair finds its expert's entry (the first pair's), and sets its token's bit and weight
-    if (valid && sl >= 0) {
+    // every resident or host pair finds its expert's entry (the first pair's), and sets its token's bit and weight
+    if (valid && s_kind[j] <= 1) {
+        const int kd = s_kind[j];
         int q = 0;
-        while (s_e[q] != e || s_sl[q] < 0) ++q;   // the first pair of this expert
-        const int ent = s_first[q];
+        while (s_e[q] != e || s_kind[q] != kd) ++q;   // the first pair of this expert
+        const int ent = kd == 0 ? s_first[q] : s_nh + s_miss[q];
         hits->pair_ent[j] = ent;
         atomicOr(&s_mask[ent], 1u << t);
         hits->e[ent].w[t] = wt;
         if (q == j) {
             hits->e[ent].expert = e;
             hits->e[ent].slot = sl;
+            hits->e[ent].blob = kd == 1 ? hb : 0ull;
         }
     }
-    if (valid && sl < 0) {
+    if (valid && s_kind[j] == 2) {
         hits->pair_ent[j] = -1;
-        const int pos = s_miss[j];
+        const int pos = s_cpu[j];
         msg->miss_t[pos] = t;
         msg->miss_e[pos] = e;
         msg->miss_w[pos] = wt;
     }
     __syncthreads();
-    if (j < s_nh) hits->e[j].mask = s_mask[j];
+    if (j < s_nh + s_nhost) hits->e[j].mask = s_mask[j];
     if (j == 0) {
         hits->n = s_nh;
+        hits->n_host = s_nhost;
         hits->n_miss = s_nm;
         msg->n_miss = s_nm;
+        msg->n_host = s_nhost;
         msg->T = T;
     }
     if (s_nm > 0) {
@@ -119,8 +149,9 @@ __device__ __forceinline__ void moe_plan_body(const int32_t * ids, const float *
 __global__ void __launch_bounds__(kMaxRouted) moe_plan_k(const int32_t * ids, const float * w, int T, int k,
                                                          const int32_t * slot_of, HitList * hits, MoeMsg * msg,
                                                          const float * x, int E, const uint32_t * seq,
-                                                         uint32_t * counts) {
-    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
+                                                         uint32_t * counts, const unsigned long long * host_of,
+                                                         float host_share) {
+    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts, host_of, host_share);
 }
 
 // route_topk and moe_plan in one launch: warp t picks token t's experts (as route_topk_k), then the block plans
@@ -128,11 +159,12 @@ template <int PER>
 __global__ void __launch_bounds__(256) moe_route_plan_k(const float * logits, int n_exp, float w_scale, int32_t * ids,
                                                         float * w, int T, int k, const int32_t * slot_of,
                                                         HitList * hits, MoeMsg * msg, const float * x, int E,
-                                                        const uint32_t * seq, uint32_t * counts) {
+                                                        const uint32_t * seq, uint32_t * counts,
+                                                        const unsigned long long * host_of, float host_share) {
     const int t = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (t < T) route_topk_warp<PER>(logits, n_exp, k, ids, w, w_scale, t, lane);
     __syncthreads();   // the ids / weights (global, this block's writes) for the plan
-    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
+    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts, host_of, host_share);
 }
 
 void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * ids, float * w, int T, int k,
@@ -144,33 +176,34 @@ void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * id
     }
     if (n_exp <= 512)
         moe_route_plan_k<16><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
-                                               counts_layer);
+                                               counts_layer, d.host_of, d.host_share);
     else
         moe_route_plan_k<32><<<1, 256, 0, st>>>(logits, n_exp, w_scale, ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq,
-                                               counts_layer);
+                                               counts_layer, d.host_of, d.host_share);
 }
 
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
               const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st) {
     if (T * k > kMaxRouted) { fprintf(stderr, "moe_plan: %d pairs exceed %d\n", T * k, kMaxRouted); abort(); }
-    moe_plan_k<<<1, kMaxRouted, 0, st>>>(ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq, counts_layer);
+    moe_plan_k<<<1, kMaxRouted, 0, st>>>(ids, w, T, k, d.slot_of, s.hits, msg, x, E, seq, counts_layer, d.host_of, d.host_share);
 }
 
 // ------------------------------------------------------------------------------------------- hits
 // grid (kMaxRouted, ceil(2F/8)); warp per gate/up row of one hit expert.
-template <int FMT, int NT>
+template <int FMT, int NT, bool HOST = false>
 __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                 size_t blob, size_t gate_bytes, size_t grow, int F, int E,
                                                 const int8_t * __restrict__ aq, const float * __restrict__ ad,
                                                 int64_t cols_pad, float * __restrict__ gu) {
-    const int ent = blockIdx.x;
-    if (ent >= hits->n) return;
+    const int ent = HOST ? hits->n + blockIdx.x : blockIdx.x;
+    if (HOST ? (int) blockIdx.x >= hits->n_host : ent >= hits->n) return;
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
     if (r >= 2 * F) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
+    const uint8_t * eb = HOST ? (const uint8_t *) h.blob : base + (size_t) h.slot * blob;
+    const uint8_t * row = eb + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
     const int nsb = E / 32;
     const int64_t nb = cols_pad / 32;
     float acc[NT];
@@ -200,7 +233,7 @@ __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hit
 __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __restrict__ gu, int F,
                           int8_t * __restrict__ hq, float * __restrict__ hd, ExpScales es) {
     const int ent = blockIdx.x, t = blockIdx.y;
-    if (ent >= hits->n || !(hits->e[ent].mask & (1u << t))) return;
+    if (ent >= hits->n + hits->n_host || !(hits->e[ent].mask & (1u << t))) return;
     const size_t base = (size_t) ent * kMaxWindow + t;
     const float * g = gu + base * 2 * F;
     const int ex = hits->e[ent].expert;
@@ -217,19 +250,19 @@ __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __res
 }
 
 // grid (kMaxRouted, ceil(E/8)); warp per down row
-template <int FMT, int NT>
+template <int FMT, int NT, bool HOST = false>
 __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                   size_t blob, size_t down_off, size_t drow, int F, int E,
                                                   const int8_t * __restrict__ hq, const float * __restrict__ hd,
                                                   float * __restrict__ part) {
-    const int ent = blockIdx.x;
-    if (ent >= hits->n) return;
+    const int ent = HOST ? hits->n + blockIdx.x : blockIdx.x;
+    if (HOST ? (int) blockIdx.x >= hits->n_host : ent >= hits->n) return;
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
     if (r >= E) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
+    const uint8_t * row = (HOST ? (const uint8_t *) h.blob : base + (size_t) h.slot * blob) + down_off + (size_t) r * drow;
     const int nsb = F / 32;
     float acc[NT];
 #pragma unroll
@@ -374,9 +407,29 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
 
 static int lpr_for(int nsb) { return nsb >= 128 ? 32 : nsb >= 48 ? 16 : nsb >= 24 ? 8 : 4; }
 
+// the host entries: the ggml-layout kernels over each entry's blob in page-locked host RAM (PCIe reads)
+template <int NT>
+static void hits_launch_host(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
+                             cudaStream_t st, bool gu_part) {
+    const int maxent = T * k;
+    if (gu_part) {
+        auto gu = [&]<int FMT>() {
+            moe_gu_k<FMT, NT, true><<<dim3(maxent, (2 * F + 7) / 8), 256, 0, st>>>(s.hits, nullptr, 0, d.h_gate_bytes, d.h_grow,
+                                                                                   F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+        };
+        BNK_DISPATCH_DP4A(d.gate_type, gu);
+    } else {
+        auto dn = [&]<int FMT>() {
+            moe_down_k<FMT, NT, true><<<dim3(maxent, (E + 7) / 8), 256, 0, st>>>(s.hits, nullptr, 0, d.h_gate_bytes + d.h_up_bytes,
+                                                                                 d.h_drow, F, E, s.hq, s.hd, s.part);
+        };
+        BNK_DISPATCH_DP4A(d.down_type, dn);
+    }
+}
+
 template <int NT>
 static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
-                          cudaStream_t st) {
+                          cudaStream_t st, bool host) {
     const int maxent = T * k;
     const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
     auto gu = [&]<int FMT>() {
@@ -399,6 +452,7 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
         }
     };
     BNK_DISPATCH_R(d.gate_type, gu);
+    if (host) hits_launch_host<NT>(d, s, xq, T, k, E, F, st, true);
     moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.scales);
     auto dn = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
@@ -414,6 +468,7 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
         }
     };
     BNK_DISPATCH_R(d.down_type, dn);
+    if (host) hits_launch_host<NT>(d, s, xq, T, k, E, F, st, false);
 }
 
 // ---- cache fill: ggml blob -> R slot, one thread per row
@@ -466,10 +521,11 @@ static void hits_launch(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq
 
 void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st) {
     if (d.rlay) {
-        if (T == 1) hits_launch_r<1>(d, s, xq, T, k, E, F, st);
-        else if (T == 2) hits_launch_r<2>(d, s, xq, T, k, E, F, st);
-        else if (T <= 4) hits_launch_r<4>(d, s, xq, T, k, E, F, st);
-        else hits_launch_r<8>(d, s, xq, T, k, E, F, st);
+        const bool host = d.host_of && d.host_share > 0.f;
+        if (T == 1) hits_launch_r<1>(d, s, xq, T, k, E, F, st, host);
+        else if (T == 2) hits_launch_r<2>(d, s, xq, T, k, E, F, st, host);
+        else if (T <= 4) hits_launch_r<4>(d, s, xq, T, k, E, F, st, host);
+        else hits_launch_r<8>(d, s, xq, T, k, E, F, st, host);
         check_launch("moe_hits_r");
         return;
     }

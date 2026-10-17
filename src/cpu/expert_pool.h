@@ -33,14 +33,20 @@ public:
     // reads an expert's blob (gate | up | down) from the model file into dst (one outside the arena: a page fault
     // per 4 KiB otherwise)
     void read_blob(int il, int e, uint8_t * dst) const;
+    void read_blob_part(int il, int e, uint8_t * dst, int part, int nparts) const;
     // the expert's blob (gate | up | down, blob_bytes(il)) to device memory on `s`
     void copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s);
     // the blobs of `experts` of layer il to dst + i * stride on `s`: arena experts by DMA; the others read from the
     // model file by a few threads into a pinned stage, wave by wave, and DMA'd from there (the host waits for each
     // wave's copies before the stage is reused)
     void copy_batch_to_device(int il, const std::vector<int> & experts, uint8_t * dst, size_t stride, cudaStream_t s);
-    int disk_threads = 8;
+    int disk_threads = 16;   // the NVMe gives 2 GB/s to one reader, 5.3 GB/s to sixteen
     bool in_arena(int il, int e) const { return arena_slot_[(size_t) il * n_expert_ + e] >= 0; }
+    // the expert's blob as the GPUs see it (the arena is mapped for them), 0 when it is not in the arena
+    unsigned long long host_dev_ptr(int il, int e) const {
+        const int32_t sl = arena_slot_[(size_t) il * n_expert_ + e];
+        return sl < 0 || !mapped_ ? 0ull : (unsigned long long) (dev_base_ + slot_off_[sl]);
+    }
     size_t blob_bytes(int il) const { return blob_[il]; }
     size_t max_blob_bytes() const { return max_blob_; }
     size_t total_bytes() const { return total_; }     // the arena
@@ -54,7 +60,8 @@ private:
     uint8_t * base_ = nullptr;
     size_t total_ = 0, model_ = 0, max_blob_ = 0;
     int n_expert_ = 0, n_arena_ = 0;
-    bool pinned_ = false;
+    bool pinned_ = false, mapped_ = false;
+    uint8_t * dev_base_ = nullptr;      // the arena's device address (UVA: the host one)
     std::vector<size_t> blob_;
     std::vector<int32_t> arena_slot_;   // [n_layer * n_expert] -> arena slot, -1 = the file mapping
     std::vector<size_t> slot_off_;      // arena byte offset of each slot
@@ -99,6 +106,7 @@ public:
     int threads() const { return pool_ ? pool_->size() : 0; }
     double last_ms = 0;
     int64_t disk_reads_ = 0;   // experts read from the model file (outside the arena)
+    int64_t disk_reads() const { return disk_reads_; }
 
 private:
     const Model * m_ = nullptr;

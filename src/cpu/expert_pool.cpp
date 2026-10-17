@@ -36,11 +36,26 @@ static void pread_all(int fd, uint8_t * dst, size_t n, uint64_t off) {
     }
 }
 
-void ExpertStore::read_blob(int il, int e, uint8_t * dst) const {
+void ExpertStore::read_blob(int il, int e, uint8_t * dst) const { read_blob_part(il, e, dst, 0, 1); }
+
+// slice `part` of `nparts` of the blob (gate | up | down: three ranges of the file), so a 14 MB expert is read
+// by every thread of a pool at once rather than one thread each
+void ExpertStore::read_blob_part(int il, int e, uint8_t * dst, int part, int nparts) const {
     const LayerWeights & L = m_->layers[il];
-    pread_all(L.exp_fd, dst, L.gate_bytes, L.gate_off + (uint64_t) e * L.gate_bytes);
-    pread_all(L.exp_fd, dst + L.gate_bytes, L.up_bytes, L.up_off + (uint64_t) e * L.up_bytes);
-    pread_all(L.exp_fd, dst + L.gate_bytes + L.up_bytes, L.down_bytes, L.down_off + (uint64_t) e * L.down_bytes);
+    const size_t total = L.gate_bytes + L.up_bytes + L.down_bytes;
+    const size_t chunk = (total + nparts - 1) / nparts / 4096 * 4096 + 4096;
+    const size_t a = std::min(total, chunk * part), b = std::min(total, a + chunk);
+    if (a >= b) return;
+    const size_t seg_len[3] = {L.gate_bytes, L.up_bytes, L.down_bytes};
+    const uint64_t seg_off[3] = {L.gate_off + (uint64_t) e * L.gate_bytes, L.up_off + (uint64_t) e * L.up_bytes,
+                                 L.down_off + (uint64_t) e * L.down_bytes};
+    size_t s0 = 0;
+    for (int i = 0; i < 3; ++i) {
+        const size_t s1 = s0 + seg_len[i];
+        const size_t lo = std::max(a, s0), hi = std::min(b, s1);
+        if (lo < hi) pread_all(L.exp_fd, dst + lo, hi - lo, seg_off[i] + (lo - s0));
+        s0 = s1;
+    }
 }
 
 void ExpertStore::dstage_ensure() {
@@ -67,8 +82,8 @@ void ExpertStore::copy_batch_to_device(int il, const std::vector<int> & experts,
         const int nth = std::min(disk_threads, n);
         std::vector<std::thread> th;
         for (int t = 0; t < nth; ++t)
-            th.emplace_back([&, t]() {
-                for (int j = t; j < n; j += nth) read_blob(il, experts[disk[w0 + j]], dstage_ + (size_t) j * max_blob_);
+            th.emplace_back([&, t]() {   // every thread reads its slice of every expert of the wave
+                for (int j = 0; j < n; ++j) read_blob_part(il, experts[disk[w0 + j]], dstage_ + (size_t) j * max_blob_, t, nth);
             });
         for (auto & x : th) x.join();
         for (int j = 0; j < n; ++j)
@@ -156,8 +171,14 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, 
     for (int i = 0; i < threads; ++i) th.emplace_back(worker);
     for (auto & t : th) t.join();
     const double t1 = now_ms();
-    pinned_ = total_ > 0 && cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
+    pinned_ = total_ > 0 && cudaHostRegister(base_, total_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
+    if (pinned_) {   // mapped for the GPUs: the hit kernels read non-resident experts straight from it
+        void * dp = nullptr;
+        mapped_ = cudaHostGetDevicePointer(&dp, base_, 0) == cudaSuccess;
+        if (!mapped_) cudaGetLastError();
+        dev_base_ = (uint8_t *) dp;
+    }
     if (verbose) {
         fprintf(stderr, "bnk: experts: %.2f GiB in RAM (copied in %.1f s, %.2f GiB/s), %s\n", total_ / 1073741824.0,
                 (t1 - t0) / 1000, total_ / 1073741824.0 / ((t1 - t0) / 1000),
@@ -294,12 +315,13 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
         if (!disk.empty()) {
             const size_t bb = st_->blob_bytes(il);
             if (dscratch_.size() < disk.size() * bb) dscratch_.resize(disk.size() * bb);
-            pool_->run([&](int part, int nparts) {
-                for (size_t j = part; j < disk.size(); j += nparts) {
-                    uint8_t * d = dscratch_.data() + j * bb;
-                    st_->read_blob(il, tasks[groups_[disk[j]][0]].expert, d);
-                    gparts_[disk[j]] = ExpertStore::Parts{d, d + L.gate_bytes, d + L.gate_bytes + L.up_bytes, false};
-                }
+            for (size_t j = 0; j < disk.size(); ++j) {
+                uint8_t * d = dscratch_.data() + j * bb;
+                gparts_[disk[j]] = ExpertStore::Parts{d, d + L.gate_bytes, d + L.gate_bytes + L.up_bytes, false};
+            }
+            pool_->run([&](int part, int nparts) {   // every thread reads its slice of every expert
+                for (size_t j = 0; j < disk.size(); ++j)
+                    st_->read_blob_part(il, tasks[groups_[disk[j]][0]].expert, dscratch_.data() + j * bb, part, nparts);
             });
             disk_reads_ += (int64_t) disk.size();
         }

@@ -48,6 +48,9 @@ public:
     // VRAM bytes of one expert of layer il (R-layout rows)
     static size_t slot_bytes(const Model & m, int il);
     MoeLayerDesc desc(int il) const;
+    // after the host arena is built: the device table of the arena blobs the GPU may read for non-resident experts
+    // (MoeLayerDesc::host_of), and the share of a window's eligible misses it takes (0: none)
+    void set_host_experts(const ExpertStore & st, float share);
     int resident() const { return resident_; }
     size_t bytes() const;
     int slots(int il) const { return (int) slot_expert_[il].size(); }
@@ -75,6 +78,8 @@ private:
     std::vector<std::vector<int>> slot_expert_;
     std::vector<int32_t> slot_of_host_;
     int32_t * slot_of_dev_ = nullptr;
+    unsigned long long * host_of_dev_ = nullptr;
+    float host_share_ = 0.f;
     // adaptive state
     cudaStream_t copy_ = nullptr;
     std::vector<uint32_t> last_counts_;

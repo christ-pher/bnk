@@ -312,6 +312,14 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             return false;
         };
         store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank, on_gpu);
+        float share = (float) opt.host_share;
+        if (share < 0.f) share = (float) env_double("BNK_HOST_SHARE", 0.0);   // measured: the CPU pool beats PCIe reads
+        for (Engine * st = this; st; st = st->next_.get()) {
+            DeviceScope ds(st->dev_);
+            st->cache_.set_host_experts(*store_, share);
+        }
+        if (opt.verbose && share > 0.f)
+            fprintf(stderr, "bnk: the GPUs read %.0f%% of a window's missed experts from the host arena over PCIe\n", 100.0 * share);
     }
 }
 
@@ -1296,12 +1304,14 @@ void Engine::service_cpu(uint32_t seq, int T) {
         head_->times.wait_ms += t1 - t0;
         const int n = m->n_miss;
         head_->times.misses += n;
+        head_->times.host_experts += m->n_host;
         head_->times.routed += (int64_t) T * c.n_expert_used;
         head_->layer_misses[il] += n;
         head_->layer_routed[il] += (int64_t) T * c.n_expert_used;
         if (n > 0) {
             tasks_.clear();
             for (int i = 0; i < n; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
+            const int64_t dr0 = cpu_->disk_reads();
             cpu_->run(il, T, m->x(), tasks_, m->out(E));
             __atomic_thread_fence(__ATOMIC_RELEASE);
             m->seq_done = seq;
@@ -1309,7 +1319,7 @@ void Engine::service_cpu(uint32_t seq, int T) {
             head_->times.cpu_experts_ms += t2 - t1;
             if (route_log_) cpu_us_[il] = (float) ((t2 - t1) * 1e3);
             static const bool prof = getenv("BNK_SVC_PROF") != nullptr;
-            if (prof) fprintf(stderr, "svc L%02d n=%d wait %.1f us  cpu %.1f us\n", il, n, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
+            if (prof) fprintf(stderr, "svc L%02d n=%d file=%d wait %.1f us  cpu %.1f us\n", il, n, (int) (cpu_->disk_reads() - dr0), (t1 - t0) * 1e3, (t2 - t1) * 1e3);
         }
     }
 }

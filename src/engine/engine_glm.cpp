@@ -189,6 +189,7 @@ void Engine::glm_moe(int il, int T) {
         for (int i = 0; i < m->n_miss; ++i) tasks_.push_back({m->miss_t[i], 0, m->miss_e[i], m->miss_w[i]});
         if (!tasks_.empty()) cpu_->run(il, T, m->x(), tasks_, m->out(E));
         head_->times.misses += m->n_miss;
+        head_->times.host_experts += m->n_host;
         head_->times.routed += (int64_t) T * k;
         head_->layer_misses[il] += m->n_miss;
         head_->layer_routed[il] += (int64_t) T * k;
