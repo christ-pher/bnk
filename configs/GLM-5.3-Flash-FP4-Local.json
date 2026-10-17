@@ -1,0 +1,13 @@
+{
+  "notes": "nvidia/GLM-5.3-Flash-FP4-Local (ModelOpt NVFP4 experts, MXFP8 / FP8 dense, quantization-aware distilled from zai-org/GLM-5.3-Flash: 320B total, 18B active, hybrid KDA / MLA+DSA attention, mHC) converted by tools/convert_glm_fp4.py: every weight the checkpoint's own (NVFP4 experts with their global scales), the FP8 projections as Q8_0. Sampling as the model's generation_config. No speculation yet (the MTP layer is not built; mtp empty keeps run.sh from loading Qwen's drafter). 159.5 GiB of experts: the GPUs cache the hottest, the RAM arena the next 100 GiB (engine_args --ram-gib), the rest come from the model file. docs/GLM.md.",
+  "aliases": ["glm", "glm-flash", "glm53"],
+  "source": {
+    "path": "/root/.cache/bnk/gguf/GLM-5.3-Flash-FP4-Local.gguf"
+  },
+  "mtp": "",
+  "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0 },
+  "speculation": { "draft": 0, "draft_min_p": 0.8 },
+  "thinking_loop_guard": true,
+  "engine_args": ["--ram-gib", "100"],
+  "server_args": ["--model-id", "GLM-5.3-Flash", "--max-tokens", "32768", "--slots", "2", "--park-gib", "8"]
+}

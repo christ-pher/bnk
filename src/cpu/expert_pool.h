@@ -22,12 +22,24 @@ using Ranking = std::vector<std::pair<int, int>>;  // (layer, expert), hottest f
 class ExpertStore {
 public:
     ~ExpertStore();
-    // cap: bytes of arena (0: every expert); rank: which experts take it, hottest first (empty: in order)
-    void build(const Model & m, int threads, bool verbose = true, size_t cap = 0, const Ranking & rank = {});
+    // cap: bytes of arena (0: every expert); rank: which experts take it, hottest first (empty: in order);
+    // skip(il, e): experts that do not need the arena (resident in a GPU cache already). Until build() runs,
+    // every expert is served from the model file's mapping (prepare() alone), so the GPU caches can fill first.
+    void prepare(const Model & m);
+    void build(const Model & m, int threads, bool verbose = true, size_t cap = 0, const Ranking & rank = {},
+               const std::function<bool(int, int)> & skip = {});
     struct Parts { const uint8_t * gate, * up, * down; bool pinned; };
     Parts parts(int il, int e) const;
+    // reads an expert's blob (gate | up | down) from the model file into dst (one outside the arena: a page fault
+    // per 4 KiB otherwise)
+    void read_blob(int il, int e, uint8_t * dst) const;
     // the expert's blob (gate | up | down, blob_bytes(il)) to device memory on `s`
-    void copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s) const;
+    void copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s);
+    // the blobs of `experts` of layer il to dst + i * stride on `s`: arena experts by DMA; the others read from the
+    // model file by a few threads into a pinned stage, wave by wave, and DMA'd from there (the host waits for each
+    // wave's copies before the stage is reused)
+    void copy_batch_to_device(int il, const std::vector<int> & experts, uint8_t * dst, size_t stride, cudaStream_t s);
+    int disk_threads = 8;
     bool in_arena(int il, int e) const { return arena_slot_[(size_t) il * n_expert_ + e] >= 0; }
     size_t blob_bytes(int il) const { return blob_[il]; }
     size_t max_blob_bytes() const { return max_blob_; }
@@ -46,6 +58,10 @@ private:
     std::vector<size_t> blob_;
     std::vector<int32_t> arena_slot_;   // [n_layer * n_expert] -> arena slot, -1 = the file mapping
     std::vector<size_t> slot_off_;      // arena byte offset of each slot
+    uint8_t * dstage_ = nullptr;        // pinned stage for the file-read blobs on their way to a GPU
+    int dstage_slots_ = 0;
+    std::mutex dstage_mu_;
+    void dstage_ensure();
 };
 
 // A fixed set of spinning workers. run() calls fn(part, nparts) once on every thread (the caller is
@@ -82,6 +98,7 @@ public:
     void run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
     int threads() const { return pool_ ? pool_->size() : 0; }
     double last_ms = 0;
+    int64_t disk_reads_ = 0;   // experts read from the model file (outside the arena)
 
 private:
     const Model * m_ = nullptr;
@@ -93,6 +110,8 @@ private:
     std::vector<uint8_t> hq_;      // per task: h quantized for the down product
     std::unique_ptr<std::atomic<int>[]> rows_done_;
     std::vector<std::vector<int>> groups_;   // tasks of the same expert
+    std::vector<ExpertStore::Parts> gparts_; // each group's matrices (the arena, or the scratch below)
+    std::vector<uint8_t> dscratch_;          // file-read blobs for this call
     int chunks_per_thread_ = 1;
     int rows_done_n_ = 0;
     std::mutex mu_;

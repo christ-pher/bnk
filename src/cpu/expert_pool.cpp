@@ -23,11 +23,62 @@ namespace bnk {
 ExpertStore::~ExpertStore() {
     if (base_) {
         if (pinned_) cudaHostUnregister(base_);
-        munmap(base_, total_);
+        munmap(base_, std::max<size_t>(total_, 4096));
+    }
+    if (dstage_) cudaFreeHost(dstage_);
+}
+
+static void pread_all(int fd, uint8_t * dst, size_t n, uint64_t off) {
+    while (n) {
+        const ssize_t r = pread(fd, dst, n, (off_t) off);
+        if (r <= 0) throw std::runtime_error("pread of the model file failed");
+        dst += r; n -= (size_t) r; off += (uint64_t) r;
     }
 }
 
-void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, const Ranking & rank) {
+void ExpertStore::read_blob(int il, int e, uint8_t * dst) const {
+    const LayerWeights & L = m_->layers[il];
+    pread_all(L.exp_fd, dst, L.gate_bytes, L.gate_off + (uint64_t) e * L.gate_bytes);
+    pread_all(L.exp_fd, dst + L.gate_bytes, L.up_bytes, L.up_off + (uint64_t) e * L.up_bytes);
+    pread_all(L.exp_fd, dst + L.gate_bytes + L.up_bytes, L.down_bytes, L.down_off + (uint64_t) e * L.down_bytes);
+}
+
+void ExpertStore::dstage_ensure() {
+    if (dstage_) return;
+    dstage_slots_ = std::max(1, env_int("BNK_DISK_STAGE", 32));
+    if (cudaHostAlloc((void **) &dstage_, (size_t) dstage_slots_ * max_blob_, cudaHostAllocPortable) != cudaSuccess)
+        throw std::runtime_error("cannot allocate the disk stage");
+}
+
+void ExpertStore::copy_batch_to_device(int il, const std::vector<int> & experts, uint8_t * dst, size_t stride,
+                                       cudaStream_t s) {
+    const size_t bb = blob_[il];
+    std::vector<int> disk;
+    for (size_t i = 0; i < experts.size(); ++i) {
+        const Parts p = parts(il, experts[i]);
+        if (p.pinned) CUDA_CHECK(cudaMemcpyAsync(dst + i * stride, p.gate, bb, cudaMemcpyHostToDevice, s));
+        else disk.push_back((int) i);
+    }
+    if (disk.empty()) return;
+    std::lock_guard<std::mutex> lk(dstage_mu_);
+    dstage_ensure();
+    for (size_t w0 = 0; w0 < disk.size(); w0 += dstage_slots_) {
+        const int n = (int) std::min<size_t>(dstage_slots_, disk.size() - w0);
+        const int nth = std::min(disk_threads, n);
+        std::vector<std::thread> th;
+        for (int t = 0; t < nth; ++t)
+            th.emplace_back([&, t]() {
+                for (int j = t; j < n; j += nth) read_blob(il, experts[disk[w0 + j]], dstage_ + (size_t) j * max_blob_);
+            });
+        for (auto & x : th) x.join();
+        for (int j = 0; j < n; ++j)
+            CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) disk[w0 + j] * stride, dstage_ + (size_t) j * max_blob_, bb,
+                                       cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));   // (an event would belong to one GPU; the stage serves every stage)
+    }
+}
+
+void ExpertStore::prepare(const Model & m) {
     const Config & c = m.cfg;
     m_ = &m;
     n_expert_ = c.n_expert;
@@ -39,9 +90,17 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, 
         model_ += blob_[il] * c.n_expert;
         max_blob_ = std::max(max_blob_, blob_[il]);
     }
-    // which experts get the arena: the ranking's order (completed with the rest, by layer), while they fit
     arena_slot_.assign((size_t) c.n_layer * c.n_expert, -1);
     slot_off_.clear();
+    total_ = 0;
+}
+
+void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, const Ranking & rank,
+                        const std::function<bool(int, int)> & skip) {
+    const Config & c = m.cfg;
+    prepare(m);
+    // which experts get the arena: the ranking's order (completed with the rest: expert by expert across the
+    // layers, as the GPU caches complete theirs), those a GPU holds skipped, while they fit
     std::vector<std::pair<int, int>> order;
     {
         std::vector<char> seen(arena_slot_.size(), 0);
@@ -50,13 +109,14 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, 
                 seen[(size_t) l * c.n_expert + e] = 1;
                 order.emplace_back(l, e);
             }
-        for (int l = 0; l < c.n_layer; ++l)
-            for (int e = 0; e < c.n_expert; ++e)
+        for (int e = 0; e < c.n_expert; ++e)
+            for (int l = 0; l < c.n_layer; ++l)
                 if (blob_[l] && !seen[(size_t) l * c.n_expert + e]) order.emplace_back(l, e);
     }
-    total_ = 0;
     const size_t limit = cap ? cap : model_;
+    int skipped = 0;
     for (auto [l, e] : order) {
+        if (skip && skip(l, e)) { ++skipped; continue; }
         if (total_ + blob_[l] > limit) continue;
         arena_slot_[(size_t) l * c.n_expert + e] = (int32_t) slot_off_.size();
         slot_off_.push_back(total_);
@@ -103,8 +163,8 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, 
                 (t1 - t0) / 1000, total_ / 1073741824.0 / ((t1 - t0) / 1000),
                 pinned_ ? "page-locked for DMA" : "NOT page-locked (DMA falls back to staging)");
         if (total_ < model_)
-            fprintf(stderr, "bnk: experts: %d of %zu in RAM; the other %.2f GiB stay in the model file (page cache / disk)\n",
-                    n_arena_, order.size(), (model_ - total_) / 1073741824.0);
+            fprintf(stderr, "bnk: experts: %d of %zu in RAM, %d on the GPUs; the other %.2f GiB stay in the model file (page cache / disk)\n",
+                    n_arena_, order.size(), skipped, (model_ - total_ - (size_t) skipped * max_blob_) / 1073741824.0);
     }
 }
 
@@ -119,16 +179,8 @@ ExpertStore::Parts ExpertStore::parts(int il, int e) const {
                  L.down_src + (size_t) e * L.down_bytes, false};
 }
 
-void ExpertStore::copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s) const {
-    const LayerWeights & L = m_->layers[il];
-    const Parts p = parts(il, e);
-    if (p.pinned) {
-        CUDA_CHECK(cudaMemcpyAsync(dst, p.gate, L.gate_bytes + L.up_bytes + L.down_bytes, cudaMemcpyHostToDevice, s));
-        return;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(dst, p.gate, L.gate_bytes, cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(dst + L.gate_bytes, p.up, L.up_bytes, cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(dst + L.gate_bytes + L.up_bytes, p.down, L.down_bytes, cudaMemcpyHostToDevice, s));
+void ExpertStore::copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s) {
+    copy_batch_to_device(il, {e}, dst, 0, s);
 }
 
 // ------------------------------------------------------------------------------------------ pool
@@ -230,6 +282,28 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
         gidx[i] = g;
     }
     const int ng = (int) groups_.size();
+    // experts outside the page-locked arena are read from the model file into a scratch first (the pool's threads
+    // each read some), rather than faulted in a page at a time by the dot products
+    gparts_.resize(ng);
+    {
+        std::vector<int> disk;
+        for (int gi = 0; gi < ng; ++gi) {
+            gparts_[gi] = st_->parts(il, tasks[groups_[gi][0]].expert);
+            if (!gparts_[gi].pinned) disk.push_back(gi);
+        }
+        if (!disk.empty()) {
+            const size_t bb = st_->blob_bytes(il);
+            if (dscratch_.size() < disk.size() * bb) dscratch_.resize(disk.size() * bb);
+            pool_->run([&](int part, int nparts) {
+                for (size_t j = part; j < disk.size(); j += nparts) {
+                    uint8_t * d = dscratch_.data() + j * bb;
+                    st_->read_blob(il, tasks[groups_[disk[j]][0]].expert, d);
+                    gparts_[disk[j]] = ExpertStore::Parts{d, d + L.gate_bytes, d + L.gate_bytes + L.up_bytes, false};
+                }
+            });
+            disk_reads_ += (int64_t) disk.size();
+        }
+    }
 
     xq_.resize(xrow * T);
     gu_.resize((size_t) nt * 2 * F);
@@ -263,7 +337,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             const int r_end = std::min(e, (gi + 1) * 2 * F);
             const std::vector<int> & grp = groups_[gi];
             const int n = (int) grp.size();
-            const ExpertStore::Parts pt = st_->parts(il, tasks[grp[0]].expert);
+            const ExpertStore::Parts pt = gparts_[gi];
             for (int k = 0; k < n; ++k) ys[k] = xq_.data() + tasks[grp[k]].t * xrow;
             for (; g < r_end; ++g) {
                 const int r = g - gi * 2 * F;
@@ -317,7 +391,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             for (int gi = 0; gi < ng; ++gi) {
                 const std::vector<int> & grp = groups_[gi];
                 const int n = (int) grp.size();
-                const uint8_t * w = st_->parts(il, tasks[grp[0]].expert).down + (size_t) r * drow;
+                const uint8_t * w = gparts_[gi].down + (size_t) r * drow;
                 for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
                 if (dn_multi && n > 1) {
                     mdot(L.down_type, F, w, hs, n, vals);

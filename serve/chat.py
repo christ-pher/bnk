@@ -70,6 +70,9 @@ class ChatTemplate:
 
 _TOOL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
+# GLM-5: <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
+_GLM_TOOL_RE = re.compile(r"<tool_call>\s*([^<\n]+?)\s*((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)</tool_call>", re.S)
+_GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
 
 
 def _param_types(tools) -> dict:
@@ -94,6 +97,23 @@ def parse_tool_calls(text: str, tools=None):
     a parameter, JSON is tried first, text is the fallback."""
     calls = []
     types = _param_types(tools)
+    if "<arg_key>" in text and "<function=" not in text:   # the GLM format
+        for m in _GLM_TOOL_RE.finditer(text):
+            name = m.group(1).strip()
+            args = {}
+            for p in _GLM_ARG_RE.finditer(m.group(2)):
+                pname, raw = p.group(1).strip(), p.group(2)
+                if types.get(name, {}).get(pname) == "string":
+                    args[pname] = raw
+                    continue
+                try:
+                    args[pname] = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    args[pname] = raw
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        content = _GLM_TOOL_RE.sub("", text).strip() if calls else text
+        return content, calls
     for m in _TOOL_RE.finditer(text):
         args = {}
         name = m.group(1).strip()

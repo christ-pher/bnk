@@ -79,10 +79,8 @@ void ExpertCache::fill(int il, const std::vector<int> & slots, const std::vector
     for (size_t i0 = 0; i0 < slots.size(); i0 += stage_n_) {
         const int n = (int) std::min<size_t>(stage_n_, slots.size() - i0);
         std::vector<uint8_t *> dst(n);
-        for (int j = 0; j < n; ++j) {
-            st_->copy_to_device(il, experts[i0 + j], stage_ + (size_t) j * bb, s);
-            dst[j] = layer_base_[il] + (size_t) slots[i0 + j] * sb;
-        }
+        for (int j = 0; j < n; ++j) dst[j] = layer_base_[il] + (size_t) slots[i0 + j] * sb;
+        const_cast<ExpertStore *>(st_)->copy_batch_to_device(il, std::vector<int>(experts.begin() + i0, experts.begin() + i0 + n), stage_, bb, s);
         CUDA_CHECK(cudaMemcpyAsync(dst_ptrs_, dst.data(), n * sizeof(uint8_t *), cudaMemcpyHostToDevice, s));
         moe_repack_blobs(stage_, bb, dst_ptrs_, n, c.n_ff_exp, c.n_embd, L.gate_type, grb, L.down_type, drb, s);
         // the stage is reused by the next batch: let this one finish first
@@ -208,7 +206,7 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
             const LayerWeights & L = m_->layers[c.il];
             const size_t bb = st_->blob_bytes(c.il);
             uint8_t * stg = swap_stage_ + (size_t) started * stage_bytes_;
-            st_->copy_to_device(c.il, c.in, stg, copy_);
+            const_cast<ExpertStore *>(st_)->copy_to_device(c.il, c.in, stg, copy_);
             uint8_t * dst = layer_base_[c.il] + (size_t) c.slot * sb_[c.il];
             CUDA_CHECK(cudaMemcpyAsync(swap_ptrs_ + started, &dst, sizeof(uint8_t *), cudaMemcpyHostToDevice, copy_));
             moe_repack_blobs(stg, bb, swap_ptrs_ + started, 1, cf.n_ff_exp, cf.n_embd, L.gate_type,

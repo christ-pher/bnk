@@ -369,14 +369,23 @@ void Engine::glm_pf_layer(int il, int N) {
     const LayerWeights & L = model_.layers[il];
     const int E = c.n_embd;
     auto & p = pf_;
+    // BNK_PF_PROF=1: wall time of each part of the layer (synchronizing after each)
+    static const bool prof = env_int("BNK_PF_PROF", 0) != 0;
+    double t0 = 0, t1 = 0, t2 = 0;
+    auto tick = [&]() { if (!prof) return 0.0; CUDA_CHECK(cudaStreamSynchronize(st_)); return now_ms(); };
+    t0 = tick();
     glm_pf_mhc_pre(L.hc_attn_fn, L.hc_attn_base, L.hc_attn_scale, gpf_.hcw, N);
     rmsnorm_rows(p.mixed, F(L.attn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
     if (L.attn) glm_pf_mla(il, N); else glm_pf_kda(il, N);
     mhc_combine(p.res, p.out, gpf_.hcw, N, c.hc, E, st_);
+    t1 = tick();
     glm_pf_mhc_pre(L.hc_ffn_fn, L.hc_ffn_base, L.hc_ffn_scale, gpf_.hcw, N);
     rmsnorm_rows(p.mixed, F(L.ffn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
     if (L.moe) glm_pf_moe(il, N); else glm_pf_ffn(il, N);
     mhc_combine(p.res, p.moe, gpf_.hcw, N, c.hc, E, st_);
+    t2 = tick();
+    if (prof) fprintf(stderr, "pf L%02d N=%d %s %.1f ms  %s %.1f ms\n", il, N, L.attn ? "mla" : "kda", t1 - t0,
+                      L.moe ? "moe" : "ffn", t2 - t1);
 }
 
 }  // namespace bnk

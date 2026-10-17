@@ -298,6 +298,21 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         }
     }
     CUDA_CHECK(cudaSetDevice(dev_));
+    // the host arena: the ranking's next experts after the ones the GPUs hold
+    {
+        const Config & c = model_.cfg;
+        Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
+        if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
+        size_t cap = 0;
+        if (opt.ram_gib > 0) cap = (size_t) (opt.ram_gib * 1073741824.0);
+        else if (opt.ram_gib < 0 && c.is_glm()) cap = (size_t) (env_double("BNK_RAM_GIB", 100.0) * 1073741824.0);
+        auto on_gpu = [this](int il, int e) {
+            for (const Engine * st = this; st; st = st->next_.get())
+                if (st->cache_.owns(il) && st->cache_.slot_of(il, e) >= 0) return true;
+            return false;
+        };
+        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank, on_gpu);
+    }
 }
 
 void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
@@ -326,13 +341,9 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (head) {
         layer_routed.assign(model_.cfg.n_layer, 0);
         layer_misses.assign(model_.cfg.n_layer, 0);
-        // the ranking decides which experts get the arena when it is capped (loaded again below for the cache)
-        Ranking rank = load_ranking(opt.profile, model_.cfg.n_layer, model_.cfg.n_expert);
-        if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, model_.cfg.n_layer, model_.cfg.n_expert);
-        size_t cap = 0;
-        if (opt.ram_gib > 0) cap = (size_t) (opt.ram_gib * 1073741824.0);
-        else if (opt.ram_gib < 0 && model_.cfg.is_glm()) cap = (size_t) (env_double("BNK_RAM_GIB", 100.0) * 1073741824.0);
-        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank);
+        // the arena is filled after every stage's cache (Engine::load): the GPUs take the hottest experts, the
+        // RAM the next ones; until then the caches fill from the model file's mapping
+        store_->prepare(model_);
         cpu_->init(model_, *store_, opt.cpu_threads);
     }
 
@@ -1277,6 +1288,7 @@ void Engine::service_cpu(uint32_t seq, int T) {
     const Config & c = model_.cfg;
     const int E = c.n_embd;
     for (int il = l0_; il < l1_; ++il) {
+        if (!c.is_moe(il)) continue;   // a dense layer posts no request
         MoeMsg * m = msg(il);
         const double t0 = now_ms();
         while (__atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE) != seq) __builtin_ia32_pause();

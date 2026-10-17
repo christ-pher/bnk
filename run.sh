@@ -114,6 +114,10 @@ if [[ -z "$PLE" && -f "$HERE/configs/$NAME.json" ]]; then
   PLE=$("$HERE/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ple_gguf",""))' "$HERE/configs/$NAME.json")
   [[ -n "$PLE" && ! -f "$PLE" ]] && { echo "the PLE table $PLE (configs/$NAME.json) is missing" >&2; exit 1; }
 fi
+# a model without a drafter of its own (configs/<name>.json "mtp": "") runs without speculation
+if [[ -f "$HERE/configs/$NAME.json" ]] && "$HERE/.venv/bin/python" -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if "mtp" in c and not c["mtp"] else 1)' "$HERE/configs/$NAME.json"; then
+  MTP=""
+fi
 COUNTS="$CACHE/counts-$NAME.bnkc"
 ARGS=(--model "$MODEL" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 # per-model tuning: sampling defaults, speculation, the thinking-loop guard (configs/<name>.json)

@@ -51,6 +51,7 @@ public:
     std::vector<float> get_f32_arr(const std::string & key) const;
 
     const std::vector<std::string> & shard_paths() const { return paths_; }
+    int fd(int shard) const { return maps_.at(shard).fd; }   // the shard's open file (pread of tensor bytes)
     gguf_context * meta() const { return ctx_.empty() ? nullptr : ctx_[0]; }
 
     // Advise the kernel about a byte range (MADV_WILLNEED / MADV_SEQUENTIAL ...).

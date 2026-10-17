@@ -382,6 +382,9 @@ void Model::expert_src(int il) {
     L.up_bytes = u.nbytes / c.n_expert;
     L.down_bytes = d.nbytes / c.n_expert;
     L.gate_src = g.data; L.up_src = u.data; L.down_src = d.data;
+    if (g.shard != u.shard || g.shard != d.shard) throw std::runtime_error("expert tensors of layer " + std::to_string(il) + " span shards");
+    L.exp_fd = gguf.fd(g.shard);
+    L.gate_off = g.file_offset; L.up_off = u.file_offset; L.down_off = d.file_offset;
     // per-expert global scales (NVFP4): absent means 1
     const TensorRef * sg = gguf.find(b + "ffn_gate_exps.scale"), * su = gguf.find(b + "ffn_up_exps.scale"),
                     * sd = gguf.find(b + "ffn_down_exps.scale");

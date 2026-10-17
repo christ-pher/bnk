@@ -331,13 +331,18 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
         if eff == "none":
             thinking = False
         else:
-            kwargs["reasoning_effort"] = {"high": "xhigh", "minimal": "low"}.get(eff, eff)
+            glm = getattr(S.tok, "arch", "") == "glm5next"   # GLM's template takes low / high (anything else: max)
+            kwargs["reasoning_effort"] = eff if glm else {"high": "xhigh", "minimal": "low"}.get(eff, eff)
     kwargs["enable_thinking"] = bool(thinking)
     text = S.template.render(body.get("messages", []), tools=body.get("tools"), add_generation_prompt=True, **kwargs)
     # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
-    tail = text[text.rfind("<|im_start|>assistant"):]
+    glm = getattr(S.tok, "arch", "") == "glm5next"
+    tail = text[text.rfind("<|assistant|>" if glm else "<|im_start|>assistant"):]
+    want_thinking = thinking
     thinking = "<think>" in tail and "</think>" not in tail
-    if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
+    if glm and thinking and not want_thinking:   # GLM always opens a think block: close it to answer at once
+        text, thinking = text + "</think>", False
+    elif title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
         text, thinking = text + "\n</think>\n\n", False
     return S.tok.encode_chat(text), thinking
 

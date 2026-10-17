@@ -208,11 +208,8 @@ void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
     if (experts.size() * blob > p.stage_bytes)
         throw std::runtime_error("expert staging too small: " + std::to_string(experts.size()) + " experts of layer " +
                                  std::to_string(il) + " need " + std::to_string((experts.size() * blob) >> 20) + " MiB");
-    for (int e : experts) {
-        idx[e] = n;
-        store_->copy_to_device(il, e, p.stage[b] + (size_t) n * blob, p.copy);
-        ++n;
-    }
+    for (int e : experts) idx[e] = n++;
+    store_->copy_batch_to_device(il, experts, p.stage[b], blob, p.copy);
     CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
 }
 
