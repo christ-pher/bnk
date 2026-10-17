@@ -549,7 +549,11 @@ __global__ void dsa_score_k(const float * q, int64_t ldq, const float * w, int64
 #pragma unroll
     for (int h = 0; h < 32; ++h)
         if (h < ih) sc += ws[h] * fmaxf(acc[h], 0.f);
-    scores[(int64_t) t * max_blocks + b] = sc;
+    // the head weights have either sign, so can the score: the radix top-k compares the bits as unsigned, so
+    // store them in the order-preserving unsigned form (positive: sign bit set; negative: all bits flipped)
+    unsigned u = __float_as_uint(sc);
+    u = (sc >= 0.f) ? (u | 0x80000000u) : ~u;
+    scores[(int64_t) t * max_blocks + b] = __uint_as_float(u);
 }
 void dsa_score(const float * q, int64_t ldq, const float * w, int64_t ldw, const float * pooled, float * scores,
                int max_blocks, int T, int ih, int id, int r, int dense_cells, const int * pos0, int t_off, cudaStream_t s) {

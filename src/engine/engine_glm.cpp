@@ -290,7 +290,11 @@ void Engine::glm_pf_kda(int il, int N) {
     gdn_conv(p.conv, F(L.ssm_conv1d), p.co, N, C, K, st_);
     kda_l2norm(p.co, N, C, H, S, 1e-6f, st_);
     kda_recurrence(p.co, C, g.g, p.b, cur_->ssm_state[il], p.o, N, H, S, N, st_);
+    dbg(st_, il, "kda_conv", p.co, (size_t) N * C);
+    dbg(st_, il, "kda_g", g.g, (size_t) N * QKV);
+    dbg(st_, il, "kda_o", p.o, (size_t) N * QKV);
     gated_rmsnorm(p.o, p.z, F(L.ssm_norm), p.n, N, H, S, c.rms_eps, st_);
+    dbg(st_, il, "kda_normed", p.n, (size_t) N * QKV);
     gemm_.run(L.ssm_out, p.n, QKV, N, p.out, E);
     CUDA_CHECK(cudaMemcpyAsync(cur_->conv_buf[il].p, p.conv.p + (size_t) N * C, (size_t) (K - 1) * C * 4,
                                cudaMemcpyDeviceToDevice, st_));
@@ -312,6 +316,8 @@ void Engine::glm_pf_mla(int il, int N) {
     rmsnorm_rows(g.qr.p + c.q_lora, F(L.attn_kv_a_norm), g.qr.p + c.q_lora, N, Dl, QR, QR, c.rms_eps, st_);
     mla_store_latent(g.qr.p + c.q_lora, QR, cur_->kc[il], N, Dl, &d_par_->pos0, st_);
     gemm_.run(L.attn_q_b_idx, g.qn, c.q_lora, N, g.qb, QB);
+    dbg(st_, il, "mla_qb", g.qb, (size_t) N * QB);
+    dbg(st_, il, "mla_ix", g.ix, (size_t) N * IX);
     const int32_t * sel = nullptr, * nsel = nullptr;
     if (sparse) {
         dsa_store(g.ix, IX, F(L.idx_k_norm_w), F(L.idx_k_norm_b), cur_->kraw[il], N, c.idx_dim, c.idx_heads, &d_par_->pos0,
@@ -339,6 +345,7 @@ void Engine::glm_pf_mla(int il, int N) {
                               t0, t0 + n, H, Dl, r, qsh_.top_blocks, pos0, st_);
         mla_out(g.olat, (const half *) L.attn_kv_b.data, p.ao.p + (size_t) t0 * H * Dv, n, H, Dk, Dv, Dl, st_);
     }
+    dbg(st_, il, "mla_o", p.ao, (size_t) N * H * Dv);
     gemm_.run(L.wo, p.ao, H * Dv, N, p.out, E);
 }
 
@@ -348,11 +355,13 @@ void Engine::glm_pf_ffn(int il, int N) {
     const int E = c.n_embd, FF = c.n_ff;
     auto & p = pf_;
     auto & g = gpf_;
-    f32_to_f16(p.xn, gemm_.xbuf(), (int64_t) N * E, st_);
+    // piece by piece (the gate / up / h buffers hold kGlmPiece rows); each GEMM converts its own input, since
+    // Gemm::run's fp16 buffer is one (the down product's conversion would overwrite the next piece's input)
     for (int t0 = 0; t0 < N; t0 += kGlmPiece) {
         const int n = std::min(kGlmPiece, N - t0);
-        gemm_.run_h(qmat_rows(L.ffn_gate_up, 0, FF), gemm_.xbuf() + (size_t) t0 * E, E, n, g.gu, FF);
-        gemm_.run_h(qmat_rows(L.ffn_gate_up, FF, FF), gemm_.xbuf() + (size_t) t0 * E, E, n, g.u, FF);
+        f32_to_f16(p.xn.p + (size_t) t0 * E, gemm_.xbuf(), (int64_t) n * E, st_);
+        gemm_.run_h(qmat_rows(L.ffn_gate_up, 0, FF), gemm_.xbuf(), E, n, g.gu, FF);
+        gemm_.run_h(qmat_rows(L.ffn_gate_up, FF, FF), gemm_.xbuf(), E, n, g.u, FF);
         swiglu_clamp(g.gu, g.u, g.h, (int64_t) n * FF, c.swiglu_limit, st_);
         gemm_.run(L.ffn_down, g.h, FF, n, p.moe.p + (size_t) t0 * E, E);
     }
@@ -375,14 +384,22 @@ void Engine::glm_pf_layer(int il, int N) {
     auto tick = [&]() { if (!prof) return 0.0; CUDA_CHECK(cudaStreamSynchronize(st_)); return now_ms(); };
     t0 = tick();
     glm_pf_mhc_pre(L.hc_attn_fn, L.hc_attn_base, L.hc_attn_scale, gpf_.hcw, N);
+    dbg(st_, il, "hc_attn_w", gpf_.hcw, (size_t) N * (2 + c.hc) * c.hc);
+    dbg(st_, il, "hc_attn_in", p.mixed, (size_t) N * E);
     rmsnorm_rows(p.mixed, F(L.attn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
+    dbg(st_, il, "attn_in", p.xn, (size_t) N * E);
     if (L.attn) glm_pf_mla(il, N); else glm_pf_kda(il, N);
+    dbg(st_, il, "attn_out", p.out, (size_t) N * E);
     mhc_combine(p.res, p.out, gpf_.hcw, N, c.hc, E, st_);
+    dbg(st_, il, "hc_combine", p.res, (size_t) N * c.hc_dim());
     t1 = tick();
     glm_pf_mhc_pre(L.hc_ffn_fn, L.hc_ffn_base, L.hc_ffn_scale, gpf_.hcw, N);
     rmsnorm_rows(p.mixed, F(L.ffn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
+    dbg(st_, il, "ffn_in", p.xn, (size_t) N * E);
     if (L.moe) glm_pf_moe(il, N); else glm_pf_ffn(il, N);
+    dbg(st_, il, "ffn_out", p.moe, (size_t) N * E);
     mhc_combine(p.res, p.moe, gpf_.hcw, N, c.hc, E, st_);
+    dbg(st_, il, "l_last", p.res, (size_t) N * c.hc_dim());
     t2 = tick();
     if (prof) fprintf(stderr, "pf L%02d N=%d %s %.1f ms  %s %.1f ms\n", il, N, L.attn ? "mla" : "kda", t1 - t0,
                       L.moe ? "moe" : "ffn", t2 - t1);

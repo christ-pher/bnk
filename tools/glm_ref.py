@@ -89,8 +89,7 @@ layer_types = kv(A + "layer_types")
 mlp_types = kv(A + "mlp_layer_types")
 route_scale = float(kv(A + "expert_weights_scale"))
 swiglu_limit = float(kv(A + "swiglu_limit"))
-if len(toks) > topk + kpool - 1:
-    sys.exit(f"dense attention only: at most {topk + kpool - 1} tokens")
+select_tail = bool(kv(A + "attention.indexer.select_tail", True))
 
 _E4M3 = np.array([(lambda b: (-1.0 if b & 0x80 else 1.0) * (float("nan") if (b & 0x7F) == 0x7F else
                    ((b & 7) / 8.0 * 2.0 ** -6 if ((b >> 3) & 0xF) == 0 else (1 + (b & 7) / 8.0) * 2.0 ** (((b >> 3) & 0xF) - 7))))(b)
@@ -251,7 +250,35 @@ def mla(x, il):
     kvx = (c @ kvb.T).view(Tn, H, Dk + Dv)
     kk, vv = kvx[..., :Dk], kvx[..., Dk:]
     scores = torch.einsum("thd,shd->hts", q, kk) * Dk ** -0.5
-    mask = torch.triu(torch.ones(Tn, Tn, dtype=torch.bool), 1)
+    mask = torch.triu(torch.ones(Tn, Tn, dtype=torch.bool), 1)   # True = hidden
+    # the DSA indexer: rows beyond the budget see only their top pools (of kpool cells) and their tail
+    ix = x @ W(b + "idx_x.weight").T                              # [T, idim + ih + idim]
+    kidx = torch.nn.functional.layer_norm(ix[:, :idim], (idim,), W(b + "idx_k_norm.weight"), W(b + "idx_k_norm.bias"), 1e-6)
+    wh = ix[:, idim:idim + ih] * ih ** -0.5
+    gate = ix[:, idim + ih:]
+    qidx = qb[:, H * Dk:].view(Tn, ih, idim)
+    n_pools = Tn // kpool
+    dump(il, "idx_k", kidx)
+    if n_pools > 0:
+        ape = W(b + "idx_ape")                                    # [kpool, idim]
+        gk = kidx[:n_pools * kpool].view(n_pools, kpool, idim)
+        gg = gate[:n_pools * kpool].view(n_pools, kpool, idim) + ape[None]
+        pooled = (torch.softmax(gg, dim=1) * gk).sum(1)           # [n_pools, idim]
+        dump(il, "idx_pooled", pooled)
+        sc = torch.relu(torch.einsum("thd,pd->thp", qidx, pooled) * idim ** -0.5)
+        isc = torch.einsum("th,thp->tp", wh, sc)                  # [T, n_pools]
+        dense_cells = topk + kpool - 1
+        for t in range(Tn):
+            if t + 1 <= dense_cells:
+                continue
+            nb = (t + 1) // kpool                                 # complete pools before the tail
+            k = min(topk // kpool, nb)
+            sel = torch.topk(isc[t, :nb], k).indices
+            allowed = torch.zeros(Tn, dtype=torch.bool)
+            for p_ in sel.tolist():
+                allowed[p_ * kpool:(p_ + 1) * kpool] = True
+            allowed[nb * kpool:t + 1] = True                      # the tail (always)
+            mask[t] |= ~allowed
     scores = scores.masked_fill(mask, float("-inf"))
     p = torch.softmax(scores, dim=-1)
     o = torch.einsum("hts,shd->thd", p, vv)                   # [T, H, Dv]
