@@ -211,7 +211,8 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
             if constexpr (GU) {
                 const int row = blockIdx.y * kTcRows + warp * 8 + rr;
                 if (row < nrows) {
-                    const float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
+                    float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
+                    if (es.limit > 0.f) { gv = fminf(gv, es.limit); uv = fminf(fmaxf(uv, -es.limit), es.limit); }
                     o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
                 }
             } else {

@@ -8,6 +8,7 @@
 
 #include "core/util.h"
 #include "kernels/qsa.h"
+#include "kernels/glm_ops.h"
 #include "kernels/kvq.cuh"
 #include "kernels/ops.h"
 
@@ -391,6 +392,11 @@ void qsa_select(const float * q, const float * pooled, float * scores, int max_b
             q, pooled, scores, max_blocks, sh.ih, sh.id, sh.ratio, sh.dense_cells(), pos0, t_off);
     qsa_topk_k<<<T, 1024, 0, s>>>(scores, max_blocks, sel, n_sel, sh.top_blocks, sh.ratio, sh.dense_cells(), pos0,
                                   t_off);
+}
+
+void dsa_topk(const float * scores, int max_blocks, int32_t * sel, int32_t * n_sel, int T, int K, int r,
+              int dense_cells, const int * pos0, int t_off, cudaStream_t s) {
+    qsa_topk_k<<<T, 1024, 0, s>>>(scores, max_blocks, sel, n_sel, K, r, dense_cells, pos0, t_off);
 }
 
 // ------------------------------------------------------------------------------------------- attention

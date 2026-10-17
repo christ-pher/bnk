@@ -7,6 +7,7 @@
 #include "engine/engine.h"
 #include "ggml.h"
 #include "kernels/ops.h"
+#include "kernels/glm_ops.h"
 
 namespace bnk {
 
@@ -64,6 +65,7 @@ size_t Engine::prefill_carve(int N, bool dry_only) {
         carve(p.hq, tc ? 0 : (size_t) N * k * F); carve(p.hd, tc ? 0 : (size_t) N * k * F / 32);
         carve(p.gu32, tc ? 0 : (size_t) N * k * 2 * F);
         carve(p.items, (size_t) (2 * (N * k + c.n_expert)) * sizeof(PfItem));
+        if (c.is_glm()) glm_pf_carve(N, [&](DevBuf<float> & b, size_t n) { carve(b, n); });
         if (c.ple_layer >= 0 && owns(c.ple_layer)) {
             const int ph = c.ple_heads();
             carve(p.ple_emb, (size_t) N * ph * c.ple_dim); carve(p.ple_key, (size_t) N * HC);
@@ -115,8 +117,11 @@ void Engine::prefill_alloc(int N) {
     auto upd = [&](const QMat & m) { if (m.valid()) maxw = std::max(maxw, (size_t) m.rows * m.cols); };
     for (const auto & L : model_.layers) {
         for (const QMat * m : {&L.hc_attn.down, &L.hc_attn.up, &L.wq, &L.wk, &L.wv, &L.wo, &L.wqkv, &L.wgate,
-                               &L.ssm_out, &L.ple_key, &L.ple_value, &L.router, &L.sh_gate, &L.sh_up, &L.sh_down})
+                               &L.ssm_out, &L.ple_key, &L.ple_value, &L.router, &L.sh_gate, &L.sh_up, &L.sh_down,
+                               &L.hc_attn_fn, &L.kda_fgb_a, &L.kda_f_b, &L.attn_qkv_a, &L.attn_q_b_idx, &L.idx_x,
+                               &L.sh_gu, &L.ffn_down})
             upd(*m);
+        if (L.ffn_gate_up.valid()) maxw = std::max(maxw, (size_t) L.ffn_gate_up.rows / 2 * L.ffn_gate_up.cols);
     }
     gemm_.init(st_, maxw, (size_t) N * std::max(HC, c.n_head * c.head_dim * 2));
 }
@@ -205,7 +210,7 @@ void Engine::pf_stage_list(int il, const std::vector<int> & experts) {
                                  std::to_string(il) + " need " + std::to_string((experts.size() * blob) >> 20) + " MiB");
     for (int e : experts) {
         idx[e] = n;
-        CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) n * blob, store_->blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
+        store_->copy_to_device(il, e, p.stage[b] + (size_t) n * blob, p.copy);
         ++n;
     }
     CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
@@ -366,14 +371,19 @@ void Engine::pf_moe(int il, int N) {
     // routing
     f32_to_f16(p.mixed, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.router, gemm_.xbuf(), E, N, p.rlog, c.n_expert);
-    route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, st_);
+    if (c.is_glm()) route_sigmoid_topk(p.rlog, (const float *) L.router_bias.data, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, c.router_norm, st_);
+    else route_topk(p.rlog, N, c.n_expert, k, p.ids, p.w, c.expert_weights_scale, st_);
     // the shared expert meanwhile
     gemm_.run_h(L.sh_gate, gemm_.xbuf(), E, N, p.sg, FF);
     gemm_.run_h(L.sh_up, gemm_.xbuf(), E, N, p.su, FF);
-    gemm_.run_h(L.shexp_gate_inp, gemm_.xbuf(), E, N, p.sgate, 1);
-    silu_mul(p.sg, p.su, p.sh, (int64_t) N * FF, st_);
+    if (c.is_glm()) {   // no gate on the shared expert; the swiglu clamp
+        swiglu_clamp(p.sg, p.su, p.sh, (int64_t) N * FF, c.swiglu_limit, st_);
+    } else {
+        gemm_.run_h(L.shexp_gate_inp, gemm_.xbuf(), E, N, p.sgate, 1);
+        silu_mul(p.sg, p.su, p.sh, (int64_t) N * FF, st_);
+    }
     gemm_.run(L.sh_down, p.sh, FF, N, p.shared, E);
-    sigmoid_inplace(p.sgate, N, st_);
+    if (!c.is_glm()) sigmoid_inplace(p.sgate, N, st_);
     CUDA_CHECK(cudaMemcpyAsync(p.h_ids, p.ids.p, (size_t) N * k * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
 
@@ -575,7 +585,7 @@ void Engine::pf_moe(int il, int N) {
         extra = p.cpu.p;
     }
     // per token: shared * gate + the CPU part + its GPU experts (in routing order)
-    moe_gather_sum(p.dd, p.inv, p.w, N, k, E, p.shared, p.sgate, extra, p.moe, st_);
+    moe_gather_sum(p.dd, p.inv, p.w, N, k, E, p.shared, c.is_glm() ? nullptr : p.sgate.p, extra, p.moe, st_);
 }
 
 void Engine::prefill_chunk(const int32_t * tokens, int N) {
@@ -617,6 +627,7 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     for (int il = l0_; il < l1_; ++il) {
         const LayerWeights & L = model_.layers[il];
         if (p.prefetch && il + 1 < l1_) pf_stage_layer(il + 1);
+        if (c.is_glm()) { glm_pf_layer(il, N); continue; }
         if (il == c.ple_layer) pf_ple(il, N);
         pf_hc_pre(L.hc_attn, N, true);
         if (L.attn) pf_attn(il, N); else pf_gdn(il, N);

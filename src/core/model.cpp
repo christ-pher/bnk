@@ -14,9 +14,12 @@
 
 namespace bnk {
 
+Config load_config_glm(const GgufModel & g);
+
 Config load_config(const GgufModel & g) {
     const std::string arch = g.get_str("general.architecture");
-    if (arch != "qwen4exp") throw std::runtime_error("unsupported architecture '" + arch + "' (expected qwen4exp)");
+    if (arch == "glm5next") return load_config_glm(g);
+    if (arch != "qwen4exp") throw std::runtime_error("unsupported architecture '" + arch + "' (expected qwen4exp or glm5next)");
     auto k = [&](const char * s) { return arch + "." + s; };
     Config c;
     // block_count includes the MTP ("nextn") prediction blocks some files carry after the trunk (e.g.
@@ -230,6 +233,10 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
     const Config & c = cfg;
     l0 = first;
     l1 = end < 0 ? c.n_layer : end;
+    if (c.is_glm()) {
+        load_glm(verbose, embd, head);
+        return;
+    }
     if (verbose && l0 == 0)
         fprintf(stderr, "bnk: %s: %d layers, %d experts (%d used), hc %d, %zu shard(s)\n",
                 gguf.get_str("general.name").c_str(), c.n_layer, c.n_expert, c.n_expert_used, c.hc,
@@ -387,6 +394,11 @@ void Model::expert_src(int il) {
             memcpy(v.data(), t->data, (size_t) c.n_expert * 4);
         };
         read(sg, L.exp_sgate); read(su, L.exp_sup); read(sd, L.exp_sdown);
+        if (c.is_glm()) {
+            bool any = false;
+            for (float v : L.exp_sgate) any |= v != 0.f;
+            L.experts_present = any;
+        }
         auto up = [&](const std::vector<float> & v) {
             void * p = nullptr;
             if (cudaMalloc(&p, v.size() * 4) != cudaSuccess) throw std::runtime_error("cudaMalloc failed (expert scales)");
@@ -398,6 +410,7 @@ void Model::expert_src(int il) {
         L.exp_scales.up = up(L.exp_sup);
         L.exp_scales.down = up(L.exp_sdown);
     }
+    L.exp_scales.limit = c.swiglu_limit;
 }
 
 }  // namespace bnk

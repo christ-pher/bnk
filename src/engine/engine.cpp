@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "kernels/ops.h"
+#include "kernels/glm_ops.h"
 
 namespace bnk {
 
@@ -182,8 +183,8 @@ std::vector<int> Engine::plan_split(const std::string & path, const EngineOption
     }
     for (int il = 0; il < L; ++il)
         if (c.is_attn(il)) {
-            double cell = 4.0 * c.n_head_kv * kv_row_halves(c.head_dim);
-            if (c.compress_ratio[il] > 0) cell += 2.0 * c.idx_dim + 4.0 * c.idx_dim / c.compress_ratio[il];
+            double cell = (c.is_glm() ? 2.0 : 4.0) * c.n_head_kv * kv_row_halves(c.head_dim);
+            if (c.compress_ratio[il] > 0) cell += 2.0 * c.idx_raw_dim() + 4.0 * c.idx_dim / c.compress_ratio[il];
             lay[il] += cell * opt.max_ctx;
         }
     // per GPU: fixed costs (CUDA context, workspaces, prompt buffers) and the free memory; one GPU listed twice
@@ -325,13 +326,20 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (head) {
         layer_routed.assign(model_.cfg.n_layer, 0);
         layer_misses.assign(model_.cfg.n_layer, 0);
-        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
+        // the ranking decides which experts get the arena when it is capped (loaded again below for the cache)
+        Ranking rank = load_ranking(opt.profile, model_.cfg.n_layer, model_.cfg.n_expert);
+        if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, model_.cfg.n_layer, model_.cfg.n_expert);
+        size_t cap = 0;
+        if (opt.ram_gib > 0) cap = (size_t) (opt.ram_gib * 1073741824.0);
+        else if (opt.ram_gib < 0 && model_.cfg.is_glm()) cap = (size_t) (env_double("BNK_RAM_GIB", 100.0) * 1073741824.0);
+        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank);
         cpu_->init(model_, *store_, opt.cpu_threads);
     }
 
     const Config & c = model_.cfg;
     const int W = kMaxWindow, E = c.n_embd, HC = c.hc_dim();
-    x_.alloc(W * E); res_.alloc(W * HC); xn_.alloc(W * HC); lo_.alloc(W * c.hc_rank);
+    x_.alloc(W * E); res_.alloc(W * HC); xn_.alloc(W * HC);
+    if (c.hc_rank) lo_.alloc(W * c.hc_rank);
     gpre_.alloc(W * HC); mixed_.alloc(W * E); inj_.alloc(W * c.hc); out_.alloc(W * E);
     const int C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state;
     conv_out_.alloc(W * C); z_.alloc(W * VI); alpha_.alloc(W * c.ssm_vheads); beta_.alloc(W * c.ssm_vheads);
@@ -393,16 +401,16 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     size_t state_bytes = 0, kv_cell_bytes = 0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) {
-            kv_cell_bytes += 2 * (size_t) c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
-            if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
-                kv_cell_bytes += c.idx_dim * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
+            kv_cell_bytes += (c.is_glm() ? 1 : 2) * (size_t) c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
+            if ((model_.layers[il].idx_q.valid() || model_.layers[il].idx_x.valid()) && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
+                kv_cell_bytes += c.idx_raw_dim() * sizeof(half) + c.idx_dim * sizeof(float) / c.compress_ratio[il];
                 qsa_on_ = true;
             }
         } else {
             // the second lane only for a pipeline (two batches in flight)
             for (int l = 0; l < (first() && last_ ? 1 : kLanes); ++l) {
                 gdn_co_[l][il].alloc((size_t) W * C);
-                gdn_g_[l][il].alloc((size_t) W * c.ssm_vheads);
+                gdn_g_[l][il].alloc((size_t) W * (c.is_glm() ? c.kda_qkv() : c.ssm_vheads));   // KDA: a decay per channel
                 gdn_b_[l][il].alloc((size_t) W * c.ssm_vheads);
             }
             state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) c.ssm_vheads * c.ssm_state * c.ssm_state) * 4;
@@ -416,13 +424,14 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     }
     cur_ = seqs_[0].get();
     cur_->used = true;
+    if (c.is_glm()) glm_alloc(W);
     if (qsa_on_) {
         int r = 0;
         for (int il = 0; il < c.n_layer; ++il) r = std::max(r, c.compress_ratio[il]);
         qsh_ = QsaShape{c.n_head, c.n_head_kv, c.head_dim, c.idx_heads, c.idx_dim, r, c.idx_top_k / r, c.n_rot,
                         c.rope_base, c.rms_eps};
         max_blocks_ = opt.max_ctx / r + 1;
-        ik_.alloc(W * c.idx_dim); iq_.alloc(W * c.idx_heads * c.idx_dim);
+        ik_.alloc(W * c.idx_raw_dim()); iq_.alloc(W * c.idx_heads * c.idx_dim);
         qsa_scores_.alloc((size_t) W * max_blocks_); qsa_sel_.alloc((size_t) W * (c.idx_top_k / r)); qsa_nsel_.alloc(W);
     }
     if (opt.verbose)
@@ -535,11 +544,13 @@ void Engine::alloc_seq(Seq & q) {
             // address space for the whole context; VRAM is mapped as the conversation grows (ensure_ctx)
             const size_t kv = (size_t) opt_.max_ctx * c.n_head_kv * kv_row_halves(c.head_dim);
             q.kv_k[il].reserve(kv * sizeof(half), &budget_, "KV cache");
-            q.kv_v[il].reserve(kv * sizeof(half), &budget_, "KV cache");
             q.kc[il].view(q.kv_k[il].as<half>(), kv);
-            q.vc[il].view(q.kv_v[il].as<half>(), kv);
-            if (model_.layers[il].idx_q.valid() && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
-                const size_t nraw = (size_t) opt_.max_ctx * c.idx_dim;
+            if (!c.is_glm()) {   // MLA caches the latent only: no V
+                q.kv_v[il].reserve(kv * sizeof(half), &budget_, "KV cache");
+                q.vc[il].view(q.kv_v[il].as<half>(), kv);
+            }
+            if ((model_.layers[il].idx_q.valid() || model_.layers[il].idx_x.valid()) && c.compress_ratio[il] > 0 && !getenv("BNK_NO_QSA")) {
+                const size_t nraw = (size_t) opt_.max_ctx * c.idx_raw_dim();
                 const size_t npool = (size_t) (opt_.max_ctx / c.compress_ratio[il] + 1) * c.idx_dim;
                 q.kv_raw[il].reserve(nraw * sizeof(half), &budget_, "indexer keys");
                 q.kv_pool[il].reserve(npool * sizeof(float), &budget_, "indexer keys");
@@ -607,7 +618,7 @@ void Engine::map_ctx(int cells) {
             add(cur_->kv_k[il], kv);
             add(cur_->kv_v[il], kv);
             if (cur_->kv_raw[il].reserved()) {
-                add(cur_->kv_raw[il], (size_t) cells * c.idx_dim * sizeof(half));
+                add(cur_->kv_raw[il], (size_t) cells * c.idx_raw_dim() * sizeof(half));
                 add(cur_->kv_pool[il], (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
             }
         }
@@ -620,13 +631,13 @@ void Engine::map_ctx(int cells) {
         const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
         if (grow) {
             cur_->kv_k[il].ensure(kv);
-            cur_->kv_v[il].ensure(kv);
+            if (cur_->kv_v[il].reserved()) cur_->kv_v[il].ensure(kv);
         } else {
             cur_->kv_k[il].shrink_to(kv);
-            cur_->kv_v[il].shrink_to(kv);
+            if (cur_->kv_v[il].reserved()) cur_->kv_v[il].shrink_to(kv);
         }
         if (cur_->kv_raw[il].reserved()) {
-            const size_t raw = (size_t) cells * c.idx_dim * sizeof(half);
+            const size_t raw = (size_t) cells * c.idx_raw_dim() * sizeof(half);
             const size_t pool = (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float);
             if (grow) {
                 cur_->kv_raw[il].ensure(raw);
@@ -945,8 +956,12 @@ void Engine::enqueue_commit(int cnt) {
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) continue;
         const int ln = cur_->last_lane;
-        gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv, cur_->ssm_state[il],
-                       nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+        if (c.is_glm())
+            kda_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * c.kda_qkv(), gdn_b_[ln][il].p + r0 * nv,
+                           cur_->ssm_state[il], nullptr, cnt, nv, S, cnt, st_);
+        else
+            gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv, cur_->ssm_state[il],
+                           nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
     if (n_gdn_) shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
     if (cur_->ple_hist.p) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
@@ -1172,6 +1187,7 @@ void Engine::moe(int il, int T) {
 
 void Engine::head(int T) {
     const Config & c = model_.cfg;
+    if (c.is_glm()) { glm_head(T); return; }
     hc_pre(model_.hc_head, T, false);
     gemv_auto(model_.output, mixed_, c.n_embd, T, logits_, c.n_vocab, false, act_, st_);
 }
@@ -1179,6 +1195,7 @@ void Engine::head(int T) {
 void Engine::layer_forward(int il, int T) {
     const Config & c = model_.cfg;
     const LayerWeights & L = model_.layers[il];
+    if (c.is_glm()) { glm_layer_forward(il, T); return; }
     if (il == c.ple_layer) {   // the PLE adds into res_: a pending combine first
         if (pend_out_) hc_combine(res_, pend_out_, inj_, T, c.hc, c.n_embd, st_);
         pend_out_ = nullptr;

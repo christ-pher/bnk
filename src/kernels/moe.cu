@@ -204,10 +204,11 @@ __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __res
     const size_t base = (size_t) ent * kMaxWindow + t;
     const float * g = gu + base * 2 * F;
     const int ex = hits->e[ent].expert;
-    const float sg = es.gate ? es.gate[ex] : 1.f, sud = es.up ? es.up[ex] * es.down[ex] : 1.f;
+    const float sg = es.gate ? es.gate[ex] : 1.f, su = es.up ? es.up[ex] : 1.f, sd = es.down ? es.down[ex] : 1.f;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
-        const float gv = g[r] * sg;
-        const float h = gv / (1.f + __expf(-gv)) * g[F + r] * sud;
+        float gv = g[r] * sg, uv = g[F + r] * su;
+        if (es.limit > 0.f) { gv = fminf(gv, es.limit); uv = fminf(fmaxf(uv, -es.limit), es.limit); }
+        const float h = gv / (1.f + __expf(-gv)) * uv * sd;
         float d;
         const int8_t q = quant_lane(h, d);
         hq[base * F + r] = q;
@@ -603,10 +604,11 @@ __global__ void moe_act_list_k(const PfItem * __restrict__ items, const float * 
     if ((int) blockIdx.y >= it.n) return;
     const size_t pr = it.pair[blockIdx.y];
     const float * g = gu + pr * 2 * F;
-    const float sg = es.gate ? es.gate[it.expert] : 1.f, sud = es.up ? es.up[it.expert] * es.down[it.expert] : 1.f;
+    const float sg = es.gate ? es.gate[it.expert] : 1.f, su = es.up ? es.up[it.expert] : 1.f, sd = es.down ? es.down[it.expert] : 1.f;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
-        const float gv = g[r] * sg;
-        const float h = gv / (1.f + __expf(-gv)) * g[F + r] * sud;
+        float gv = g[r] * sg, uv = g[F + r] * su;
+        if (es.limit > 0.f) { gv = fminf(gv, es.limit); uv = fminf(fmaxf(uv, -es.limit), es.limit); }
+        const float h = gv / (1.f + __expf(-gv)) * uv * sd;
         float d;
         const int8_t q = quant_lane(h, d);
         hq[pr * F + r] = q;

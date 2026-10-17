@@ -33,6 +33,10 @@ def _common_chars(a: str, b: str) -> int:
 # llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 expression (the tokenizer.json original, with (?i:) expanded)
 QWEN35 = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
           r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# GLM-4 / GLM-5 (llama.cpp's "glm4": the tokenizer.json expression with (?i:) expanded)
+GLM4 = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+        r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+PRE_TYPES = {"qwen35": QWEN35, "glm4": GLM4}
 
 
 def bytes_to_unicode() -> dict[int, str]:
@@ -48,8 +52,10 @@ def bytes_to_unicode() -> dict[int, str]:
 
 
 class Tokenizer:
-    def __init__(self, tokens: list[str], merges: list[str], types: list[int], specials: dict[str, int]):
+    def __init__(self, tokens: list[str], merges: list[str], types: list[int], specials: dict[str, int],
+                 pre: str = "qwen35"):
         self.tokens = tokens
+        self.pre_type = pre if pre in PRE_TYPES else "qwen35"
         self.vocab = {t: i for i, t in enumerate(tokens)}
         self.ranks = {}
         for i, m in enumerate(merges):
@@ -61,7 +67,7 @@ class Tokenizer:
         # control (3) and user-defined (4) tokens are matched literally in text
         self.special = {t: i for i, t in enumerate(tokens) if types and types[i] in (3, 4)}
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
-        self.pre = regex.compile(QWEN35)
+        self.pre = regex.compile(PRE_TYPES[self.pre_type])
         self.cache: dict[str, list[int]] = {}
         self.wcache: dict[str, list[int]] = {}
         self.byte_table = {i: c for i, c in self.byte_enc.items()}
@@ -82,12 +88,15 @@ class Tokenizer:
                 with open(cp, "rb") as f:
                     return pickle.load(f)
         md = read_metadata(path, {"tokenizer.ggml.tokens", "tokenizer.ggml.merges", "tokenizer.ggml.token_type",
+                                  "tokenizer.ggml.pre", "glm5next.eos_token_ids", "general.architecture",
                                   "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id",
                                   "tokenizer.ggml.bos_token_id", "tokenizer.chat_template", "general.name",
                                   "general.sampling.temp", "general.sampling.top_k", "general.sampling.top_p"})
         specials = {k.split(".")[-1]: v for k, v in md.items() if k.endswith("_token_id")}
         tok = cls(md["tokenizer.ggml.tokens"], md["tokenizer.ggml.merges"], md.get("tokenizer.ggml.token_type") or [],
-                  specials)
+                  specials, md.get("tokenizer.ggml.pre") or "qwen35")
+        tok.eos_ids = list(md.get("glm5next.eos_token_ids") or [])
+        tok.arch = md.get("general.architecture", "qwen4exp")
         tok.chat_template = md.get("tokenizer.chat_template", "")
         tok.model_name = md.get("general.name", "model")
         tok.sampling = {k.split(".")[-1]: v for k, v in md.items() if k.startswith("general.sampling.")}
@@ -113,7 +122,7 @@ class Tokenizer:
         self._recent = []
         self._recent_lock = threading.Lock()
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
-        self.pre = regex.compile(QWEN35)
+        self.pre = regex.compile(PRE_TYPES[getattr(self, "pre_type", "qwen35")])
 
     # ----------------------------------------------------------------- encode
     def _bpe(self, word: str) -> list[int]:

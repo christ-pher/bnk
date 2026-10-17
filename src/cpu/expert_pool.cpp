@@ -27,56 +27,108 @@ ExpertStore::~ExpertStore() {
     }
 }
 
-void ExpertStore::build(const Model & m, int threads, bool verbose) {
+void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, const Ranking & rank) {
     const Config & c = m.cfg;
-    layer_off_.resize(c.n_layer);
+    m_ = &m;
+    n_expert_ = c.n_expert;
     blob_.resize(c.n_layer);
-    total_ = 0;
+    model_ = 0;
     for (int il = 0; il < c.n_layer; ++il) {
         const LayerWeights & L = m.layers[il];
         blob_[il] = (L.gate_bytes + L.up_bytes + L.down_bytes + 63) / 64 * 64;
-        layer_off_[il] = total_;
-        total_ += blob_[il] * c.n_expert;
+        model_ += blob_[il] * c.n_expert;
         max_blob_ = std::max(max_blob_, blob_[il]);
     }
+    // which experts get the arena: the ranking's order (completed with the rest, by layer), while they fit
+    arena_slot_.assign((size_t) c.n_layer * c.n_expert, -1);
+    slot_off_.clear();
+    std::vector<std::pair<int, int>> order;
+    {
+        std::vector<char> seen(arena_slot_.size(), 0);
+        for (auto [l, e] : rank)
+            if (l >= 0 && l < c.n_layer && e >= 0 && e < c.n_expert && blob_[l] && !seen[(size_t) l * c.n_expert + e]) {
+                seen[(size_t) l * c.n_expert + e] = 1;
+                order.emplace_back(l, e);
+            }
+        for (int l = 0; l < c.n_layer; ++l)
+            for (int e = 0; e < c.n_expert; ++e)
+                if (blob_[l] && !seen[(size_t) l * c.n_expert + e]) order.emplace_back(l, e);
+    }
+    total_ = 0;
+    const size_t limit = cap ? cap : model_;
+    for (auto [l, e] : order) {
+        if (total_ + blob_[l] > limit) continue;
+        arena_slot_[(size_t) l * c.n_expert + e] = (int32_t) slot_off_.size();
+        slot_off_.push_back(total_);
+        total_ += blob_[l];
+    }
+    n_arena_ = (int) slot_off_.size();
     const double t0 = now_ms();
-    void * p = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    void * p = mmap(nullptr, std::max<size_t>(total_, 4096), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("cannot reserve the expert arena");
     madvise(p, total_, MADV_HUGEPAGE);
     base_ = (uint8_t *) p;
 
-    // copy in parallel; each job streams one contiguous range of one source tensor (a matrix of a run of
-    // experts), so a cold page cache reads the files sequentially
-    constexpr int PARTS = 4;
+    // copy in parallel, each job a run of arena slots (in file order when there is no ranking)
+    std::vector<std::pair<int, int>> slots;   // slot -> (layer, expert)
+    slots.resize(n_arena_);
+    for (int l = 0; l < c.n_layer; ++l)
+        for (int e = 0; e < c.n_expert; ++e) {
+            const int32_t sl = arena_slot_[(size_t) l * c.n_expert + e];
+            if (sl >= 0) slots[sl] = {l, e};
+        }
+    constexpr int CHUNK = 16;
     std::atomic<int> next{0};
-    const int jobs = c.n_layer * 3 * PARTS;
+    const int jobs = (n_arena_ + CHUNK - 1) / CHUNK;
     auto worker = [&]() {
         for (int j; (j = next.fetch_add(1)) < jobs;) {
-            const int il = j / (3 * PARTS), mat = (j / PARTS) % 3, part = j % PARTS;
-            const LayerWeights & L = m.layers[il];
-            const int e0 = part * c.n_expert / PARTS, e1 = (part + 1) * c.n_expert / PARTS;
-            const uint8_t * src = mat == 0 ? L.gate_src : mat == 1 ? L.up_src : L.down_src;
-            const size_t sz = mat == 0 ? L.gate_bytes : mat == 1 ? L.up_bytes : L.down_bytes;
-            const size_t dst_off = mat == 0 ? 0 : mat == 1 ? L.gate_bytes : L.gate_bytes + L.up_bytes;
-            const uint8_t * s0 = src + (size_t) e0 * sz;
-            const size_t len = (size_t) (e1 - e0) * sz;
-            const uintptr_t pa = (uintptr_t) s0 & ~(uintptr_t) 4095;
-            madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_SEQUENTIAL);
-            madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_WILLNEED);
-            for (int e = e0; e < e1; ++e)
-                memcpy(base_ + layer_off_[il] + (size_t) e * blob_[il] + dst_off, src + (size_t) e * sz, sz);
+            for (int sl = j * CHUNK; sl < std::min(n_arena_, (j + 1) * CHUNK); ++sl) {
+                const auto [il, e] = slots[sl];
+                const LayerWeights & L = m.layers[il];
+                uint8_t * dst = base_ + slot_off_[sl];
+                memcpy(dst, L.gate_src + (size_t) e * L.gate_bytes, L.gate_bytes);
+                memcpy(dst + L.gate_bytes, L.up_src + (size_t) e * L.up_bytes, L.up_bytes);
+                memcpy(dst + L.gate_bytes + L.up_bytes, L.down_src + (size_t) e * L.down_bytes, L.down_bytes);
+            }
         }
     };
     std::vector<std::thread> th;
     for (int i = 0; i < threads; ++i) th.emplace_back(worker);
     for (auto & t : th) t.join();
     const double t1 = now_ms();
-    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
+    pinned_ = total_ > 0 && cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
-    if (verbose)
+    if (verbose) {
         fprintf(stderr, "bnk: experts: %.2f GiB in RAM (copied in %.1f s, %.2f GiB/s), %s\n", total_ / 1073741824.0,
                 (t1 - t0) / 1000, total_ / 1073741824.0 / ((t1 - t0) / 1000),
                 pinned_ ? "page-locked for DMA" : "NOT page-locked (DMA falls back to staging)");
+        if (total_ < model_)
+            fprintf(stderr, "bnk: experts: %d of %zu in RAM; the other %.2f GiB stay in the model file (page cache / disk)\n",
+                    n_arena_, order.size(), (model_ - total_) / 1073741824.0);
+    }
+}
+
+ExpertStore::Parts ExpertStore::parts(int il, int e) const {
+    const LayerWeights & L = m_->layers[il];
+    const int32_t sl = arena_slot_[(size_t) il * n_expert_ + e];
+    if (sl >= 0) {
+        const uint8_t * b = base_ + slot_off_[sl];
+        return Parts{b, b + L.gate_bytes, b + L.gate_bytes + L.up_bytes, pinned_};
+    }
+    return Parts{L.gate_src + (size_t) e * L.gate_bytes, L.up_src + (size_t) e * L.up_bytes,
+                 L.down_src + (size_t) e * L.down_bytes, false};
+}
+
+void ExpertStore::copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s) const {
+    const LayerWeights & L = m_->layers[il];
+    const Parts p = parts(il, e);
+    if (p.pinned) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, p.gate, L.gate_bytes + L.up_bytes + L.down_bytes, cudaMemcpyHostToDevice, s));
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, p.gate, L.gate_bytes, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(dst + L.gate_bytes, p.up, L.up_bytes, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(dst + L.gate_bytes + L.up_bytes, p.down, L.down_bytes, cudaMemcpyHostToDevice, s));
 }
 
 // ------------------------------------------------------------------------------------------ pool
@@ -211,11 +263,11 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             const int r_end = std::min(e, (gi + 1) * 2 * F);
             const std::vector<int> & grp = groups_[gi];
             const int n = (int) grp.size();
-            const uint8_t * blob = st_->blob(il, tasks[grp[0]].expert);
+            const ExpertStore::Parts pt = st_->parts(il, tasks[grp[0]].expert);
             for (int k = 0; k < n; ++k) ys[k] = xq_.data() + tasks[grp[k]].t * xrow;
             for (; g < r_end; ++g) {
                 const int r = g - gi * 2 * F;
-                const uint8_t * w = r < F ? blob + (size_t) r * grow : blob + L.gate_bytes + (size_t) (r - F) * urow;
+                const uint8_t * w = r < F ? pt.gate + (size_t) r * grow : pt.up + (size_t) (r - F) * urow;
                 if (gu_multi && n > 1) {
                     mdot(L.gate_type, E, w, ys, n, vals);
                 } else {
@@ -230,7 +282,12 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 const float sg = L.exp_sgate.empty() ? 1.f : L.exp_sgate[ex0], su = L.exp_sup.empty() ? 1.f : L.exp_sup[ex0];
                 for (int k = 0; k < n; ++k) {
                     float * gu = gu_.data() + (size_t) grp[k] * 2 * F;
-                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r] * su;
+                    const float lim = L.exp_scales.limit;
+                    for (int r = 0; r < F; ++r) {
+                        float gv = gu[r] * sg, uv = gu[F + r] * su;
+                        if (lim > 0.f) { gv = std::min(gv, lim); uv = std::min(std::max(uv, -lim), lim); }
+                        gu[r] = silu(gv) * uv;
+                    }
                     if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + grp[k] * hrow));
                     else hfrom(gu, hq_.data() + grp[k] * hrow, F);
                 }
@@ -260,7 +317,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             for (int gi = 0; gi < ng; ++gi) {
                 const std::vector<int> & grp = groups_[gi];
                 const int n = (int) grp.size();
-                const uint8_t * w = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
+                const uint8_t * w = st_->parts(il, tasks[grp[0]].expert).down + (size_t) r * drow;
                 for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
                 if (dn_multi && n > 1) {
                     mdot(L.down_type, F, w, hs, n, vals);

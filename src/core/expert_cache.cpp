@@ -80,7 +80,7 @@ void ExpertCache::fill(int il, const std::vector<int> & slots, const std::vector
         const int n = (int) std::min<size_t>(stage_n_, slots.size() - i0);
         std::vector<uint8_t *> dst(n);
         for (int j = 0; j < n; ++j) {
-            CUDA_CHECK(cudaMemcpyAsync(stage_ + (size_t) j * bb, st_->blob(il, experts[i0 + j]), bb, cudaMemcpyHostToDevice, s));
+            st_->copy_to_device(il, experts[i0 + j], stage_ + (size_t) j * bb, s);
             dst[j] = layer_base_[il] + (size_t) slots[i0 + j] * sb;
         }
         CUDA_CHECK(cudaMemcpyAsync(dst_ptrs_, dst.data(), n * sizeof(uint8_t *), cudaMemcpyHostToDevice, s));
@@ -208,7 +208,7 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
             const LayerWeights & L = m_->layers[c.il];
             const size_t bb = st_->blob_bytes(c.il);
             uint8_t * stg = swap_stage_ + (size_t) started * stage_bytes_;
-            CUDA_CHECK(cudaMemcpyAsync(stg, st_->blob(c.il, c.in), bb, cudaMemcpyHostToDevice, copy_));
+            st_->copy_to_device(c.il, c.in, stg, copy_);
             uint8_t * dst = layer_base_[c.il] + (size_t) c.slot * sb_[c.il];
             CUDA_CHECK(cudaMemcpyAsync(swap_ptrs_ + started, &dst, sizeof(uint8_t *), cudaMemcpyHostToDevice, copy_));
             moe_repack_blobs(stg, bb, swap_ptrs_ + started, 1, cf.n_ff_exp, cf.n_embd, L.gate_type,
@@ -244,6 +244,7 @@ static Ranking complete_ranking(const Ranking & rank, int n_layer, int n_expert,
 
 size_t ExpertCache::slot_bytes(const Model & m, int il) {
     const LayerWeights & L = m.layers[il];
+    if (!L.moe) return 0;   // a dense layer (glm5next's leading ones): no experts, no slots
     const RLayout gl = r_layout(L.gate_type, m.cfg.n_embd), dl = r_layout(L.down_type, m.cfg.n_ff_exp);
     return ((size_t) 2 * m.cfg.n_ff_exp * gl.row_bytes + (size_t) m.cfg.n_embd * dl.row_bytes + 63) / 64 * 64;
 }
@@ -256,6 +257,7 @@ static std::vector<int> plan_slots(const Model & m, size_t budget, const Ranking
     size_t used = 0;
     for (auto [l, e] : full) {
         (void) e;
+        if (!sb[l]) continue;
         const size_t add = vmem_round((slots[l] + 1) * sb[l]) - vmem_round(slots[l] * sb[l]);
         if (used + add > budget) continue;
         used += add;
@@ -306,7 +308,7 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     resident_ = 0;
     for (int l = 0; l < n_layer_; ++l) {
         sb_[l] = slot_bytes(m, l);
-        if (!owns(l)) continue;
+        if (!owns(l) || !sb_[l]) continue;
         layer_buf_[l].reserve((size_t) n_expert_ * sb_[l], vb, "expert cache", false);
         layer_buf_[l].ensure(slot_expert_[l].size() * sb_[l]);
         layer_base_[l] = layer_buf_[l].as<uint8_t>();

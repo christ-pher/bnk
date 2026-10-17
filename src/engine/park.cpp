@@ -45,9 +45,9 @@ template <typename F> void Engine::each_ctx(int cells, F && f) {
         if (!cur_->kc[il].p) continue;
         const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
         f((void *) cur_->kc[il].p, kv);
-        f((void *) cur_->vc[il].p, kv);
+        if (cur_->vc[il].p) f((void *) cur_->vc[il].p, kv);
         if (cur_->kraw[il].p) {
-            f((void *) cur_->kraw[il].p, (size_t) cells * c.idx_dim * sizeof(half));
+            f((void *) cur_->kraw[il].p, (size_t) cells * c.idx_raw_dim() * sizeof(half));
             f((void *) cur_->pooled[il].p, (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
         }
     }

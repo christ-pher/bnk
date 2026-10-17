@@ -51,6 +51,7 @@ struct HitList {
 // per-32 scale carries the magnitude) or on the tensor-core down product before its fp16 store.
 struct ExpScales {
     const float * gate = nullptr, * up = nullptr, * down = nullptr;
+    float limit = 0.f;   // > 0: h = silu(min(gate, limit)) * clamp(up, -limit, limit) (glm5next's swiglu_limit)
 };
 
 struct MoeLayerDesc {

@@ -122,6 +122,7 @@ int main(int argc, char ** argv) {
             }
         }
         else if (a == "--vram-reserve-gib") opt.vram_reserve_gib = std::stod(next());
+        else if (a == "--ram-gib") opt.ram_gib = std::stod(next());
         else if (a == "--no-graphs") opt.use_graphs = false;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--gemm-min-tokens") opt.gemm_min_tokens = std::stoi(next());

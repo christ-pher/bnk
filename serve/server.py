@@ -45,7 +45,8 @@ class State:
         self.im_start = self.tok.id_of("<|im_start|>")
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
-                                            self.tok.id_of("<|endoftext|>")] if t is not None})
+                                            self.tok.id_of("<|endoftext|>")] + list(getattr(self.tok, "eos_ids", []))
+                                if t is not None})
         # sampling defaults: the model file's recommendation, then the model config (configs/<model>.json);
         # a request's own fields always win
         samp = self.tok.sampling

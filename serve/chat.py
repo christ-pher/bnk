@@ -18,7 +18,8 @@ def _text(content) -> str:
 
 class ChatTemplate:
     def __init__(self, source: str):
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True)
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True,
+                                          extensions=["jinja2.ext.loopcontrols"])   # GLM templates use {% break %}
 
         def raise_exception(msg):
             raise jinja2.exceptions.TemplateError(msg)

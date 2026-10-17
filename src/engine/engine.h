@@ -46,6 +46,9 @@ struct EngineOptions {
     bool use_graphs = true;
     double vram_reserve_gib = 0.75;  // left free after the expert cache
     double expert_cache_gib = -1;    // < 0: everything that fits
+    // host RAM for the routed experts (page-locked arena): < 0 auto (every expert when they fit, else as much as
+    // the machine allows), 0 every expert; the rest stay in the model file's mapping (glm5next: 160 GiB of experts)
+    double ram_gib = -1;
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
@@ -313,6 +316,32 @@ private:
     void pf_stage_layer(int il);
     void pf_stage_list(int il, const std::vector<int> & experts);
     void mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0);
+
+    // ---- glm5next (engine_glm.cpp): the same forward driver, a different layer
+    void glm_alloc(int W);
+    void glm_layer_forward(int il, int T);
+    void glm_head(int T);
+    // mHC: w = (pre, post, comb) of every row from the streams; mixed (and mixact_) = the collapsed input
+    void glm_mhc_pre(const QMat & fn, const QMat & base, const QMat & scale, float * w, int T);
+    void glm_kda(int il, int T);
+    void glm_mla(int il, int T);
+    void glm_ffn(int il, int T);      // the dense MLP layers
+    void glm_moe(int il, int T);
+    // the prompt path
+    void glm_pf_layer(int il, int N);
+    void glm_pf_mhc_pre(const QMat & fn, const QMat & base, const QMat & scale, float * w, int N);
+    void glm_pf_kda(int il, int N);
+    void glm_pf_mla(int il, int N);
+    void glm_pf_ffn(int il, int N);
+    void glm_pf_moe(int il, int N);
+    void glm_pf_carve(int N, const std::function<void(DevBuf<float> &, size_t)> & carve);
+    DevBuf<float> g_ones_;
+    // decode buffers (kMaxWindow rows)
+    DevBuf<float> g_hcw_, g_qr_, g_qb_, g_qabs_, g_olat_, g_idxq_, g_idxw_, g_gates_, g_ffn_gu_, g_ffn_h_, g_small_;
+    struct {   // prompt buffers, carved from the arena (qabs / olat / gu / h / u for kGlmPiece rows at a time)
+        DevBuf<float> hcw, small, qr, qn, qb, qabs, olat, gates, g, gu, h, u, ix;
+    } gpf_;
+    static constexpr int kGlmPiece = 1024;
 
     Model model_;
     ExpertStore own_store_;          // the first stage's (every stage uses it)

@@ -40,6 +40,7 @@ set(BNK_CUDA_FLAGS_QUIET -lineinfo --use_fast_math -Wno-deprecated-gpu-targets
 add_library(bnk_core STATIC
   src/core/gguf_model.cpp
   src/core/model.cpp
+  src/core/model_glm.cpp
   src/core/expert_cache.cpp
   src/core/vmem.cpp
   src/core/pinned.cpp
@@ -53,6 +54,8 @@ add_library(bnk_core STATIC
   src/kernels/moe.cu
   src/kernels/moe_tc.cu
   src/kernels/qsa.cu
+  src/kernels/glm_ops.cu
+  src/engine/engine_glm.cpp
   src/engine/engine.cpp
   src/engine/mtp.cpp
   src/engine/generate.cpp

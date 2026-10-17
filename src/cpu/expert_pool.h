@@ -6,31 +6,46 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/model.h"
 
 namespace bnk {
 
-// Every routed expert of every layer as one contiguous blob [gate rows | up rows | down rows] in one
-// page-locked arena, so the GPU can DMA blobs into its cache and the CPU computes them in place.
+using Ranking = std::vector<std::pair<int, int>>;  // (layer, expert), hottest first
+
+// The routed experts in host RAM: each one a blob [gate rows | up rows | down rows] in a page-locked arena, so the
+// GPU can DMA blobs into its cache and the CPU computes them in place. When the arena is capped (a model whose
+// experts exceed the RAM: glm5next's 160 GiB), the hottest experts of the ranking get the arena and the rest stay
+// in the model file's mapping (three separate matrices, read through the page cache and the disk).
 class ExpertStore {
 public:
     ~ExpertStore();
-    void build(const Model & m, int threads, bool verbose = true);
-    const uint8_t * blob(int il, int e) const { return base_ + layer_off_[il] + (size_t) e * blob_[il]; }
+    // cap: bytes of arena (0: every expert); rank: which experts take it, hottest first (empty: in order)
+    void build(const Model & m, int threads, bool verbose = true, size_t cap = 0, const Ranking & rank = {});
+    struct Parts { const uint8_t * gate, * up, * down; bool pinned; };
+    Parts parts(int il, int e) const;
+    // the expert's blob (gate | up | down, blob_bytes(il)) to device memory on `s`
+    void copy_to_device(int il, int e, uint8_t * dst, cudaStream_t s) const;
+    bool in_arena(int il, int e) const { return arena_slot_[(size_t) il * n_expert_ + e] >= 0; }
     size_t blob_bytes(int il) const { return blob_[il]; }
     size_t max_blob_bytes() const { return max_blob_; }
-    size_t total_bytes() const { return total_; }
+    size_t total_bytes() const { return total_; }     // the arena
+    size_t model_bytes() const { return model_; }     // every expert
+    int arena_experts() const { return n_arena_; }
     bool pinned() const { return pinned_; }
     uint8_t * base() const { return base_; }
-    size_t layer_offset(int il) const { return layer_off_[il]; }
 
 private:
+    const Model * m_ = nullptr;
     uint8_t * base_ = nullptr;
-    size_t total_ = 0, max_blob_ = 0;
+    size_t total_ = 0, model_ = 0, max_blob_ = 0;
+    int n_expert_ = 0, n_arena_ = 0;
     bool pinned_ = false;
-    std::vector<size_t> layer_off_, blob_;
+    std::vector<size_t> blob_;
+    std::vector<int32_t> arena_slot_;   // [n_layer * n_expert] -> arena slot, -1 = the file mapping
+    std::vector<size_t> slot_off_;      // arena byte offset of each slot
 };
 
 // A fixed set of spinning workers. run() calls fn(part, nparts) once on every thread (the caller is
