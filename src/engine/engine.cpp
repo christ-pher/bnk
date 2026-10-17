@@ -318,6 +318,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
             DeviceScope ds(st->dev_);
             st->cache_.set_host_experts(*store_, share);
         }
+        if (share > 0.f) store_->set_puts(false);   // the GPUs' table of arena blobs is built once
         if (opt.verbose && share > 0.f)
             fprintf(stderr, "bnk: the GPUs read %.0f%% of a window's missed experts from the host arena over PCIe\n", 100.0 * share);
     }

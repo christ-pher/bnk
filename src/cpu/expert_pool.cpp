@@ -25,6 +25,16 @@ ExpertStore::~ExpertStore() {
         if (pinned_) cudaHostUnregister(base_);
         munmap(base_, std::max<size_t>(total_, 4096));
     }
+    if (put_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(put_mu_);
+            put_stop_ = true;
+        }
+        put_cv_.notify_all();
+        put_thread_.join();
+    }
+    for (cudaEvent_t ev : dma_ev_)
+        if (ev) cudaEventDestroy(ev);
     if (dstage_) cudaFreeHost(dstage_);
 }
 
@@ -69,11 +79,22 @@ void ExpertStore::dstage_ensure() {
 void ExpertStore::copy_batch_to_device(int il, const std::vector<int> & experts, uint8_t * dst, size_t stride,
                                        cudaStream_t s) {
     const size_t bb = blob_[il];
+    std::shared_lock<std::shared_mutex> rl(arena_mu_);   // the slots copied from stay put until the copies are done
     std::vector<int> disk;
+    bool from_arena = false;
     for (size_t i = 0; i < experts.size(); ++i) {
         const Parts p = parts(il, experts[i]);
-        if (p.pinned) CUDA_CHECK(cudaMemcpyAsync(dst + i * stride, p.gate, bb, cudaMemcpyHostToDevice, s));
-        else disk.push_back((int) i);
+        if (p.pinned) {
+            CUDA_CHECK(cudaMemcpyAsync(dst + i * stride, p.gate, bb, cudaMemcpyHostToDevice, s));
+            from_arena = true;
+        } else disk.push_back((int) i);
+    }
+    if (from_arena) {   // a put waits for this before it overwrites a slot
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        if ((int) dma_ev_.size() <= dev) dma_ev_.resize(dev + 1, nullptr);
+        if (!dma_ev_[dev]) CUDA_CHECK(cudaEventCreateWithFlags(&dma_ev_[dev], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(dma_ev_[dev], s));
     }
     if (disk.empty()) return;
     std::lock_guard<std::mutex> lk(dstage_mu_);
@@ -98,6 +119,60 @@ void ExpertStore::copy_batch_to_device(int il, const std::vector<int> & experts,
                                        cudaMemcpyHostToDevice, s));
     }
     CUDA_CHECK(cudaStreamSynchronize(s));   // the stage is free for the next caller once every copy is done
+}
+
+void ExpertStore::put(int il, int e) {
+    if (!puts_on_ || n_arena_ == 0 || arena_slot_[(size_t) il * n_expert_ + e] >= 0) return;
+    std::lock_guard<std::mutex> lk(put_mu_);
+    if (put_q_.size() >= 4096) return;   // a flood (a long prompt's eviction) keeps the newest, the hottest come first anyway
+    put_q_.emplace_back(il, e);
+    if (!put_thread_.joinable()) put_thread_ = std::thread([this]() { put_loop(); });
+    put_cv_.notify_one();
+}
+
+void ExpertStore::drain_puts() {
+    std::unique_lock<std::mutex> lk(put_mu_);
+    put_cv_.wait(lk, [&]() { return put_q_.empty(); });
+}
+
+void ExpertStore::put_loop() {
+    for (;;) {
+        std::pair<int, int> job;
+        {
+            std::unique_lock<std::mutex> lk(put_mu_);
+            put_cv_.wait(lk, [&]() { return put_stop_ || !put_q_.empty(); });
+            if (put_stop_) return;
+            job = put_q_.front();
+            put_q_.pop_front();
+        }
+        const auto [il, e] = job;
+        if (arena_slot_[(size_t) il * n_expert_ + e] >= 0) { put_cv_.notify_all(); continue; }
+        const size_t bb = blob_[il];
+        if (put_scratch_.size() < bb) put_scratch_.resize(bb);
+        read_blob(il, e, put_scratch_.data());   // outside the lock: the pool keeps computing meanwhile
+        // the victim: the next slot of the tail ring holding a blob of the same size
+        int sl = -1;
+        for (int tries = 0; tries < ring_ && sl < 0; ++tries) {
+            const int cand = n_arena_ - 1 - ring_cursor_;
+            ring_cursor_ = (ring_cursor_ + 1) % ring_;
+            if (blob_[slot_expert_[cand].first] == bb) sl = cand;
+        }
+        if (sl >= 0) {
+            std::unique_lock<std::shared_mutex> wl(arena_mu_);
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            for (size_t d = 0; d < dma_ev_.size(); ++d)   // copies from the arena still in flight
+                if (dma_ev_[d]) { cudaSetDevice((int) d); cudaEventSynchronize(dma_ev_[d]); }
+            cudaSetDevice(dev0);
+            const auto [vl, ve] = slot_expert_[sl];
+            arena_slot_[(size_t) vl * n_expert_ + ve] = -1;
+            memcpy(base_ + slot_off_[sl], put_scratch_.data(), bb);
+            slot_expert_[sl] = {il, e};
+            arena_slot_[(size_t) il * n_expert_ + e] = sl;
+            ++puts_;
+        }
+        put_cv_.notify_all();
+    }
 }
 
 void ExpertStore::prepare(const Model & m) {
@@ -177,6 +252,9 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, size_t cap, 
     std::vector<std::thread> th;
     for (int i = 0; i < threads; ++i) th.emplace_back(worker);
     for (auto & t : th) t.join();
+    slot_expert_ = slots;
+    ring_ = std::max(1, n_arena_ / 10);
+    ring_cursor_ = 0;
     const double t1 = now_ms();
     pinned_ = total_ > 0 && cudaHostRegister(base_, total_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
@@ -274,6 +352,7 @@ static inline void split(int n, int part, int nparts, int & b, int & e) {
 }
 
 void CpuExpertPool::run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out) {
+    std::shared_lock<std::shared_mutex> rl(const_cast<ExpertStore *>(st_)->arena_mu_);   // the slots read stay put
     std::lock_guard<std::mutex> lk(mu_);
     const double t0 = now_ms();
     const Config & c = m_->cfg;

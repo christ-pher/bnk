@@ -4,7 +4,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -42,6 +45,15 @@ public:
     void copy_batch_to_device(int il, const std::vector<int> & experts, uint8_t * dst, size_t stride, cudaStream_t s);
     int disk_threads = 16;   // the NVMe gives 2 GB/s to one reader, 5.3 GB/s to sixteen
     bool in_arena(int il, int e) const { return arena_slot_[(size_t) il * n_expert_ + e] >= 0; }
+    // The arena as the second level of the GPU caches: an expert a GPU evicts is written into it (read from the
+    // model file on a background thread, into the arena's tail ring: its coldest tenth, cycled), so later misses
+    // on it cost the pool 0.3 ms rather than a file read. A no-op when it is there already, or when the layer's
+    // blobs are another size than the victim's. Readers of arena pointers hold arena_mu_ shared meanwhile.
+    void put(int il, int e);
+    void drain_puts();
+    void set_puts(bool on) { puts_on_ = on; }   // off while the GPUs read the arena directly (their table is static)
+    int64_t puts() const { return puts_; }
+    std::shared_mutex arena_mu_;
     // the expert's blob as the GPUs see it (the arena is mapped for them), 0 when it is not in the arena
     unsigned long long host_dev_ptr(int il, int e) const {
         const int32_t sl = arena_slot_[(size_t) il * n_expert_ + e];
@@ -65,6 +77,19 @@ private:
     std::vector<size_t> blob_;
     std::vector<int32_t> arena_slot_;   // [n_layer * n_expert] -> arena slot, -1 = the file mapping
     std::vector<size_t> slot_off_;      // arena byte offset of each slot
+    std::vector<std::pair<int, int>> slot_expert_;   // slot -> (layer, expert)
+    // puts: the queue, its thread, the tail ring it writes into
+    std::deque<std::pair<int, int>> put_q_;
+    std::mutex put_mu_;
+    std::condition_variable put_cv_;
+    std::thread put_thread_;
+    bool put_stop_ = false, puts_on_ = true;
+    int ring_ = 0, ring_cursor_ = 0;
+    int64_t puts_ = 0;
+    std::vector<uint8_t> put_scratch_;
+    void put_loop();
+    // the last DMA from the arena on each device: a put waits for them before a slot changes hands
+    std::vector<cudaEvent_t> dma_ev_;
     uint8_t * dstage_ = nullptr;        // pinned stage for the file-read blobs on their way to a GPU
     int dstage_slots_ = 0;
     std::mutex dstage_mu_;

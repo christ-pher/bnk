@@ -193,6 +193,7 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         if (started >= max_swaps || started >= swap_n_) break;
         const int old = slot_expert_[c.il][c.slot];
         if (old >= 0) {
+            const_cast<ExpertStore *>(st_)->put(c.il, old);   // the arena keeps what the GPU drops
             int32_t minus1 = -1;
             CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) c.il * n_expert_ + old, &minus1, 4, cudaMemcpyHostToDevice, s));
             slot_of_host_[(size_t) c.il * n_expert_ + old] = -1;
@@ -379,6 +380,7 @@ size_t ExpertCache::shrink(size_t need, cudaStream_t s) {
             const int e = slot_expert_[l][sl];
             if (evict[sl] && e >= 0) {
                 evicted_[(size_t) l * n_expert_ + e] = 1;
+                const_cast<ExpertStore *>(st_)->put(l, e);
                 slot_of_host_[(size_t) l * n_expert_ + e] = -1;
                 --resident_;
                 --resident_l_[l];

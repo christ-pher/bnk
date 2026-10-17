@@ -596,8 +596,8 @@ int main(int argc, char ** argv) {
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));
     print_stages(eng);
-    printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps; %.2f experts per forward read by the GPUs from host RAM\n",
+    printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps, %lld dropped experts kept by the arena; %.2f experts per forward read by the GPUs from host RAM\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
-           (long long) eng.cache_swaps(), (double) tm.host_experts / std::max(1, tm.calls));
+           (long long) eng.cache_swaps(), (long long) eng.arena_puts(), (double) tm.host_experts / std::max(1, tm.calls));
     return 0;
 }

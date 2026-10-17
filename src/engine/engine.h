@@ -132,6 +132,7 @@ public:
     int cache_resident() const;
     size_t cache_bytes() const;
     int64_t cache_swaps() const;
+    int64_t arena_puts() const { return store_->puts(); }   // experts the GPUs dropped and the arena took
     // the layers of each stage when the model is split over `gpus` (balanced by the memory each needs and has)
     static std::vector<int> plan_split(const std::string & path, const EngineOptions & opt, const std::vector<int> & gpus);
 
