@@ -327,7 +327,11 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
                 if (st->cache_.owns(il) && st->cache_.slot_of(il, e) >= 0) return true;
             return false;
         };
-        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank, on_gpu);
+        // the GPUs' experts stay out of the arena only when it cannot hold every expert anyway (glm5next): a model
+        // that fits keeps every expert in RAM, so what the caches drop is there already
+        const bool exclusive = cap > 0 && cap < store_->model_bytes();
+        store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose, cap, rank,
+                      exclusive ? on_gpu : std::function<bool(int, int)>());
         float share = (float) opt.host_share;
         if (share < 0.f) share = (float) env_double("BNK_HOST_SHARE", 0.0);   // measured: the CPU pool beats PCIe reads
         for (Engine * st = this; st; st = st->next_.get()) {
