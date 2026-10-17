@@ -305,7 +305,23 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
         size_t cap = 0;
         if (opt.ram_gib > 0) cap = (size_t) (opt.ram_gib * 1073741824.0);
-        else if (opt.ram_gib < 0 && c.is_glm()) cap = (size_t) (env_double("BNK_RAM_GIB", 100.0) * 1073741824.0);
+        else if (opt.ram_gib < 0 && c.is_glm()) {
+            // auto: what the machine has available less headroom for the server's parking, the staging, the
+            // snapshots and the OS (BNK_RAM_GIB sets it outright); every expert when they fit (192 GB: they do)
+            double gib = env_double("BNK_RAM_GIB", -1.0);
+            if (gib <= 0) {
+                size_t avail_kb = 0;
+                if (FILE * f = fopen("/proc/meminfo", "r")) {
+                    char line[256];
+                    while (fgets(line, sizeof line, f))
+                        if (sscanf(line, "MemAvailable: %zu kB", &avail_kb) == 1) break;
+                    fclose(f);
+                }
+                const double headroom = env_double("BNK_RAM_HEADROOM_GIB", 24.0);
+                gib = std::max(16.0, avail_kb / 1048576.0 - headroom);
+            }
+            cap = (size_t) (gib * 1073741824.0);
+        }
         auto on_gpu = [this](int il, int e) {
             for (const Engine * st = this; st; st = st->next_.get())
                 if (st->cache_.owns(il) && st->cache_.slot_of(il, e) >= 0) return true;
