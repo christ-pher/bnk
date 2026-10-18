@@ -8,6 +8,9 @@ by the CPU during decoding, and experts stream over PCIe while a prompt is read.
 With **two (or more) V100s** the model's layers are split between them (a pipeline): two 32 GB cards hold every
 expert, so the CPU leaves the decode path and prompts are read on both cards at once (`docs/DUAL-GPU.md`).
 
+It also runs the **dense Qwen3.8 models** (`qwen35`: Qwen3.8-27B) through a second engine that keeps every weight
+in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s with its own MTP drafter.
+
 On top of that: speculative decoding with the model's own MTP layer, a 256K context whose memory is lent to the
 expert cache until it is needed, **several agents served at once** (their conversations decoded together in one
 batch, and parked in host RAM between turns so a turn reads only its new tokens), a thinking-loop guard, an
@@ -54,6 +57,21 @@ Anthropic one at the root. The first start takes about a minute. Details, option
 All numbers were measured on the machine above. "Greedy" runs decode deterministically with a warm expert cache;
 "served" runs go through the HTTP server with each model's default sampling (`configs/`), which is what a chat
 client sees.
+
+### Qwen3.8-27B (dense) on the two V100s
+
+`unsloth/Qwen3.8-27B-GGUF` Q8_0 (27 GiB, every weight in VRAM) through the dense engine (`docs/DENSE.md`): the
+model's layers are the Flash-Next blocks without the experts, so the same kernels run it. Its layer outputs match
+llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top token everywhere tested.
+
+| Greedy, Q8_0 | Layer pipeline (`--gpus 0,1`) | Tensor parallel (`--tp 1`, the config's default) |
+|---|---|---|
+| Decode without drafting | 30.8 tok/s | **42.4 tok/s** |
+| Decode with the model's MTP block drafting | 80.6 tok/s (3.4 tokens per round) | **104 tok/s** |
+| 3,000-token prompt | 981 tok/s | **1,193 tok/s** |
+
+Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
+stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
 ### What v0.3.1 changed: faster turns on both models
 
@@ -348,6 +366,10 @@ per-layer n-gram embedding. Expert formats: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3
 Q5_K, Q6_K, Q8_0, NVFP4 (with llama.cpp's per-expert `.scale` tensors; `docs/NVFP4.md`). Files that also carry an
 MTP block (`nextn_predict_layers`) load their trunk.
 
+It also runs GGUFs of the `qwen35` architecture (the dense Qwen3.8 models: 27B) through the dense engine of
+`src/dense/` (`docs/DENSE.md`): every weight in VRAM, any quant the R layouts support (Q8_0 is the one measured),
+the model's own MTP block as the drafter.
+
 Each model is one file in `configs/`: its settings and the Hugging Face files it comes from. `./run.sh` lists
 exactly these models, and `./models.sh` manages them:
 
@@ -364,6 +386,7 @@ exactly these models, and `./models.sh` manages them:
 | `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
 | `cyber-frost` | [peasantsmith CYBER-FROST-3.8-PS-GUFF Q5_K_M](https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF) (Blackfrost-AI's cybersecurity fine-tune) | 112.5 GB, 1 file; needs ~110 GB of RAM |
 | `fp4-local` | [nvidia Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (NVFP4, quantization-aware distilled), converted locally with `tools/convert_nvfp4.py` and `tools/convert_ple_nvfp4.py` (`docs/NVFP4.md`) | 75 GB + 29 GB table, two local GGUFs; the config's paths point at them |
+| `qwen27b` | [unsloth Qwen3.8-27B-GGUF Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (the dense 27B; `docs/DENSE.md`) | 29 GB, 1 file; needs two V100s |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
 `$HF_HUB_CACHE`), the same place `hf download` uses, so a model already downloaded with `hf` is found as it is. With
@@ -592,12 +615,14 @@ interleaved with decoding), `tools/llama_ref.cpp` (llama.cpp reference dumps for
 src/core/      GGUF loading, model config, expert cache, elastic VRAM (vmem)
 src/kernels/   CUDA: R-layout GEMV, MoE, QSA sparse attention, DeltaNet, sampling (top-k), GEMM helpers
 src/cpu/       expert store, CPU expert pool, AVX2 multi-token kernels
-src/engine/    engine (decode, batched decode, prefill, parking), MTP drafter, generator (speculation, sampling)
+src/engine/    engine (decode, batched decode, prefill, parking), MTP drafter, generator (speculation, sampling);
+               engine_api.h: the interface both engines implement
+src/dense/     the dense engine (qwen35: Qwen3.8-27B): weights in VRAM, pipeline or tensor parallel, its MTP block
 src/server/    the engine's JSON-lines protocol and request scheduler (bnk serve)
 serve/         HTTP server: APIs, chat templates, tokenizer, conversations, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
 configs/       the models: settings and download source, one file each (models.sh manages them)
-docs/          ROADMAP.md: what was measured, what changed, what is next; DUAL-GPU.md: several GPUs
+docs/          ROADMAP.md: what was measured, what changed, what is next; DUAL-GPU.md: several GPUs; DENSE.md: the dense engine
 tools/         CLI, models.py (behind models.sh), MTP builder, draft-vocabulary builder, agent benchmarks, batching simulator, checks
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT

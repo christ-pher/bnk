@@ -1,0 +1,109 @@
+# The dense engine: Qwen3.8-27B on the two V100s (branch `dense`, 2026-10-18)
+
+Goal: run the dense Qwen3.8 models (`unsloth/Qwen3.8-27B-GGUF`) in bnk without touching the Flash-Next (MoE)
+code paths, at a quantization high enough to keep the model's quality, and as fast as the two V100s allow.
+
+## What the model is
+
+Qwen3.8-27B is not a classical dense transformer. Its GGUF architecture is `qwen35`, the Qwen3.5 hybrid that
+Flash-Next also descends from:
+
+| | Qwen3.8-27B | Qwen3.8-Flash-Next (bnk's MoE engine) |
+|---|---|---|
+| Layers | 64: 48 Gated DeltaNet + 16 gated full attention (every 4th) | 48: 36 + 12 |
+| Width / FFN | 5,120 / 17,408, dense SwiGLU | 2,560 / 512 experts top-10 + shared |
+| DeltaNet | 16 key groups x 48 value heads, head dim 128, conv 4 | the same shapes |
+| Attention | 24 q heads / 4 KV heads, head dim 256, q|gate per head, RoPE on 64 dims | 24 / 2, QSA indexer |
+| Residual | one stream, RMSNorm before each half, plain adds | 4 hyper-connection streams, PLE n-grams |
+| MTP | one block after the trunk (block 64 of the GGUF, `nextn.*` tensors) | separate draft-layer GGUF |
+| Vocabulary | 248,320 (tokenizer pre-type `qwen35`) | the same tokenizer family |
+
+So the blocks bnk already had (DeltaNet conv / recurrence / gated norm, gated attention with the KV cache, the
+quantized GEMVs, the fp16 tensor-core GEMMs of the prompt path, graphs, the drafter protocol) cover it; what is
+new is the dense FFN, the plain residual, and a model with every weight in VRAM.
+
+One difference that matters: the DeltaNet output gate of this family is **silu(z)** (`output_gate_type: swish`),
+not sigmoid(z) as in Flash-Next. The first run produced garbage because of it; `gated_rmsnorm_silu` /
+`quantize_gated_norm_silu` are the two added kernels. Two converter conventions were checked and found compatible:
+the GGUF's norm weights carry the model's `1 + w` folded in (no `+1` at load, unlike `tools/build_mtp.py`'s
+output), and the value heads are stored in llama.cpp's *tiled* order, which is exactly the `h % n_groups` mapping
+bnk's recurrence assumes.
+
+## Which quant
+
+The two cards hold 64 GB. The GGUF sizes from the repo: Q8_0 27.05 GiB, UD-Q6_K_XL 23.6, UD-Q5_K_XL 19.4,
+UD-Q4_K_XL 16.4, and BF16 51 GiB (too big beside a context). Q8_0 is the pick: near-lossless (8.5 bits per
+weight), and it leaves ~17 GB per card for the context and the prompt path. The engine's layer outputs match
+llama.cpp's fp32 CPU path within 0.3-1.2% RMS (that is the int8 activation quantization of the GEMVs; the weights
+are used bit for bit), with the same top token at every position tested and a KL of 2e-4 on the logits.
+
+## Where the code lives (and does not)
+
+* `src/dense/`: `dense_model` (config, weight upload, tensor-parallel slicing), `dense_engine` (decode windows,
+  graphs, slots, snapshots, pipeline or tensor parallel), `dense_prefill` (chunked prompt path), `dense_mtp` (the
+  drafter), `dense_ops.cu` (the residual stream's fused norm + quantize, the adds).
+* `src/engine/engine_api.h`: the interface the generator, server and command line talk to. The MoE `Engine` and
+  `DenseEngine` both implement it; `bnk` picks one from the GGUF's `general.architecture`. That is the whole
+  extent of the change to the shared code: `generate.cpp`, `serve.cpp` and `bnk_main.cpp` call the interface,
+  `engine.h` declares the MoE engine as implementing it, and the two silu-gated kernels were added beside the
+  sigmoid ones (not in their place). The Flash-Next regression (`Qwen3.8-Flash-Next-FP4-Local`, 3,000-token
+  prompt, 300 greedy tokens with MTP) produces the same tokens on this branch as on master.
+* `configs/Qwen3.8-27B-Q8_0.json` (aliases `qwen27b`, `27b`, `dense`): `"mtp": "builtin"` tells `run.sh` the
+  drafter is inside the model file; `engine_args --tp 1` turns on tensor parallelism.
+
+## How the two GPUs are used
+
+**Pipeline (default of the engine, `--gpus 0,1`):** layers 0-33 on GPU 0, 34-63 on GPU 1 (balanced by bytes,
+the head and the MTP block counted on the last card). Decode is bandwidth-bound: each card streams its 13 GB of
+weights in ~16 ms, one after the other, 32.5 ms per forward. Prompts overlap in chunks (one stage works on chunk
+k+1 while the other finishes chunk k).
+
+**Tensor parallel (`--tp 1`, the config's setting):** every layer is split across both cards: half the attention
+heads and KV heads, half the DeltaNet key groups with their value heads (the KV cache and recurrent state follow
+their heads), half the FFN rows. Both cards stream their half at once; after the attention / DeltaNet and after
+the FFN the two partial sums are all-reduced. Peer-to-peer copies between these two V100s take 51 ms whatever the
+size (the PCIe topology under the hypervisor), so the exchange goes through pinned host memory: each rank copies
+its partial out, waits for the peer's event, copies the peer's partial in and adds it. 23 us per exchange at one
+row, 43 us at five; 128 of them per forward. Both ranks add the same two values, so their residual streams stay
+identical bit for bit (prompt chunks exchange fp16 partials, and both ranks add the two rounded halves). One CUDA
+graph per window layout spans both devices (rank 0 captures, the peer's stream joins through an event). Rank 0
+holds the head and the drafter; the peer's residual is identical, so nothing needs to cross for them.
+
+| Two V100s, Q8_0 | Pipeline | Tensor parallel |
+|---|---|---|
+| Decode, greedy, no drafting | 30.8 tok/s (32.5 ms per forward) | **42.4 tok/s** (23 ms) |
+| Decode with the MTP drafter (draft 4 / min-p 0.8) | 80.6 tok/s, 3.4 tokens per round | **104 tok/s**, 3.4 per round |
+| 3,000-token prompt | 981 tok/s | **1,193 tok/s** |
+| 300-token prompt | 507 tok/s | 825 tok/s |
+
+The verify window of a speculative round carries up to 5 rows and takes 28 ms in TP (23 at one row): the GEMVs
+are still weight-bandwidth-bound, the extra rows are nearly free, which is why drafting pays 2.5x here.
+
+## The prompt path
+
+cuBLAS fp16 GEMMs with each matrix dequantized to fp16 on the fly (as the MoE engine's dense projections), the
+DeltaNet recurrence over the whole chunk, and the existing one-warp-per-(row, head) attention kernel over the KV
+cache. Per block kind on a 3,000-token chunk (pipeline, GPU 0, 34 layers): FFN 1,104 ms (about 50 TFLOPS, near
+what the 150 W power cap leaves of the tensor cores), DeltaNet 594 ms, attention 504 ms of which ~400 is the
+attention kernel itself. That kernel is the open item for long prompts: it is O(N^2) on CUDA cores (2 TFLOPS); a
+tensor-core flash-attention kernel for the V100 would take the attention layers from ~60 ms to ~15 ms per 3,000
+rows and make 32K+ prompts practical (today a 32K prompt would spend most of its time there).
+
+## Serving
+
+`./run.sh qwen27b` (the config's `server_args`: context 131,072, 2 slots, no parking: parking exists for the MoE
+engine's expert cache pressure and is a no-op here; the KV cache is mapped on demand like the MoE engine's). The
+server's telemetry fields about experts read 0 and the console shows no "CPU misses" line, since nothing runs on
+the CPU.
+
+## Open items
+
+1. A tensor-core attention kernel for prompt chunks (above).
+2. fp16 exchange in decode windows too (halves the bytes of the 5-row verify windows: 43 -> ~30 us per
+   exchange, ~1.5 ms per forward).
+3. The draft head: the drafter reads the 1.3 GB Q8_0 head (over the draft vocabulary's 145K rows re-quantized to
+   Q4_K, as the MoE engine does) once per draft step; a smaller draft vocabulary or a lower quant of the draft
+   head would cut the ~1 ms per step.
+4. Sliced head: the head's rows could be split between the ranks too (0.8 ms per forward on rank 0 today).
+5. Lower quants (UD-Q6_K_XL, UD-Q5_K_XL): the loader is format-agnostic (any ggml type the R layouts support);
+   a K-quant's 256-wide blocks fit the 1,024-wide slices tensor parallelism makes. Untested.
