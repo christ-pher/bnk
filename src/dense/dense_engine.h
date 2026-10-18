@@ -41,12 +41,12 @@ public:
     std::vector<int> devices() const override;
     int device() const override { return dev_; }
     int last_device() const override { return next_ ? next_->last_device() : dev_; }
-    int stages() const override { return next_ ? 1 + next_->stages() : 1; }
+    int stages() const override { return tp() ? 1 : next_ ? 1 + next_->stages() : 1; }
     StageInfo stage_info(int i) const override;
     std::string model_name() const override { return model_.gguf.get_str("general.name", "bnk"); }
     const Config & cfg() const override { return model_.cfg; }
     int res_dim() const override { return model_.cfg.n_embd; }
-    Drafter * mtp() override { return next_ ? next_->mtp() : mtp_.loaded() ? &mtp_ : nullptr; }
+    Drafter * mtp() override { return next_ && !tp() ? next_->mtp() : mtp_.loaded() ? &mtp_ : nullptr; }
     int max_ctx() const override { return opt_.max_ctx; }
     int cpu_threads() const override { return 0; }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
@@ -76,10 +76,10 @@ public:
                       int second_lane) override;
     int row0_of(int slot) const override { return seqs_.at(slot)->last_r0; }
     void commit(int c) override;
-    const float * residual_dev() const override { return next_ ? next_->residual_dev() : res_.p; }
+    const float * residual_dev() const override { return next_ && !tp() ? next_->residual_dev() : res_.p; }
     void set_mtp_pending(const float * R_row_dev, int cell) override;
-    const float * mtp_pending_R() const override { return next_ ? next_->mtp_pending_R() : cur_->mtp_R; }
-    int mtp_pending_cell() const override { return next_ ? next_->mtp_pending_cell() : cur_->mtp_cell; }
+    const float * mtp_pending_R() const override { return next_ && !tp() ? next_->mtp_pending_R() : cur_->mtp_R; }
+    int mtp_pending_cell() const override { return next_ && !tp() ? next_->mtp_pending_cell() : cur_->mtp_cell; }
 
     int argmax(int t) override;
     void argmax_all(int T, int32_t * out, int row0 = 0) override;
@@ -109,7 +109,34 @@ private:
     bool last_ = true;
     DenseEngine * head_ = this;
     std::unique_ptr<DenseEngine> next_;
-    DenseEngine * tail() { return next_ ? next_->tail() : this; }
+    DenseEngine * tail() { return next_ && !tp() ? next_->tail() : this; }
+    // ---- tensor parallel: the chain's objects are the ranks, every layer on each (sliced); rank 0 drives both
+    // GPUs' streams in lockstep and captures one graph over both devices
+    int tp_n_ = 1, tp_rank_ = 0;
+    bool tp() const { return tp_n_ > 1; }
+    DenseEngine * peer_ = nullptr;
+    // the all-reduce with the peer through pinned host memory, per exchange point (0: after the attention /
+    // DeltaNet, 1: after the FFN) and layer parity (a layer's copy out must not overwrite what the peer still reads)
+    float * tp_h_[2][2] = {};           // decode: this rank's partial [W][E] (fp32, exact: both ranks add the same)
+    half * tp_pfh_[2][2] = {};          // prompt chunks: [pf_max][E] as fp16 (both ranks add the two rounded halves)
+    std::vector<cudaEvent_t> tp_ev_[2], tp_pfev_[2];   // per point and layer (a capture keeps every record apart)
+    DevBuf<float> tp_tmp_;
+    DevBuf<half> tp_mine16_, tp_peer16_;
+    cudaEvent_t tp_fork_ = nullptr, tp_join_ = nullptr;
+    void tp_send(const float * buf, int rows, int point, int il);
+    void tp_recv(float * buf, int rows, int point, int il);
+    void tp_pf_send(const float * partial, int rows, int point, int il);   // as fp16, from partial
+    void tp_pf_recv(float * res, int rows, int point, int il);             // res += mine16 + peer16
+    void tp_enqueue_forward(int T);
+    void tp_prefill_chunk(const int32_t * tokens, int N);
+    // the per-rank phases of a layer, driven in lockstep over the ranks
+    void fwd_in(int T);
+    void layer_block(int il, int T);
+    void layer_ffn(int il, int T);
+    void pf_in(const int32_t * tokens, int N, int buf);
+    void pf_layer_a(int il, int N);
+    void pf_layer_b(int il, int N);
+    void pf_out(int N, int buf);
     bool first() const { return l0_ == 0; }
     bool owns(int il) const { return il >= l0_ && il < l1_; }
     void load_stage(const std::string & path, const EngineOptions & opt);

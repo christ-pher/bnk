@@ -36,6 +36,13 @@ struct DenseMtpWeights {
 
 struct DenseModel {
     Config cfg;
+    // Tensor parallel (tp_n > 1): this rank's slice of every layer. lc is the config of the slice: its heads, KV
+    // heads, DeltaNet key groups and value heads, FFN width (the kernels run on those). Attention heads, KV heads,
+    // DeltaNet groups and the FFN are split evenly; a rank's value heads are those whose key group it holds (the
+    // GGUF's tiled order keeps a rank's heads in runs of nk/tp_n), so the local head h belongs to local group
+    // h % (nk/tp_n) as before.
+    int tp_n = 1, tp_rank = 0;
+    Config lc;
     GgufModel gguf;
     std::vector<DenseLayer> layers;   // every layer; weights only for [l0, l1)
     QMat tok_embd;                    // page-locked host memory, gathered by row over PCIe
@@ -45,16 +52,22 @@ struct DenseModel {
     size_t vram_bytes = 0;
 
     // Uploads layers [l0, l1) (l1 < 0: all), the token table with `embd`, the head with `head`, the MTP block
-    // with `mtp` (the block after the trunk, when the file has one).
+    // with `mtp` (the block after the trunk, when the file has one); tp_n > 1: rank tp_rank's slice of each layer.
     void load(const std::string & path, bool verbose, int l0 = 0, int l1 = -1, bool embd = true, bool head = true,
-              bool mtp = false);
+              bool mtp = false, int tp_n = 1, int tp_rank = 0);
     ~DenseModel();
+    using Ranges = std::vector<std::pair<int64_t, int64_t>>;
 
 private:
     std::vector<void *> device_allocs_;
     std::vector<void *> host_allocs_;
     QMat upload(const std::string & name, bool required = true);
     QMat upload_tensor(const TensorRef & t, bool repack);
+    // slices: the given row ranges [r0, r1) concatenated, or the given column ranges of every row (ranges in
+    // whole quant blocks)
+    QMat upload_rows(const std::string & name, const Ranges & rows);
+    QMat upload_cols(const std::string & name, const Ranges & cols);
+    QMat upload_rows2(const std::string & na, const std::string & nb, const Ranges & ra, const Ranges & rb, QMat & a, QMat & b);
     // two matrices of the same format and width stacked (a | b): one upload; a and b become row views of it
     bool stack(const std::string & na, const std::string & nb, QMat & a, QMat & b, QMat & ab);
     void load_layer(DenseLayer & L, const std::string & prefix, bool attn);

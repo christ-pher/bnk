@@ -101,6 +101,10 @@ __global__ void add_rows_k(float * __restrict__ y, const float * __restrict__ x,
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += x[i];
 }
+__global__ void add_rows_f16x2_k(float * __restrict__ y, const half * __restrict__ a, const half * __restrict__ b, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += __half2float(a[i]) + __half2float(b[i]);
+}
 
 }  // namespace
 
@@ -132,6 +136,9 @@ void dense_norm_q(float * res, const float * pend, const float * w, float * xn, 
 
 void add_rows(float * y, const float * x, int64_t n, cudaStream_t s) {
     add_rows_k<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, x, n);
+}
+void add_rows_f16x2(float * y, const half * a, const half * b, int64_t n, cudaStream_t s) {
+    add_rows_f16x2_k<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, a, b, n);
 }
 
 }  // namespace bnk

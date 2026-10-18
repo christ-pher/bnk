@@ -14,14 +14,14 @@ namespace bnk {
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
 // Debug dumps of one layer's intermediates (BNK_DUMP_DIR, BNK_DUMP_LAYER; eager mode only): appended per window.
-static void dbg(cudaStream_t st, int il, const char * name, const float * dev, size_t n) {
+static void dbg(cudaStream_t st, int rank, int il, const char * name, const float * dev, size_t n) {
     static const char * dir = getenv("BNK_DUMP_DIR");
     static int layer = env_int("BNK_DUMP_LAYER", 0);
     if (!dir || il != layer) return;
     std::vector<float> h(n);
     CUDA_CHECK(cudaStreamSynchronize(st));
     CUDA_CHECK(cudaMemcpy(h.data(), dev, n * 4, cudaMemcpyDeviceToHost));
-    FILE * f = fopen((std::string(dir) + "/" + name).c_str(), "ab");
+    FILE * f = fopen((std::string(dir) + "/" + name + (rank ? ".r" + std::to_string(rank) : "")).c_str(), "ab");
     fwrite(h.data(), 4, n, f);
     fclose(f);
 }
@@ -99,6 +99,16 @@ DenseEngine::~DenseEngine() {
     if (ev_out_) cudaEventDestroy(ev_out_);
     if (ev_t0_) cudaEventDestroy(ev_t0_);
     if (ev_t1_) cudaEventDestroy(ev_t1_);
+    for (int pt = 0; pt < 2; ++pt) {
+        for (int par = 0; par < 2; ++par) {
+            if (tp_h_[pt][par]) cudaFreeHost(tp_h_[pt][par]);
+            if (tp_pfh_[pt][par]) cudaFreeHost(tp_pfh_[pt][par]);
+        }
+        for (cudaEvent_t e : tp_ev_[pt]) cudaEventDestroy(e);
+        for (cudaEvent_t e : tp_pfev_[pt]) cudaEventDestroy(e);
+    }
+    if (tp_fork_) cudaEventDestroy(tp_fork_);
+    if (tp_join_) cudaEventDestroy(tp_join_);
 }
 
 cudaStream_t DenseEngine::fork(int i) {
@@ -122,7 +132,7 @@ std::vector<int> DenseEngine::devices() const {
 }
 
 StageInfo DenseEngine::stage_info(int i) const {
-    const DenseEngine * s = stage(i);
+    const DenseEngine * s = tp() ? (i == 0 ? this : nullptr) : stage(i);
     if (!s) throw std::runtime_error("no stage " + std::to_string(i));
     return StageInfo{s->dev_, s->l0_, s->l1_, 0, 0, s->gpu_ms_, s->gpu_forwards_, s->pf_ms_, s->pf_tokens_};
 }
@@ -190,18 +200,33 @@ void DenseEngine::load(const std::string & path, const EngineOptions & opt) {
     }
     for (int d : gpus)
         if (d < 0 || d >= count) throw std::runtime_error("no CUDA device " + std::to_string(d) + " (" + std::to_string(count) + " visible)");
-    const std::vector<int> bounds = gpus.size() > 1 ? plan_split(path, opt, gpus) : std::vector<int>{0, -1};
+    const bool tpar = opt.tp > 0 && gpus.size() > 1;
+    if (tpar && gpus.size() != 2) throw std::runtime_error("tensor parallel: two GPUs (--gpus 0,1)");
+    const std::vector<int> bounds = gpus.size() > 1 && !tpar ? plan_split(path, opt, gpus) : std::vector<int>{0, -1, -1};
     DenseEngine * s = this, * prev = nullptr;
     for (size_t k = 0; k < gpus.size(); ++k) {
         s->head_ = this;
         s->dev_ = gpus[k];
-        s->l0_ = bounds[k];
-        s->l1_ = bounds[k + 1];
-        s->last_ = k + 1 == gpus.size();
-        if (opt.verbose && gpus.size() > 1)
-            fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
-        s->load_stage(path, opt);
+        if (tpar) {   // every layer on each rank, sliced; rank 0 holds the head and drafts
+            s->tp_n_ = (int) gpus.size();
+            s->tp_rank_ = (int) k;
+            s->l0_ = 0;
+            s->l1_ = -1;
+            s->last_ = k == 0;
+            if (opt.verbose) fprintf(stderr, "bnk: tensor parallel slice %zu of %zu: GPU %d\n", k + 1, gpus.size(), s->dev_);
+        } else {
+            s->l0_ = bounds[k];
+            s->l1_ = bounds[k + 1];
+            s->last_ = k + 1 == gpus.size();
+            if (opt.verbose && gpus.size() > 1)
+                fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
+        }
         if (prev) {
+            prev->peer_ = s;
+            s->peer_ = prev;
+        }
+        s->load_stage(path, opt);
+        if (prev && !tpar) {
             for (int l = 0; l < kLanes; ++l) prev->xfer_out_[l] = s->xfer_in_[l];
             prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
             prev->pf_xfer_out_[1] = s->pf_xfer_in_[1];
@@ -237,9 +262,9 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     // --mtp (any value: the block lives in the model file) makes the last stage load the drafter; it embeds its
     // tokens and shares the head, so that stage holds the token table too
     const bool want_mtp = last_ && !opt.mtp.empty();
-    model_.load(path, opt.verbose, l0_, l1_, first() || want_mtp, last_, want_mtp);
+    model_.load(path, opt.verbose, l0_, l1_, first() || want_mtp, last_, want_mtp, tp_n_, tp_rank_);
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;   // this slice's dimensions (the whole model's unless tensor parallel)
     if (head) {
         layer_routed.assign(c.n_layer, 0);
         layer_misses.assign(c.n_layer, 0);
@@ -268,6 +293,28 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
         for (float *& b : xfer_in_) CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) W * E * 4, cudaHostAllocPortable));
         if (pf_max_ > 0)
             for (float *& b : pf_xfer_in_) CUDA_CHECK(cudaHostAlloc((void **) &b, (size_t) pf_max_ * E * 4, cudaHostAllocPortable));
+    }
+    if (tp()) {   // the exchange buffers with the peer
+        for (int pt = 0; pt < 2; ++pt) {
+            for (int par = 0; par < 2; ++par) {
+                CUDA_CHECK(cudaHostAlloc((void **) &tp_h_[pt][par], (size_t) W * E * 4, cudaHostAllocPortable));
+                if (pf_max_ > 0)
+                    CUDA_CHECK(cudaHostAlloc((void **) &tp_pfh_[pt][par], (size_t) pf_max_ * E * 2, cudaHostAllocPortable));
+            }
+            tp_ev_[pt].resize(c.n_layer);
+            tp_pfev_[pt].resize(c.n_layer);
+            for (int il = 0; il < c.n_layer; ++il) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&tp_ev_[pt][il], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&tp_pfev_[pt][il], cudaEventDisableTiming));
+            }
+        }
+        tp_tmp_.alloc((size_t) W * E);
+        if (pf_max_ > 0) {
+            tp_mine16_.alloc((size_t) pf_max_ * E);
+            tp_peer16_.alloc((size_t) pf_max_ * E);
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&tp_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&tp_join_, cudaEventDisableTiming));
     }
     for (int l = 0; l < kLanes; ++l) {
         gdn_co_[l].resize(c.n_layer);
@@ -306,7 +353,8 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     if (opt.verbose)
         fprintf(stderr, "bnk: %scontext %d: %.0f KiB of %sKV per token (%.2f GiB when full, mapped as used), "
                         "recurrent state %.2f GiB%s\n",
-                first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
+                tp() ? ("slice " + std::to_string(tp_rank_ + 1) + ": ").c_str()
+                     : first() && last_ ? "" : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1) + ": ").c_str(),
                 opt.max_ctx, kv_cell_bytes / 1024.0, opt.kv8 ? "8-bit " : "", (double) kv_cell_bytes * opt.max_ctx / 1073741824.0,
                 state_bytes / 1073741824.0, seqs_.size() > 1 ? (", " + std::to_string(seqs_.size()) + " conversation slots").c_str() : "");
     if (pf_max_ > 0) prefill_alloc(pf_max_);
@@ -323,12 +371,13 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
             CUDA_CHECK(cudaHostAlloc((void **) &q->ckpts.back().host, ck, cudaHostAllocPortable));
         }
     if (opt.verbose)
-        fprintf(stderr, "bnk: layers %d-%d: snapshots %d x %d slots x %.0f MiB pinned\n", l0_, l1_ - 1, kMaxCheckpoints,
-                (int) seqs_.size(), ck / 1048576.0);
+        fprintf(stderr, "bnk: %s: snapshots %d x %d slots x %.0f MiB pinned\n",
+                tp() ? ("slice " + std::to_string(tp_rank_ + 1)).c_str() : ("layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1)).c_str(),
+                kMaxCheckpoints, (int) seqs_.size(), ck / 1048576.0);
 }
 
 void DenseEngine::alloc_seq(Seq & q) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const int W = kMaxWindow, C = c.conv_channels();
     q.conv_buf.resize(c.n_layer);
     q.ssm_state.resize(c.n_layer);
@@ -395,7 +444,7 @@ void DenseEngine::ensure_ctx_here(int cells) {
 }
 
 void DenseEngine::map_ctx(int cells) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const bool grow = cells > cur_->ctx_mapped;
     for (int il = 0; il < c.n_layer; ++il) {
         if (!cur_->kv_k[il].reserved()) continue;
@@ -500,7 +549,7 @@ void DenseEngine::reset() {
 void DenseEngine::reset_here() {
     DeviceScope ds(dev_);
     join_commit_here();
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     cur_->history.clear();
     for (auto & k : cur_->ckpts) k.pos = -1;
     cur_->mtp_cell = -1;
@@ -516,7 +565,7 @@ void DenseEngine::reset_here() {
 
 // ------------------------------------------------------------------------------------------------ the forward
 void DenseEngine::gdn(int il, int T) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     float * co = gdn_co_[lane_][il], * gg = gdn_g_[lane_][il], * gb = gdn_b_[lane_][il];
@@ -538,14 +587,14 @@ void DenseEngine::gdn(int il, int T) {
             CUDA_CHECK(cudaMemcpyAsync(w.q->conv_buf[il].p + (size_t) (K - 1) * C, conv_out_.p + (size_t) w.r0 * C,
                                        (size_t) w.T * C * 4, cudaMemcpyDeviceToDevice, st_));
     join(0);
-    dbg(st_, il, "qkv", qkv, (size_t) T * C);
-    dbg(st_, il, "z", z_, (size_t) T * nv * S);
-    dbg(st_, il, "beta", gb, (size_t) T * nv);
-    dbg(st_, il, "alpha", gg, (size_t) T * nv);
+    dbg(st_, tp_rank_, il, "qkv", qkv, (size_t) T * C);
+    dbg(st_, tp_rank_, il, "z", z_, (size_t) T * nv * S);
+    dbg(st_, tp_rank_, il, "beta", gb, (size_t) T * nv);
+    dbg(st_, tp_rank_, il, "alpha", gg, (size_t) T * nv);
     for (const Win & w : wins_) {
         float * cw = co + (size_t) w.r0 * C, * gw = gg + (size_t) w.r0 * nv, * bw = gb + (size_t) w.r0 * nv;
         gdn_conv(w.q->conv_buf[il], F(L.ssm_conv1d), cw, w.T, C, K, st_);
-        dbg(st_, il, "conv_silu", cw, (size_t) w.T * C);
+        dbg(st_, tp_rank_, il, "conv_silu", cw, (size_t) w.T * C);
         gdn_prep(cw, w.T, C, c.ssm_groups, nv, S, gw, bw, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
         gdn_recurrence(cw, C, gw, bw, w.q->ssm_state[il], gdn_o_.p + (size_t) w.r0 * nv * S, w.T, c.ssm_groups, nv, S,
                        w.commit ? w.T : 0, st_);
@@ -563,7 +612,7 @@ void DenseEngine::gdn(int il, int T) {
 }
 
 void DenseEngine::attn(int il, int T) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     gemv(L.wq, &act_, nullptr, 0, T, qfull_, H * D * 2, false, st_);
@@ -572,8 +621,8 @@ void DenseEngine::attn(int il, int T) {
         gemv(L.wk, &act_, nullptr, 0, T, k_, Hkv * D, false, st_);
         gemv(L.wv, &act_, nullptr, 0, T, v_, Hkv * D, false, st_);
     }
-    dbg(st_, il, "Qcur_full", qfull_, (size_t) T * H * D * 2);
-    dbg(st_, il, "Vcur", v_, (size_t) T * Hkv * D);
+    dbg(st_, tp_rank_, il, "Qcur_full", qfull_, (size_t) T * H * D * 2);
+    dbg(st_, tp_rank_, il, "Vcur", v_, (size_t) T * Hkv * D);
     for (size_t wi = 0; wi < wins_.size(); ++wi) {
         const Win & w = wins_[wi];
         const int * pos0 = &d_par_[wi].pos0;
@@ -583,13 +632,13 @@ void DenseEngine::attn(int il, int T) {
                   w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_);
         attention(qw, w.q->kc[il], w.q->vc[il], qf, ao, w.T, H, Hkv, D, pos0, 1.f / sqrtf((float) D), attn_scratch_, st_);
     }
-    dbg(st_, il, "attn_gated", attn_o_, (size_t) T * H * D);
+    dbg(st_, tp_rank_, il, "attn_gated", attn_o_, (size_t) T * H * D);
     quantize_act(attn_o_, H * D, T, H * D, act_, st_);
     gemv(L.wo, &act_, nullptr, 0, T, out_, E, false, st_);
 }
 
 void DenseEngine::ffn(int il, int T) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, FF = c.n_ff;
     if (L.gu.valid()) gemv(L.gu, &act_, nullptr, 0, T, sg_, FF, false, st_, GemvSplit{FF, su_, FF});
@@ -609,22 +658,38 @@ void DenseEngine::head(int T) {
     gemv(model_.output, &act_, nullptr, 0, T, logits_, c.n_vocab, false, st_);
 }
 
-// res -> norm -> attention / DeltaNet -> (+) -> norm -> FFN -> (+): each add rides in the next norm's pass; the
-// stage's last layer adds explicitly (its residual leaves the stage)
-void DenseEngine::layer_forward(int il, int T) {
-    const Config & c = model_.cfg;
+// res (+ pending) -> norm -> attention / DeltaNet -> out_ (a partial sum under tensor parallel)
+void DenseEngine::layer_block(int il, int T) {
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd;
     dense_norm_q(res_, pend_, F(L.attn_norm), xn_, T, E, c.rms_eps, act_, st_);
-    dbg(st_, il, "input", res_, (size_t) T * E);
-    dbg(st_, il, "attn_norm", xn_, (size_t) T * E);
+    pend_ = nullptr;
+    dbg(st_, tp_rank_, il, "input", res_, (size_t) T * E);
+    dbg(st_, tp_rank_, il, "attn_norm", xn_, (size_t) T * E);
     if (L.attn) attn(il, T); else gdn(il, T);
-    dbg(st_, il, "attn_output", out_, (size_t) T * E);
+    dbg(st_, tp_rank_, il, "attn_output", out_, (size_t) T * E);
+}
+
+// res += out_ -> norm -> FFN -> ffn_out_ (a partial sum under tensor parallel)
+void DenseEngine::layer_ffn(int il, int T) {
+    const Config & c = model_.lc;
+    const DenseLayer & L = model_.layers[il];
+    const int E = c.n_embd;
     dense_norm_q(res_, out_, F(L.post_norm), xn_, T, E, c.rms_eps, act_, st_);
-    dbg(st_, il, "attn_residual", res_, (size_t) T * E);
-    dbg(st_, il, "attn_post_norm", xn_, (size_t) T * E);
+    dbg(st_, tp_rank_, il, "attn_residual", res_, (size_t) T * E);
+    dbg(st_, tp_rank_, il, "attn_post_norm", xn_, (size_t) T * E);
     ffn(il, T);
-    dbg(st_, il, "ffn_out", ffn_out_, (size_t) T * E);
+    dbg(st_, tp_rank_, il, "ffn_out", ffn_out_, (size_t) T * E);
+}
+
+// res -> norm -> attention / DeltaNet -> (+) -> norm -> FFN -> (+): each add rides in the next norm's pass; the
+// stage's last layer adds explicitly (its residual leaves the stage)
+void DenseEngine::layer_forward(int il, int T) {
+    const Config & c = model_.lc;
+    const int E = c.n_embd;
+    layer_block(il, T);
+    layer_ffn(il, T);
     pend_ = ffn_out_;
     if (il + 1 == l1_ && !last_) {
         add_rows(res_, pend_, (int64_t) T * E, st_);
@@ -643,16 +708,114 @@ void DenseEngine::layer_forward(int il, int T) {
     }
 }
 
-void DenseEngine::enqueue_forward(int T) {
+// the window's inputs: its parameters, and the token embeddings (first stage) or the previous stage's rows
+void DenseEngine::fwd_in(int T) {
     const Config & c = model_.cfg;
     const size_t rows = (size_t) T * c.n_embd * 4;
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     if (first()) dequant_gather(model_.tok_embd, h_tok_, T, res_, st_);
     else CUDA_CHECK(cudaMemcpyAsync(res_.p, xfer_in_[lane_], rows, cudaMemcpyHostToDevice, st_));
     pend_ = nullptr;
+}
+
+void DenseEngine::enqueue_forward(int T) {
+    const size_t rows = (size_t) T * model_.cfg.n_embd * 4;
+    fwd_in(T);
     for (int il = l0_; il < l1_; ++il) layer_forward(il, T);
     if (last_) head(T);
     else CUDA_CHECK(cudaMemcpyAsync(xfer_out_[lane_], res_.p, rows, cudaMemcpyDeviceToHost, st_));
+}
+
+// ---- tensor parallel: the all-reduce with the peer in two phases, so that each rank records its event before
+// the other waits for it (a capture may not wait on an event recorded later). tp_send copies this rank's partial
+// sum out to the pinned buffer of (point, layer parity) and marks it; tp_recv, queued after the peer's tp_send,
+// waits for the peer's mark, brings its partial in and adds it. Both ranks add the same two fp32 values, so their
+// residuals stay bit for bit identical.
+void DenseEngine::tp_send(const float * buf, int rows, int point, int il) {
+    const int par = il & 1;
+    CUDA_CHECK(cudaMemcpyAsync(tp_h_[point][par], buf, (size_t) rows * model_.cfg.n_embd * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaEventRecord(tp_ev_[point][il], st_));
+}
+
+void DenseEngine::tp_recv(float * buf, int rows, int point, int il) {
+    const int par = il & 1;
+    const size_t n = (size_t) rows * model_.cfg.n_embd;
+    CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_ev_[point][il], 0));
+    CUDA_CHECK(cudaMemcpyAsync(tp_tmp_.p, peer_->tp_h_[point][par], n * 4, cudaMemcpyHostToDevice, st_));
+    add_rows(buf, tp_tmp_, (int64_t) n, st_);
+}
+
+// prompt chunks exchange fp16 partials (half the PCIe bytes): res += mine16 + peer16 on both ranks
+void DenseEngine::tp_pf_send(const float * partial, int rows, int point, int il) {
+    const int par = il & 1;
+    const size_t n = (size_t) rows * model_.cfg.n_embd;
+    f32_to_f16(partial, tp_mine16_, (int64_t) n, st_);
+    CUDA_CHECK(cudaMemcpyAsync(tp_pfh_[point][par], tp_mine16_.p, n * 2, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaEventRecord(tp_pfev_[point][il], st_));
+}
+
+void DenseEngine::tp_pf_recv(float * res, int rows, int point, int il) {
+    const int par = il & 1;
+    const size_t n = (size_t) rows * model_.cfg.n_embd;
+    CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_pfev_[point][il], 0));
+    CUDA_CHECK(cudaMemcpyAsync(tp_peer16_.p, peer_->tp_pfh_[point][par], n * 2, cudaMemcpyHostToDevice, st_));
+    add_rows_f16x2(res, tp_mine16_, tp_peer16_, (int64_t) n, st_);
+}
+
+// Rank 0 drives both ranks' streams layer by layer (each phase on each rank, then the exchange): captured into
+// one graph over both devices, or run eagerly.
+void DenseEngine::tp_enqueue_forward(int T) {
+    DenseEngine * rk[2] = {this, peer_};
+    const Config & c = model_.cfg;
+    for (DenseEngine * r : rk) {
+        DeviceScope ds(r->dev_);
+        r->fwd_in(T);
+    }
+    for (int il = 0; il < c.n_layer; ++il) {
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->layer_block(il, T);
+            r->tp_send(r->out_, T, 0, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->tp_recv(r->out_, T, 0, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->layer_ffn(il, T);
+            r->tp_send(r->ffn_out_, T, 1, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->tp_recv(r->ffn_out_, T, 1, il);
+            r->pend_ = r->ffn_out_;
+        }
+        if (head_->dump_all) {   // the residual after the layer (rank 0's; the peer's is the same)
+            DeviceScope ds(dev_);
+            add_rows(res_, pend_, (int64_t) T * c.n_embd, st_);
+            pend_ = nullptr;
+            auto & dl = head_->dumped_layers;
+            dl.resize(c.n_layer);
+            dl[il].resize((size_t) T * c.n_embd);
+            CUDA_CHECK(cudaMemcpyAsync(dl[il].data(), res_.p, dl[il].size() * 4, cudaMemcpyDeviceToHost, st_));
+            CUDA_CHECK(cudaStreamSynchronize(st_));
+            {
+                DeviceScope d2(peer_->dev_);
+                add_rows(peer_->res_, peer_->pend_, (int64_t) T * c.n_embd, peer_->st_);
+                peer_->pend_ = nullptr;
+            }
+        }
+    }
+    {
+        DeviceScope ds(dev_);
+        head(T);   // rank 0: the head (its norm adds the last FFN)
+    }
+    {   // the peer's residual complete too (its drafter-free copy; BNK_TP_DEBUG compares the two)
+        DeviceScope ds(peer_->dev_);
+        if (peer_->pend_) add_rows(peer_->res_, peer_->pend_, (int64_t) T * c.n_embd, peer_->st_);
+        peer_->pend_ = nullptr;
+    }
 }
 
 void DenseEngine::forward(const int32_t * tokens, int T, bool commit_all) {
@@ -664,7 +827,10 @@ void DenseEngine::forward_batch(const std::vector<BatchWin> & batch_in) {
     std::sort(batch.begin(), batch.end(), [](const BatchWin & a, const BatchWin & b) { return a.slot < b.slot; });
     if (batch.empty() || batch.size() > (size_t) kMaxSlots) throw std::runtime_error("forward: bad batch");
     const double t0 = now_ms();
-    for (DenseEngine * s = this; s; s = s->next_.get()) s->fwd_prepare(batch);
+    // tensor parallel: the peer books its windows first (rank 0's capture bakes the peer's window buffers)
+    if (tp()) peer_->fwd_prepare(batch);
+    for (DenseEngine * s = this; s; s = s->next_.get())
+        if (!(tp() && s == peer_)) s->fwd_prepare(batch);
     cudaEvent_t after = nullptr;
     for (DenseEngine * s = this; s; s = s->next_.get()) {
         s->fwd_launch(after);
@@ -715,6 +881,7 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     last_T = R;
     fwd_graph_ = opt_.use_graphs && !head_->dump_all;
     fwd_exec_ = nullptr;
+    if (tp() && tp_rank_ > 0) return;   // rank 0's graph covers this rank's work
     if (fwd_graph_) {
         FwdGraph & fg = fwd_graphs_[key];
         if (!fg.exec) {
@@ -731,7 +898,21 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
             cudaMemGetInfo(&f0, &tot);
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
-            enqueue_forward(R);
+            if (tp()) {   // the peer's stream joins the capture
+                CUDA_CHECK(cudaEventRecord(tp_fork_, st_));
+                {
+                    DeviceScope d2(peer_->dev_);
+                    CUDA_CHECK(cudaStreamWaitEvent(peer_->st_, tp_fork_, 0));
+                }
+                tp_enqueue_forward(R);
+                {   // (an event records only on its own device's streams: the peer's join event)
+                    DeviceScope d2(peer_->dev_);
+                    CUDA_CHECK(cudaEventRecord(peer_->tp_join_, peer_->st_));
+                }
+                CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_join_, 0));
+            } else {
+                enqueue_forward(R);
+            }
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
             CUDA_CHECK(cudaGraphInstantiate(&fg.exec, g, 0));
             cudaGraphDestroy(g);
@@ -748,10 +929,29 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
 
 void DenseEngine::fwd_launch(cudaEvent_t after) {
     DeviceScope ds(dev_);
+    if (tp() && tp_rank_ > 0) {   // ordered after rank 0's launch, which holds this rank's work
+        CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->ev_out_, 0));
+        return;
+    }
     if (after) CUDA_CHECK(cudaStreamWaitEvent(st_, after, 0));
     CUDA_CHECK(cudaEventRecord(ev_t0_, st_));
-    if (fwd_graph_) CUDA_CHECK(cudaGraphLaunch(fwd_exec_, st_));
-    else enqueue_forward(last_T);
+    if (fwd_graph_) {
+        CUDA_CHECK(cudaGraphLaunch(fwd_exec_, st_));
+    } else if (tp()) {
+        CUDA_CHECK(cudaEventRecord(tp_fork_, st_));
+        {
+            DeviceScope d2(peer_->dev_);
+            CUDA_CHECK(cudaStreamWaitEvent(peer_->st_, tp_fork_, 0));
+        }
+        tp_enqueue_forward(last_T);
+        {
+            DeviceScope d2(peer_->dev_);
+            CUDA_CHECK(cudaEventRecord(peer_->tp_join_, peer_->st_));
+        }
+        CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_join_, 0));
+    } else {
+        enqueue_forward(last_T);
+    }
     CUDA_CHECK(cudaEventRecord(ev_out_, st_));
     CUDA_CHECK(cudaEventRecord(ev_t1_, st_));
 }
@@ -759,6 +959,23 @@ void DenseEngine::fwd_launch(cudaEvent_t after) {
 void DenseEngine::fwd_end() {
     DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
+    if (tp() && tp_rank_ > 0) return;
+    static const bool tpdbg = getenv("BNK_TP_DEBUG") != nullptr;
+    if (tp() && tpdbg) {   // the two ranks' residual rows must agree bit for bit
+        const size_t n = (size_t) last_T * model_.cfg.n_embd;
+        std::vector<float> a(n), b(n);
+        CUDA_CHECK(cudaMemcpy(a.data(), res_.p, n * 4, cudaMemcpyDeviceToHost));
+        {
+            DeviceScope d2(peer_->dev_);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(b.data(), peer_->res_.p, n * 4, cudaMemcpyDeviceToHost));
+        }
+        double sa = 0, sb = 0, sd = 0;
+        for (size_t i = 0; i < n; ++i) { sa += a[i] * a[i]; sb += b[i] * b[i]; sd += (a[i] - b[i]) * (a[i] - b[i]); }
+        fprintf(stderr, "tp: residual rms rank0 %.5f rank1 %.5f diff %.3e (%s)\n", sqrt(sa / n), sqrt(sb / n), sqrt(sd / n),
+                fwd_graph_ ? "graph" : "eager");
+    }
     float ms = 0.f;
     if (cudaEventElapsedTime(&ms, ev_t0_, ev_t1_) == cudaSuccess) {
         gpu_ms_ += ms;
@@ -766,7 +983,6 @@ void DenseEngine::fwd_end() {
     } else {
         cudaGetLastError();
     }
-    for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
 }
 
 // Two batches in flight on a two-GPU pipeline: `first` runs on the first GPU while `second` (which went through
@@ -774,7 +990,7 @@ void DenseEngine::fwd_end() {
 // commit: the lanes have their own window buffers.
 void DenseEngine::forward_pipe(const std::vector<BatchWin> & first_in, int first_lane, const std::vector<BatchWin> & second_in,
                                int second_lane) {
-    if (stages() != 2) throw std::runtime_error("forward_pipe: needs a pipeline of two GPUs");
+    if (stages() != 2 || tp()) throw std::runtime_error("forward_pipe: needs a pipeline of two GPUs");
     if (!first_in.empty() && !second_in.empty() && first_lane == second_lane)
         throw std::runtime_error("forward_pipe: the two batches need different lanes");
     auto sorted = [](std::vector<BatchWin> b) {
@@ -800,7 +1016,7 @@ void DenseEngine::forward_pipe(const std::vector<BatchWin> & first_in, int first
 // ------------------------------------------------------------------------------------------------ commit
 // Keep the first c rows of the last verify window: replay the delta rule over them and shift the histories.
 void DenseEngine::enqueue_commit(int cnt) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     const size_t r0 = (size_t) cur_->last_r0;
     for (int il = l0_; il < l1_; ++il) {
@@ -830,7 +1046,7 @@ void DenseEngine::commit(int cnt) {
 void DenseEngine::commit_here(int cnt) {
     DeviceScope ds(dev_);
     if (!cur_->conv_ptrs.p) {   // the conv buffers never move: their pointer table once, before any capture
-        const Config & c = model_.cfg;
+        const Config & c = model_.lc;
         std::vector<float *> ptrs;
         for (int il = l0_; il < l1_; ++il)
             if (!c.is_attn(il)) ptrs.push_back(cur_->conv_buf[il].p);
@@ -880,7 +1096,7 @@ void DenseEngine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, 
 }
 
 void DenseEngine::set_mtp_pending(const float * R_row_dev, int cell) {
-    if (next_) return next_->set_mtp_pending(R_row_dev, cell);
+    if (next_ && !tp()) return next_->set_mtp_pending(R_row_dev, cell);
     if (!mtp_.loaded()) return;
     DeviceScope ds(dev_);
     if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) model_.cfg.n_embd * 4));
@@ -890,7 +1106,7 @@ void DenseEngine::set_mtp_pending(const float * R_row_dev, int cell) {
 
 // ------------------------------------------------------------------------------------------------ logits
 int DenseEngine::argmax(int t) {
-    if (next_) return next_->argmax(t);
+    if (next_ && !tp()) return next_->argmax(t);
     DeviceScope ds(dev_);
     argmax_rows(logits_.p + (size_t) t * model_.cfg.n_vocab, 1, model_.cfg.n_vocab, argmax_dev_, st_);
     int32_t r;
@@ -900,7 +1116,7 @@ int DenseEngine::argmax(int t) {
 }
 
 void DenseEngine::argmax_all(int T, int32_t * out, int row0) {
-    if (next_) return next_->argmax_all(T, out, row0);
+    if (next_ && !tp()) return next_->argmax_all(T, out, row0);
     DeviceScope ds(dev_);
     argmax_rows(logits_.p + (size_t) row0 * model_.cfg.n_vocab, T, model_.cfg.n_vocab, argmax_dev_, st_);
     CUDA_CHECK(cudaMemcpyAsync(out, argmax_dev_.p, T * 4, cudaMemcpyDeviceToHost, st_));
@@ -908,7 +1124,7 @@ void DenseEngine::argmax_all(int T, int32_t * out, int row0) {
 }
 
 void DenseEngine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp) {
-    if (next_) return next_->topk_rows_host(row0, T, K, ids, vals, z, temp);
+    if (next_ && !tp()) return next_->topk_rows_host(row0, T, K, ids, vals, z, temp);
     DeviceScope ds(dev_);
     if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
     if (!topk_ids_.p) {
@@ -928,14 +1144,14 @@ void DenseEngine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * 
 }
 
 void DenseEngine::logits_rows_host(int T, float * out, int row0) {
-    if (next_) return next_->logits_rows_host(T, out, row0);
+    if (next_ && !tp()) return next_->logits_rows_host(T, out, row0);
     DeviceScope ds(dev_);
     CUDA_CHECK(cudaMemcpy(out, logits_.p + (size_t) row0 * model_.cfg.n_vocab, (size_t) T * model_.cfg.n_vocab * 4,
                           cudaMemcpyDeviceToHost));
 }
 
 std::vector<float> DenseEngine::logits_host(int t) {
-    if (next_) return next_->logits_host(t);
+    if (next_ && !tp()) return next_->logits_host(t);
     DeviceScope ds(dev_);
     std::vector<float> v(model_.cfg.n_vocab);
     CUDA_CHECK(cudaMemcpy(v.data(), logits_.p + (size_t) t * model_.cfg.n_vocab, v.size() * 4, cudaMemcpyDeviceToHost));

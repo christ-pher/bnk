@@ -84,6 +84,9 @@ struct EngineOptions {
     // same id twice runs two stages on one GPU (for testing the split on a single card; cap expert_cache_gib).
     std::vector<int> gpus;           // {-1}: every GPU of compute capability 7.0+
     std::vector<int> split;          // first layer of every stage after the first (empty: balanced by memory)
+    // Tensor parallel instead of a pipeline (the dense engine): every layer split across the GPUs, their partial
+    // sums exchanged through host memory twice per layer. 0: a pipeline, 1: tensor parallel over `gpus`.
+    int tp = 0;
     std::vector<double> stage_cache_gib;   // expert_cache_gib per stage (empty: expert_cache_gib for every one)
 };
 

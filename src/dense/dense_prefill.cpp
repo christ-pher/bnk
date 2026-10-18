@@ -13,7 +13,7 @@ namespace bnk {
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
 void DenseEngine::prefill_alloc(int N) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const int E = c.n_embd, C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state, FF = c.n_ff;
     auto & p = pf_;
     p.x.alloc((size_t) N * E); p.res.alloc((size_t) N * E); p.xn.alloc((size_t) N * E); p.out.alloc((size_t) N * E);
@@ -36,7 +36,7 @@ void DenseEngine::prefill_alloc(int N) {
 }
 
 void DenseEngine::pf_gdn(int il, int N) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     auto & p = pf_;
@@ -56,7 +56,7 @@ void DenseEngine::pf_gdn(int il, int N) {
 }
 
 void DenseEngine::pf_attn(int il, int N) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
     auto & p = pf_;
@@ -72,7 +72,7 @@ void DenseEngine::pf_attn(int il, int N) {
 }
 
 void DenseEngine::pf_ffn(int il, int N) {
-    const Config & c = model_.cfg;
+    const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, FF = c.n_ff;
     auto & p = pf_;
@@ -91,17 +91,14 @@ void DenseEngine::prefill_chunk(const int32_t * tokens, int N) {
     pstats.chunks++;
 }
 
-// This stage's part of a prompt chunk: embeddings (first stage) or the previous stage's residual rows, its layers,
-// then the head on the last token (last stage) or the rows out to the next stage.
-void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
-    DeviceScope ds(dev_);
-    const double t0 = now_ms();
+// A chunk's inputs on this stage: the history, the parameters, the embeddings (first stage) or the previous
+// stage's residual rows.
+void DenseEngine::pf_in(const int32_t * tokens, int N, int buf) {
     join_commit_here();
     if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
     if (cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
     if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
-    const Config & c = model_.cfg;
-    const int E = c.n_embd;
+    const int E = model_.cfg.n_embd;
     auto & p = pf_;
     const int pos0 = pos();
     cur_->history.insert(cur_->history.end(), tokens, tokens + N);
@@ -113,6 +110,46 @@ void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     } else {
         CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_[buf], (size_t) N * E * 4, cudaMemcpyHostToDevice, st_));
     }
+}
+
+// res -> norm -> attention / DeltaNet -> p.out
+void DenseEngine::pf_layer_a(int il, int N) {
+    const Config & c = model_.cfg;
+    const DenseLayer & L = model_.layers[il];
+    rmsnorm_rows(pf_.res, F(L.attn_norm), pf_.xn, N, c.n_embd, c.n_embd, c.n_embd, c.rms_eps, st_);
+    if (L.attn) pf_attn(il, N); else pf_gdn(il, N);
+}
+
+// res -> norm -> FFN -> p.out  (the residual already holds the block's output)
+void DenseEngine::pf_layer_b(int il, int N) {
+    const Config & c = model_.cfg;
+    const DenseLayer & L = model_.layers[il];
+    rmsnorm_rows(pf_.res, F(L.post_norm), pf_.xn, N, c.n_embd, c.n_embd, c.n_embd, c.rms_eps, st_);
+    pf_ffn(il, N);
+}
+
+// the head on the last token (through the decode buffers, row 0), or the rows out to the next stage
+void DenseEngine::pf_out(int N, int buf) {
+    const int E = model_.cfg.n_embd;
+    auto & p = pf_;
+    if (last_) {
+        CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, st_));
+        pend_ = nullptr;
+        head(1);
+    } else if (!tp()) {
+        CUDA_CHECK(cudaMemcpyAsync(pf_xfer_out_[buf], p.res.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
+    }
+    last_T = 1;
+}
+
+// This stage's part of a prompt chunk: embeddings (first stage) or the previous stage's residual rows, its layers,
+// then the head on the last token (last stage) or the rows out to the next stage.
+void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
+    DeviceScope ds(dev_);
+    const double t0 = now_ms();
+    const int E = model_.cfg.n_embd, pos0 = pos();
+    auto & p = pf_;
+    pf_in(tokens, N, buf);
     // BNK_PF_PROF=1: GPU time per block kind over the chunk (attention, DeltaNet, FFN), synchronously measured
     static const bool prof = getenv("BNK_PF_PROF") != nullptr;
     double t_attn = 0, t_gdn = 0, t_ffn = 0;
@@ -125,29 +162,58 @@ void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
         acc += now_ms() - a;
     };
     for (int il = l0_; il < l1_; ++il) {
-        const DenseLayer & L = model_.layers[il];
-        rmsnorm_rows(p.res, F(L.attn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
-        if (L.attn) lap(t_attn, [&]() { pf_attn(il, N); });
-        else lap(t_gdn, [&]() { pf_gdn(il, N); });
+        lap(model_.layers[il].attn ? t_attn : t_gdn, [&]() { pf_layer_a(il, N); });
         add_rows(p.res, p.out, (int64_t) N * E, st_);
-        rmsnorm_rows(p.res, F(L.post_norm), p.xn, N, E, E, E, c.rms_eps, st_);
-        lap(t_ffn, [&]() { pf_ffn(il, N); });
+        lap(t_ffn, [&]() { pf_layer_b(il, N); });
         add_rows(p.res, p.out, (int64_t) N * E, st_);
     }
     if (prof)
         fprintf(stderr, "pf GPU %d: chunk of %d at %d: attention %.1f ms, DeltaNet %.1f ms, FFN %.1f ms\n", dev_, N, pos0,
                 t_attn, t_gdn, t_ffn);
-    if (last_) {   // the head on the last token, through the decode buffers (row 0)
-        CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, st_));
-        pend_ = nullptr;
-        head(1);
-    } else {
-        CUDA_CHECK(cudaMemcpyAsync(pf_xfer_out_[buf], p.res.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
-    }
+    pf_out(N, buf);
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    last_T = 1;
     pf_ms_ += now_ms() - t0;
     pf_tokens_ += N;
+}
+
+// Tensor parallel: both ranks run the chunk in lockstep, their partial sums exchanged (as fp16) after each block.
+void DenseEngine::tp_prefill_chunk(const int32_t * tokens, int N) {
+    const double t0 = now_ms();
+    DenseEngine * rk[2] = {this, peer_};
+    const Config & c = model_.cfg;
+    const int E = c.n_embd;
+    for (DenseEngine * r : rk) {
+        DeviceScope ds(r->dev_);
+        r->pf_in(tokens, N, 0);
+    }
+    for (int il = 0; il < c.n_layer; ++il) {
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->pf_layer_a(il, N);
+            r->tp_pf_send(r->pf_.out, N, 0, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->tp_pf_recv(r->pf_.res, N, 0, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->pf_layer_b(il, N);
+            r->tp_pf_send(r->pf_.out, N, 1, il);
+        }
+        for (DenseEngine * r : rk) {
+            DeviceScope ds(r->dev_);
+            r->tp_pf_recv(r->pf_.res, N, 1, il);
+        }
+    }
+    for (DenseEngine * r : rk) {
+        DeviceScope ds(r->dev_);
+        r->pf_out(N, 0);
+        CUDA_CHECK(cudaStreamSynchronize(r->st_));
+        r->pf_tokens_ += N;
+    }
+    pf_ms_ += now_ms() - t0;
+    (void) E;
 }
 
 // Processes a prompt (batched chunks for long stretches, decode windows for short tails) and commits it; the
@@ -160,6 +226,30 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
     const int n = (int) tokens.size();
     DenseEngine * t = tail();
+    if (tp()) {   // both ranks together, chunk by chunk
+        while (i < tokens.size()) {
+            const size_t left = tokens.size() - i;
+            const int pos0 = pos();
+            if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+                const int N = (int) std::min<size_t>(pf_max_, left);
+                const double c0 = now_ms();
+                tp_prefill_chunk(tokens.data() + i, N);
+                mtp_feed(pf_.res, tokens.data() + i, N, pos0);
+                pstats.ms += now_ms() - c0;
+                pstats.tokens += N;
+                pstats.chunks++;
+                i += N;
+            } else {
+                const int T = (int) std::min<size_t>(kMaxWindow, left);
+                forward(tokens.data() + i, T);
+                mtp_feed(res_, tokens.data() + i, T, pos0);
+                i += T;
+            }
+            if (on_prefill_progress) on_prefill_progress(i, tokens.size());
+        }
+        last_rebalance_ms = 0;
+        return;
+    }
     static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
     if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
     // Chunks of even size on a pipeline, enough of them that the stages overlap (a read in one chunk leaves the

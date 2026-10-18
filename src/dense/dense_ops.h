@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "kernels/gemv.h"
@@ -14,5 +15,8 @@ void dense_norm_q(float * res, const float * pend, const float * w, float * xn, 
                   cudaStream_t s);
 // y[i] += x[i]
 void add_rows(float * y, const float * x, int64_t n, cudaStream_t s);
+// y[i] += (float) a[i] + (float) b[i]  (two fp16 partial sums: both ranks of a tensor-parallel pair add the same
+// rounded values, so their residuals stay identical)
+void add_rows_f16x2(float * y, const half * a, const half * b, int64_t n, cudaStream_t s);
 
 }  // namespace bnk
