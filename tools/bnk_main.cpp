@@ -12,7 +12,9 @@
 #include <string>
 #include <vector>
 
+#include "dense/dense_engine.h"
 #include "engine/engine.h"
+#include "engine/engine_api.h"
 #include "engine/generate.h"
 #include "engine/mtp.h"
 #include "server/serve.h"
@@ -64,17 +66,34 @@ static double rel_rms(const float * a, const float * b, size_t n) {
 }
 
 // each pipeline stage's GPU time per decode forward
-static void print_stages(const Engine & eng) {
+static void print_stages(const EngineApi & eng) {
     for (int i = 0; i < eng.stages(); ++i) {
-        const Engine * s = eng.stage(i);
-        printf("stage %d (GPU %d, layers %d-%d): %.2f ms of GPU time per forward over %lld forwards", i, s->device(),
-               s->layer_begin(), s->layer_end() - 1, s->gpu_ms() / std::max<int64_t>(1, s->gpu_forwards()),
-               (long long) s->gpu_forwards());
-        if (s->prompt_tokens())
-            printf("; prompt chunks %.1f s for %lld tokens (%.0f tok/s)", s->prompt_ms() / 1000, (long long) s->prompt_tokens(),
-                   s->prompt_tokens() / (s->prompt_ms() / 1000));
+        const StageInfo s = eng.stage_info(i);
+        printf("stage %d (GPU %d, layers %d-%d): %.2f ms of GPU time per forward over %lld forwards", i, s.device,
+               s.layer_begin, s.layer_end - 1, s.gpu_ms / std::max<int64_t>(1, s.gpu_forwards), (long long) s.gpu_forwards);
+        if (s.prompt_tokens)
+            printf("; prompt chunks %.1f s for %lld tokens (%.0f tok/s)", s.prompt_ms / 1000, (long long) s.prompt_tokens,
+                   s.prompt_tokens / (s.prompt_ms / 1000));
         printf("\n");
     }
+}
+
+// The engine for the model's architecture: the MoE engine (qwen4exp) or the dense one (qwen35).
+static std::unique_ptr<EngineApi> make_engine(const std::string & model, const EngineOptions & opt) {
+    std::string arch;
+    {
+        GgufModel g;
+        g.open(model);
+        arch = g.get_str("general.architecture");
+    }
+    if (arch == "qwen35") {
+        auto e = std::make_unique<DenseEngine>();
+        e->load(model, opt);
+        return e;
+    }
+    auto e = std::make_unique<Engine>();
+    e->load(model, opt);
+    return e;
 }
 
 int main(int argc, char ** argv) {
@@ -138,9 +157,8 @@ int main(int argc, char ** argv) {
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
     }
     if (mode == "serve") {
-        Engine eng;
-        eng.load(model, opt);
-        return serve_main(eng, gopt, eng.model().gguf.get_str("general.name", "bnk"));
+        std::unique_ptr<EngineApi> engp = make_engine(model, opt);
+        return serve_main(*engp, gopt, engp->model_name());
     }
     // several conversations share the expert cache: it has to follow a mix of routings, so it adapts every forward
     // and swaps more at a time (3 batched agents: 72-76 -> 84 tok/s; one conversation: no measurable change)
@@ -149,8 +167,8 @@ int main(int argc, char ** argv) {
         opt.adapt_swaps = 32;
     }
     auto prompt = mode == "multi" ? std::vector<int32_t>{} : read_tokens(tokfile);
-    Engine eng;
-    eng.load(model, opt);
+    std::unique_ptr<EngineApi> engp = make_engine(model, opt);
+    EngineApi & eng = *engp;
     const Config & c = eng.cfg();
 
     if (mode == "nll") {
@@ -271,11 +289,13 @@ int main(int argc, char ** argv) {
 
     if (mode == "check") {
         // window by window, compare every layer's residual and the logits at every position
+        // the residual after every layer: llama_ref names it l_last-N for the HC models, l_out-N otherwise
         std::vector<std::vector<float>> ref_layers(c.n_layer);
-        for (int il = 0; il < c.n_layer; ++il) read_floats(ref + ".l_last-" + std::to_string(il), ref_layers[il]);
+        for (int il = 0; il < c.n_layer; ++il)
+            read_floats(ref + (c.hc > 1 ? ".l_last-" : ".l_out-") + std::to_string(il), ref_layers[il]);
         std::vector<float> ref_logits;
         read_floats(ref + ".logits", ref_logits);
-        const size_t HC = c.hc_dim();
+        const size_t HC = eng.res_dim();
         std::vector<double> lerr(c.n_layer, 0);
         double logit_err = 0, kl_sum = 0, kl_max = 0;
         int agree = 0;
@@ -359,7 +379,7 @@ int main(int argc, char ** argv) {
             // (from the step before) runs on the second, then verifies, commits and drafts that one
             std::vector<int> lane_of(n);
             for (int i = 0; i < n; ++i) lane_of[i] = i & 1;
-            std::vector<Engine::BatchWin> mid_wins;
+            std::vector<EngineApi::BatchWin> mid_wins;
             std::vector<int> mid_ids;
             int mid = -1;
             auto finish = [&](const std::vector<int> & ids) {
@@ -391,7 +411,7 @@ int main(int argc, char ** argv) {
                 std::vector<Generator *> ga;
                 for (int i : ids) ga.push_back(gens[i].get());
                 const std::vector<int> rows = Generator::share_rows(ga);
-                std::vector<Engine::BatchWin> wins;
+                std::vector<EngineApi::BatchWin> wins;
                 for (size_t j = 0; j < ids.size(); ++j) {
                     const auto & w = gens[ids[j]]->window(rows[j]);
                     wins.push_back({ids[j], w.data(), (int) w.size(), w.size() == 1});
@@ -428,7 +448,7 @@ int main(int argc, char ** argv) {
                 static const bool even = getenv("BNK_EVEN_ROWS") != nullptr;
                 std::vector<int> rows = Generator::share_rows(ga);
                 if (even) rows.assign(act.size(), std::max(1, kMaxWindow / (int) act.size()));
-                std::vector<Engine::BatchWin> wins;
+                std::vector<EngineApi::BatchWin> wins;
                 for (size_t j = 0; j < act.size(); ++j) {
                     const auto & w = gens[act[j]]->window(rows[j]);
                     wins.push_back({act[j], w.data(), (int) w.size(), w.size() == 1});

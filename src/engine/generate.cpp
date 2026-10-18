@@ -1,5 +1,7 @@
 #include "engine/generate.h"
 
+#include "core/util.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +16,7 @@ void Generator::recent_tail(std::vector<int32_t> & out) const {
     out.insert(out.end(), emitted_tail_.begin(), emitted_tail_.end());
 }
 
-int Generator::gpu_k() const { return sp_.top_k > 0 ? sp_.top_k : Engine::kTopkMax; }
+int Generator::gpu_k() const { return sp_.top_k > 0 ? sp_.top_k : EngineApi::kTopkMax; }
 
 void Generator::gpu_candidates(int row0, int T) {
     const int K = gpu_k();
@@ -102,7 +104,7 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
         b = eng_.argmax(eng_.last_T - 1);
     } else {
         bool done = false;
-        if (Sampler::gpu_ok(sp_, Engine::kTopkMax)) {
+        if (Sampler::gpu_ok(sp_, EngineApi::kTopkMax)) {
             gpu_candidates(eng_.last_T - 1, 1);
             if ((done = row_distribution(0, dist_))) b = sampler_.draw(dist_);
         }
@@ -123,7 +125,7 @@ std::vector<int32_t> Generator::next() {
     const int T = (int) win_.size();
     use_slot();
     const double t0 = now_ms();
-    eng_.forward_batch({Engine::BatchWin{eng_.current_slot(), win_.data(), T, T == 1}});
+    eng_.forward_batch({EngineApi::BatchWin{eng_.current_slot(), win_.data(), T, T == 1}});
     stats.verify_ms += now_ms() - t0;
     return finish();
 }
@@ -177,7 +179,7 @@ std::vector<int32_t> Generator::finish(bool draft) {
         const int V = eng_.cfg().n_vocab;
         // the top-k candidates of every row in one GPU pass (K values per row cross PCIe, not the vocabulary)
         // (without top-k: the 1,024 most likely and each row's normalizer, enough unless min-p and top-p keep more)
-        const bool gpu = Sampler::gpu_ok(sp_, Engine::kTopkMax) && !getenv("BNK_HOST_SAMPLER");
+        const bool gpu = Sampler::gpu_ok(sp_, EngineApi::kTopkMax) && !getenv("BNK_HOST_SAMPLER");
         if (gpu) {
             gpu_candidates(r0, T);
         } else {
@@ -231,8 +233,8 @@ std::vector<int32_t> Generator::finish(bool draft) {
     if (mtp_ && !draft) {   // left for draft_batch(): the residual rows stay valid until the next forward
         std::vector<int32_t> nxt(win.begin() + 1, win.begin() + 1 + a);
         nxt.push_back(bonus);
-        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.cfg().hc_dim();
-        eng_.set_mtp_pending(R + (size_t) a * eng_.cfg().hc_dim(), P + a);
+        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.res_dim();
+        eng_.set_mtp_pending(R + (size_t) a * eng_.res_dim(), P + a);
         job_ = DraftJob{opt_.max_draft > 0, R, nxt, P};
         return out;
     }
@@ -242,10 +244,10 @@ std::vector<int32_t> Generator::finish(bool draft) {
         std::vector<int32_t> nxt(win.begin() + 1, win.begin() + 1 + a);
         nxt.push_back(bonus);
         float pr = 0.f;
-        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.cfg().hc_dim();
+        const float * R = eng_.residual_dev() + (size_t) r0 * eng_.res_dim();
         int d = mtp_->run(R, nxt.data(), a + 1, P, opt_.max_draft > 0, &pr);
         stats.draft_run_ms += now_ms() - t0;
-        eng_.set_mtp_pending(R + (size_t) a * eng_.cfg().hc_dim(), P + a);
+        eng_.set_mtp_pending(R + (size_t) a * eng_.res_dim(), P + a);
         if (opt_.max_draft > 0) {
             drafts_.push_back(d);
             int cell = P + a + 1;
@@ -267,9 +269,9 @@ void Generator::draft_batch(const std::vector<Generator *> & gens) {
     for (Generator * x : gens)
         if (x->job_.pending && x->mtp_) g.push_back(x);
     if (g.empty()) return;
-    MtpLayer * mtp = g[0]->mtp_;
+    Drafter * mtp = g[0]->mtp_;
     const double t0 = now_ms();
-    std::vector<MtpLayer::RunItem> items;
+    std::vector<Drafter::RunItem> items;
     for (Generator * x : g)
         items.push_back({x->slot_, x->job_.R, x->job_.next.data(), (int) x->job_.next.size(), x->job_.cell0});
     std::vector<int32_t> tok(g.size());
@@ -284,7 +286,7 @@ void Generator::draft_batch(const std::vector<Generator *> & gens) {
         g[i]->stats.draft_run_ms += (t1 - t0) / g.size();
     }
     while (true) {
-        std::vector<MtpLayer::StepItem> st;
+        std::vector<Drafter::StepItem> st;
         std::vector<size_t> who;
         for (size_t i = 0; i < g.size(); ++i) {
             Generator * x = g[i];

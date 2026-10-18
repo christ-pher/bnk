@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
-# bnk: a V100 (sm_70) + host-RAM MoE inference engine for qwen4exp models.
+# bnk: a V100 (sm_70) + host-RAM MoE inference engine for qwen4exp models, and a VRAM-only engine for the dense
+# qwen35 family (src/dense).
 if(NOT DEFINED CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_COMPILER /usr/local/cuda-12.8/bin/nvcc)
 endif()
@@ -61,6 +62,11 @@ add_library(bnk_core STATIC
   src/server/serve.cpp
   src/engine/prefill.cpp
   src/kernels/gemm.cu
+  src/dense/dense_model.cpp
+  src/dense/dense_engine.cpp
+  src/dense/dense_prefill.cpp
+  src/dense/dense_mtp.cpp
+  src/dense/dense_ops.cu
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)

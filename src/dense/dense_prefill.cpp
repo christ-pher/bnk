@@ -1,0 +1,247 @@
+// Batched prompt processing for the dense engine: fp16 tensor-core GEMMs (cuBLAS, weights dequantized on the
+// fly) for every projection, the DeltaNet recurrence and the attention over whole chunks.
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+#include "dense/dense_engine.h"
+#include "dense/dense_ops.h"
+#include "kernels/ops.h"
+
+namespace bnk {
+
+static const float * F(const QMat & m) { return (const float *) m.data; }
+
+void DenseEngine::prefill_alloc(int N) {
+    const Config & c = model_.cfg;
+    const int E = c.n_embd, C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state, FF = c.n_ff;
+    auto & p = pf_;
+    p.x.alloc((size_t) N * E); p.res.alloc((size_t) N * E); p.xn.alloc((size_t) N * E); p.out.alloc((size_t) N * E);
+    p.conv.alloc((size_t) (N + c.ssm_conv - 1) * C); p.co.alloc((size_t) N * C); p.z.alloc((size_t) N * VI);
+    p.g.alloc((size_t) N * c.ssm_vheads); p.b.alloc((size_t) N * c.ssm_vheads); p.o.alloc((size_t) N * VI);
+    p.n.alloc((size_t) N * VI);
+    p.qfull.alloc((size_t) N * c.n_head * c.head_dim * 2); p.k.alloc((size_t) N * c.n_head_kv * c.head_dim);
+    p.v.alloc((size_t) N * c.n_head_kv * c.head_dim); p.q.alloc((size_t) N * c.n_head * c.head_dim);
+    p.ao.alloc((size_t) N * c.n_head * c.head_dim);
+    p.sg.alloc((size_t) N * FF); p.su.alloc((size_t) N * FF);
+    p.tok.alloc(N);
+    // GEMM workspace: the largest matrix dequantized at once (gate / up / down: FF x E), and N x max K inputs
+    size_t maxw = (size_t) FF * E;
+    for (int il = l0_; il < l1_; ++il) {
+        const DenseLayer & L = model_.layers[il];
+        for (const QMat * m : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wqkv, &L.wgate, &L.ssm_out, &L.gate, &L.up, &L.down})
+            if (m->valid()) maxw = std::max(maxw, (size_t) m->rows * m->cols);
+    }
+    gemm_.init(st_, maxw, (size_t) N * std::max({(int64_t) E, (int64_t) VI, (int64_t) c.n_head * c.head_dim, (int64_t) FF}));
+}
+
+void DenseEngine::pf_gdn(int il, int N) {
+    const Config & c = model_.cfg;
+    const DenseLayer & L = model_.layers[il];
+    const int E = c.n_embd, C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
+    auto & p = pf_;
+    CUDA_CHECK(cudaMemcpyAsync(p.conv.p, cur_->conv_buf[il].p, (size_t) (K - 1) * C * 4, cudaMemcpyDeviceToDevice, st_));
+    f32_to_f16(p.xn, gemm_.xbuf(), (int64_t) N * E, st_);
+    gemm_.run_h(L.wqkv, gemm_.xbuf(), E, N, p.conv.p + (size_t) (K - 1) * C, C);
+    gemm_.run_h(L.wgate, gemm_.xbuf(), E, N, p.z, nv * S);
+    gemm_.run_h(L.ssm_beta, gemm_.xbuf(), E, N, p.b, nv);
+    gemm_.run_h(L.ssm_alpha, gemm_.xbuf(), E, N, p.g, nv);
+    gdn_conv(p.conv, F(L.ssm_conv1d), p.co, N, C, K, st_);
+    gdn_prep(p.co, N, C, c.ssm_groups, nv, S, p.g, p.b, F(L.ssm_dt), F(L.ssm_a), c.rms_eps, st_);
+    gdn_recurrence(p.co, C, p.g, p.b, cur_->ssm_state[il], p.o, N, c.ssm_groups, nv, S, N, st_);
+    gated_rmsnorm_silu(p.o, p.z, F(L.ssm_norm), p.n, N, nv, S, c.rms_eps, st_);
+    gemm_.run(L.ssm_out, p.n, nv * S, N, p.out, E);
+    CUDA_CHECK(cudaMemcpyAsync(cur_->conv_buf[il].p, p.conv.p + (size_t) N * C, (size_t) (K - 1) * C * 4,
+                               cudaMemcpyDeviceToDevice, st_));
+}
+
+void DenseEngine::pf_attn(int il, int N) {
+    const Config & c = model_.cfg;
+    const DenseLayer & L = model_.layers[il];
+    const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
+    auto & p = pf_;
+    const int pos0 = pos() - N;
+    f32_to_f16(p.xn, gemm_.xbuf(), (int64_t) N * E, st_);
+    gemm_.run_h(L.wq, gemm_.xbuf(), E, N, p.qfull, H * D * 2);
+    gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
+    gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
+    attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
+              &d_par_->pos0, c.rms_eps, st_);
+    attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
+    gemm_.run(L.wo, p.ao, H * D, N, p.out, E);
+}
+
+void DenseEngine::pf_ffn(int il, int N) {
+    const Config & c = model_.cfg;
+    const DenseLayer & L = model_.layers[il];
+    const int E = c.n_embd, FF = c.n_ff;
+    auto & p = pf_;
+    f32_to_f16(p.xn, gemm_.xbuf(), (int64_t) N * E, st_);
+    gemm_.run_h(L.gate, gemm_.xbuf(), E, N, p.sg, FF);
+    gemm_.run_h(L.up, gemm_.xbuf(), E, N, p.su, FF);
+    silu_mul(p.sg, p.su, p.sg, (int64_t) N * FF, st_);
+    gemm_.run(L.down, p.sg, FF, N, p.out, E);
+}
+
+void DenseEngine::prefill_chunk(const int32_t * tokens, int N) {
+    const double t0 = now_ms();
+    for (DenseEngine * s = this; s; s = s->next_.get()) s->prefill_chunk_here(tokens, N);
+    pstats.ms += now_ms() - t0;
+    pstats.tokens += N;
+    pstats.chunks++;
+}
+
+// This stage's part of a prompt chunk: embeddings (first stage) or the previous stage's residual rows, its layers,
+// then the head on the last token (last stage) or the rows out to the next stage.
+void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
+    DeviceScope ds(dev_);
+    const double t0 = now_ms();
+    join_commit_here();
+    if (N < 1 || N > pf_max_) throw std::runtime_error("prefill_chunk: bad size");
+    if (cur_->pending_T) throw std::runtime_error("prefill_chunk: a verify window is pending");
+    if (pos() + N > opt_.max_ctx) throw std::runtime_error("context full");
+    const Config & c = model_.cfg;
+    const int E = c.n_embd;
+    auto & p = pf_;
+    const int pos0 = pos();
+    cur_->history.insert(cur_->history.end(), tokens, tokens + N);
+    *h_par_ = WinParams{pos0, N, ++seq_, 0};
+    CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
+    if (first()) {
+        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
+        dequant_gather(model_.tok_embd, p.tok, N, p.res, st_);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_[buf], (size_t) N * E * 4, cudaMemcpyHostToDevice, st_));
+    }
+    // BNK_PF_PROF=1: GPU time per block kind over the chunk (attention, DeltaNet, FFN), synchronously measured
+    static const bool prof = getenv("BNK_PF_PROF") != nullptr;
+    double t_attn = 0, t_gdn = 0, t_ffn = 0;
+    auto lap = [&](double & acc, auto && f) {
+        if (!prof) { f(); return; }
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        const double a = now_ms();
+        f();
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        acc += now_ms() - a;
+    };
+    for (int il = l0_; il < l1_; ++il) {
+        const DenseLayer & L = model_.layers[il];
+        rmsnorm_rows(p.res, F(L.attn_norm), p.xn, N, E, E, E, c.rms_eps, st_);
+        if (L.attn) lap(t_attn, [&]() { pf_attn(il, N); });
+        else lap(t_gdn, [&]() { pf_gdn(il, N); });
+        add_rows(p.res, p.out, (int64_t) N * E, st_);
+        rmsnorm_rows(p.res, F(L.post_norm), p.xn, N, E, E, E, c.rms_eps, st_);
+        lap(t_ffn, [&]() { pf_ffn(il, N); });
+        add_rows(p.res, p.out, (int64_t) N * E, st_);
+    }
+    if (prof)
+        fprintf(stderr, "pf GPU %d: chunk of %d at %d: attention %.1f ms, DeltaNet %.1f ms, FFN %.1f ms\n", dev_, N, pos0,
+                t_attn, t_gdn, t_ffn);
+    if (last_) {   // the head on the last token, through the decode buffers (row 0)
+        CUDA_CHECK(cudaMemcpyAsync(res_.p, p.res.p + (size_t) (N - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, st_));
+        pend_ = nullptr;
+        head(1);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(pf_xfer_out_[buf], p.res.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    last_T = 1;
+    pf_ms_ += now_ms() - t0;
+    pf_tokens_ += N;
+}
+
+// Processes a prompt (batched chunks for long stretches, decode windows for short tails) and commits it; the
+// logits of its last token are in logits row 0. Several stages: chunk k+1 on the first stage while a worker runs
+// chunk k through the others.
+void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
+    DeviceScope ds(dev_);
+    join_commit();
+    size_t i = 0;
+    ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
+    const int n = (int) tokens.size();
+    DenseEngine * t = tail();
+    static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
+    if (next_ && pipe && !worker_) worker_ = std::make_unique<Worker>();
+    // Chunks of even size on a pipeline, enough of them that the stages overlap (a read in one chunk leaves the
+    // GPUs taking turns: 3,000 tokens 715 tok/s whole, 1,100+ in four): at least one per stage, chunks of at least
+    // BNK_PIPE_CHUNK_MIN (512) tokens as the GEMMs lose efficiency below that; a read shorter than BNK_PIPE_SPLIT
+    // (256) stays whole.
+    static const int split_min = getenv("BNK_PIPE_SPLIT") ? atoi(getenv("BNK_PIPE_SPLIT")) : 256;
+    static const int chunk_min = getenv("BNK_PIPE_CHUNK_MIN") ? atoi(getenv("BNK_PIPE_CHUNK_MIN")) : 512;
+    static const int min_parts = getenv("BNK_PIPE_PARTS") ? atoi(getenv("BNK_PIPE_PARTS")) : 0;
+    int chunk = pf_max_;
+    if (next_ && pipe && split_min > 0 && pf_max_ > 0 && n >= split_min && n >= 2 * opt_.prefill_min) {
+        int parts = std::max((n + pf_max_ - 1) / pf_max_, std::max(1, n / std::max(chunk_min, opt_.prefill_min)));
+        parts = std::max(parts, std::min(stages(), n / opt_.prefill_min));
+        if (min_parts > 0) parts = std::max(parts, min_parts);
+        chunk = std::max(opt_.prefill_min, (n + parts - 1) / parts);
+    }
+    size_t handed = 0;
+    bool posted = false;
+    int buf = 0;
+    auto drain = [&]() {
+        if (!posted) return;
+        worker_->wait();
+        posted = false;
+        if (on_prefill_progress && handed < tokens.size()) on_prefill_progress(handed, tokens.size());
+    };
+    auto settle = [&]() {
+        if (!posted) return;
+        try {
+            worker_->wait();
+        } catch (...) {
+        }
+        posted = false;
+    };
+    while (i < tokens.size()) try {
+        const size_t left = tokens.size() - i;
+        const int pos0 = pos();
+        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
+            const int N = (int) std::min<size_t>(chunk, left);
+            const int32_t * tk = tokens.data() + i;
+            const double c0 = now_ms();
+            prefill_chunk_here(tk, N, buf);
+            worker_->wait();
+            if (posted && on_prefill_progress) on_prefill_progress(handed, tokens.size());
+            const int b = buf;
+            worker_->post([this, t, tk, N, pos0, b, c0]() {
+                for (DenseEngine * s = next_.get(); s; s = s->next_.get()) s->prefill_chunk_here(tk, N, b);
+                t->mtp_feed(t->pf_.res, tk, N, pos0);
+                std::lock_guard<std::mutex> lk(stats_mu_);
+                pstats.ms += now_ms() - c0;
+                pstats.tokens += N;
+                pstats.chunks++;
+            });
+            posted = true;
+            buf ^= 1;
+            i += N;
+            handed = i;
+            continue;
+        }
+        drain();
+        if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+            const int N = (int) std::min<size_t>(pf_max_, left);
+            prefill_chunk(tokens.data() + i, N);
+            t->mtp_feed(t->pf_.res, tokens.data() + i, N, pos0);
+            i += N;
+        } else {
+            const int T = (int) std::min<size_t>(kMaxWindow, left);
+            forward(tokens.data() + i, T);
+            t->mtp_feed(t->res_, tokens.data() + i, T, pos0);
+            i += T;
+        }
+        handed = i;
+        if (on_prefill_progress) on_prefill_progress(i, tokens.size());
+    } catch (...) {
+        settle();
+        throw;
+    }
+    if (posted) {
+        worker_->wait();
+        if (on_prefill_progress) on_prefill_progress(handed, tokens.size());
+    }
+    for (DenseEngine * s = this; s; s = s->next_.get()) s->last_T = t->last_T;
+    last_rebalance_ms = 0;
+}
+
+}  // namespace bnk

@@ -49,6 +49,9 @@ void gdn_recurrence(const float * conv_out, int C, const float * g, const float 
 // y[t][h][:] = rmsnorm(o[t][h][:]) * w * sigmoid(z[t][h][:])
 void gated_rmsnorm(const float * o, const float * z, const float * w, float * y, int T, int H, int S, float eps,
                    cudaStream_t s);
+// ... with silu(z) as the gate (the qwen35 family's "swish" output gate)
+void gated_rmsnorm_silu(const float * o, const float * z, const float * w, float * y, int T, int H, int S, float eps,
+                        cudaStream_t s);
 
 // ---- full attention
 // The K/V cache cell format, process-wide (set before any cache is sized): fp16, or 8-bit with a fp16 scale per 32

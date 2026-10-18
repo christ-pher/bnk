@@ -6,8 +6,7 @@
 
 #include <vector>
 
-#include "engine/engine.h"
-#include "engine/mtp.h"
+#include "engine/engine_api.h"
 #include "engine/sampler.h"
 
 namespace bnk {
@@ -29,7 +28,7 @@ struct GenStats {
 class Generator {
 public:
     // slot: the engine's conversation slot this generator decodes in (-1: whichever is current)
-    Generator(Engine & eng, MtpLayer * mtp, GenOptions opt = {}, int slot = -1)
+    Generator(EngineApi & eng, Drafter * mtp, GenOptions opt = {}, int slot = -1)
         : eng_(eng), mtp_(mtp), opt_(opt), slot_(slot) {}
 
     // Starts a request: reuses the engine state when its history is a prefix of `prompt` (only the rest is
@@ -67,8 +66,8 @@ private:
     void draft_from(const float * R_row, int32_t tok, int cell);
     void recent_tail(std::vector<int32_t> & out) const;
 
-    Engine & eng_;
-    MtpLayer * mtp_;
+    EngineApi & eng_;
+    Drafter * mtp_;
     GenOptions opt_;
     int slot_ = -1;
     std::vector<int32_t> win_;   // this round's window

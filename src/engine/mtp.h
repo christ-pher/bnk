@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 
 #include "core/model.h"
+#include "engine/engine_api.h"
 #include "core/util.h"
 #include "core/vmem.h"
 #include "kernels/gemv.h"
@@ -23,7 +24,7 @@
 
 namespace bnk {
 
-class MtpLayer {
+class MtpLayer : public Drafter {
 public:
     ~MtpLayer();
     // Loads the MTP GGUF (tools/build_mtp.py: the checkpoint's mtp.* tensors) for the given main model.
@@ -58,12 +59,8 @@ public:
     // Batched drafting: several conversations' drafter passes in one forward (their slots' K/V each; the draft
     // rows share the rest of the layer, the MoE and the head). run_multi is run() for every item; step_multi is
     // step() for the items given by index into the last run_multi/step_multi (which chains their residuals).
-    struct RunItem { int slot; const float * R_rows; const int32_t * tokens; int n; int cell0; };
-    struct StepItem { int prev; int32_t tok; int cell; };   // prev: the item's index in the previous call
     void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out);
     void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out);
-    double ms = 0;
-    int64_t calls = 0;
 
 private:
     int forward(int n, int cell0, bool draft, float * prob);

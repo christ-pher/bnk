@@ -484,6 +484,7 @@ void gdn_recurrence(const float * conv_out, int C, const float * g, const float 
     else gdn_rec4_k<128, 4><<<dim3(nv, 128 / 32), 128, 0, s>>>(conv_out, C, g, beta, state, out, T, nk, nv, commit);
 }
 
+template <bool SILU>
 __global__ void gated_rmsnorm_k(const float * o, const float * z, const float * w, float * y, int S, float eps) {
     __shared__ float sh[32];
     const int64_t r = blockIdx.x;  // (t, h)
@@ -492,11 +493,16 @@ __global__ void gated_rmsnorm_k(const float * o, const float * z, const float * 
     for (int i = threadIdx.x; i < S; i += blockDim.x) ss += x[i] * x[i];
     ss = block_sum(ss, sh);
     const float inv = rsqrtf(ss / S + eps);
-    for (int i = threadIdx.x; i < S; i += blockDim.x) y[r * S + i] = x[i] * inv * w[i] * sigmoidf_(z[r * S + i]);
+    for (int i = threadIdx.x; i < S; i += blockDim.x)
+        y[r * S + i] = x[i] * inv * w[i] * (SILU ? siluf_(z[r * S + i]) : sigmoidf_(z[r * S + i]));
 }
 void gated_rmsnorm(const float * o, const float * z, const float * w, float * y, int T, int H, int S, float eps,
                    cudaStream_t s) {
-    gated_rmsnorm_k<<<T * H, 128, 0, s>>>(o, z, w, y, S, eps);
+    gated_rmsnorm_k<false><<<T * H, 128, 0, s>>>(o, z, w, y, S, eps);
+}
+void gated_rmsnorm_silu(const float * o, const float * z, const float * w, float * y, int T, int H, int S, float eps,
+                        cudaStream_t s) {
+    gated_rmsnorm_k<true><<<T * H, 128, 0, s>>>(o, z, w, y, S, eps);
 }
 
 // ------------------------------------------------------------------------------------------- attention

@@ -18,6 +18,7 @@ struct Config {
     int n_rot = 0;                                         // rotary dims per head (NeoX pairing)
     float rope_base = 1e7f;
     float rms_eps = 1e-6f;
+    int n_ff = 0;                                          // dense FFN width (0: MoE layers)
     int n_expert = 0, n_expert_used = 0, n_ff_exp = 0, n_ff_shexp = 0;
     float expert_weights_scale = 0.f;                      // 0 / 1 = none
     // gated delta net

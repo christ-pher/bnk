@@ -82,6 +82,8 @@ void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T,
 
 // y[t][h][:] = rmsnorm(o[t][h][:]) * w * sigmoid(z[t][h][:]) quantized straight away: a block per (t, h) of S = 128
 // values (4 warps, a sub-block each); the sum of squares over the 4 warps through shared memory.
+// SILU: the gate is silu(z) (the qwen35 family's "swish" output gate) instead of sigmoid(z)
+template <bool SILU>
 __global__ void quantize_gated_norm_k(const float * __restrict__ o, const float * __restrict__ z,
                                       const float * __restrict__ w, float eps, int8_t * __restrict__ q,
                                       float * __restrict__ d, int16_t * __restrict__ sums, half * __restrict__ h,
@@ -98,7 +100,7 @@ __global__ void quantize_gated_norm_k(const float * __restrict__ o, const float 
     __syncthreads();
     const float inv = rsqrtf((sh[0] + sh[1] + sh[2] + sh[3]) / 128.f + eps);
     const float zz = z[(int64_t) r * 128 + i];
-    const float v = x * inv * w[i] / (1.f + __expf(-zz));
+    const float v = x * inv * w[i] * (SILU ? zz : 1.f) / (1.f + __expf(-zz));
     float amax = fabsf(v);
 #pragma unroll
     for (int of = 16; of > 0; of >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, of));
@@ -123,7 +125,16 @@ bool quantize_gated_norm(const float * o, const float * z, const float * w, int 
     a.T = T;
     a.cols = (int64_t) H * S;
     a.cols_pad = a.cols;
-    quantize_gated_norm_k<<<T * H, 128, 0, s>>>(o, z, w, eps, a.q, a.d, a.s, a.h, a.cols_pad, H);
+    quantize_gated_norm_k<false><<<T * H, 128, 0, s>>>(o, z, w, eps, a.q, a.d, a.s, a.h, a.cols_pad, H);
+    return true;
+}
+bool quantize_gated_norm_silu(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
+                              cudaStream_t s) {
+    if (S != 128) return false;
+    a.T = T;
+    a.cols = (int64_t) H * S;
+    a.cols_pad = a.cols;
+    quantize_gated_norm_k<true><<<T * H, 128, 0, s>>>(o, z, w, eps, a.q, a.d, a.s, a.h, a.cols_pad, H);
     return true;
 }
 

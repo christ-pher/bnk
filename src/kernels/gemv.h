@@ -48,6 +48,9 @@ void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T,
 // when S is not 128 (then run gated_rmsnorm and quantize_act)
 bool quantize_gated_norm(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
                          cudaStream_t s);
+// ... with the gate silu(z) instead of sigmoid(z) (the qwen35 family)
+bool quantize_gated_norm_silu(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,
+                              cudaStream_t s);
 
 // Two matrices that share an input are stacked into one at load time (Model: beta | alpha, the indexer's k | q,
 // router | shared-expert gate, shared gate | up, HC down | inject, k | v): one launch, and the rows from r1 on go

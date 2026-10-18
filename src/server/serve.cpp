@@ -31,6 +31,7 @@
 #include <string>
 #include <thread>
 
+#include "core/util.h"
 #include "engine/generate.h"
 #include "server/json.h"
 
@@ -49,7 +50,7 @@ void emit(const std::string & line) {
 // After a request failed: when the GPU context is gone (an illegal access or another sticky error: every CUDA
 // call fails from then on), the process exits, so the server restarts the engine rather than fail every request
 // that follows. An ordinary error is reported once and cleared; a sticky one is returned again.
-void exit_if_gpu_lost(const Engine & eng) {
+void exit_if_gpu_lost(const EngineApi & eng) {
     for (int d : eng.devices()) {
         DeviceScope ds(d);
         if (cudaDeviceSynchronize() == cudaSuccess) continue;
@@ -102,7 +103,7 @@ std::string arr(const V & v) {
 }
 
 // cur: the request shown in "req"; inflight: the in-flight requests summed (for the lifetime counters)
-std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot, const Current & cur,
+std::string telemetry_json(EngineApi & eng, const GenStats & gs, const Totals & tot, const Current & cur,
                            const Current & inflight, int active, const std::string & model_name) {
     // VRAM of every GPU the pipeline uses (summed), and each one's
     size_t vfree = 0, vtotal = 0;
@@ -119,10 +120,10 @@ std::string telemetry_json(Engine & eng, const GenStats & gs, const Totals & tot
     gpus += "]";
     std::string stages = "[";
     for (int i = 0; i < eng.stages(); ++i) {
-        const Engine * st = eng.stage(i);
-        stages += (i ? "," : "") + JsonOut().kv("device", st->device()).kv("layer_begin", st->layer_begin())
-                      .kv("layer_end", st->layer_end()).kv("experts_resident", st->cache().resident())
-                      .kv("expert_cache_gb", (double) st->cache().bytes() / 1073741824.0).done();
+        const StageInfo st = eng.stage_info(i);
+        stages += (i ? "," : "") + JsonOut().kv("device", st.device).kv("layer_begin", st.layer_begin)
+                      .kv("layer_end", st.layer_end).kv("experts_resident", st.experts_resident)
+                      .kv("expert_cache_gb", (double) st.cache_bytes / 1073741824.0).done();
     }
     stages += "]";
     struct sysinfo si;
@@ -235,7 +236,7 @@ struct Active {
     Current cur;
 };
 
-int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_name) {
+int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & model_name) {
     const int n_slots = eng.slots();
     Totals tot;
     std::mutex mu;
@@ -480,7 +481,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             std::vector<Generator *> gens;
             for (auto & a : active) gens.push_back(a->gen.get());
             const std::vector<int> rows = Generator::share_rows(gens);
-            std::vector<Engine::BatchWin> wins;
+            std::vector<EngineApi::BatchWin> wins;
             for (size_t i = 0; i < active.size(); ++i) {
                 const auto & w = active[i]->gen->window(rows[i]);
                 wins.push_back({active[i]->slot, w.data(), (int) w.size(), w.size() == 1});
@@ -527,7 +528,7 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
     static const bool pipe_decode = eng.stages() == 2 &&
                                     (getenv("BNK_PIPE_DECODE") ? atoi(getenv("BNK_PIPE_DECODE")) != 0
                                                                : eng.device() != eng.last_device());
-    struct Lane { std::vector<Active *> reqs; std::vector<Engine::BatchWin> wins; };
+    struct Lane { std::vector<Active *> reqs; std::vector<EngineApi::BatchWin> wins; };
     Lane lanes[2];
     int mid = -1;         // the lane whose batch went through the first GPU only
     bool piped = false;   // lanes formed
@@ -602,14 +603,14 @@ int serve_main(Engine & eng, const GenOptions & gopt, const std::string & model_
             std::vector<Generator *> gens;
             for (Active * a : lanes[x].reqs) gens.push_back(a->gen.get());
             const std::vector<int> rows = Generator::share_rows(gens);
-            std::vector<Engine::BatchWin> wins;
+            std::vector<EngineApi::BatchWin> wins;
             for (size_t i = 0; i < lanes[x].reqs.size(); ++i) {
                 Active * a = lanes[x].reqs[i];
                 const auto & w = a->gen->window(rows[i]);
                 wins.push_back({a->slot, w.data(), (int) w.size(), w.size() == 1});
             }
             const double f0 = now_ms();
-            eng.forward_pipe(wins, x, mid >= 0 ? lanes[mid].wins : std::vector<Engine::BatchWin>{}, mid >= 0 ? mid : 1 - x);
+            eng.forward_pipe(wins, x, mid >= 0 ? lanes[mid].wins : std::vector<EngineApi::BatchWin>{}, mid >= 0 ? mid : 1 - x);
             const double f1 = now_ms();
             for (Active * a : lanes[x].reqs) a->gen->stats.verify_ms += (f1 - f0) / 2;
             const int done = mid;

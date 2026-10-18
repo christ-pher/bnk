@@ -31,6 +31,7 @@
 #include "core/model.h"
 #include "core/util.h"
 #include "cpu/expert_pool.h"
+#include "engine/engine_api.h"
 #include "engine/mtp.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
@@ -86,12 +87,6 @@ struct EngineOptions {
     std::vector<double> stage_cache_gib;   // expert_cache_gib per stage (empty: expert_cache_gib for every one)
 };
 
-struct StageTimes {
-    double total_ms = 0, cpu_experts_ms = 0, ple_ms = 0, wait_ms = 0;
-    int64_t misses = 0, routed = 0;
-    int calls = 0;
-};
-
 struct WinParams {     // pinned host; copied to the device by the graph's first node
     int32_t pos0;
     int32_t T;
@@ -99,7 +94,7 @@ struct WinParams {     // pinned host; copied to the device by the graph's first
     int32_t pad;
 };
 
-class Engine {
+class Engine : public EngineApi {
 public:
     ~Engine();
     void load(const std::string & path, const EngineOptions & opt);
@@ -124,6 +119,13 @@ public:
     int cache_resident() const;
     size_t cache_bytes() const;
     int64_t cache_swaps() const;
+    StageInfo stage_info(int i) const {
+        const Engine * s = stage(i);
+        return StageInfo{s->device(), s->layer_begin(), s->layer_end(), s->cache().resident(), s->cache().bytes(),
+                         s->gpu_ms(), s->gpu_forwards(), s->prompt_ms(), s->prompt_tokens()};
+    }
+    std::string model_name() const { return model_.gguf.get_str("general.name", "bnk"); }
+    int res_dim() const { return model_.cfg.hc_dim(); }
     // the layers of each stage when the model is split over `gpus` (balanced by the memory each needs and has)
     static std::vector<int> plan_split(const std::string & path, const EngineOptions & opt, const std::vector<int> & gpus);
 
@@ -135,7 +137,6 @@ public:
     // given order (at most kMaxWindow in all); the row-wise work (norms, GEMVs, MoE, head) runs once over all of
     // them, attention / DeltaNet / PLE per slot on its own state. row0(i) is where window i's rows start (logits,
     // residuals); a slot's commit() afterwards keeps rows of its own window.
-    struct BatchWin { int slot; const int32_t * tokens; int T; bool commit_all; };
     int64_t graph_captures() const { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
     size_t graph_bytes() const { return graph_bytes_ + (next_ ? next_->graph_bytes() : 0); }
     void forward_batch(const std::vector<BatchWin> & wins);
@@ -162,7 +163,6 @@ public:
     // (the expert cache gives the bytes up), and rebalance() hands spare bytes back to the cache.
     void ensure_ctx(int cells);
     void rebalance();
-    double last_rebalance_ms = 0;
     size_t vram_budget() const { return budget_.limit() + (next_ ? next_->vram_budget() : 0); }
     size_t kv_bytes_mapped() const;
     // One batched prompt pass over N tokens (commits; logits of the last token in row 0).
@@ -205,13 +205,11 @@ public:
     }
     size_t parked_bytes() const;
     size_t spare_bytes() const;   // pinned buffers kept for reuse, every stage
-    struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; } park_stats;
     const std::vector<int32_t> & history() const { return cur_->history; }
     int max_ctx() const { return opt_.max_ctx; }
     int cpu_threads() const { return cpu_->threads(); }
     void logits_rows_host(int T, float * out, int row0 = 0);   // rows row0..row0+T-1 of the last forward's logits
     // the K largest logits of rows row0..row0+T-1 of the last window, selected on the GPU: ids/vals [T][K] (host)
-    static constexpr int kTopkMax = 1024;
     // z (optional): each row's sum of exp((logit - max) / temp) within 30 nats of its max (Sampler::distribution_head)
     void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z = nullptr, float temp = 1.f);
     void set_mtp_pending(const float * R_row_dev, int cell);
@@ -219,17 +217,7 @@ public:
     const Model & model() const { return model_; }
     const ExpertCache & cache() const { return cache_; }   // this stage's (cache_*() above: every stage's)
     MtpLayer * mtp() { return next_ ? next_->mtp() : mtp_.loaded() ? &mtp_ : nullptr; }
-    StageTimes times;
-    // lifetime routing counters per layer (expert uses, and those served by the CPU)
-    std::vector<int64_t> layer_routed, layer_misses;
-    // called after every prefill chunk/window with (tokens done, tokens total)
-    std::function<void(size_t, size_t)> on_prefill_progress;
     void save_counts();
-
-    // debugging (disables graphs): HC residual after every layer, dumped_layers[il] = [T][hc*E]
-    bool dump_all = false;
-    std::vector<std::vector<float>> dumped_layers;
-    int last_T = 0;
 
 private:
     // ---- pipeline stages: this stage's device and layers [l0_, l1_); head_ is the first stage (which holds the

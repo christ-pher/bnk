@@ -100,8 +100,14 @@ if [[ ! -f "$WEB/dist/index.html" || -n "$(find "$WEB/src" "$WEB/index.html" -ne
   (cd "$WEB" && { [[ -d node_modules ]] || "${NPM[@]}" ci --silent; } && "${NPM[@]}" run build --silent) >/dev/null || echo "warning: dashboard build failed (the APIs still work)"
 fi
 
+# a model's own drafter: configs/<name>.json "mtp": "" runs without speculation, "builtin" drafts with the MTP block
+# inside the model file (the dense qwen35 family), a path names a draft-layer GGUF
+if [[ -f "$HERE/configs/$NAME.json" ]]; then
+  cfg_mtp=$("$HERE/.venv/bin/python" -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["mtp"] if "mtp" in c else "<default>")' "$HERE/configs/$NAME.json")
+  [[ "$cfg_mtp" != "<default>" ]] && MTP="$cfg_mtp"
+fi
 DRAFT_VOCAB="${BNK_DRAFT_VOCAB-$CACHE/draft-vocab-$NAME.bin}"
-if [[ -n "$MTP" && ! -f "$MTP" ]]; then
+if [[ -n "$MTP" && "$MTP" != builtin && ! -f "$MTP" ]]; then
   echo "note: no MTP draft layer at $MTP; running without speculative decoding."
   echo "      build it once with: .venv/bin/python tools/build_mtp.py --out $MTP --cache $(dirname "$MTP")/official"
   MTP=""
