@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "dense/dense_attn.h"
 #include "dense/dense_engine.h"
 #include "dense/dense_ops.h"
 #include "kernels/ops.h"
@@ -67,7 +68,11 @@ void DenseEngine::pf_attn(int il, int N) {
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
     attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_);
-    attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
+    // the tensor-core kernel (fp16 KV cache, head dim 256); BNK_PF_ATTN_TC=0: the one-warp-per-row kernel
+    static const bool tc = !getenv("BNK_PF_ATTN_TC") || atoi(getenv("BNK_PF_ATTN_TC")) != 0;
+    if (!(tc && !kv_q8() &&
+          attention_prefill_tc(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_)))
+        attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
     gemm_.run(L.wo, p.ao, H * D, N, p.out, E);
 }
 

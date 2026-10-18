@@ -67,6 +67,7 @@ add_library(bnk_core STATIC
   src/dense/dense_prefill.cpp
   src/dense/dense_mtp.cpp
   src/dense/dense_ops.cu
+  src/dense/dense_attn.cu
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
