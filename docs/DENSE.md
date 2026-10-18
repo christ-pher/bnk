@@ -73,8 +73,9 @@ holds the head and the drafter; the peer's residual is identical, so nothing nee
 |---|---|---|
 | Decode, greedy, no drafting | 30.8 tok/s (32.5 ms per forward) | **42.4 tok/s** (23 ms) |
 | Decode with the MTP drafter (draft 4 / min-p 0.8) | 80.6 tok/s, 3.4 tokens per round | **104 tok/s**, 3.4 per round |
-| 3,000-token prompt | 981 tok/s | **1,193 tok/s** |
+| 3,000-token prompt | 981 tok/s (1,106 with the tensor-core attention below) | **1,193 tok/s** (**1,333**) |
 | 300-token prompt | 507 tok/s | 825 tok/s |
+| Served (`./run.sh qwen27b`, temperature 1.0, 545-token answer with thinking) | | 87.5 tok/s, 2.8 tokens per round |
 
 The verify window of a speculative round carries up to 5 rows and takes 28 ms in TP (23 at one row): the GEMVs
 are still weight-bandwidth-bound, the extra rows are nearly free, which is why drafting pays 2.5x here.
@@ -82,12 +83,15 @@ are still weight-bandwidth-bound, the extra rows are nearly free, which is why d
 ## The prompt path
 
 cuBLAS fp16 GEMMs with each matrix dequantized to fp16 on the fly (as the MoE engine's dense projections), the
-DeltaNet recurrence over the whole chunk, and the existing one-warp-per-(row, head) attention kernel over the KV
-cache. Per block kind on a 3,000-token chunk (pipeline, GPU 0, 34 layers): FFN 1,104 ms (about 50 TFLOPS, near
-what the 150 W power cap leaves of the tensor cores), DeltaNet 594 ms, attention 504 ms of which ~400 is the
-attention kernel itself. That kernel is the open item for long prompts: it is O(N^2) on CUDA cores (2 TFLOPS); a
-tensor-core flash-attention kernel for the V100 would take the attention layers from ~60 ms to ~15 ms per 3,000
-rows and make 32K+ prompts practical (today a 32K prompt would spend most of its time there).
+DeltaNet recurrence over the whole chunk, and a flash-attention kernel on the tensor cores
+(`src/dense/dense_attn.cu`: mma.m8n8k4 with the GEMV's fragment layout, 32 query rows per block, 32-key tiles, the
+online softmax in registers). Per block kind on a 3,000-token read (pipeline, GPU 0, 34 layers, five 600-token
+chunks): FFN 1,412 ms (about 50 TFLOPS, near what the 150 W power cap leaves of the tensor cores), DeltaNet
+667 ms, attention 228 ms (504 with the one-warp-per-row kernel it replaces; `BNK_PF_ATTN_TC=0` brings that one
+back, and an 8-bit KV cache falls back to it). The tensor-core kernel still runs at only ~1.6 TMAC/s (every warp
+streams its K tile from L2 and gathers V from shared memory with bank conflicts); staging K in shared memory and
+larger tiles would give it several times more, which matters from ~32K tokens on, where the attention becomes
+the biggest part of a read.
 
 ## Serving
 
@@ -98,7 +102,7 @@ the CPU.
 
 ## Open items
 
-1. A tensor-core attention kernel for prompt chunks (above).
+1. The tensor-core attention kernel's efficiency (above).
 2. fp16 exchange in decode windows too (halves the bytes of the 5-row verify windows: 43 -> ~30 us per
    exchange, ~1.5 ms per forward).
 3. The draft head: the drafter reads the 1.3 GB Q8_0 head (over the draft vocabulary's 145K rows re-quantized to
