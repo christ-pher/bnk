@@ -310,7 +310,7 @@ bool attention_prefill_tc(const float * q, const half * kcache, const half * vca
 
 int decode_splits() {
     static const int n = [] {
-        const int v = getenv("BNK_DEC_SPLITS") ? atoi(getenv("BNK_DEC_SPLITS")) : 128;
+        const int v = getenv("BNK_DEC_SPLITS") ? atoi(getenv("BNK_DEC_SPLITS")) : 64;
         return v < 1 ? 1 : v > kDecodeSplitsMax ? kDecodeSplitsMax : v;
     }();
     return n;

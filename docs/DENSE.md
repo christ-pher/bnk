@@ -76,6 +76,7 @@ holds the head and the drafter; the peer's residual is identical, so nothing nee
 | 3,000-token prompt | 981 tok/s (1,106 with the tensor-core attention below) | **1,193 tok/s** (**1,333**) |
 | 300-token prompt | 507 tok/s | 825 tok/s |
 | Served (`./run.sh qwen27b`, temperature 1.0, 545-token answer with thinking) | | 87.5 tok/s, 2.8 tokens per round |
+| Decode at 64K / 250K of context (greedy, drafting) | | 84.8 / 53.9 tok/s |
 
 The verify window of a speculative round carries up to 5 rows and takes 28 ms in TP (23 at one row): the GEMVs
 are still weight-bandwidth-bound, the extra rows are nearly free, which is why drafting pays 2.5x here.
@@ -101,6 +102,36 @@ max moved: together ~2.5x on the kernel). The next steps would be double-buffere
 are the top stall) and 16 query rows per warp (halves the operand traffic per MAC), both of which need registers
 the kernel does not have at 12 warps; at 3K-12K tokens the projections now cost more than the kernel, so this is
 left as is.
+
+## Long context (2026-10-18)
+
+The user's conversations run to 256K tokens, so the engine was taken there. The hybrid helps: only 16 of the 64
+layers keep a KV cache (64 KiB per token in fp16, 32 KiB in 8 bits), the DeltaNet layers' state is fixed-size,
+so a 262,144-token context costs 16 GiB of KV in fp16 (8 per rank under tensor parallelism) or 8 GiB in 8 bits.
+The cache is mapped as a conversation grows. The config now runs the model's native 262,144 with the 8-bit cache
+and two slots, which fit beside the weights even with both conversations full; fp16 fits one.
+
+Decode at depth was the first problem: the split-KV decode kernel of `kernels/ops.cu` reads the whole cache once
+per window row and query head at a third of the memory bandwidth, so a 5-row verify window at 64K spent ~28 ms
+per forward there. The tensor-core kernel above now serves decode too: one pass over each KV head's cache for the
+window's rows and the 6 query heads of its group, the keys split over 64 blocks per head and combined (pos0 read
+from device memory, so the forward graphs replay). The drafter uses it as well.
+
+| Q8_0, tensor parallel, greedy with the MTP drafter | 64K context | 250K context |
+|---|---|---|
+| Cold read of the whole context | 67.5 s (970 tok/s) | 471 s (531 tok/s) |
+| Decode at that depth, CUDA-core decode kernel | 56.6 tok/s | |
+| Decode at that depth, tensor-core decode kernel | 84.8 tok/s | 53.9 tok/s |
+| Verify window (5 rows) at that depth | 40 ms | 58 ms |
+| Drafting per round at that depth | 7 ms | 13.5 ms |
+
+What remains at 250K: the read is the attention kernel's 25% tensor-core utilization (the read's attention part
+grows with the square of the length: ~5.5 of the 7.9 minutes), and decode is 54 instead of 104 tok/s because
+every verify window and every draft step streams the 8 GiB of KV per rank (a verify window at 250K reads
+~16 GiB across the two cards in ~30 ms: close to the bandwidth; the drafter's three attention passes per round
+add ~10 ms). A follow-up turn reads only its new tokens: the engine snapshots the recurrent state where the last
+turn began and resumes from there, as the MoE engine does. The engine has no parking: a third conversation
+arriving while two slots are full is read from scratch, and the slots are not moved to host RAM.
 
 ## Serving
 
