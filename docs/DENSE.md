@@ -84,14 +84,23 @@ are still weight-bandwidth-bound, the extra rows are nearly free, which is why d
 
 cuBLAS fp16 GEMMs with each matrix dequantized to fp16 on the fly (as the MoE engine's dense projections), the
 DeltaNet recurrence over the whole chunk, and a flash-attention kernel on the tensor cores
-(`src/dense/dense_attn.cu`: mma.m8n8k4 with the GEMV's fragment layout, 32 query rows per block, 32-key tiles, the
-online softmax in registers). Per block kind on a 3,000-token read (pipeline, GPU 0, 34 layers, five 600-token
-chunks): FFN 1,412 ms (about 50 TFLOPS, near what the 150 W power cap leaves of the tensor cores), DeltaNet
-667 ms, attention 228 ms (504 with the one-warp-per-row kernel it replaces; `BNK_PF_ATTN_TC=0` brings that one
-back, and an 8-bit KV cache falls back to it). The tensor-core kernel still runs at only ~1.6 TMAC/s (every warp
-streams its K tile from L2 and gathers V from shared memory with bank conflicts); staging K in shared memory and
-larger tiles would give it several times more, which matters from ~32K tokens on, where the attention becomes
-the biggest part of a read.
+(`src/dense/dense_attn.cu`: mma.m8n8k4 with the GEMV's fragment layout; a block is 8 query rows x the 6 query
+heads of one KV head, so a K/V tile staged in shared memory serves 6 warps; 32-key tiles, the online softmax
+and the rescale of O in registers, V transposed in shared memory for the P V operands). Per block kind on a
+3,000-token read (pipeline, GPU 0, 34 layers, five 600-token chunks): FFN ~1,430 ms (about 50 TFLOPS, near what
+the 150 W power cap leaves of the tensor cores), DeltaNet ~680 ms, attention 214 ms, of which ~180 are the
+q/k/v/o projections and ~35 the attention kernel (504 ms with the one-warp-per-row kernel it replaces;
+`BNK_PF_ATTN_TC=0` brings that one back, and an 8-bit KV cache falls back to it). A 12,000-token read: 13.8 s
+with the old kernel, 9.2 s with this one (1,309 tok/s, tensor parallel).
+
+What Nsight Compute says about the kernel (2026-10-18): tensor pipe ~25% active, 12 resident warps per SM (168
+registers and 38 KB of shared memory per 6-warp block), an instruction issued every ~4 cycles; the first version
+also had 12-way bank conflicts on the transposed V stores (fixed: the staging threads run along the keys) and
+masked every tile (now only the diagonal ones; exp2 with the scale folded in; the O rescale skipped when no row
+max moved: together ~2.5x on the kernel). The next steps would be double-buffered K/V staging (the global loads
+are the top stall) and 16 query rows per warp (halves the operand traffic per MAC), both of which need registers
+the kernel does not have at 12 warps; at 3K-12K tokens the projections now cost more than the kernel, so this is
+left as is.
 
 ## Serving
 
@@ -102,7 +111,7 @@ the CPU.
 
 ## Open items
 
-1. The tensor-core attention kernel's efficiency (above).
+1. The tensor-core attention kernel's efficiency (above) for 32K+ prompts.
 2. fp16 exchange in decode windows too (halves the bytes of the 5-row verify windows: 43 -> ~30 us per
    exchange, ~1.5 ms per forward).
 3. The draft head: the drafter reads the 1.3 GB Q8_0 head (over the draft vocabulary's 145K rows re-quantized to

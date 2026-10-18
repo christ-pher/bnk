@@ -68,7 +68,8 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 |---|---|---|
 | Decode without drafting | 30.8 tok/s | **42.4 tok/s** |
 | Decode with the model's MTP block drafting | 80.6 tok/s (3.4 tokens per round) | **104 tok/s** |
-| 3,000-token prompt | 1,106 tok/s | **1,333 tok/s** |
+| 3,000-token prompt | 1,100 tok/s | **1,330 tok/s** |
+| 12,000-token prompt | | **1,309 tok/s** (869 with the CUDA-core attention kernel) |
 | Served (sampled, thinking, 545-token answer) | | 87.5 tok/s |
 
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
