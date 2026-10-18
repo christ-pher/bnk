@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "dense/dense_attn.h"
 #include "dense/dense_ops.h"
 #include "ggml.h"
 #include "kernels/ops.h"
@@ -57,7 +58,8 @@ void DenseMtp::load(const DenseModel & main, int max_ctx, cudaStream_t st, bool 
     Rin_.alloc(W * E); emb_.alloc(W * E); cat_.alloc((size_t) W * 2 * E); R_.alloc(W * E); xn_.alloc(W * E);
     qfull_.alloc(W * c.n_head * c.head_dim * 2); k_.alloc(W * c.n_head_kv * c.head_dim);
     v_.alloc(W * c.n_head_kv * c.head_dim); q_.alloc(W * c.n_head * c.head_dim); attn_o_.alloc(c.n_head * c.head_dim);
-    attn_scratch_.alloc(attention_scratch_floats(1, c.n_head, c.head_dim, max_ctx));
+    attn_scratch_.alloc(std::max(attention_scratch_floats(1, c.n_head, c.head_dim, max_ctx),
+                                 attention_decode_tc_scratch_floats(1, c.n_head, c.head_dim)));
     bo_.alloc(E); sg_.alloc(FF); su_.alloc(FF); y_.alloc(E); sample_.alloc(E); logits_.alloc(c.n_vocab); prob_.alloc(2);
     tok_dev_.alloc(W); pos_dev_.alloc(4); out_dev_.alloc(2);
     const int64_t maxcols = std::max<int64_t>(2 * E, FF);
@@ -216,8 +218,11 @@ void DenseMtp::enqueue(int n, bool draft) {
     // the rest of the block on the last row
     const int Lr = n - 1;
     float * RL = R_.p + (size_t) Lr * E;
-    attention(q_.p + (size_t) Lr * H * D, cur_->kc, cur_->vc, qfull_.p + (size_t) Lr * H * D * 2, attn_o_, 1, H, Hkv, D,
-              pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+    static const bool tc = !getenv("BNK_ATTN_TC") || atoi(getenv("BNK_ATTN_TC")) != 0;
+    if (!(tc && attention_decode_tc(q_.p + (size_t) Lr * H * D, cur_->kc, cur_->vc, qfull_.p + (size_t) Lr * H * D * 2, attn_o_,
+                                    1, H, Hkv, D, pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_)))
+        attention(q_.p + (size_t) Lr * H * D, cur_->kc, cur_->vc, qfull_.p + (size_t) Lr * H * D * 2, attn_o_, 1, H, Hkv, D,
+                  pos_dev_.p + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
     quantize_act(attn_o_, H * D, 1, H * D, act_, st_);
     gemv(L.wo, &act_, nullptr, 0, 1, bo_, E, false, st_);
     dense_norm_q(RL, bo_, F(L.post_norm), xn_, 1, E, c.rms_eps, act_, st_);
@@ -362,8 +367,11 @@ void DenseMtp::enqueue_multi(const std::vector<MItem> & items) {
         copy_f32(Dres_.p + (size_t) i * E, R_.p + (size_t) last[i] * E, E, st_);
         Slot & sl = slots_.at(items[i].slot);
         const size_t Lr = (size_t) last[i];
-        attention(q_.p + Lr * H * D, sl.kc, sl.vc, qfull_.p + Lr * H * D * 2, dattn_.p + (size_t) i * H * D, 1, H, Hkv, D,
-                  mpos_.p + 2 * i + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
+        static const bool tc = !getenv("BNK_ATTN_TC") || atoi(getenv("BNK_ATTN_TC")) != 0;
+        if (!(tc && attention_decode_tc(q_.p + Lr * H * D, sl.kc, sl.vc, qfull_.p + Lr * H * D * 2, dattn_.p + (size_t) i * H * D,
+                                        1, H, Hkv, D, mpos_.p + 2 * i + 1, 1.f / sqrtf((float) D), attn_scratch_, st_)))
+            attention(q_.p + Lr * H * D, sl.kc, sl.vc, qfull_.p + Lr * H * D * 2, dattn_.p + (size_t) i * H * D, 1, H, Hkv, D,
+                      mpos_.p + 2 * i + 1, 1.f / sqrtf((float) D), attn_scratch_, st_);
     }
     // the rest of the block on the draft rows together
     quantize_act(dattn_, H * D, S, H * D, act_, st_);

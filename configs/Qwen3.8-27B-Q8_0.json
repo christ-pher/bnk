@@ -1,5 +1,5 @@
 {
-  "notes": "Qwen/Qwen3.8-27B (dense: 48 Gated DeltaNet + 16 gated-attention layers, 27B parameters) as unsloth's Q8_0 GGUF (27.05 GiB, all weights in VRAM, tensor parallel over the two V100s (engine_args --tp 1), bnk's dense engine: src/dense, docs/DENSE.md). Q8_0 is the near-lossless quant that fits both cards with room for the context: the engine's per-layer output matches llama.cpp's fp32 CPU path within ~1% (quantized activations), top token identical on every prompt tested. The drafter is the model's own MTP block (mtp: builtin, in the same file: block 64); the draft head runs over run.sh's draft vocabulary. Sampling as the Qwen release recommends.",
+  "notes": "Qwen/Qwen3.8-27B (dense: 48 Gated DeltaNet + 16 gated-attention layers, 27B parameters) as unsloth's Q8_0 GGUF (27.05 GiB, all weights in VRAM, tensor parallel over the two V100s (engine_args --tp 1), bnk's dense engine: src/dense, docs/DENSE.md). Q8_0 is the near-lossless quant that fits both cards with room for the context: the engine's per-layer output matches llama.cpp's fp32 CPU path within ~1% (quantized activations), top token identical on every prompt tested. The drafter is the model's own MTP block (mtp: builtin, in the same file: block 64); the draft head runs over run.sh's draft vocabulary. Sampling as the Qwen release recommends. Context 262,144 (the model's native length) with the KV cache in 8 bits (--kv8 1: 32 KiB per token instead of 64, so two full-length conversations fit beside the weights; KL vs the fp16 cache 1e-3) and two slots; the KV cache is mapped as a conversation grows, so short conversations cost nothing.",
   "aliases": [
     "qwen27b",
     "27b",
@@ -28,7 +28,7 @@
     "--model-id",
     "Qwen3.8-27B",
     "--ctx",
-    "131072",
+    "262144",
     "--max-tokens",
     "32768",
     "--slots",
@@ -38,6 +38,8 @@
   ],
   "engine_args": [
     "--tp",
+    "1",
+    "--kv8",
     "1"
   ]
 }

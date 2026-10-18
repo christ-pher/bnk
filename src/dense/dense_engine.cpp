@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "dense/dense_attn.h"
 #include "dense/dense_ops.h"
 #include "kernels/ops.h"
 
@@ -277,7 +278,8 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     qfull_.alloc(W * c.n_head * c.head_dim * 2); k_.alloc(W * c.n_head_kv * c.head_dim);
     v_.alloc(W * c.n_head_kv * c.head_dim); q_.alloc(W * c.n_head * c.head_dim);
     attn_o_.alloc(W * c.n_head * c.head_dim);
-    attn_scratch_.alloc(attention_scratch_floats(W, c.n_head, c.head_dim, opt.max_ctx));
+    attn_scratch_.alloc(std::max(attention_scratch_floats(W, c.n_head, c.head_dim, opt.max_ctx),
+                                 attention_decode_tc_scratch_floats(W, c.n_head, c.head_dim)));
     sg_.alloc(W * FF); su_.alloc(W * FF);
     if (last_) logits_.alloc((size_t) W * c.n_vocab);
     argmax_dev_.alloc(W);
@@ -630,7 +632,12 @@ void DenseEngine::attn(int il, int T) {
         float * qw = q_.p + r * H * D, * qf = qfull_.p + r * H * D * 2, * ao = attn_o_.p + r * H * D;
         attn_prep(qf, k_.p + r * Hkv * D, v_.p + r * Hkv * D, F(L.q_norm), F(L.k_norm), qw, w.q->kc[il], w.q->vc[il],
                   w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_);
-        attention(qw, w.q->kc[il], w.q->vc[il], qf, ao, w.T, H, Hkv, D, pos0, 1.f / sqrtf((float) D), attn_scratch_, st_);
+        // the tensor-core split-KV kernel (one pass over the cache for the window's rows and the KV head's
+        // query heads); BNK_ATTN_TC=0: the one-row-per-block kernel
+        static const bool tc = !getenv("BNK_ATTN_TC") || atoi(getenv("BNK_ATTN_TC")) != 0;
+        if (!(tc && attention_decode_tc(qw, w.q->kc[il], w.q->vc[il], qf, ao, w.T, H, Hkv, D, pos0, 1.f / sqrtf((float) D),
+                                        attn_scratch_, st_)))
+            attention(qw, w.q->kc[il], w.q->vc[il], qf, ao, w.T, H, Hkv, D, pos0, 1.f / sqrtf((float) D), attn_scratch_, st_);
     }
     dbg(st_, tp_rank_, il, "attn_gated", attn_o_, (size_t) T * H * D);
     quantize_act(attn_o_, H * D, T, H * D, act_, st_);
