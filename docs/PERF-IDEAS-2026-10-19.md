@@ -101,3 +101,4 @@ nothing here is a new measurement. The numbered items are referred to by number 
 ## Status
 
 - 2026-10-19: items 3 (as prompt-lookup drafting; tree verification not done) and 10 done (branch `drafting-prefix`, merged): `docs/LOOKUP-FORK.md`.
+- 2026-10-19: idea C (lookahead pipelining) built on branch `dual-gpu`: `docs/LOOKAHEAD.md`.

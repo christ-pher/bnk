@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -100,6 +101,23 @@ public:
     // new conversation over rolling a sibling's slot back
     virtual bool can_fork() const { return false; }
     virtual int park_min() const { return 2048; }   // tokens a conversation must have to be worth keeping (parking)
+
+    // Lookahead on a two-stage pipeline (docs/LOOKAHEAD.md): while the second stage runs a verify window, the
+    // first stage runs the window that follows if every draft is accepted. false: unsupported (the calls throw).
+    virtual bool lookahead_ok() const { return false; }
+    // `win` through both stages; `chain` is called on a worker thread while the GPUs work and may fill the
+    // tokens of the window that would follow full acceptance (returns their count, 0 = none), which the first
+    // stage then runs speculatively. stage0_done: `win`'s first-stage half was last round's confirmed
+    // speculation (only the second stage runs it).
+    virtual void forward_lookahead(const BatchWin &, int /*lane*/, const std::function<int(std::vector<int32_t> &)> & /*chain*/,
+                                   bool /*stage0_done*/) { throw std::runtime_error("lookahead: not supported by this engine"); }
+    virtual bool spec_pending() const { return false; }   // a speculative window awaits the verdict
+    virtual int spec_lane() const { return -1; }
+    virtual void spec_confirm() { throw std::runtime_error("lookahead: not supported"); }   // it held: it is the pending window now
+    virtual void spec_discard() { throw std::runtime_error("lookahead: not supported"); }   // it did not
+    // a request ends while its next window's first-stage half is pending (a confirmed speculation): that half
+    // is dropped, the slot's state is what the verified windows committed
+    virtual void spec_abort() {}
     virtual void set_busy(const std::vector<int> & slots) = 0;
     virtual int parked() const = 0;
     virtual size_t parked_bytes() const = 0;

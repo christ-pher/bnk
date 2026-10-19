@@ -585,6 +585,7 @@ int main(int argc, char ** argv) {
     Generator gen(eng, eng.mtp(), gopt);
     const double t0 = now_ms();
     int tok = gen.prefill(prompt);
+    gen.set_lookahead(!getenv("BNK_LOOKAHEAD") || atoi(getenv("BNK_LOOKAHEAD")) != 0);
     const double t1 = now_ms();
     std::vector<int> out{tok};
     eng.times = StageTimes{};
@@ -593,7 +594,7 @@ int main(int argc, char ** argv) {
     if (prof) cudaProfilerStart();
     const double t2 = now_ms();
     while ((int) out.size() < max_new && out.back() != c.eos_token) {
-        for (int t : gen.next()) {
+        for (int t : gen.next_lookahead()) {
             out.push_back(t);
             if (t == c.eos_token) break;
         }
@@ -611,6 +612,8 @@ int main(int argc, char ** argv) {
            (double) gs.emitted / std::max<int64_t>(1, gs.rounds), (long long) gs.accepted, (long long) gs.drafted,
            (long long) gs.lookup_accepted, (long long) gs.lookup_drafted, (long long) gs.lookup_rounds,
            (long long) gs.mtp_accepted, (long long) gs.mtp_drafted, (long long) gs.mtp_rounds);
+    if (gs.la_rounds) printf("lookahead: %lld of %lld rounds with a speculative next window confirmed (%.0f%%)\n",
+                             (long long) gs.la_hits, (long long) gs.la_rounds, 100.0 * gs.la_hits / gs.la_rounds);
     printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms\n",
            gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
            gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls));

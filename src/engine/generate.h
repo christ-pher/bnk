@@ -35,6 +35,9 @@ struct GenStats {
     // per draft source: rounds whose drafts came from the lookup / the MTP drafter, their drafts and accepted ones
     int64_t lookup_rounds = 0, lookup_drafted = 0, lookup_accepted = 0;
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
+    // lookahead probe (BNK_LA_PROBE=1): rounds with drafts, and those where every draft was accepted and the
+    // bonus token equalled the drafter's next chained token (a speculative next window would have been right)
+    int64_t la_rounds = 0, la_hits = 0;
 };
 
 // The n-grams of a token sequence, for prompt-lookup drafting: where the latest occurrence of each `n`-gram
@@ -73,6 +76,21 @@ public:
     int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, const std::vector<int> & checkpoints);
     // Emits the next tokens: 1 + accepted drafts.
     std::vector<int32_t> next();
+    // The same with lookahead (EngineApi::forward_lookahead): while the second GPU verifies this window, the first
+    // runs the window that follows if every draft is accepted; a confirmed speculation skips the first GPU's
+    // half of the next round. Same tokens as next() in greedy mode. Falls back to next() when unsupported.
+    std::vector<int32_t> next_lookahead();
+    bool lookahead_on() const { return la_on_; }
+    void set_lookahead(bool on) { la_on_ = on; }
+    // a confirmed speculation left the next window's first-stage half done: the next round must be a
+    // next_lookahead() round (with lookahead off it runs only the second stage, no new speculation)
+    bool lookahead_pending() const { return la_stage0_done_; }
+    // the request ends: a half-done next window is dropped (the engine keeps what the verified windows committed)
+    void lookahead_abort() {
+        if (la_stage0_done_) { use_slot(); eng_.spec_abort(); }
+        la_stage0_done_ = false;
+        la_spec_.clear();
+    }
     // The same round in two halves around Engine::forward_batch (several generators in one forward):
     // window() is this round's tokens (the pending one plus up to max_rows-1 drafts), finish() verifies them from
     // this slot's rows of the forward, commits, drafts the next ones and returns the emitted tokens.
@@ -120,6 +138,22 @@ private:
     std::vector<int32_t> lookup_;       // the lookup's proposal for the next window (empty: none)
     int lookup_ctx_ = 0;                // its context length
     bool drafts_from_lookup_ = false;   // the current drafts_ came from the lookup
+    int32_t probe_ = -1;                // the drafter's token after the window's last draft (the probe)
+    bool probing_ = false;
+    // lookahead
+    bool la_on_ = false;
+    int la_lane_ = 0;                   // the lane this round's window runs in
+    bool la_stage0_done_ = false;       // the window's first-stage half ran as last round's confirmed speculation
+    std::vector<int32_t> la_spec_;      // the speculative window run last round (the chain-ahead tokens)
+    int la_cell_ = 0;                   // the drafter's next cell after the window's last draft
+    int32_t la_last_ = -1;              // the window's last draft token (the chain starts from it)
+    // speculate only when it is likely to hold: a missed speculation delays the next round by the speculative
+    // forward (GPU 0 is busy with it), a hit saves GPU 0's half, so the break-even is about half the rounds.
+    // Lookup drafts hold 85-92% of the time; MTP drafts follow the recent rate of full acceptance.
+    double la_full_ = 0.5;              // EMA of "every draft accepted" over recent rounds
+    double la_conf_ = 0.0;              // the drafter's own confidence in the window's drafts (the product of its probabilities)
+    double la_threshold_ = 0.8;         // BNK_LA_MIN: speculate when the confidence is at least this
+    int verify_window(int T, int r0, int32_t * bonus);   // accepted drafts of the window just run; *bonus = the next token
     std::vector<int32_t> seq_;          // scratch: history + the pending token
     void use_slot() { if (slot_ >= 0) eng_.select(slot_); }
     SamplingParams sp_;

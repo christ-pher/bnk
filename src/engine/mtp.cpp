@@ -70,7 +70,10 @@ void MtpLayer::release_ctx(int cells) {
 void MtpLayer::load(const std::string & path, const Model & main, int max_ctx, cudaStream_t st, bool verbose,
                     const std::string & draft_vocab, VramBudget * budget, int slots) {
     main_ = &main;
-    st_ = st;
+    main_st_ = st;
+    if (getenv("BNK_MTP_OWN_STREAM") && atoi(getenv("BNK_MTP_OWN_STREAM")) == 0) st_ = st;   // bisection: the stage's stream, as before
+    else CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&main_ev_, cudaEventDisableTiming));
     max_ctx_ = max_ctx;
     CUDA_CHECK(cudaGetDevice(&dev_));   // the last pipeline stage's GPU (callers may have another one current)
     GgufModel g;
@@ -335,10 +338,16 @@ void MtpLayer::hc_pre(const HcWeights & w, const float * res, int T, bool inject
     hc_mix(xn_, gpre_, mixed, T, c.hc, E, st_);
 }
 
+void MtpLayer::after_main() {
+    CUDA_CHECK(cudaEventRecord(main_ev_, main_st_));
+    CUDA_CHECK(cudaStreamWaitEvent(st_, main_ev_, 0));
+}
+
 int MtpLayer::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
     DeviceScope ds(dev_);
     if (n < 1 || n > kMaxWindow) throw std::runtime_error("mtp: bad row count");
     const int HC = main_->cfg.hc_dim();
+    after_main();   // the rows come from the main model's last forward (and its commit, queued before)
     // no stream sync here: the pinned inputs below are read only by this layer's graphs, and forward() waits for
     // each of those; whatever else is queued (the main model's commit) runs first, in stream order
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_rows, (size_t) n * HC * 4, cudaMemcpyDeviceToDevice, st_));
@@ -478,6 +487,7 @@ void MtpLayer::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, 
     const int HC = main_->cfg.hc_dim();
     std::vector<MItem> mi;
     int r = 0;
+    after_main();
     for (const auto & it : items) {
         CUDA_CHECK(cudaMemcpyAsync(Rin_.p + (size_t) r * HC, it.R_rows, (size_t) it.n * HC * 4, cudaMemcpyDeviceToDevice, st_));
         memcpy(h_multi_ + r, it.tokens, it.n * 4);

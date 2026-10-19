@@ -77,6 +77,16 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
+### What lookahead pipelining changed (2026-10-19)
+
+On the two-GPU pipeline a single stream used each card half the time: GPU 0's layers, then GPU 1's, and the next
+window waits for the verdict. Lookahead runs the next window on GPU 0 while GPU 1 verifies this one, assuming
+every draft is accepted, against a shadow copy of the recurrent state; when the verdict agrees (the drafter's
+confidence, or a lookup match, decides when to try) the round shrinks to GPU 1's half, and when it does not,
+nothing was touched. Copy-heavy output gains a fifth (a verbatim file rewrite on FP4-Local: 177 -> 209 tok/s,
+86% of speculations confirmed), code a few percent, prose nothing. `docs/LOOKAHEAD.md`; `BNK_LOOKAHEAD=0`
+turns it off.
+
 ### What prompt-lookup drafting and prefix forking changed (2026-10-19)
 
 Two of the opportunities in `docs/PERF-IDEAS-2026-10-19.md`, details and measurements in `docs/LOOKUP-FORK.md`:

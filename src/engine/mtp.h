@@ -87,7 +87,10 @@ private:
     bool loaded_ = false;
     int dev_ = 0;
     const Model * main_ = nullptr;
-    cudaStream_t st_ = nullptr;
+    cudaStream_t st_ = nullptr;        // the drafter's own stream (lookahead: its steps overlap the main model's forward)
+    cudaStream_t main_st_ = nullptr;   // the stage's stream, whose residual rows it reads
+    cudaEvent_t main_ev_ = nullptr;
+    void after_main();                 // st_ waits for everything queued on main_st_ so far
     size_t vram_ = 0;
     std::vector<void *> allocs_;
     int max_ctx_ = 0;
