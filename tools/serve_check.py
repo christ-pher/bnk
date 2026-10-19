@@ -26,6 +26,7 @@ ap.add_argument("prompts", nargs="+")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--ple-gguf", default="", help="the n-gram table GGUF of a model that keeps it in a second file")
+ap.add_argument("--cold-experts", default="", help="the cold-experts file (docs/EXPERT-MIX.md)")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
 ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=64)
@@ -42,6 +43,8 @@ if a.gpus:
     args += ["--gpus", a.gpus]
 if a.ple_gguf:
     args += ["--ple-gguf", a.ple_gguf]
+if a.cold_experts:
+    args += ["--cold-experts", a.cold_experts]
 eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 events: dict[str, list] = {}
 order: list = []   # (id, type, n tokens) in arrival order

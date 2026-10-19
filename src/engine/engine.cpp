@@ -1395,12 +1395,10 @@ void Engine::moe(int il, int T) {
         const int ng = cache_.n_cold_groups(il);
         if (!ng) {
             moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
-        } else {   // gate/up per region, the activation once, down per region (docs/EXPERT-MIX.md)
-            moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_, 0, c.n_expert);
-            for (int g = 0; g < ng; ++g) moe_hits(cache_.desc_cold(il, g), moes_, mixact_, T, k, E, c.n_ff_exp, st_, 0, c.n_expert);
-            moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_, 1, c.n_expert);
-            moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_, 2, c.n_expert);
-            for (int g = 0; g < ng; ++g) moe_hits(cache_.desc_cold(il, g), moes_, mixact_, T, k, E, c.n_ff_exp, st_, 2, c.n_expert);
+        } else {   // the hot region and the cold bands in one launch per phase (docs/EXPERT-MIX.md)
+            std::vector<MoeLayerDesc> descs{d};
+            for (int g = 0; g < ng; ++g) descs.push_back(cache_.desc_cold(il, g));
+            moe_hits_regions(moe_regions(descs.data(), (int) descs.size()), d.scales, c.n_expert, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
         }
     }
     join(0);

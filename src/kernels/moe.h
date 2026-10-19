@@ -89,6 +89,25 @@ void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * id
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s,
               MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);
 // Hit experts on the GPU: writes s.part.
+// Several regions of one layer (the hot one and its cold bands, docs/EXPERT-MIX.md) in one launch per phase: each
+// block picks its entry's region by slot and that region's format (a block-uniform switch), so a layer with cold
+// bands costs the same launches as one without.
+struct MoeRegion {
+    const uint8_t * base = nullptr;
+    size_t blob = 0, up_off = 0, grow = 0, down_off = 0, drow = 0;
+    uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};
+    int lo = 0, hi = 0, gate_type = 0, down_type = 0;
+};
+constexpr int kMaxRegions = 4;
+struct MoeRegions {
+    MoeRegion r[kMaxRegions];
+    int n = 0;
+};
+MoeRegions moe_regions(const MoeLayerDesc * descs, int n);   // from a layer's hot descriptor and its cold ones
+// gate/up, the activation (cold_lo: entries at or past it carry their scale in their blocks) and down, one launch each
+void moe_hits_regions(const MoeRegions & R, const ExpScales & scales, int cold_lo, MoeScratch & s, const ActQ8 & xq, int T,
+                      int k, int E, int F, cudaStream_t st);
+
 // phase -1: gate/up, the activation, down (the whole layer for one region); 0 / 1 / 2: one of them, so that
 // several regions of a layer (a hot one and cold bands) run their gate/up and down each, the activation once
 // (cold_lo: entries whose slot is at least this hold their global scale in their blocks)
