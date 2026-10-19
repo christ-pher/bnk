@@ -155,10 +155,19 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         extra = {}
         # snapshot the engine state where the prompt's last turn begins: the next request in this conversation
         # shares everything before it (even when the client re-renders this turn's answer differently)
+        # and where the first turn after a leading system message begins: other conversations with the same
+        # system prompt (an agent's workers) start from that snapshot instead of reading it again
         if S.im_start is not None and allow_guard:
             last = len(ids) - 1 - ids[::-1].index(S.im_start) if S.im_start in ids else -1
+            cps = []
+            if ids and ids[0] == S.im_start and S.im_start in ids[1:]:
+                first = ids.index(S.im_start, 1)
+                if 0 < first < last:
+                    cps.append(first)
             if last > 0:
-                extra["checkpoint"] = last
+                cps.append(last)
+            if cps:
+                extra["checkpoints"] = cps
         gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids},
                                 on_start=lambda r: S.convs.status(cid, "reading", r))
         wrap_pending, wrap_deadline, outcome = False, 0, None
@@ -281,7 +290,8 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
              "total_tokens": len(prompt_ids) + len(generated)}
     timings = {k: done_msg.get(k) for k in ("prefill_ms", "prefill_tps", "gen_ms", "tps", "reused", "rounds",
                                              "tokens_per_round", "accepted", "drafted", "expert_miss_rate",
-                                             "verify_ms", "draft_ms", "cpu_expert_ms")}
+                                             "verify_ms", "draft_ms", "cpu_expert_ms",
+                                             "lookup_rounds", "lookup_drafted", "lookup_accepted")}
     if first_prefill:   # the prompt's own read, not a resumed slice's
         ms = first_prefill.get("ms") or 0
         fresh = len(prompt_ids) - (first_prefill.get("reused") or 0)

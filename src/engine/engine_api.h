@@ -19,7 +19,7 @@ struct StageTimes {
     int calls = 0;
 };
 
-struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0; double park_ms = 0, restore_ms = 0; };
+struct ParkStats { int64_t parks = 0, restores = 0, evictions = 0, forks = 0; double park_ms = 0, restore_ms = 0, fork_ms = 0; };
 
 // one pipeline stage (GPU) as the telemetry shows it
 struct StageInfo {
@@ -95,6 +95,11 @@ public:
     virtual int rollback(int max_pos) = 0;
     virtual void select_conversation(const std::vector<int32_t> & prompt) = 0;
     virtual int reusable(const std::vector<int32_t> & prompt) const = 0;
+    // true: select_conversation can fork a prefix another conversation has processed (a shared system prompt)
+    // into the current slot without disturbing that conversation; the server then prefers an empty slot for a
+    // new conversation over rolling a sibling's slot back
+    virtual bool can_fork() const { return false; }
+    virtual int park_min() const { return 2048; }   // tokens a conversation must have to be worth keeping (parking)
     virtual void set_busy(const std::vector<int> & slots) = 0;
     virtual int parked() const = 0;
     virtual size_t parked_bytes() const = 0;

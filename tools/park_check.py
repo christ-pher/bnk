@@ -25,6 +25,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("model")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
+ap.add_argument("--ple-gguf", default="", help="the n-gram table GGUF of a model that keeps it in a second file")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
 ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=48)
@@ -41,6 +42,8 @@ if a.mtp:
         args += ["--draft-vocab", a.draft_vocab]
 if a.gpus:
     args += ["--gpus", a.gpus]
+if a.ple_gguf:
+    args += ["--ple-gguf", a.ple_gguf]
 eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=0)
 im_start = tok.id_of("<|im_start|>")
 stops = [t for t in (tok.id_of("<|im_end|>"), tok.ids.get("eos_token_id")) if t is not None]

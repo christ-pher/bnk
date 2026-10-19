@@ -4,6 +4,7 @@
 // keeps the target distribution.
 #pragma once
 
+#include <unordered_map>
 #include <vector>
 
 #include "engine/engine_api.h"
@@ -14,6 +15,14 @@ namespace bnk {
 struct GenOptions {
     int max_draft = 3;      // drafts per verify window (window = 1 + drafts)
     float min_p = 0.5f;     // stop drafting when the drafter's own probability falls below this
+    // Prompt-lookup drafting: when the sequence's last `lookup_n` tokens occurred earlier in it, what followed
+    // them then is proposed as the drafts (up to lookup_max, the window's other rows). Agents re-emit file
+    // contents, identifiers and tool-call scaffolding; the MTP drafter proposes 4 tokens at ~75% each, a lookup
+    // match proposes 7. The MTP drafter still runs every round (its K/V must follow the conversation) and its
+    // first token decides between the two when the match is short (lookup_agree). 0 turns the lookup off.
+    int lookup_n = 3;
+    int lookup_max = 7;
+    int lookup_agree = 6;   // a match with fewer than this many tokens of context needs the MTP's first token to agree
 };
 
 struct GenStats {
@@ -23,6 +32,27 @@ struct GenStats {
     double draft_run_ms = 0;   // the drafter over the kept rows (and the first draft)
     int64_t draft_steps = 0;   // further one-row draft steps
     int64_t host_rows = 0;     // rows sampled from the whole vocabulary on the host after the GPU candidates fell short
+    // per draft source: rounds whose drafts came from the lookup / the MTP drafter, their drafts and accepted ones
+    int64_t lookup_rounds = 0, lookup_drafted = 0, lookup_accepted = 0;
+    int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
+};
+
+// The n-grams of a token sequence, for prompt-lookup drafting: where the latest occurrence of each `n`-gram
+// ends. Extended as the sequence grows; rebuilt when it shrinks (a rollback).
+class LookupIndex {
+public:
+    explicit LookupIndex(int n = 3) : n_(n) {}
+    void sync(const std::vector<int32_t> & seq);   // index every n-gram of seq (incrementally when seq extends the last one)
+    // the latest earlier occurrence of seq's last n tokens: the position after it (the first token it predicts),
+    // or -1; *context = tokens before the n-gram that agree with the sequence too (up to 32)
+    int find(const std::vector<int32_t> & seq, int * context) const;
+    size_t size() const { return done_; }
+private:
+    uint64_t key(const int32_t * t) const;
+    int n_;
+    size_t done_ = 0;                                   // seq tokens indexed so far
+    std::vector<int32_t> head_;                         // seq[0, min(done_, 8)) to notice a replaced sequence
+    std::unordered_map<uint64_t, int32_t> table_;       // n-gram -> the position after its latest occurrence
 };
 
 class Generator {
@@ -35,7 +65,12 @@ public:
     // processed), otherwise starts over. Returns the first generated token.
     // `checkpoint_at`: where to snapshot the state for later requests to resume from (the start of the prompt's
     // last turn, which the next request will share); -1 = the end of the prompt.
-    int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at = -1);
+    int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, int checkpoint_at = -1) {
+        return start(prompt, sp, std::vector<int>{checkpoint_at});
+    }
+    // `checkpoints`: positions to snapshot at, ascending (the end of a system prompt other conversations share,
+    // the start of the last turn); -1 = the end of the prompt
+    int32_t start(const std::vector<int32_t> & prompt, const SamplingParams & sp, const std::vector<int> & checkpoints);
     // Emits the next tokens: 1 + accepted drafts.
     std::vector<int32_t> next();
     // The same round in two halves around Engine::forward_batch (several generators in one forward):
@@ -59,11 +94,18 @@ public:
     }
     void set_draft(int n) { opt_.max_draft = n; }
     void set_draft_min_p(float p) { opt_.min_p = p; }
+    void set_lookup(int n, int max_drafts, int agree) { opt_.lookup_n = n; opt_.lookup_max = max_drafts; opt_.lookup_agree = agree; index_ = LookupIndex(std::max(n, 1)); }
     GenStats stats;
 
 private:
     int32_t pick(const float * logits_row, std::vector<std::pair<int32_t, float>> & dist);
     void draft_from(const float * R_row, int32_t tok, int cell);
+    // the lookup's proposal for what follows `bonus` (the token the next window starts with), into lookup_
+    void lookup_drafts(int32_t bonus);
+    // after the MTP's first draft of a round: picks the lookup's chain or the MTP's as this round's drafts; true
+    // when the MTP chain is to be continued (step())
+    bool choose_drafts(int32_t mtp_first, float mtp_prob);
+    void count_round(int accepted, int drafted);
     void recent_tail(std::vector<int32_t> & out) const;
 
     EngineApi & eng_;
@@ -74,6 +116,11 @@ private:
     // the drafter's job after a round, left for draft_batch(): the kept rows' residuals, their next tokens, cells
     struct DraftJob { bool pending = false; const float * R = nullptr; std::vector<int32_t> next; int cell0 = 0; };
     DraftJob job_;
+    LookupIndex index_{3};
+    std::vector<int32_t> lookup_;       // the lookup's proposal for the next window (empty: none)
+    int lookup_ctx_ = 0;                // its context length
+    bool drafts_from_lookup_ = false;   // the current drafts_ came from the lookup
+    std::vector<int32_t> seq_;          // scratch: history + the pending token
     void use_slot() { if (slot_ >= 0) eng_.select(slot_); }
     SamplingParams sp_;
     Sampler sampler_;

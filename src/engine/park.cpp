@@ -39,19 +39,27 @@ size_t Engine::state_floats() {
     return floats;
 }
 
-template <typename F> void Engine::each_ctx(int cells, F && f) {
+template <typename F> void Engine::each_ctx(int cells, F && f) { each_ctx_of(*cur_, cells, f); }
+
+template <typename F> void Engine::each_ctx_of(Seq & q, int cells, F && f) {
     const Config & c = model_.cfg;
     for (int il = 0; il < c.n_layer; ++il) {
-        if (!cur_->kc[il].p) continue;
+        if (!q.kc[il].p) continue;
         const size_t kv = (size_t) cells * c.n_head_kv * kv_row_halves(c.head_dim) * sizeof(half);
-        f((void *) cur_->kc[il].p, kv);
-        f((void *) cur_->vc[il].p, kv);
-        if (cur_->kraw[il].p) {
-            f((void *) cur_->kraw[il].p, (size_t) cells * c.idx_dim * sizeof(half));
-            f((void *) cur_->pooled[il].p, (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
+        f((void *) q.kc[il].p, kv);
+        f((void *) q.vc[il].p, kv);
+        if (q.kraw[il].p) {
+            f((void *) q.kraw[il].p, (size_t) cells * c.idx_dim * sizeof(half));
+            f((void *) q.pooled[il].p, (size_t) (cells / c.compress_ratio[il] + 1) * c.idx_dim * sizeof(float));
         }
     }
-    if (mtp_.loaded()) mtp_.each_ctx(cells, f);
+    if (mtp_.loaded()) mtp_.each_ctx_of(slot_of(&q), cells, f);
+}
+
+int Engine::slot_of(const Seq * q) const {
+    for (size_t i = 0; i < seqs_.size(); ++i)
+        if (seqs_[i].get() == q) return (int) i;
+    throw std::runtime_error("slot_of: not a slot of this engine");
 }
 
 size_t Engine::parked_bytes() const {
@@ -368,24 +376,171 @@ int Engine::reusable(const std::vector<int32_t> & prompt) const {
     return reuse_of(cur_->history, cur_->ckpts, prompt);
 }
 
+static int fork_min_env(int dflt) {
+    static const int v = getenv("BNK_FORK_MIN") ? atoi(getenv("BNK_FORK_MIN")) : dflt;
+    return v;
+}
+
+bool Engine::can_fork() const { return fork_min_env(fork_min_) > 0; }
+
+namespace {
+
+// the prompt continues this history (every token of it, and more)
+bool extends(const std::vector<int32_t> & h, const std::vector<int32_t> & prompt) {
+    return !h.empty() && h.size() < prompt.size() && std::equal(h.begin(), h.end(), prompt.begin());
+}
+
+}  // namespace
+
+// The state this request starts from: the live slot's own (Generator::start continues or rewinds it), a parked
+// conversation it continues (restored), or the prefix another conversation shares with it, parked or on the
+// GPU (forked: copied in, the other conversation untouched). The live conversation is parked first when the
+// request would throw much of it away.
 void Engine::select_conversation(const std::vector<int32_t> & prompt) {
-    if (opt_.park_gib <= 0 || prompt.empty()) return;
+    if (prompt.empty()) return;
+    const int fork_min = fork_min_env(fork_min_);
     const int live = reuse_of(cur_->history, cur_->ckpts, prompt);
-    int best = -1, best_r = live;
-    for (size_t i = 0; i < parked_.size(); ++i) {
-        const int r = reuse_of(parked_[i].history, parked_[i].ckpts, prompt);
-        if (r > best_r) best = (int) i, best_r = r;
+    int bestp = -1, bestp_r = live;
+    bool bestp_ext = false;
+    if (opt_.park_gib > 0)
+        for (size_t i = 0; i < parked_.size(); ++i) {
+            const int r = reuse_of(parked_[i].history, parked_[i].ckpts, prompt);
+            if (r > bestp_r) bestp = (int) i, bestp_r = r, bestp_ext = extends(parked_[i].history, prompt);
+        }
+    int bests = -1, bests_r = std::max(live, bestp_r);
+    if (fork_min > 0)
+        for (size_t i = 0; i < seqs_.size(); ++i) {
+            Seq * q = seqs_[i].get();
+            if (q == cur_ || !q->used || (i < busy_.size() && busy_[i]) || extends(q->history, prompt)) continue;
+            const int r = reuse_of(q->history, q->ckpts, prompt);   // a snapshot inside the shared prefix
+            if (r > bests_r) bests = (int) i, bests_r = r;
+        }
+    const bool fork_s = bests >= 0 && bests_r >= fork_min;
+    const bool take_p = !fork_s && bestp >= 0 && (bestp_ext || (fork_min > 0 && bestp_r >= fork_min));
+    const bool replace = fork_s || take_p;   // else the live state is the best start (Generator::start continues or rewinds it)
+    // the live conversation is kept when this request would throw much of it away: all of it when another comes
+    // in, the part past the reusable prefix when it rewinds or starts over
+    const uint64_t keep = take_p ? parked_[bestp].used : 0;
+    const int lost = replace ? pos() : pos() - live;
+    if (lost > 0 && lost >= opt_.park_min && opt_.park_gib > 0) {
+        park(keep, replace);   // the live snapshots go along when the live state is replaced below
+        for (size_t i = 0; i < parked_.size() && take_p; ++i)   // park() may have dropped others: find it again
+            if (parked_[i].used == keep) bestp = (int) i;
     }
-    // the live conversation is kept when this request would throw much of it away (a parked one comes in, or
-    // the live state rewinds / starts over)
-    const int lost = pos() - (best < 0 ? live : 0);
-    if (lost > 0 && lost >= opt_.park_min) {
-        const uint64_t keep = best >= 0 ? parked_[best].used : 0;
-        park(keep, best >= 0);
-        for (size_t i = 0; i < parked_.size() && best >= 0; ++i)   // park() may have dropped others: find it again
-            if (parked_[i].used == keep) best = (int) i;
+    if (!replace) return;
+    if (fork_s) fork_slot(bests, bests_r);
+    else if (bestp_ext) restore((size_t) bestp);
+    else fork_parked(keep, bestp_r);
+}
+
+void Engine::fork_parked(uint64_t id, int pos) {
+    join_commit();
+    const double t0 = now_ms();
+    restoring_ = id;   // evictions while room is made keep the source
+    try {
+        ensure_ctx(pos + kMaxWindow);
+    } catch (...) {
+        restoring_ = 0;
+        throw;
     }
-    if (best >= 0) restore((size_t) best);
+    restoring_ = 0;
+    for (Engine * s = this; s; s = s->next_.get()) s->fork_copy_parked(id, pos, false);
+    for (Engine * s = this; s; s = s->next_.get()) s->fork_copy_parked(id, pos, true);
+    checkpoint();   // the prefix is a snapshot of the new conversation too (its own rewinds and forks)
+    park_stats.forks++;
+    park_stats.fork_ms += now_ms() - t0;
+    if (opt_.verbose)
+        fprintf(stderr, "bnk: forked a conversation from a parked one's first %d tokens in %.0f ms\n", pos, now_ms() - t0);
+}
+
+void Engine::fork_slot(int src, int pos) {
+    join_commit();
+    const double t0 = now_ms();
+    std::vector<char> was = busy_;   // the source stays on the GPU while room is made
+    if (busy_.size() < seqs_.size()) busy_.resize(seqs_.size(), 0);
+    busy_[src] = 1;
+    try {
+        ensure_ctx(pos + kMaxWindow);
+    } catch (...) {
+        busy_ = was;
+        throw;
+    }
+    busy_ = was;
+    for (Engine * s = this; s; s = s->next_.get()) s->fork_copy_slot(src, pos, false);
+    for (Engine * s = this; s; s = s->next_.get()) s->fork_copy_slot(src, pos, true);
+    checkpoint();
+    park_stats.forks++;
+    park_stats.fork_ms += now_ms() - t0;
+    if (opt_.verbose)
+        fprintf(stderr, "bnk: forked a conversation from slot %d's first %d tokens in %.0f ms\n", src, pos, now_ms() - t0);
+}
+
+// This stage's part of a fork from parked entry `id` (finish false: the copies, left in flight on st_; true:
+// waited for, the live conversation becomes the prefix)
+void Engine::fork_copy_parked(uint64_t id, int pos, bool finish) {
+    DeviceScope ds(dev_);
+    size_t i = parked_.size();
+    for (size_t j = 0; j < parked_.size(); ++j)
+        if (parked_[j].used == id) i = j;
+    if (i == parked_.size()) throw std::runtime_error("fork: a pipeline stage lost the parked conversation");
+    Parked & p = parked_[i];
+    const Checkpoint * c = nullptr;
+    for (const auto & k : p.ckpts)
+        if (k.pos == pos) c = &k;
+    if (!c) throw std::runtime_error("fork: the parked conversation has no snapshot at " + std::to_string(pos));
+    if (!finish) {
+        join_commit_here();
+        const int n = (int) p.history.size();
+        std::vector<size_t> full;   // the entry's layout: every buffer at its full length
+        each_ctx(n, [&](void *, size_t b) { full.push_back(b); });
+        size_t off = 0, k = 0;
+        each_ctx(pos, [&](void * d, size_t b) {
+            CUDA_CHECK(cudaMemcpyAsync(d, p.host + off, b, cudaMemcpyHostToDevice, st_));
+            off += full[k++];
+        });
+        size_t so = 0;
+        each_state([&](float * d, size_t f) {
+            CUDA_CHECK(cudaMemcpyAsync(d, c->host + so, f * 4, cudaMemcpyHostToDevice, st_));
+            so += f;
+        });
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    fork_done_here(p.history, pos, c->mtp_cell);
+}
+
+// The same from an idle slot on this GPU (device-to-device copies)
+void Engine::fork_copy_slot(int src, int pos, bool finish) {
+    DeviceScope ds(dev_);
+    Seq & q = *seqs_.at(src);
+    const Checkpoint * c = nullptr;
+    for (const auto & k : q.ckpts)
+        if (k.pos == pos) c = &k;
+    if (!c) throw std::runtime_error("fork: slot " + std::to_string(src) + " has no snapshot at " + std::to_string(pos));
+    if (!finish) {
+        join_commit_here();
+        std::vector<void *> dst;
+        each_ctx(pos, [&](void * d, size_t) { dst.push_back(d); });
+        size_t k = 0;
+        each_ctx_of(q, pos, [&](void * s, size_t b) {
+            CUDA_CHECK(cudaMemcpyAsync(dst.at(k++), s, b, cudaMemcpyDeviceToDevice, st_));
+        });
+        size_t so = 0;
+        each_state([&](float * d, size_t f) {
+            CUDA_CHECK(cudaMemcpyAsync(d, c->host + so, f * 4, cudaMemcpyHostToDevice, st_));
+            so += f;
+        });
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    fork_done_here(q.history, pos, c->mtp_cell);
+}
+
+void Engine::fork_done_here(const std::vector<int32_t> & h, int pos, int mtp_cell) {
+    cur_->history.assign(h.begin(), h.begin() + pos);
+    cur_->mtp_cell = mtp_cell;
+    cur_->pending_T = 0;
+    for (auto & k : cur_->ckpts) k.pos = -1;
 }
 
 }  // namespace bnk

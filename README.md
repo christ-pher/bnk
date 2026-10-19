@@ -77,6 +77,21 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
+### What prompt-lookup drafting and prefix forking changed (2026-10-19)
+
+Two of the opportunities in `docs/PERF-IDEAS-2026-10-19.md`, details and measurements in `docs/LOOKUP-FORK.md`:
+
+* **Prompt-lookup drafting.** When the last three tokens occurred earlier in the conversation, what followed
+  them is proposed as up to 7 drafts for the verify window (the MTP drafter proposes 4, one step each); the
+  MTP's first draft arbitrates when the match is short. Copy-heavy output, what coding agents produce when they
+  re-emit files, goes from 4.6-4.9 to 7.2 tokens per round: a verbatim file rewrite decodes at 213 tok/s on
+  the 27B (was 135) and 175 on FP4-Local (was 150), same tokens; prose is unchanged.
+* **Prefix forking.** The server snapshots the state where the first turn after a system message begins, and
+  a new conversation that starts with a system prompt another conversation has read gets that prefix copied
+  into its slot (16-21 ms for 3,600 tokens, from a sibling on the GPU or a parked one) while the sibling keeps
+  its own state: a fleet of agents with one system prompt reads it once. First turns of such siblings: 3-5.5 s ->
+  0.15-0.2 s at 3,600 tokens of shared prompt.
+
 ### What the toks tokenizer changed (2026-10-19)
 
 The server encodes prompts through [toks](https://github.com/actual-computer/toks), a C tokenizer library (AVX2
