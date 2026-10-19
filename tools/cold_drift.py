@@ -37,7 +37,7 @@ for f in r.fields.values():
 if not bands_s:
     sys.exit(2)
 pcts = [int(x.split(":")[1]) for x in bands_s.split(",")]
-names = [x.split(":")[0].replace("/", "_") for x in bands_s.split(",")]
+names = [f"b{i}" for i in range(len(pcts))]   # bands are named by index in the file
 have = {}   # (layer, band) -> set of experts in the file
 for t in r.tensors:
     if t.name.startswith("blk.") and ".cold_" in t.name and t.name.endswith(".experts"):

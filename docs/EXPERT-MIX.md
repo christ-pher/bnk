@@ -48,4 +48,20 @@ NVFP4 store (the machine has 192 GB).
 
 ## Measured
 
-(filled below)
+Quality is `bnk nll` over 10,000 tokens of the README (`BNK_NLL_SKIP=2000`), with the plain model's top-64
+log-probabilities per row as the reference (`BNK_NLL_DUMP` / `BNK_NLL_REF`): the NLL, and the mean KL from the
+plain model. For scale: the tensor-core prompt path of 2026-10-15 sits at KL 0.028 and was kept; 8-bit KV at
+0.001; two plain runs of a prompt differ from each other by about 0.008 (near-ties).
+
+| cold file | residency | NLL (plain 1.4432) | KL mean | same top-1 | verdict |
+|---|---|---|---|---|---|
+| machinery check: coldest 10% at Q8_0 (gate/up and down) | | 1.4432 | 0.008 | 96.4% | the cold path is correct: a near-lossless band changes nothing |
+| iq2_s/q2_0:30, iq3_s/q2_0:40 (Q2_0 down in every layer) | 100% / 100% | 1.5516 | 0.247 | 81.5% | rejected: 2-bit down matrices in every layer cost a tenth of the perplexity |
+| iq2_s/iq4_nl:30, iq3_s/iq4_nl:40, Q2_0 down only in the 9 layers the IQ3_S release uses it | 92% / 94% | 1.4688 | 0.108 | 86.9% | rejected: the 2-3 bit gate/up without an importance matrix still cost four times the accepted band |
+
+The second file's speed: 3K read 1,565 tok/s (+41%), code decode 122 tok/s (+17%), prose decode 86.9 (-7%: the
+extra gate/up and down launches per band, about 2 ms per forward, on a round with nothing else to gain), misses
+2-3%. Speed with the first file, for what the mechanism gives at full residency: 3K-token read 1,108 -> 1,789
+tok/s, decode on code 104.5 -> 130.0 tok/s (the 12 ms of CPU experts per forward gone), prose decode unchanged
+(93.8 -> 92.7), a 50-token turn 462 -> 341 ms, misses 0.
+

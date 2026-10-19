@@ -345,7 +345,7 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     slot_of_host_.assign((size_t) n_layer_ * n_expert_, -1);
     // staging for ggml blobs on their way into R slots
     stage_n_ = 64;
-    stage_bytes_ = st.max_blob_bytes();
+    stage_bytes_ = std::max(st.max_blob_bytes(), cs_ ? cs_->max_blob_bytes() : (size_t) 0);   // a cold band's blobs may be larger (Q8_0)
     CUDA_CHECK(cudaMalloc(&stage_, stage_bytes_ * stage_n_));
     CUDA_CHECK(cudaMalloc(&dst_ptrs_, sizeof(uint8_t *) * stage_n_));
     resident_ = 0;
