@@ -33,6 +33,24 @@ private:
     std::vector<size_t> layer_off_, blob_;
 };
 
+// The cold experts' blobs (model.h ColdGroup), pinned host memory like the store's: per layer and group, each
+// expert's gate | up | down ggml blocks, 64-byte aligned; blob(il, g, i) is the i-th expert of the group.
+class ColdStore {
+public:
+    ~ColdStore();
+    void build(const Model & m, int threads, bool verbose = true);
+    bool empty() const { return total_ == 0; }
+    const uint8_t * blob(int il, int g, int i) const { return base_ + off_[il][g] + (size_t) i * blob_[il][g]; }
+    size_t blob_bytes(int il, int g) const { return blob_[il][g]; }
+    size_t max_blob_bytes() const { return max_blob_; }
+    size_t total_bytes() const { return total_; }
+private:
+    uint8_t * base_ = nullptr;
+    size_t total_ = 0, max_blob_ = 0;
+    bool pinned_ = false;
+    std::vector<std::vector<size_t>> off_, blob_;
+};
+
 // A fixed set of spinning workers. run() calls fn(part, nparts) once on every thread (the caller is
 // part 0); each part takes a static share of the work, so dispatch needs no shared counter.
 class SpinPool {

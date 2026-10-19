@@ -61,6 +61,9 @@ struct MoeLayerDesc {
     int gate_type, down_type;
     size_t grow, drow;        // row bytes of gate/up rows and of down rows
     int rlay = 0;             // slots hold R-layout rows (rfmt.h) rather than ggml blocks
+    // the slots this region holds: an entry whose slot is outside [slot_lo, slot_hi) belongs to another region
+    // of the layer (a cold band in a smaller format, docs/EXPERT-MIX.md); slot - slot_lo indexes `base`
+    int slot_lo = 0, slot_hi = 1 << 30;
     ExpScales scales;         // NVFP4 experts' per-matrix global scales (null when the format has none)
     uint32_t go[5] = {0, 0, 0, 0, 0}, dof[5] = {0, 0, 0, 0, 0};  // R field offsets of gate/up and down rows
 };
@@ -86,7 +89,11 @@ void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * id
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s,
               MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);
 // Hit experts on the GPU: writes s.part.
-void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st);
+// phase -1: gate/up, the activation, down (the whole layer for one region); 0 / 1 / 2: one of them, so that
+// several regions of a layer (a hot one and cold bands) run their gate/up and down each, the activation once
+// (cold_lo: entries whose slot is at least this hold their global scale in their blocks)
+void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st,
+              int phase = -1, int cold_lo = 1 << 30);
 // Waits for the CPU's answer when the layer had misses.
 void moe_wait(const MoeScratch & s, MoeMsg * msg, const uint32_t * seq, cudaStream_t st);
 // out[t] = sum hits + shared * sgate[t] + cpu answer

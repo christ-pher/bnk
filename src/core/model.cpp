@@ -1,4 +1,5 @@
 #include <cmath>
+#include <map>
 #include "core/model.h"
 
 #include <cstdio>
@@ -359,6 +360,62 @@ void Model::load(const std::string & path, bool verbose, const std::string & ple
         if (l0 == 0 && l1 == c.n_layer) fprintf(stderr, "bnk: dense weights in VRAM: %.2f GiB\n", vram_dense_bytes / 1073741824.0);
         else fprintf(stderr, "bnk: layers %d-%d: dense weights in VRAM: %.2f GiB\n", l0, l1 - 1, vram_dense_bytes / 1073741824.0);
     }
+}
+
+int Model::load_cold(const std::string & path, bool verbose) {
+    const Config & c = cfg;
+    cold_gguf.open(path);
+    if (cold_gguf.get_str("general.architecture") != "bnk-cold-experts")
+        throw std::runtime_error(path + " is not a cold-experts file (tools/requant_experts)");
+    const std::string name = cold_gguf.get_str("bnk.cold.model");
+    if (!name.empty() && name != gguf.get_str("general.name", "")) {
+        fprintf(stderr, "bnk: warning: the cold experts were written for '%s', the model is '%s'\n", name.c_str(),
+                gguf.get_str("general.name", "").c_str());
+    }
+    int total = 0;
+    size_t bytes = 0;
+    std::map<int, int> per_type;
+    for (int il = 0; il < c.n_layer; ++il) {
+        LayerWeights & L = layers[il];
+        if (!L.gate_src) continue;   // not a layer this process loads
+        L.cold.clear();
+        L.cold_of.assign(c.n_expert, -1);
+        const std::string b = "blk." + std::to_string(il) + ".";
+        for (const TensorRef & t : cold_gguf.tensors()) {
+            if (t.name.compare(0, b.size(), b) != 0 || t.name.compare(b.size(), 5, "cold_") != 0) continue;
+            // blk.N.cold_<type>.experts
+            const std::string tname = t.name.substr(b.size() + 5, t.name.size() - b.size() - 5 - 8);   // "<band>" of blk.N.cold_<band>.experts
+            LayerWeights::ColdGroup g;
+            g.experts.assign((const int32_t *) t.data, (const int32_t *) t.data + t.ne[0]);
+            const TensorRef & gw = cold_gguf.get(b + "ffn_gate_exps." + tname);
+            const TensorRef & uw = cold_gguf.get(b + "ffn_up_exps." + tname);
+            const TensorRef & dw = cold_gguf.get(b + "ffn_down_exps." + tname);
+            if (gw.ne[2] != (int64_t) g.experts.size() || gw.ne[0] != c.n_embd || gw.ne[1] != c.n_ff_exp ||
+                dw.ne[0] != c.n_ff_exp || dw.ne[1] != c.n_embd || gw.type != uw.type)
+                throw std::runtime_error("cold experts: tensor shape mismatch in " + t.name);
+            g.gate_type = gw.type;
+            g.down_type = dw.type;
+            g.gate_src = gw.data; g.up_src = uw.data; g.down_src = dw.data;
+            g.gate_bytes = gw.nbytes / g.experts.size();
+            g.up_bytes = uw.nbytes / g.experts.size();
+            g.down_bytes = dw.nbytes / g.experts.size();
+            for (size_t i = 0; i < g.experts.size(); ++i) {
+                const int e = g.experts[i];
+                if (e < 0 || e >= c.n_expert || L.cold_of[e] >= 0) throw std::runtime_error("cold experts: bad expert list in " + t.name);
+                L.cold_of[e] = (int8_t) L.cold.size();
+            }
+            total += (int) g.experts.size();
+            bytes += (g.gate_bytes + g.up_bytes + g.down_bytes) * g.experts.size();
+            per_type[g.gate_type] += (int) g.experts.size();
+            L.cold.push_back(std::move(g));
+        }
+    }
+    if (verbose && total) {
+        std::string s;
+        for (auto [t, n] : per_type) s += (s.empty() ? "" : ", ") + std::to_string(n) + " at " + ggml_type_name((ggml_type) t);
+        fprintf(stderr, "bnk: cold experts: %d (%s), %.2f GiB\n", total, s.c_str(), bytes / 1073741824.0);
+    }
+    return total;
 }
 
 void Model::expert_src(int il) {

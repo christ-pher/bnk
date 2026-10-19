@@ -51,6 +51,7 @@ struct EngineOptions {
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
+    std::string cold_experts;        // the least-routed experts in a smaller format (tools/requant_experts), all kept resident
     // chunk size for long prompts (borrows VRAM from the expert cache meanwhile). 4,096 since the experts moved to
     // the tensor cores: 8,192-token chunks evicted experts that then streamed back every chunk, and left the
     // pipeline fewer chunks to overlap (two V100s, cold reads: 64K 2,587 -> 2,901 tok/s, 128K 1,375 -> 2,905)
@@ -325,6 +326,8 @@ private:
 
     Model model_;
     ExpertStore own_store_;          // the first stage's (every stage uses it)
+    ColdStore own_cold_;             // the cold experts' blobs (docs/EXPERT-MIX.md), the first stage's too
+    ColdStore * cold_store_ = &own_cold_;
     ExpertStore * store_ = &own_store_;
     ExpertCache cache_;
     MtpLayer mtp_;

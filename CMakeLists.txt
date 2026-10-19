@@ -78,6 +78,8 @@ set_target_properties(bnk_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 add_executable(bnk tools/bnk_main.cpp)
 target_link_libraries(bnk PRIVATE bnk_core)
+add_executable(requant_experts tools/requant_experts.cpp)
+target_link_libraries(requant_experts PRIVATE bnk_core)
 target_compile_options(bnk PRIVATE -O2 -march=native)
 
 

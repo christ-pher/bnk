@@ -123,6 +123,7 @@ int main(int argc, char ** argv) {
         else if (a == "--profile") opt.profile = next();
         else if (a == "--mtp") opt.mtp = next();
         else if (a == "--ple-gguf") opt.ple_gguf = next();
+        else if (a == "--cold-experts") opt.cold_experts = next();
         else if (a == "--draft-vocab") opt.draft_vocab = next();
         else if (a == "--prefill-chunk-max") opt.prefill_chunk_max = std::stoi(next());
         else if (a == "--prefill-small") opt.prefill_small = std::stoi(next());
