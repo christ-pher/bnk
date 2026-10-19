@@ -176,7 +176,9 @@ std::string telemetry_json(EngineApi & eng, const GenStats & gs, const Totals & 
         .kv("restores", eng.park_stats.restores)
         .kv("park_evictions", eng.park_stats.evictions)
         .kv("park_ms", eng.park_stats.park_ms)
-        .kv("restore_ms", eng.park_stats.restore_ms);
+        .kv("restore_ms", eng.park_stats.restore_ms)
+        .kv("forks", eng.park_stats.forks)
+        .kv("fork_ms", eng.park_stats.fork_ms);
     std::vector<int> slots(c.n_layer);
     for (int il = 0; il < c.n_layer; ++il) slots[il] = eng.cache_slots(il);
     JsonOut o;
@@ -381,6 +383,7 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
                  .kv("gen_ms", gms).kv("tps", tps).kv("prompt_tokens", (int64_t) a.prompt.size())
                  .kv("reused", gs.reused_tokens).kv("prefill_ms", a.t1 - a.t0).kv("prefill_tps", prefill_tps)
                  .kv("rounds", gs.rounds).kv("drafted", gs.drafted).kv("accepted", gs.accepted)
+                 .kv("lookup_rounds", gs.lookup_rounds).kv("lookup_drafted", gs.lookup_drafted).kv("lookup_accepted", gs.lookup_accepted)
                  .kv("tokens_per_round", gs.rounds ? (double) gs.emitted / gs.rounds : 0.0)
                  .kv("expert_miss_rate", eng.times.routed ? (double) eng.times.misses / eng.times.routed : 0.0)
                  .kv("verify_ms", gs.verify_ms).kv("draft_ms", gs.draft_ms)
@@ -390,15 +393,20 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         cancelled.erase(a.id);
     };
     // the free slot to read a prompt into: the one whose conversation it continues best, else the least recently
-    // used (the engine's parking still brings back a conversation parked in host RAM)
+    // used (the engine's parking still brings back a conversation parked in host RAM). An engine that can fork
+    // ranks a slot the prompt continues first, then one it rewinds by less than park_min tokens (its own
+    // conversation with the last turn re-rendered), then an empty one, then the least recently used: a new
+    // conversation sharing another's system prompt gets that prefix copied in rather than that slot rewound.
     auto pick_slot = [&](const std::vector<int32_t> & prompt) {
         int best = -1, best_r = -1;
+        const bool fork = eng.can_fork();
         for (int s = 0; s < n_slots; ++s) {
             bool busy = false;
             for (auto & a : active) busy |= a->slot == s;
             if (busy) continue;
             eng.select(s);
-            const int r = eng.reusable(prompt);
+            int r = eng.reusable(prompt);
+            if (fork) r = r > 0 && r == eng.pos() ? 3 : (r > 0 && eng.pos() - r < eng.park_min() ? 2 : (eng.pos() == 0 ? 1 : 0));
             if (r > best_r || (r == best_r && slot_used[s] < slot_used[best])) best = s, best_r = r;
         }
         return best;
@@ -441,7 +449,12 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
             a->t0 = a->cur.t_start = now_ms();
             shown = a.get();
             telemetry(true);
-            const int32_t tok = a->gen->start(a->prompt, sp, req.has("checkpoint") ? (int) req["checkpoint"].num() : -1);
+            std::vector<int> cps;
+            if (req.has("checkpoints"))
+                for (const auto & v : req["checkpoints"].a) cps.push_back((int) v.num());
+            else
+                cps.push_back(req.has("checkpoint") ? (int) req["checkpoint"].num() : -1);
+            const int32_t tok = a->gen->start(a->prompt, sp, cps);
             a->t1 = now_ms() - a->interleave_ms;
             const auto & gs = a->gen->stats;
             a->fresh = gs.prompt_tokens - gs.reused_tokens;

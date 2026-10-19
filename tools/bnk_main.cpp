@@ -605,9 +605,12 @@ int main(int argc, char ** argv) {
     printf("\nprefill %zu tokens in %.1f ms (%.1f tok/s)\n", prompt.size(), t1 - t0, prompt.size() / ((t1 - t0) / 1000));
     const auto & tm = eng.times;
     const auto & gs = gen.stats;
-    printf("decode %zu tokens in %.1f ms (%.2f tok/s); %lld rounds, %.2f tokens/round, drafts accepted %lld/%lld\n",
+    printf("decode %zu tokens in %.1f ms (%.2f tok/s); %lld rounds, %.2f tokens/round, drafts accepted %lld/%lld"
+           " (lookup %lld/%lld in %lld rounds, MTP %lld/%lld in %lld)\n",
            out.size() - 1, t3 - t2, (out.size() - 1) / ((t3 - t2) / 1000), (long long) gs.rounds,
-           (double) gs.emitted / std::max<int64_t>(1, gs.rounds), (long long) gs.accepted, (long long) gs.drafted);
+           (double) gs.emitted / std::max<int64_t>(1, gs.rounds), (long long) gs.accepted, (long long) gs.drafted,
+           (long long) gs.lookup_accepted, (long long) gs.lookup_drafted, (long long) gs.lookup_rounds,
+           (long long) gs.mtp_accepted, (long long) gs.mtp_drafted, (long long) gs.mtp_rounds);
     printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms\n",
            gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
            gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls));

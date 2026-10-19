@@ -38,12 +38,15 @@ public:
     void release_ctx(int cells);
     size_t ctx_bytes_needed(int cells) const;
     // f(device ptr, bytes) over the buffers holding cells [0, cells) (for parking a conversation)
-    template <typename F> void each_ctx(int cells, F && f) {
-        f((void *) cur_->kc.p, (size_t) cells * kv_cell_bytes_);
-        f((void *) cur_->vc.p, (size_t) cells * kv_cell_bytes_);
+    template <typename F> void each_ctx(int cells, F && f) { each_ctx_of((int) (cur_ - slots_.data()), cells, f); }
+    // the same over another slot's buffers (forking a conversation's prefix between slots)
+    template <typename F> void each_ctx_of(int slot, int cells, F && f) {
+        Slot & s = slots_.at(slot);
+        f((void *) s.kc.p, (size_t) cells * kv_cell_bytes_);
+        f((void *) s.vc.p, (size_t) cells * kv_cell_bytes_);
         if (sparse_) {
-            f((void *) cur_->kraw.p, (size_t) cells * qsh_.id * sizeof(half));
-            f((void *) cur_->pooled.p, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
+            f((void *) s.kraw.p, (size_t) cells * qsh_.id * sizeof(half));
+            f((void *) s.pooled.p, (size_t) (cells / qsh_.ratio + 1) * qsh_.id * sizeof(float));
         }
     }
     bool loaded() const { return loaded_; }

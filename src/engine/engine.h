@@ -197,6 +197,8 @@ public:
     void select_conversation(const std::vector<int32_t> & prompt);
     // tokens of `prompt` the current slot's state can keep (its history, or its last snapshot inside the prefix)
     int reusable(const std::vector<int32_t> & prompt) const;
+    bool can_fork() const override;
+    int park_min() const override { return opt_.park_min; }
     // slots with a request in flight (decoding, or the prompt being read): never moved off the GPU to make room
     void set_busy(const std::vector<int> & slots);
     int parked() const { return (int) parked_.size(); }
@@ -379,6 +381,17 @@ private:
     // f(device ptr, bytes) over every buffer holding per-position state for cells [0, cells) (KV, indexer keys
     // and their pooled blocks, the drafter's)
     template <typename F> void each_ctx(int cells, F && f);
+    template <typename F> void each_ctx_of(Seq & q, int cells, F && f);   // the same over another slot's buffers
+    int slot_of(const Seq * q) const;
+    // Forking: the live slot takes the first `pos` tokens of another conversation's state (its KV cells and the
+    // snapshot it holds at pos) while that conversation keeps its own: a new conversation that starts with a
+    // system prompt another one has read. Decided on the first stage, carried out on every stage.
+    void fork_parked(uint64_t id, int pos);
+    void fork_slot(int src, int pos);
+    void fork_copy_parked(uint64_t id, int pos, bool finish);
+    void fork_copy_slot(int src, int pos, bool finish);
+    void fork_done_here(const std::vector<int32_t> & history, int pos, int mtp_cell);
+    int fork_min_ = 64;   // tokens a fork must save (BNK_FORK_MIN; 0 turns forking off)
     struct Parked {
         std::vector<int32_t> history;
         int mtp_cell = -1;
