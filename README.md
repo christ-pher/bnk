@@ -77,6 +77,26 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
+### What v0.4.1 changed: the day's performance work, and cold experts in smaller formats
+
+Everything since v0.4.0 (all of 2026-10-19), each with its own section below or its own doc:
+
+* **Cold experts in smaller formats** (`docs/EXPERT-MIX.md`): FP4-Local kept a quarter of its experts outside
+  VRAM, which bound its prompt reads to PCIe copies and its decode to CPU misses. Routing is skewed (the coldest
+  30% of each layer's experts carry 4.7% of routings), so the coldest 70% now live in the formats of the IQ3_S
+  release, borrowed from its own data-aware blocks, and everything fits. Reads 1,120 -> 1,620 tok/s, code decode
+  114 -> 135, prose 87 -> 88 (94 with lookahead); quality between FP4-Local and the IQ3_S release on held-out
+  text (NLL +0.5% against the release's +1.0%). The file (`tools/requant_experts`, 33 GB in the cache
+  directory) is regenerated in the background by `run.sh` when the routing drifts; `BNK_COLD_EXPERTS=0` serves
+  plain FP4-Local.
+* **Draft 7** for the IQ3_S release and the 27B (their verify windows are free): copy-heavy output +5%.
+* **Prompt-lookup drafting and prefix forking**, **lookahead pipelining** for one stream on two GPUs, and the
+  **toks tokenizer**: the sections below.
+* **The RCO IQ3_S 27B** (`./run.sh qwen27b-rco`, the `-mtp` file) loads: the dense engine re-quantizes the few
+  formats its kernels do not read (Q2_K, IQ1_M, BF16 matrices) to Q8_0 at load. Same speed as the Q8_0 27B at
+  12 GB instead of 29 (its IQ-format GEMVs are unpack-bound), quality slightly below (NLL +1.3%).
+* A performance inventory with two orderings and the ideas behind this work: `docs/PERF-IDEAS-2026-10-19.md`.
+
 ### What lookahead pipelining changed (2026-10-19)
 
 On the two-GPU pipeline a single stream used each card half the time: GPU 0's layers, then GPU 1's, and the next
