@@ -73,6 +73,20 @@ compounded by lookahead (its speculative forwards carry the same extra launches,
 confirmed in that run). Two fixes are open: one launch per phase over every region (a per-block format switch
 instead of a launch per band), which removes the 2 ms, and a lookahead gate that counts the cost of a miss.
 
+**With one launch per phase** (`moe_hits_regions`), the borrowed file against plain FP4-Local, `bnk run`, greedy:
+
+| | plain | hybrid | |
+|---|---|---|---|
+| 3K-token read | 1,118-1,126 tok/s | 1,607-1,640 | +45% |
+| prose decode, lookahead off / on | 87.3 / 86.4 tok/s | 88.1 / 94.0 | +1% / +9% |
+| code decode, lookahead off / on | 114.3 / 111.7 tok/s | 135.1 / 133.9 | +18% / +20% |
+| expert misses, prose / code | 2.9% / 7.1% | 1.3% / 2.2% | |
+| CPU experts per forward, code | 8.7-9.9 ms | 3.1-3.5 ms | |
+
+`tools/park_check.py` (3 slots) and `tools/serve_check.py` pass with the file loaded (`--cold-experts`, and
+`--cache-gib 22` so a static cache holds the bands; with their default zero cache the engine logs that the bands
+do not fit and runs plain). A cache too small for the bands never throws: the file is ignored for that run.
+
 The second file's speed: 3K read 1,565 tok/s (+41%), code decode 122 tok/s (+17%), prose decode 86.9 (-7%: the
 extra gate/up and down launches per band, about 2 ms per forward, on a round with nothing else to gain), misses
 2-3%. Speed with the first file, for what the mechanism gives at full residency: 3K-token read 1,108 -> 1,789

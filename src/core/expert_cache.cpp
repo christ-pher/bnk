@@ -298,6 +298,15 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     cold_sb_.assign(n_layer_, {});
     cold_bytes_ = 0;
     int n_cold = 0;
+    if (cs_) {   // a budget too small for the bands (a CPU-only tier, --cache-gib 0): the file is ignored, the store has every expert
+        size_t need = 0;
+        for (int l = l0_; l < l1_; ++l)
+            for (const auto & g : m.layers[l].cold) need += vmem_round(slot_bytes_for(m, g.gate_type, g.down_type) * g.experts.size());
+        if (need > budget) {
+            if (verbose) fprintf(stderr, "bnk: the cold experts need %.2f GiB of VRAM, the cache has %.2f: running without them\n", need / 1073741824.0, budget / 1073741824.0);
+            cs_ = nullptr;
+        }
+    }
     if (cs_) {
         for (int l = l0_; l < l1_; ++l) {
             const LayerWeights & L = m.layers[l];
@@ -305,7 +314,6 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
                 const size_t sb = slot_bytes_for(m, g.gate_type, g.down_type);
                 cold_sb_[l].push_back(sb);
                 const size_t region = vmem_round(sb * g.experts.size());
-                if (region > budget) throw std::runtime_error("expert cache: the cold experts alone exceed the VRAM budget");
                 budget -= region;
                 cold_bytes_ += region;
                 n_cold += (int) g.experts.size();
