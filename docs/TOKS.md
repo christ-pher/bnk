@@ -48,8 +48,22 @@ Zen 5 or Cortex-X925 core against 30-95 MB/s here, from the slower core and Pyth
 
 ## End to end
 
-The tokenizer's share of a turn was small before: a 256K-token first turn encodes in 0.2 s in Python against a
-read of 100 s (Flash-Next) or 470 s (the 27B), and a follow-up turn encodes only its new text. The LocalMaxxing
-sweep (`/opt/benchmarks/localmaxxing_bench.py`, cold read then a follow-up turn at each depth) on both models,
-the server's tokenizer in toks and in Python, measures what is left: see the table in the README section
-"What the toks tokenizer changed" (filled from the sweep's `tokenize_ms` and `ttft_ms`).
+The tokenizer's share of a turn was small before: a 256K-token first turn encoded in 0.2-0.3 s in Python against a
+read of 123 s (Flash-Next) or 512 s (the 27B), and a follow-up turn encodes only its new text. The LocalMaxxing
+sweep (`/opt/benchmarks/localmaxxing_bench.py`: a cold read, then a follow-up turn, at each depth, one pass, greedy,
+512 tokens decoded) on both models from this branch's server, the tokenizer in toks and in Python:
+
+| model, depth | turn | tokenize, Python -> toks | time to first token, Python -> toks |
+|---|---|---|---|
+| FP4-Local 4K | cold / follow-up | 11.8 -> 14.3 ms (first request, toks warming up) / 1.7 -> 0.3 ms | 2.99 -> 2.97 s / 1.00 -> 0.98 s |
+| FP4-Local 64K | cold / follow-up | 109 -> 6.2 ms / 1.8 -> 1.0 ms | 26.6 -> 26.7 s / 1.12 -> 1.11 s |
+| FP4-Local 256K | cold / follow-up | 293 -> 19 ms / 5.2 -> 4.0 ms | 126.1 -> 123.6 s / 1.50 -> 1.55 s |
+| Qwen3.8-27B 4K | cold / follow-up | 8.9 -> 0.7 ms / 1.7 -> 0.2 ms | 3.22 -> 3.19 s / 0.60 -> 0.59 s |
+| Qwen3.8-27B 64K | cold / follow-up | 110 -> 6.1 ms / 1.8 -> 1.2 ms | 69.5 -> 68.7 s / 0.93 -> 0.92 s |
+| Qwen3.8-27B 256K | cold / follow-up | 269 -> 20 ms / 4.3 -> 4.2 ms | 513.5 -> 512.1 s / 2.04 -> 2.04 s |
+
+So: 15-20x less time in the tokenizer on cold prompts, which is 0.1-0.3 s off a 64K-256K first turn and
+nothing measurable on follow-ups (their encoding was already a few milliseconds through `encode_chat`'s prefix
+reuse). Decode speeds are unchanged (the differences in the run are single-pass noise of the expert cache's
+state after a cold read). The change is worth having for its exactness guarantee and for what it removes
+(a Python BPE loop and its caches from the request path), not for the turn times.
