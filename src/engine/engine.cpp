@@ -277,6 +277,7 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         s->l1_ = bounds[k + 1];
         s->last_ = k + 1 == gpus.size();
         s->store_ = &own_store_;
+        s->cold_store_ = &own_cold_;
         s->cpu_ = &own_cpu_;
         if (opt.verbose && gpus.size() > 1)
             fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%d\n", k + 1, gpus.size(), s->dev_, s->l0_, s->l1_ - 1);
@@ -324,10 +325,13 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     // the drafter embeds its tokens and shares the head: the last stage holds the embeddings too when it drafts
     model_.load(path, opt.verbose, opt.ple_gguf, l0_, l1_, first() || (last_ && !opt.mtp.empty()), last_);
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
+    // the cold bands (every stage binds its layers' groups; the blobs are the first stage's, like the store)
+    if (!opt.cold_experts.empty()) model_.load_cold(opt.cold_experts, opt.verbose && head);
     if (head) {
         layer_routed.assign(model_.cfg.n_layer, 0);
         layer_misses.assign(model_.cfg.n_layer, 0);
         store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
+        if (!opt.cold_experts.empty()) cold_store_->build(model_, std::min(opt.cpu_threads, 16), opt.verbose);
         cpu_->init(model_, *store_, opt.cpu_threads);
     }
 
@@ -490,7 +494,7 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
             budget = nb;
         }
     }
-    cache_.init(model_, *store_, budget, rank, st_, opt.verbose, &budget_, l0_, l1_);
+    cache_.init(model_, *store_, budget, rank, st_, opt.verbose, &budget_, l0_, l1_, cold_store_);
     cache_ready_ = true;
     if (opt.prefill_chunk > 0) {
         prefill_staging_alloc();
@@ -1387,7 +1391,16 @@ void Engine::moe(int il, int T) {
         __atomic_thread_fence(__ATOMIC_RELEASE);
         m->seq_done = m->seq_req;
     }
-    moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
+    {
+        const int ng = cache_.n_cold_groups(il);
+        if (!ng) {
+            moe_hits(d, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
+        } else {   // the hot region and the cold bands in one launch per phase (docs/EXPERT-MIX.md)
+            std::vector<MoeLayerDesc> descs{d};
+            for (int g = 0; g < ng; ++g) descs.push_back(cache_.desc_cold(il, g));
+            moe_hits_regions(moe_regions(descs.data(), (int) descs.size()), d.scales, c.n_expert, moes_, mixact_, T, k, E, c.n_ff_exp, st_);
+        }
+    }
     join(0);
     moe_reduce(moes_, msg(il), shared_out_, sgate_, moe_out_, T, k, E, st_, &d_par_->seq, true);   // (waits for the CPU too)
 }

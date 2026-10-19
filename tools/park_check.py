@@ -26,6 +26,8 @@ ap.add_argument("model")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--ple-gguf", default="", help="the n-gram table GGUF of a model that keeps it in a second file")
+ap.add_argument("--cold-experts", default="", help="the cold-experts file (docs/EXPERT-MIX.md)")
+ap.add_argument("--cache-gib", default="0", help="VRAM expert cache per GPU (default 0: CPU-only tier; a size lets a cold-experts file load, still static)")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
 ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=48)
@@ -34,7 +36,7 @@ ap.add_argument("--slots", type=int, default=1, help="engine conversation slots 
 a = ap.parse_args()
 
 tok = Tokenizer.from_gguf(a.model, cache_dir=str(Path("~/.cache/bnk").expanduser()))
-args = [a.engine, "serve", "--model", a.model, "--ctx", "32768", "--cache-gib", "0", "--adapt-every", "0",
+args = [a.engine, "serve", "--model", a.model, "--ctx", "32768", "--cache-gib", a.cache_gib, "--adapt-every", "0",
         "--park-gib", "8", "--park-min", "0", "--slots", str(a.slots)]
 if a.mtp:
     args += ["--mtp", a.mtp]
@@ -44,6 +46,8 @@ if a.gpus:
     args += ["--gpus", a.gpus]
 if a.ple_gguf:
     args += ["--ple-gguf", a.ple_gguf]
+if a.cold_experts:
+    args += ["--cold-experts", a.cold_experts]
 eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, bufsize=0)
 im_start = tok.id_of("<|im_start|>")
 stops = [t for t in (tok.id_of("<|im_end|>"), tok.ids.get("eos_token_id")) if t is not None]

@@ -69,6 +69,14 @@ class State:
             eargs += ["--split", args.split]
         if args.ple_gguf:
             eargs += ["--ple-gguf", args.ple_gguf]
+        # the cold-experts file (configs/*.json "cold_experts": a file name in the cache directory, or a path)
+        cold = self.config.get("cold_experts")
+        if cold and os.environ.get("BNK_COLD_EXPERTS", "1") != "0":
+            cold = cold if os.path.isabs(cold) else os.path.join(os.path.expanduser(args.cache_dir), cold)
+            if os.path.exists(cold):
+                eargs += ["--cold-experts", cold]
+            else:
+                print(f"bnk: note: no cold-experts file at {cold}; running without (tools/requant_experts writes it)", flush=True)
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
             if args.draft_vocab:

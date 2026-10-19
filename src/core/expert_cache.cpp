@@ -72,19 +72,27 @@ std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_e
 
 // DMA the ggml blobs of (slot, expert) pairs into the stage and repack them into their R slots, in batches.
 void ExpertCache::fill(int il, const std::vector<int> & slots, const std::vector<int> & experts, cudaStream_t s) {
-    const Config & c = m_->cfg;
     const LayerWeights & L = m_->layers[il];
-    const size_t sb = sb_[il], bb = st_->blob_bytes(il);
-    const size_t grb = ggml_row_size((ggml_type) L.gate_type, c.n_embd), drb = ggml_row_size((ggml_type) L.down_type, c.n_ff_exp);
-    for (size_t i0 = 0; i0 < slots.size(); i0 += stage_n_) {
-        const int n = (int) std::min<size_t>(stage_n_, slots.size() - i0);
-        std::vector<uint8_t *> dst(n);
-        for (int j = 0; j < n; ++j) {
-            CUDA_CHECK(cudaMemcpyAsync(stage_ + (size_t) j * bb, st_->blob(il, experts[i0 + j]), bb, cudaMemcpyHostToDevice, s));
-            dst[j] = layer_base_[il] + (size_t) slots[i0 + j] * sb;
-        }
-        CUDA_CHECK(cudaMemcpyAsync(dst_ptrs_, dst.data(), n * sizeof(uint8_t *), cudaMemcpyHostToDevice, s));
-        moe_repack_blobs(stage_, bb, dst_ptrs_, n, c.n_ff_exp, c.n_embd, L.gate_type, grb, L.down_type, drb, s);
+    std::vector<uint8_t *> dst(slots.size());
+    std::vector<const uint8_t *> src(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        dst[i] = layer_base_[il] + (size_t) slots[i] * sb_[il];
+        src[i] = st_->blob(il, experts[i]);
+    }
+    fill_blobs(dst, src, st_->blob_bytes(il), L.gate_type, L.down_type, s);
+}
+
+void ExpertCache::fill_blobs(const std::vector<uint8_t *> & dst, const std::vector<const uint8_t *> & src, size_t bb,
+                             int gate_type, int down_type, cudaStream_t s) {
+    const Config & c = m_->cfg;
+    if (bb > stage_bytes_) throw std::runtime_error("expert cache: a blob larger than the stage");
+    const size_t grb = ggml_row_size((ggml_type) gate_type, c.n_embd), drb = ggml_row_size((ggml_type) down_type, c.n_ff_exp);
+    for (size_t i0 = 0; i0 < dst.size(); i0 += stage_n_) {
+        const int n = (int) std::min<size_t>(stage_n_, dst.size() - i0);
+        for (int j = 0; j < n; ++j)
+            CUDA_CHECK(cudaMemcpyAsync(stage_ + (size_t) j * bb, src[i0 + j], bb, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(dst_ptrs_, dst.data() + i0, n * sizeof(uint8_t *), cudaMemcpyHostToDevice, s));
+        moe_repack_blobs(stage_, bb, dst_ptrs_, n, c.n_ff_exp, c.n_embd, gate_type, grb, down_type, drb, s);
         // the stage is reused by the next batch: let this one finish first
         CUDA_CHECK(cudaStreamSynchronize(s));
     }
@@ -103,7 +111,7 @@ ExpertCache::~ExpertCache() {
 size_t ExpertCache::bytes() const {
     size_t b = 0;
     for (const auto & lb : layer_buf_) b += lb.mapped();
-    return b;
+    return b + cold_bytes_;
 }
 
 float ExpertCache::value(int il, int e) const {
@@ -244,7 +252,11 @@ static Ranking complete_ranking(const Ranking & rank, int n_layer, int n_expert,
 
 size_t ExpertCache::slot_bytes(const Model & m, int il) {
     const LayerWeights & L = m.layers[il];
-    const RLayout gl = r_layout(L.gate_type, m.cfg.n_embd), dl = r_layout(L.down_type, m.cfg.n_ff_exp);
+    return slot_bytes_for(m, L.gate_type, L.down_type);
+}
+
+size_t ExpertCache::slot_bytes_for(const Model & m, int gate_type, int down_type) {
+    const RLayout gl = r_layout(gate_type, m.cfg.n_embd), dl = r_layout(down_type, m.cfg.n_ff_exp);
     return ((size_t) 2 * m.cfg.n_ff_exp * gl.row_bytes + (size_t) m.cfg.n_embd * dl.row_bytes + 63) / 64 * 64;
 }
 
@@ -271,14 +283,55 @@ std::vector<int> ExpertCache::plan(const Model & m, const ExpertStore & st, size
 }
 
 void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s,
-                       bool verbose, VramBudget * vb, int l0, int l1) {
+                       bool verbose, VramBudget * vb, int l0, int l1, const ColdStore * cs) {
     m_ = &m;
     st_ = &st;
+    cs_ = cs && !cs->empty() ? cs : nullptr;
     n_layer_ = m.cfg.n_layer;
     n_expert_ = m.cfg.n_expert;
     l0_ = l0;
     l1_ = l1 < 0 ? n_layer_ : l1;
-    const Ranking full = complete_ranking(rank, n_layer_, n_expert_, l0_, l1_);
+    // the cold bands: their regions come off the budget first, every cold expert resident; the hot ranking
+    // (the other experts) fills the rest
+    cold_buf_.assign(n_layer_, {});
+    cold_base_.assign(n_layer_, {});
+    cold_sb_.assign(n_layer_, {});
+    cold_bytes_ = 0;
+    int n_cold = 0;
+    if (cs_) {   // a budget too small for the bands (a CPU-only tier, --cache-gib 0): the file is ignored, the store has every expert
+        size_t need = 0;
+        for (int l = l0_; l < l1_; ++l)
+            for (const auto & g : m.layers[l].cold) need += vmem_round(slot_bytes_for(m, g.gate_type, g.down_type) * g.experts.size());
+        if (need > budget) {
+            if (verbose) fprintf(stderr, "bnk: the cold experts need %.2f GiB of VRAM, the cache has %.2f: running without them\n", need / 1073741824.0, budget / 1073741824.0);
+            cs_ = nullptr;
+        }
+    }
+    if (cs_) {
+        for (int l = l0_; l < l1_; ++l) {
+            const LayerWeights & L = m.layers[l];
+            for (const auto & g : L.cold) {
+                const size_t sb = slot_bytes_for(m, g.gate_type, g.down_type);
+                cold_sb_[l].push_back(sb);
+                const size_t region = vmem_round(sb * g.experts.size());
+                budget -= region;
+                cold_bytes_ += region;
+                n_cold += (int) g.experts.size();
+            }
+        }
+        // the hot ranking leaves the cold experts out
+        Ranking hot;
+        for (auto [l, e] : rank)
+            if (l < 0 || l >= n_layer_ || m.layers[l].cold_of.empty() || m.layers[l].cold_of[e] < 0) hot.push_back({l, e});
+        rank = std::move(hot);
+    }
+    Ranking full = complete_ranking(rank, n_layer_, n_expert_, l0_, l1_);
+    if (cs_) {
+        Ranking hot;
+        for (auto [l, e] : full)
+            if (m.layers[l].cold_of.empty() || m.layers[l].cold_of[e] < 0) hot.push_back({l, e});
+        full = std::move(hot);
+    }
     rank_value_.assign((size_t) n_layer_ * n_expert_, 0.f);
     for (size_t i = 0; i < full.size(); ++i)
         rank_value_[(size_t) full[i].first * n_expert_ + full[i].second] = (float) (full.size() - i) / full.size();
@@ -300,10 +353,34 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     slot_of_host_.assign((size_t) n_layer_ * n_expert_, -1);
     // staging for ggml blobs on their way into R slots
     stage_n_ = 64;
-    stage_bytes_ = st.max_blob_bytes();
+    stage_bytes_ = std::max(st.max_blob_bytes(), cs_ ? cs_->max_blob_bytes() : (size_t) 0);   // a cold band's blobs may be larger (Q8_0)
     CUDA_CHECK(cudaMalloc(&stage_, stage_bytes_ * stage_n_));
     CUDA_CHECK(cudaMalloc(&dst_ptrs_, sizeof(uint8_t *) * stage_n_));
     resident_ = 0;
+    if (cs_) {   // the cold regions: mapped whole, filled from the cold store, numbered after the hot slots
+        for (int l = l0_; l < l1_; ++l) {
+            const LayerWeights & L = m.layers[l];
+            cold_buf_[l] = std::vector<ElasticBuf>(L.cold.size());
+            cold_base_[l].assign(L.cold.size(), nullptr);
+            for (size_t g = 0; g < L.cold.size(); ++g) {
+                const auto & cg = L.cold[g];
+                const size_t sb = cold_sb_[l][g];
+                cold_buf_[l][g].reserve(sb * cg.experts.size(), vb, "cold experts", false);
+                cold_buf_[l][g].ensure(sb * cg.experts.size());
+                cold_base_[l][g] = cold_buf_[l][g].as<uint8_t>();
+                std::vector<uint8_t *> dst(cg.experts.size());
+                std::vector<const uint8_t *> src(cg.experts.size());
+                for (size_t i = 0; i < cg.experts.size(); ++i) {
+                    slot_of_host_[(size_t) l * n_expert_ + cg.experts[i]] = n_expert_ * (1 + (int) g) + (int) i;
+                    dst[i] = cold_base_[l][g] + i * sb;
+                    src[i] = cs_->blob(l, (int) g, (int) i);
+                }
+                fill_blobs(dst, src, cs_->blob_bytes(l, (int) g), cg.gate_type, cg.down_type, s);
+                resident_l_[l] += (int) cg.experts.size();
+                resident_ += (int) cg.experts.size();
+            }
+        }
+    }
     for (int l = 0; l < n_layer_; ++l) {
         sb_[l] = slot_bytes(m, l);
         if (!owns(l)) continue;
@@ -317,7 +394,7 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
             sl.push_back((int) i);
             ex.push_back(e);
         }
-        resident_l_[l] = (int) ex.size();
+        resident_l_[l] += (int) ex.size();
         resident_ += (int) ex.size();
         fill(l, sl, ex, s);
     }
@@ -326,9 +403,33 @@ void ExpertCache::init(const Model & m, const ExpertStore & st, size_t budget, R
     CUDA_CHECK(cudaStreamSynchronize(s));
     const int n = (l1_ - l0_) * n_expert_;
     if (verbose)
-        fprintf(stderr, "bnk: VRAM expert cache%s: %d of %d experts (%.1f%%), %.2f GiB\n",
+        fprintf(stderr, "bnk: VRAM expert cache%s: %d of %d experts (%.1f%%), %.2f GiB%s\n",
                 n == n_layer_ * n_expert_ ? "" : (" for layers " + std::to_string(l0_) + "-" + std::to_string(l1_ - 1)).c_str(),
-                resident_, n, 100.0 * resident_ / n, bytes() / 1073741824.0);
+                resident_, n, 100.0 * resident_ / n, bytes() / 1073741824.0,
+                n_cold ? (" (" + std::to_string(n_cold) + " cold in " + std::to_string(cold_bytes_ >> 20) + " MiB)").c_str() : "");
+}
+
+MoeLayerDesc ExpertCache::desc_cold(int il, int g) const {
+    const LayerWeights::ColdGroup & cg = m_->layers[il].cold.at(g);
+    const Config & c = m_->cfg;
+    const RLayout gl = r_layout(cg.gate_type, c.n_embd), dl = r_layout(cg.down_type, c.n_ff_exp);
+    MoeLayerDesc d;
+    d.slot_of = slot_of_dev_ + (size_t) il * n_expert_;
+    d.base = cold_base_[il][g];
+    d.blob = cold_sb_[il][g];
+    d.gate_bytes = (size_t) c.n_ff_exp * gl.row_bytes;
+    d.up_bytes = (size_t) c.n_ff_exp * gl.row_bytes;
+    d.gate_type = cg.gate_type;
+    d.down_type = cg.down_type;
+    d.grow = gl.row_bytes;
+    d.drow = dl.row_bytes;
+    d.rlay = 1;
+    d.slot_lo = n_expert_ * (1 + g);
+    d.slot_hi = d.slot_lo + (int) cg.experts.size();
+    d.scales = ExpScales{};   // the global scale is folded into the cold blocks
+    const uint32_t g5[5] = {gl.off_a, gl.off_b, gl.off_c, gl.off_d, gl.off_e}, d5[5] = {dl.off_a, dl.off_b, dl.off_c, dl.off_d, dl.off_e};
+    for (int i = 0; i < 5; ++i) { d.go[i] = g5[i]; d.dof[i] = d5[i]; }
+    return d;
 }
 
 size_t ExpertCache::shrink(size_t need, cudaStream_t s) {
@@ -476,6 +577,8 @@ MoeLayerDesc ExpertCache::desc(int il) const {
     d.grow = gl.row_bytes;
     d.drow = dl.row_bytes;
     d.rlay = 1;
+    d.slot_lo = 0;
+    d.slot_hi = n_expert_;
     d.scales = L.exp_scales;
     const uint32_t g5[5] = {gl.off_a, gl.off_b, gl.off_c, gl.off_d, gl.off_e}, d5[5] = {dl.off_a, dl.off_b, dl.off_c, dl.off_d, dl.off_e};
     for (int i = 0; i < 5; ++i) { d.go[i] = g5[i]; d.dof[i] = d5[i]; }

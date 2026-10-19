@@ -86,7 +86,7 @@ done
 if [[ ! -x "$HERE/build/bnk" ]]; then
   echo "building bnk ..."
   cmake -S "$HERE" -B "$HERE/build" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$HERE/build" --target bnk -j "$(nproc)"
+  cmake --build "$HERE/build" --target bnk requant_experts -j "$(nproc)"
 fi
 # the dashboard (serve/web): built once, and again whenever its sources change
 WEB="$HERE/serve/web"
@@ -121,6 +121,30 @@ if [[ -z "$PLE" && -f "$HERE/configs/$NAME.json" ]]; then
   [[ -n "$PLE" && ! -f "$PLE" ]] && { echo "the PLE table $PLE (configs/$NAME.json) is missing" >&2; exit 1; }
 fi
 COUNTS="$CACHE/counts-$NAME.bnkc"
+# cold experts (docs/EXPERT-MIX.md): the config's "cold_experts" names a file in the cache directory. Missing, it is
+# written in the background (build/requant_experts, ~16 min on 24 threads) and used from the next start on; present,
+# tools/cold_drift.py checks it against today's routing counts and rewrites it in the background when more than a
+# tenth of its slots would hold another expert. BNK_COLD_AUTO=0 leaves the file alone either way.
+if [[ -f "$HERE/configs/$NAME.json" && "${BNK_COLD_AUTO:-1}" != 0 ]]; then
+  COLD=$("$HERE/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cold_experts",""))' "$HERE/configs/$NAME.json")
+  if [[ -n "$COLD" ]]; then
+    [[ "$COLD" == /* ]] || COLD="$CACHE/$COLD"
+    BANDS=$("$HERE/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cold_bands","iq2_s/q2_0:30,iq3_s/q2_0:40"))' "$HERE/configs/$NAME.json")
+    regen=""
+    if [[ ! -f "$COLD" ]]; then
+      [[ -f "$COUNTS" ]] && regen="no cold-experts file yet" || echo "note: no cold-experts file and no routing counts yet; serve once, then restart to write it"
+    elif [[ -f "$COUNTS" ]]; then
+      drift=$("$HERE/.venv/bin/python" "$HERE/tools/cold_drift.py" "$COLD" "$COUNTS" 2>/dev/null); rc=$?
+      [[ -n "$drift" ]] && echo "note: $drift"
+      [[ $rc == 3 ]] && regen="the routing drifted"
+    fi
+    if [[ -n "$regen" && ! -f "$COLD.tmp" ]]; then
+      echo "note: $regen: writing $COLD in the background (bands $BANDS); the next start uses it"
+      [[ -x "$HERE/build/requant_experts" ]] || cmake --build "$HERE/build" --target requant_experts -j "$(nproc)" >/dev/null
+      nohup bash -c "\"$HERE/build/requant_experts\" --model \"$MODEL\" --counts \"$COUNTS\" --out \"$COLD.tmp\" --bands \"$BANDS\" --threads 12 > \"$COLD.log\" 2>&1 && mv -f \"$COLD.tmp\" \"$COLD\" || rm -f \"$COLD.tmp\"" >/dev/null 2>&1 &
+    fi
+  fi
+fi
 ARGS=(--model "$MODEL" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 # per-model tuning: sampling defaults, speculation, the thinking-loop guard (configs/<name>.json)
 [[ -f "$HERE/configs/$NAME.json" ]] && ARGS+=(--config "$HERE/configs/$NAME.json")

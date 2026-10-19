@@ -56,7 +56,43 @@ DenseModel::~DenseModel() {
     for (void * p : host_allocs_) cudaFreeHost(p);
 }
 
+// the formats the GEMV kernels read (kernels/quant.cuh BNK_DISPATCH_*, plus the float types); anything else is
+// re-quantized to Q8_0 at load (a few small tensors of a rate-constrained mix, e.g. Q2_K / IQ1_M)
+static bool gemv_format(int t) {
+    switch (t) {
+        case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q2_0: case GGML_TYPE_NVFP4: case GGML_TYPE_NVFP4_16:
+            return true;
+        default:
+            return false;
+    }
+}
+
 QMat DenseModel::upload_tensor(const TensorRef & t, bool repack) {
+    // BF16 matrices become Q8_0 too (what the Q8_0 release ships them as; the F16 path below is for files that
+    // carry F16 matrices), as do the formats the kernels do not read
+    if ((!gemv_format((int) t.type) || t.type == GGML_TYPE_BF16) && t.ne[0] % 32 == 0 && t.nrows() >= 2 && t.name != "token_embd.weight") {
+        const auto * tt = ggml_get_type_traits(t.type);
+        if (!tt || !tt->to_float) throw std::runtime_error(std::string("unsupported weight format ") + ggml_type_name(t.type) + " in " + t.name);
+        const int64_t rows = t.nrows(), cols = t.ne[0];
+        std::vector<float> f((size_t) rows * cols);
+        tt->to_float(t.data, f.data(), rows * cols);
+        const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, cols);
+        std::vector<uint8_t> q(rb * rows);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, rows, cols, nullptr);
+        static bool said = false;
+        if (!said) {
+            fprintf(stderr, "bnk: %s and other formats the kernels do not read become Q8_0 at load (%s ...)\n", ggml_type_name(t.type), t.name.c_str());
+            said = true;
+        }
+        void * d = nullptr;
+        QMat m = upload_matrix(q.data(), GGML_TYPE_Q8_0, rows, cols, rb, repack, &d);
+        device_allocs_.push_back(d);
+        vram_bytes += m.row_bytes * m.rows;
+        return m;
+    }
     // the token table is gathered by row (a few KB per token): page-locked host memory over PCIe keeps its
     // 1.3 GiB of VRAM for the context (BNK_EMBD_HOST=0 puts it on the GPU)
     static const bool embd_host = !getenv("BNK_EMBD_HOST") || atoi(getenv("BNK_EMBD_HOST")) != 0;

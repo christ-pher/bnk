@@ -20,7 +20,7 @@
     "min_p": 0.0
   },
   "speculation": {
-    "draft": 4,
+    "draft": 7,
     "draft_min_p": 0.8
   },
   "thinking_loop_guard": true,

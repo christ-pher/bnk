@@ -72,11 +72,24 @@ struct LayerWeights {
     // converter; moe.h ExpScales). Host copies for the CPU expert path, device arrays for the kernels.
     std::vector<float> exp_sgate, exp_sup, exp_sdown;
     ExpScales exp_scales;
+    // cold experts (docs/EXPERT-MIX.md): bands of this layer's least-routed experts in a smaller format, from the
+    // --cold-experts file (tools/requant_experts); the engine keeps every one of them resident
+    struct ColdGroup {
+        int gate_type = 0, down_type = 0;   // ggml types of its gate / up matrices and of its down matrices
+        std::vector<int32_t> experts;     // ascending expert ids
+        const uint8_t * gate_src = nullptr, * up_src = nullptr, * down_src = nullptr;   // mmap, first expert
+        size_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;   // per expert
+    };
+    std::vector<ColdGroup> cold;
+    std::vector<int8_t> cold_of;          // [n_expert]: the group holding the expert, -1 = hot (empty: no cold file)
 };
 
 struct Model {
     Config cfg;
     GgufModel gguf;
+    GgufModel cold_gguf;   // the --cold-experts file (open while the model is)
+    // binds the cold bands of every loaded layer (after load); returns the experts bound
+    int load_cold(const std::string & path, bool verbose);
     std::vector<LayerWeights> layers;
     HcWeights hc_head;
     QMat output, tok_embd;

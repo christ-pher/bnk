@@ -27,8 +27,10 @@ public:
     // Fills up to `budget` bytes of VRAM following `rank` (completed with every remaining pair). Each layer's
     // slots live in an elastic region charged to `vb`, so the cache can later shrink() and grow().
     // A pipeline stage (several GPUs) caches only layers [l0, l1) (l1 < 0: every layer).
+    // `cs`: the cold experts' blobs (model.h ColdGroup); every cold expert gets a slot of its own region first,
+    // the hot ranking fills what is left of the budget.
     void init(const Model & m, const ExpertStore & st, size_t budget, Ranking rank, cudaStream_t s, bool verbose,
-              VramBudget * vb, int l0 = 0, int l1 = -1);
+              VramBudget * vb, int l0 = 0, int l1 = -1, const ColdStore * cs = nullptr);
     // The per-layer slot counts init() would choose, without allocating.
     static std::vector<int> plan(const Model & m, const ExpertStore & st, size_t budget, const Ranking & rank,
                                  int l0 = 0, int l1 = -1);
@@ -49,7 +51,10 @@ public:
     }
     // VRAM bytes of one expert of layer il (R-layout rows)
     static size_t slot_bytes(const Model & m, int il);
-    MoeLayerDesc desc(int il) const;
+    static size_t slot_bytes_for(const Model & m, int gate_type, int down_type);
+    MoeLayerDesc desc(int il) const;          // the hot region (slots [0, n_expert))
+    int n_cold_groups(int il) const { return (int) cold_sb_[il].size(); }
+    MoeLayerDesc desc_cold(int il, int g) const;   // cold region g (slots [n_expert * (1 + g), + its experts))
     int resident() const { return resident_; }
     size_t bytes() const;
     int slots(int il) const { return (int) slot_expert_[il].size(); }
@@ -70,6 +75,14 @@ private:
     std::vector<ElasticBuf> layer_buf_;   // each layer's slots, slot i at i * slot_bytes
     std::vector<uint8_t *> layer_base_;
     std::vector<size_t> sb_;               // slot bytes per layer
+    const ColdStore * cs_ = nullptr;
+    std::vector<std::vector<ElasticBuf>> cold_buf_;   // [layer][group]: the cold bands' regions (never shrunk)
+    std::vector<std::vector<uint8_t *>> cold_base_;
+    std::vector<std::vector<size_t>> cold_sb_;
+    size_t cold_bytes_ = 0;
+    // ggml blobs (src, `bb` bytes each, of types gate_type / down_type) repacked into R slots at dst
+    void fill_blobs(const std::vector<uint8_t *> & dst, const std::vector<const uint8_t *> & src, size_t bb, int gate_type,
+                    int down_type, cudaStream_t s);
     std::vector<int> resident_l_;
     std::vector<float> rank_value_;        // [n_layer * n_expert]: from the initial ranking, hottest highest
     float value(int il, int e) const;

@@ -26,13 +26,15 @@ ap.add_argument("prompts", nargs="+")
 ap.add_argument("--mtp", default="")
 ap.add_argument("--draft-vocab", default="")
 ap.add_argument("--ple-gguf", default="", help="the n-gram table GGUF of a model that keeps it in a second file")
+ap.add_argument("--cold-experts", default="", help="the cold-experts file (docs/EXPERT-MIX.md)")
+ap.add_argument("--cache-gib", default="0", help="VRAM expert cache per GPU (default 0: CPU-only tier; a size lets a cold-experts file load, still static)")
 ap.add_argument("--engine", default=str(ROOT / "build" / "bnk"))
 ap.add_argument("--gpus", default="", help="engine --gpus (e.g. 0,0: the two-stage pipeline on one GPU)")
 ap.add_argument("--gen", type=int, default=64)
 a = ap.parse_args()
 
 prompts = [[int(x) for x in Path(p).read_text().replace(",", " ").split()] for p in a.prompts]
-args = [a.engine, "serve", "--model", a.model, "--ctx", "16384", "--cache-gib", "0", "--adapt-every", "0",
+args = [a.engine, "serve", "--model", a.model, "--ctx", "16384", "--cache-gib", a.cache_gib, "--adapt-every", "0",
         "--slots", str(len(prompts)), "--park-gib", "0"]
 if a.mtp:
     args += ["--mtp", a.mtp]
@@ -42,6 +44,8 @@ if a.gpus:
     args += ["--gpus", a.gpus]
 if a.ple_gguf:
     args += ["--ple-gguf", a.ple_gguf]
+if a.cold_experts:
+    args += ["--cold-experts", a.cold_experts]
 eng = subprocess.Popen(args, env=dict(os.environ, BNK_EXACT="1"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 events: dict[str, list] = {}
 order: list = []   # (id, type, n tokens) in arrival order

@@ -162,15 +162,16 @@ template <int FMT, int NT>
 __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                 size_t blob, size_t gate_bytes, size_t grow, int F, int E,
                                                 const int8_t * __restrict__ aq, const float * __restrict__ ad,
-                                                int64_t cols_pad, float * __restrict__ gu) {
+                                                int64_t cols_pad, float * __restrict__ gu, int slot_lo, int slot_hi) {
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
     const int lane = threadIdx.x & 31;
     const int r = blockIdx.y * 8 + (threadIdx.x >> 5);
     if (r >= 2 * F) return;
     const HitEntry & h = hits->e[ent];
+    if (h.slot < slot_lo || h.slot >= slot_hi) return;   // another region's expert
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
+    const uint8_t * row = base + (size_t) (h.slot - slot_lo) * blob + (r < F ? (size_t) r * grow : gate_bytes + (size_t) (r - F) * grow);
     const int nsb = E / 32;
     const int64_t nb = cols_pad / 32;
     float acc[NT];
@@ -198,13 +199,14 @@ __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hit
 
 // grid (kMaxRouted, W); block F threads (F % 32 == 0): h = silu(g)*u quantized per 32
 __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __restrict__ gu, int F,
-                          int8_t * __restrict__ hq, float * __restrict__ hd, ExpScales es) {
+                          int8_t * __restrict__ hq, float * __restrict__ hd, ExpScales es, int cold_lo) {
     const int ent = blockIdx.x, t = blockIdx.y;
     if (ent >= hits->n || !(hits->e[ent].mask & (1u << t))) return;
     const size_t base = (size_t) ent * kMaxWindow + t;
     const float * g = gu + base * 2 * F;
     const int ex = hits->e[ent].expert;
-    const float sg = es.gate ? es.gate[ex] : 1.f, sud = es.up ? es.up[ex] * es.down[ex] : 1.f;
+    const bool cold = hits->e[ent].slot >= cold_lo;   // a cold band's blocks carry the global scale already
+    const float sg = es.gate && !cold ? es.gate[ex] : 1.f, sud = es.up && !cold ? es.up[ex] * es.down[ex] : 1.f;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
         const float gv = g[r] * sg;
         const float h = gv / (1.f + __expf(-gv)) * g[F + r] * sud;
@@ -220,7 +222,7 @@ template <int FMT, int NT>
 __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                   size_t blob, size_t down_off, size_t drow, int F, int E,
                                                   const int8_t * __restrict__ hq, const float * __restrict__ hd,
-                                                  float * __restrict__ part) {
+                                                  float * __restrict__ part, int slot_lo, int slot_hi) {
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
     const int lane = threadIdx.x & 31;
@@ -228,7 +230,8 @@ __global__ void __launch_bounds__(256) moe_down_k(const HitList * __restrict__ h
     if (r >= E) return;
     const HitEntry & h = hits->e[ent];
     const uint32_t mask = h.mask;
-    const uint8_t * row = base + (size_t) h.slot * blob + down_off + (size_t) r * drow;
+    if (h.slot < slot_lo || h.slot >= slot_hi) return;
+    const uint8_t * row = base + (size_t) (h.slot - slot_lo) * blob + down_off + (size_t) r * drow;
     const int nsb = F / 32;
     float acc[NT];
 #pragma unroll
@@ -313,9 +316,10 @@ template <int FMT, int NT, int LPR>
 __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                   size_t blob, size_t up_off, size_t grow, ROff o, int F, int E,
                                                   const int8_t * __restrict__ aq, const float * __restrict__ ad,
-                                                  int64_t cols_pad, float * __restrict__ gu_out) {
+                                                  int64_t cols_pad, float * __restrict__ gu_out, int slot_lo, int slot_hi) {
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
+    if (hits->e[ent].slot < slot_lo || hits->e[ent].slot >= slot_hi) return;   // another region's expert
     int n;
     const uint32_t tp = pack_tokens(hits->e[ent].mask, n);
     rt_tables_load<FMT>();
@@ -324,7 +328,7 @@ __global__ void __launch_bounds__(256) moe_gu_r_k(const HitList * __restrict__ h
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int sub = lane % LPR;
     const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, 2 * F - 1);   // all lanes shuffle
-    const uint8_t * row = base + (size_t) hits->e[ent].slot * blob +
+    const uint8_t * row = base + (size_t) (hits->e[ent].slot - slot_lo) * blob +
                           (r < F ? (size_t) r * grow : up_off + (size_t) (r - F) * grow);
     // up to 4 tokens per pass (an expert with 5-8 tokens of a window, rare, reads its rows twice): the 8-token path
     // needed registers that cost every block occupancy
@@ -345,7 +349,7 @@ template <int FMT, int NT, int LPR>
 __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__ hits, const uint8_t * __restrict__ base,
                                                     size_t blob, size_t down_off, size_t drow, ROff o, int F, int E,
                                                     const int8_t * __restrict__ hq, const float * __restrict__ hd,
-                                                    float * __restrict__ part) {
+                                                    float * __restrict__ part, int slot_lo, int slot_hi) {
     const int ent = blockIdx.x;
     if (ent >= hits->n) return;
     int n;
@@ -357,7 +361,8 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int sub = lane % LPR;
     const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, E - 1);
-    const uint8_t * row = base + (size_t) hits->e[ent].slot * blob + down_off + (size_t) r * drow;
+    if (hits->e[ent].slot < slot_lo || hits->e[ent].slot >= slot_hi) return;
+    const uint8_t * row = base + (size_t) (hits->e[ent].slot - slot_lo) * blob + down_off + (size_t) r * drow;
     const size_t b0 = (size_t) ent * kMaxWindow;
     for (int p0 = 0; p0 < n; p0 += 4) {   // up to 4 tokens per pass, as above
         const uint32_t tq = tp >> (4 * p0);
@@ -371,18 +376,187 @@ __global__ void __launch_bounds__(256) moe_down_r_k(const HitList * __restrict__
     }
 }
 
+// ---- several regions per launch: the body of the R-layout kernels, per format, picked per block
+template <int FMT, int NT, int LPR>
+__device__ __forceinline__ void gu_r_body(const HitList * __restrict__ hits, int ent, const MoeRegion & rg, int F, int E,
+                                          const int8_t * __restrict__ aq, const float * __restrict__ ad, int64_t cols_pad,
+                                          float * __restrict__ gu_out) {
+    int n;
+    const uint32_t tp = pack_tokens(hits->e[ent].mask, n);
+    rt_tables_load<FMT>();
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int sub = lane % LPR;
+    const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, 2 * F - 1);
+    const ROff o{rg.go[0], rg.go[1], rg.go[2], rg.go[3], rg.go[4]};
+    const uint8_t * row = rg.base + (size_t) (hits->e[ent].slot - rg.lo) * rg.blob +
+                          (r < F ? (size_t) r * rg.grow : rg.up_off + (size_t) (r - F) * rg.grow);
+    for (int p0 = 0; p0 < n; p0 += 4) {
+        const uint32_t tq = tp >> (4 * p0);
+        float acc[4];
+        row_dots_n<FMT, NT, LPR>(min(4, n - p0), row, o, E / 32, sub, tq, aq, cols_pad, ad, cols_pad / 32, acc);
+        if (sub == 0 && r0 < 2 * F) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                if (p0 + i < n) gu_out[((size_t) ent * kMaxWindow + ((tq >> (4 * i)) & 15)) * 2 * F + r] = acc[i];
+        }
+    }
+}
+
+template <int FMT, int NT, int LPR>
+__device__ __forceinline__ void down_r_body(const HitList * __restrict__ hits, int ent, const MoeRegion & rg, int F, int E,
+                                            const int8_t * __restrict__ hq, const float * __restrict__ hd,
+                                            float * __restrict__ part) {
+    int n;
+    const uint32_t tp = pack_tokens(hits->e[ent].mask, n);
+    const int nb = F / 32;
+    rt_tables_load<FMT>();
+    __syncthreads();
+    constexpr int RPW = 32 / LPR;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int sub = lane % LPR;
+    const int r0 = blockIdx.y * (8 * RPW) + warp * RPW + lane / LPR, r = min(r0, E - 1);
+    const ROff o{rg.dof[0], rg.dof[1], rg.dof[2], rg.dof[3], rg.dof[4]};
+    const uint8_t * row = rg.base + (size_t) (hits->e[ent].slot - rg.lo) * rg.blob + rg.down_off + (size_t) r * rg.drow;
+    const size_t b0 = (size_t) ent * kMaxWindow;
+    for (int p0 = 0; p0 < n; p0 += 4) {
+        const uint32_t tq = tp >> (4 * p0);
+        float acc[4];
+        row_dots_n<FMT, NT, LPR>(min(4, n - p0), row, o, nb, sub, tq, hq + b0 * F, F, hd + b0 * nb, nb, acc);
+        if (sub == 0 && r0 < E) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                if (p0 + i < n) part[(b0 + ((tq >> (4 * i)) & 15)) * E + r] = acc[i];
+        }
+    }
+}
+
+__device__ __forceinline__ int region_of(const MoeRegions & R, int slot) {
+    for (int i = 0; i < R.n; ++i)
+        if (slot >= R.r[i].lo && slot < R.r[i].hi) return i;
+    return -1;
+}
+
+#define BNK_REGION_SWITCH(fmt, BODY)                                   \
+    switch (fmt) {                                                       \
+        case QT_Q4_K: BODY(QT_Q4_K); break;                              \
+        case QT_Q5_K: BODY(QT_Q5_K); break;                              \
+        case QT_Q6_K: BODY(QT_Q6_K); break;                              \
+        case QT_IQ2_S: BODY(QT_IQ2_S); break;                            \
+        case QT_IQ2_XXS: BODY(QT_IQ2_XXS); break;                        \
+        case QT_IQ2_XS: BODY(QT_IQ2_XS); break;                          \
+        case QT_IQ3_XXS: BODY(QT_IQ3_XXS); break;                        \
+        case QT_IQ3_S: BODY(QT_IQ3_S); break;                            \
+        case QT_IQ4_NL: BODY(QT_IQ4_NL); break;                          \
+        case QT_IQ4_XS: BODY(QT_IQ4_XS); break;                          \
+        case QT_Q8_0: BODY(QT_Q8_0); break;                              \
+        case QT_Q2_0: BODY(QT_Q2_0); break;                              \
+        case QT_NVFP4: BODY(QT_NVFP4); break;                            \
+        default: break;                                                  \
+    }
+
+template <int NT, int LPR>
+__global__ void __launch_bounds__(256) moe_gu_rm_k(const HitList * __restrict__ hits, MoeRegions R, int F, int E,
+                                                   const int8_t * __restrict__ aq, const float * __restrict__ ad,
+                                                   int64_t cols_pad, float * __restrict__ gu_out) {
+    const int ent = blockIdx.x;
+    if (ent >= hits->n) return;
+    const int reg = region_of(R, hits->e[ent].slot);
+    if (reg < 0) return;
+    const MoeRegion & rg = R.r[reg];
+#define BNK_GU_BODY(FMT) gu_r_body<FMT, NT, LPR>(hits, ent, rg, F, E, aq, ad, cols_pad, gu_out)
+    BNK_REGION_SWITCH(rg.gate_type, BNK_GU_BODY)
+#undef BNK_GU_BODY
+}
+
+template <int NT, int LPR>
+__global__ void __launch_bounds__(256) moe_down_rm_k(const HitList * __restrict__ hits, MoeRegions R, int F, int E,
+                                                     const int8_t * __restrict__ hq, const float * __restrict__ hd,
+                                                     float * __restrict__ part) {
+    const int ent = blockIdx.x;
+    if (ent >= hits->n) return;
+    const int reg = region_of(R, hits->e[ent].slot);
+    if (reg < 0) return;
+    const MoeRegion & rg = R.r[reg];
+#define BNK_DN_BODY(FMT) down_r_body<FMT, NT, LPR>(hits, ent, rg, F, E, hq, hd, part)
+    BNK_REGION_SWITCH(rg.down_type, BNK_DN_BODY)
+#undef BNK_DN_BODY
+}
+
 static int lpr_for(int nsb) { return nsb >= 128 ? 32 : nsb >= 48 ? 16 : nsb >= 24 ? 8 : 4; }
 
+MoeRegions moe_regions(const MoeLayerDesc * descs, int n) {
+    MoeRegions R;
+    R.n = std::min(n, kMaxRegions);
+    for (int i = 0; i < R.n; ++i) {
+        const MoeLayerDesc & d = descs[i];
+        MoeRegion & rg = R.r[i];
+        rg.base = d.base;
+        rg.blob = d.blob;
+        rg.up_off = d.gate_bytes;
+        rg.grow = d.grow;
+        rg.down_off = d.gate_bytes + d.up_bytes;
+        rg.drow = d.drow;
+        for (int q = 0; q < 5; ++q) { rg.go[q] = d.go[q]; rg.dof[q] = d.dof[q]; }
+        rg.lo = d.slot_lo;
+        rg.hi = d.slot_hi;
+        rg.gate_type = d.gate_type;
+        rg.down_type = d.down_type;
+    }
+    return R;
+}
+
+template <int NT>
+static void regions_launch(const MoeRegions & R, const ExpScales & scales, int cold_lo, MoeScratch & s, const ActQ8 & xq,
+                           int T, int k, int E, int F, cudaStream_t st) {
+    const int maxent = T * k;
+    auto gu = [&]<int LPR>() {
+        constexpr int rows = 8 * (32 / LPR);
+        moe_gu_rm_k<NT, LPR><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, 0, st>>>(s.hits, R, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+    };
+    static const int lpr_env = getenv("BNK_MOE_LPR")                         ? atoi(getenv("BNK_MOE_LPR"))
+                               : getenv("BNK_EXACT") && atoi(getenv("BNK_EXACT")) ? std::min(8, lpr_for(E / 32))
+                                                                                 : 0;
+    switch (lpr_env ? lpr_env : NT == 1 ? lpr_for(E / 32) : std::min(8, lpr_for(E / 32))) {
+        case 32: gu.template operator()<32>(); break;
+        case 16: gu.template operator()<16>(); break;
+        case 8: gu.template operator()<8>(); break;
+        default: gu.template operator()<4>();
+    }
+    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, scales, cold_lo);
+    auto dn = [&]<int LPR>() {
+        constexpr int rows = 8 * (32 / LPR);
+        moe_down_rm_k<NT, LPR><<<dim3(maxent, (E + rows - 1) / rows), 256, 0, st>>>(s.hits, R, F, E, s.hq, s.hd, s.part);
+    };
+    switch (lpr_for(F / 32)) {
+        case 32: dn.template operator()<32>(); break;
+        case 16: dn.template operator()<16>(); break;
+        case 8: dn.template operator()<8>(); break;
+        default: dn.template operator()<4>();
+    }
+}
+
+void moe_hits_regions(const MoeRegions & R, const ExpScales & scales, int cold_lo, MoeScratch & s, const ActQ8 & xq, int T,
+                      int k, int E, int F, cudaStream_t st) {
+    if (T == 1) regions_launch<1>(R, scales, cold_lo, s, xq, T, k, E, F, st);
+    else if (T == 2) regions_launch<2>(R, scales, cold_lo, s, xq, T, k, E, F, st);
+    else if (T <= 4) regions_launch<4>(R, scales, cold_lo, s, xq, T, k, E, F, st);
+    else regions_launch<8>(R, scales, cold_lo, s, xq, T, k, E, F, st);
+    check_launch("moe_hits_regions");
+}
+
+// phase 0: gate / up for this region's experts; 1: the activation of every entry (once per layer); 2: down
 template <int NT>
 static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
-                          cudaStream_t st) {
+                          cudaStream_t st, int phase, int cold_lo) {
     const int maxent = T * k;
     const ROff go{d.go[0], d.go[1], d.go[2], d.go[3], d.go[4]}, dof{d.dof[0], d.dof[1], d.dof[2], d.dof[3], d.dof[4]};
     auto gu = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
             moe_gu_r_k<FMT, NT, LPR><<<dim3(maxent, (2 * F + rows - 1) / rows), 256, 0, st>>>(
-                s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+                s.hits, d.base, d.blob, d.gate_bytes, d.grow, go, F, E, xq.q, xq.d, xq.cols_pad, s.gu, d.slot_lo, d.slot_hi);
         };
         // several tokens: 8 lanes per row (more rows in flight per warp; bench_moe, 5 tokens: 187 -> 179 us on an
         // IQ2_S layer); one token: lpr_for (16 for 2,560 columns), which is faster there
@@ -397,13 +571,13 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
             default: L.template operator()<4>();
         }
     };
-    BNK_DISPATCH_R(d.gate_type, gu);
-    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.scales);
+    if (phase == 0) BNK_DISPATCH_R(d.gate_type, gu);
+    if (phase == 1) moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.scales, cold_lo);
     auto dn = [&]<int FMT>() {
         auto L = [&]<int LPR>() {
             constexpr int rows = 8 * (32 / LPR);
             moe_down_r_k<FMT, NT, LPR><<<dim3(maxent, (E + rows - 1) / rows), 256, 0, st>>>(
-                s.hits, d.base, d.blob, d.gate_bytes + d.up_bytes, d.drow, dof, F, E, s.hq, s.hd, s.part);
+                s.hits, d.base, d.blob, d.gate_bytes + d.up_bytes, d.drow, dof, F, E, s.hq, s.hd, s.part, d.slot_lo, d.slot_hi);
         };
         switch (lpr_for(F / 32)) {
             case 32: L.template operator()<32>(); break;
@@ -412,7 +586,7 @@ static void hits_launch_r(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & 
             default: L.template operator()<4>();
         }
     };
-    BNK_DISPATCH_R(d.down_type, dn);
+    if (phase == 2) BNK_DISPATCH_R(d.down_type, dn);
 }
 
 // ---- cache fill: ggml blob -> R slot, one thread per row
@@ -447,36 +621,39 @@ void moe_repack_blobs(const uint8_t * src, size_t src_stride, uint8_t * const * 
 
 template <int NT>
 static void hits_launch(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F,
-                        cudaStream_t st) {
+                        cudaStream_t st, int phase, int cold_lo) {
     const int maxent = T * k;
     auto gu = [&]<int FMT>() {
         moe_gu_k<FMT, NT><<<dim3(maxent, (2 * F + 7) / 8), 256, 0, st>>>(s.hits, d.base, d.blob, d.gate_bytes, d.grow,
-                                                                         F, E, xq.q, xq.d, xq.cols_pad, s.gu);
+                                                                         F, E, xq.q, xq.d, xq.cols_pad, s.gu, d.slot_lo, d.slot_hi);
     };
-    BNK_DISPATCH_DP4A(d.gate_type, gu);
-    moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.scales);
+    if (phase == 0) BNK_DISPATCH_DP4A(d.gate_type, gu);
+    if (phase == 1) moe_act_k<<<dim3(maxent, T), F <= 1024 ? F : 1024, 0, st>>>(s.hits, s.gu, F, s.hq, s.hd, d.scales, cold_lo);
     auto dn = [&]<int FMT>() {
         moe_down_k<FMT, NT><<<dim3(maxent, (E + 7) / 8), 256, 0, st>>>(s.hits, d.base, d.blob,
                                                                       d.gate_bytes + d.up_bytes, d.drow, F, E, s.hq,
-                                                                      s.hd, s.part);
+                                                                      s.hd, s.part, d.slot_lo, d.slot_hi);
     };
-    BNK_DISPATCH_DP4A(d.down_type, dn);
+    if (phase == 2) BNK_DISPATCH_DP4A(d.down_type, dn);
 }
 
-void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st) {
-    if (d.rlay) {
-        if (T == 1) hits_launch_r<1>(d, s, xq, T, k, E, F, st);
-        else if (T == 2) hits_launch_r<2>(d, s, xq, T, k, E, F, st);
-        else if (T <= 4) hits_launch_r<4>(d, s, xq, T, k, E, F, st);
-        else hits_launch_r<8>(d, s, xq, T, k, E, F, st);
-        check_launch("moe_hits_r");
-        return;
+void moe_hits(const MoeLayerDesc & d, MoeScratch & s, const ActQ8 & xq, int T, int k, int E, int F, cudaStream_t st,
+              int phase, int cold_lo) {
+    for (int ph = phase < 0 ? 0 : phase; ph <= (phase < 0 ? 2 : phase); ++ph) {
+        if (d.rlay) {
+            if (T == 1) hits_launch_r<1>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+            else if (T == 2) hits_launch_r<2>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+            else if (T <= 4) hits_launch_r<4>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+            else hits_launch_r<8>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+            check_launch("moe_hits_r");
+            continue;
+        }
+        if (T == 1) hits_launch<1>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+        else if (T == 2) hits_launch<2>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+        else if (T <= 4) hits_launch<4>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+        else hits_launch<8>(d, s, xq, T, k, E, F, st, ph, cold_lo);
+        check_launch("moe_hits");
     }
-    if (T == 1) hits_launch<1>(d, s, xq, T, k, E, F, st);
-    else if (T == 2) hits_launch<2>(d, s, xq, T, k, E, F, st);
-    else if (T <= 4) hits_launch<4>(d, s, xq, T, k, E, F, st);
-    else hits_launch<8>(d, s, xq, T, k, E, F, st);
-    check_launch("moe_hits");
 }
 
 // ------------------------------------------------------------------------------------------- wait / reduce

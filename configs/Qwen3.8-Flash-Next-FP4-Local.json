@@ -1,5 +1,5 @@
 {
-  "notes": "nvidia/Qwen3.8-Flash-Next-FP4-Local (ModelOpt NVFP4 experts, MXFP8 dense, quantization-aware distilled) converted by tools/convert_nvfp4.py --no-ple (NVFP4 experts with their per-expert scales, dense weights as Q8_0) plus the n-gram PLE table packed by tools/convert_ple_nvfp4.py as bnk's 16-wide NVFP4 type (ple_gguf below; run.sh passes it as --ple-gguf). Every weight is the checkpoint's own, bit for bit; the dense MXFP8 matrices are the one re-quantization (Q8_0). Sampling as the Qwen release recommends; speculation settings copied from the IQ3_S config (not yet re-tuned for this model). Parking reserve 16 GiB (not the 24 default): with 63 GiB of experts pinned and the 27 GiB n-gram table locked, the engine could not pin more than ~19 GiB of parked conversations (engine log, 2026-10-16: 'could not pin'); a conversation that cannot park re-reads its context next turn.",
+  "notes": "nvidia/Qwen3.8-Flash-Next-FP4-Local (ModelOpt NVFP4 experts, MXFP8 dense, quantization-aware distilled) converted by tools/convert_nvfp4.py --no-ple (NVFP4 experts with their per-expert scales, dense weights as Q8_0) plus the n-gram PLE table packed by tools/convert_ple_nvfp4.py as bnk's 16-wide NVFP4 type (ple_gguf below; run.sh passes it as --ple-gguf). Every weight is the checkpoint's own, bit for bit; the dense MXFP8 matrices are the one re-quantization (Q8_0). Sampling as the Qwen release recommends; speculation settings copied from the IQ3_S config (not yet re-tuned for this model). Parking reserve 16 GiB (not the 24 default): with 63 GiB of experts pinned and the 27 GiB n-gram table locked, the engine could not pin more than ~19 GiB of parked conversations (engine log, 2026-10-16: 'could not pin'); a conversation that cannot park re-reads its context next turn. cold_experts: the least-routed experts in smaller formats so every expert is resident (docs/EXPERT-MIX.md; tools/requant_experts writes the file into the cache directory; BNK_COLD_EXPERTS=0 serves without it).",
   "aliases": [
     "fp4-local",
     "nvfp4"
@@ -28,5 +28,6 @@
     "--park-gib",
     "16"
   ],
-  "ple_gguf": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local-ple.gguf"
+  "ple_gguf": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local-ple.gguf",
+  "cold_experts": "cold-Qwen3.8-Flash-Next-FP4-Local.gguf"
 }

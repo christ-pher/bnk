@@ -27,6 +27,62 @@ ExpertStore::~ExpertStore() {
     }
 }
 
+ColdStore::~ColdStore() {
+    if (pinned_) cudaHostUnregister(base_);
+    if (base_) munmap(base_, total_);
+}
+
+void ColdStore::build(const Model & m, int threads, bool verbose) {
+    const Config & c = m.cfg;
+    off_.assign(c.n_layer, {});
+    blob_.assign(c.n_layer, {});
+    total_ = 0;
+    int n = 0;
+    for (int il = 0; il < c.n_layer; ++il) {
+        const LayerWeights & L = m.layers[il];
+        for (const auto & g : L.cold) {
+            const size_t b = (g.gate_bytes + g.up_bytes + g.down_bytes + 63) / 64 * 64;
+            off_[il].push_back(total_);
+            blob_[il].push_back(b);
+            total_ += b * g.experts.size();
+            max_blob_ = std::max(max_blob_, b);
+            n += (int) g.experts.size();
+        }
+    }
+    if (!total_) return;
+    const double t0 = now_ms();
+    void * p = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) throw std::runtime_error("cannot reserve the cold expert arena");
+    madvise(p, total_, MADV_HUGEPAGE);
+    base_ = (uint8_t *) p;
+    std::atomic<int> next{0};
+    std::vector<std::pair<int, int>> jobs;   // (layer, group)
+    for (int il = 0; il < c.n_layer; ++il)
+        for (size_t g = 0; g < m.layers[il].cold.size(); ++g) jobs.push_back({il, (int) g});
+    auto worker = [&]() {
+        for (int j; (j = next.fetch_add(1)) < (int) jobs.size();) {
+            const auto [il, gi] = jobs[j];
+            const auto & g = m.layers[il].cold[gi];
+            uint8_t * dst = base_ + off_[il][gi];
+            const size_t b = blob_[il][gi];
+            for (size_t i = 0; i < g.experts.size(); ++i) {
+                memcpy(dst + i * b, g.gate_src + i * g.gate_bytes, g.gate_bytes);
+                memcpy(dst + i * b + g.gate_bytes, g.up_src + i * g.up_bytes, g.up_bytes);
+                memcpy(dst + i * b + g.gate_bytes + g.up_bytes, g.down_src + i * g.down_bytes, g.down_bytes);
+            }
+        }
+    };
+    std::vector<std::thread> th;
+    for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(worker);
+    for (auto & t : th) t.join();
+    const double t1 = now_ms();
+    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
+    if (!pinned_) cudaGetLastError();
+    if (verbose)
+        fprintf(stderr, "bnk: cold experts: %d in RAM, %.2f GiB (copied in %.1f s), %s\n", n, total_ / 1073741824.0,
+                (t1 - t0) / 1000, pinned_ ? "page-locked for DMA" : "not page-locked");
+}
+
 void ExpertStore::build(const Model & m, int threads, bool verbose) {
     const Config & c = m.cfg;
     layer_off_.resize(c.n_layer);

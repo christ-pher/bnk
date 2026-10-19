@@ -451,39 +451,64 @@ void Engine::pf_moe(int il, int N) {
         ds.grow = ggml_row_size((ggml_type) Lw.gate_type, E);
         ds.drow = ggml_row_size((ggml_type) Lw.down_type, F);
     }
+    // cold bands (docs/EXPERT-MIX.md): their experts sit in regions of their own, in their own formats
+    const int ng = cache_.n_cold_groups(il);
+    std::vector<MoeLayerDesc> dcold;
+    for (int g = 0; g < ng; ++g) dcold.push_back(cache_.desc_cold(il, g));
+    auto cold_of = [&](int e) -> int {   // the cold band holding e, else -1
+        const int sl = cache_.slot_of(il, e);
+        if (sl < c.n_expert) return -1;
+        return (sl - c.n_expert) / c.n_expert;
+    };
     auto src_of = [&](int e) {
         const int sl = cache_.slot_of(il, e);
+        if (sl >= c.n_expert) {
+            const MoeLayerDesc & dc = dcold[(sl - c.n_expert) / c.n_expert];
+            return dc.base + (size_t) (sl - dc.slot_lo) * dc.blob;
+        }
         return sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
+    };
+    auto desc_of = [&](int e) -> const MoeLayerDesc & {
+        const int g = cold_of(e);
+        return g >= 0 ? dcold[g] : cache_.slot_of(il, e) >= 0 ? d : ds;
     };
     if (pf_tc_) {
         // Tensor cores: every expert's run of pairs in 64-token tiles, one launch each for gate/up and down;
         // resident (R layout) and staged (ggml) experts in separate launches. Items and blocks go through the
         // pinned item buffer: items of both kinds first, then their blocks.
-        const int ne = c.n_expert, max_blocks = P / kTcTile + ne + 1;
-        TcItem * h_it[2] = {(TcItem *) p.h_items, (TcItem *) p.h_items + ne};
-        TcBlock * h_bl[2] = {(TcBlock *) ((TcItem *) p.h_items + 2 * ne), nullptr};
-        h_bl[1] = h_bl[0] + max_blocks;
-        const size_t bytes = (size_t) 2 * ne * sizeof(TcItem) + (size_t) 2 * max_blocks * sizeof(TcBlock);
+        const int ne = c.n_expert, max_blocks = P / kTcTile + ne + 1, nk = 2 + ng;
+        std::vector<TcItem *> h_it(nk);
+        std::vector<TcBlock *> h_bl(nk);
+        for (int kind = 0; kind < nk; ++kind) {
+            h_it[kind] = (TcItem *) p.h_items + (size_t) kind * ne;
+            h_bl[kind] = (TcBlock *) ((TcItem *) p.h_items + (size_t) nk * ne) + (size_t) kind * max_blocks;
+        }
+        const size_t bytes = (size_t) nk * ne * sizeof(TcItem) + (size_t) nk * max_blocks * sizeof(TcBlock);
         if (bytes > (size_t) p.max_items * sizeof(PfItem)) throw std::runtime_error("prefill: item buffer too small");
-        int n_it[2] = {0, 0}, n_bl[2] = {0, 0};
+        std::vector<int> n_it(nk, 0), n_bl(nk, 0);
         for (int e = 0; e < ne; ++e) {
             if (!cnt[e] || on_cpu[e]) continue;
-            const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
+            const int g = cold_of(e);
+            const int kind = g >= 0 ? 2 + g : cache_.slot_of(il, e) >= 0 ? 0 : 1;
             h_it[kind][n_it[kind]] = TcItem{src_of(e), off[e], cnt[e], e};
             for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) h_bl[kind][n_bl[kind]++] = TcBlock{n_it[kind], t0};
             ++n_it[kind];
         }
         CUDA_CHECK(cudaMemcpyAsync(p.items.p, p.h_items, bytes, cudaMemcpyHostToDevice, st_));
-        const TcItem * d_it[2] = {(const TcItem *) p.items.p, (const TcItem *) p.items.p + ne};
-        const TcBlock * d_bl[2] = {(const TcBlock *) ((const TcItem *) p.items.p + 2 * ne), nullptr};
-        d_bl[1] = d_bl[0] + max_blocks;
-        for (int kind = 0; kind < 2; ++kind) {
+        std::vector<const TcItem *> d_it(nk);
+        std::vector<const TcBlock *> d_bl(nk);
+        for (int kind = 0; kind < nk; ++kind) {
+            d_it[kind] = (const TcItem *) p.items.p + (size_t) kind * ne;
+            d_bl[kind] = (const TcBlock *) ((const TcItem *) p.items.p + (size_t) nk * ne) + (size_t) kind * max_blocks;
+        }
+        auto kind_desc = [&](int kind) -> const MoeLayerDesc & { return kind == 0 ? d : kind == 1 ? ds : dcold[kind - 2]; };
+        for (int kind = 0; kind < nk; ++kind) {
             if (!n_bl[kind]) continue;
             if (kind == 1) CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[il & 1], 0));
-            moe_tc_gu(d_it[kind], d_bl[kind], n_bl[kind], kind ? ds : d, p.xg, E, p.perm, p.hh, E, F, st_);
+            moe_tc_gu(d_it[kind], d_bl[kind], n_bl[kind], kind_desc(kind), p.xg, E, p.perm, p.hh, E, F, st_);
         }
-        for (int kind = 0; kind < 2; ++kind)
-            if (n_bl[kind]) moe_tc_down(d_it[kind], d_bl[kind], n_bl[kind], kind ? ds : d, p.hh, p.dd, E, F, st_);
+        for (int kind = 0; kind < nk; ++kind)
+            if (n_bl[kind]) moe_tc_down(d_it[kind], d_bl[kind], n_bl[kind], kind_desc(kind), p.hh, p.dd, E, F, st_);
     } else {
     const size_t gu_elems = (size_t) 2 * F * E, dn_elems = (size_t) E * F;
     std::vector<int> group;
@@ -496,9 +521,8 @@ void Engine::pf_moe(int il, int N) {
             const int e = group[i];
             half * wgu = p.wexp.p + i * (gu_elems + dn_elems);
             half * wdn = wgu + gu_elems;
-            const int sl = cache_.slot_of(il, e);
-            const MoeLayerDesc & dv = sl >= 0 ? d : ds;
-            const uint8_t * src = sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[il & 1] + (size_t) p.stage_idx[il][e] * blob;
+            const MoeLayerDesc & dv = desc_of(e);
+            const uint8_t * src = src_of(e);
             QMat mg{src, dv.gate_type, 2 * F, E, dv.grow};
             QMat md{src + dv.gate_bytes + dv.up_bytes, dv.down_type, E, F, dv.drow};
             if (dv.rlay) {
@@ -533,11 +557,14 @@ void Engine::pf_moe(int il, int N) {
     }
     // experts with few tokens: dp4a straight on their quantized weights, in items of <= 8 tokens; resident
     // (R slots) and staged (ggml) items go in two launches
-    int n_items[2] = {0, 0};
-    const int half_cap = p.max_items / 2;
+    const int nk = 2 + ng;
+    std::vector<int> n_items(nk, 0);
+    const int half_cap = p.max_items / nk;
     for (int e = 0; e < c.n_expert; ++e) {
         if (!cnt[e] || on_cpu[e] || cnt[e] >= opt_.gemm_min_tokens) continue;
-        const int kind = cache_.slot_of(il, e) >= 0 ? 0 : 1;
+        const int g = cold_of(e);
+        const int kind = g >= 0 ? 2 + g : cache_.slot_of(il, e) >= 0 ? 0 : 1;
+        if (n_items[kind] >= half_cap) throw std::runtime_error("prefill: item buffer too small");
         for (int j0 = 0; j0 < cnt[e]; j0 += kMaxWindow) {
             PfItem & it = p.h_items[kind * half_cap + n_items[kind]++];
             it.blob = src_of(e);
@@ -549,14 +576,18 @@ void Engine::pf_moe(int il, int N) {
             }
         }
     }
-    if (n_items[0] || n_items[1]) {
+    bool any = false;
+    for (int kind = 0; kind < nk; ++kind) any |= n_items[kind] > 0;
+    if (any) {
         ActQ8 xq;
         xq.q = p.xq; xq.d = p.xd;
         quantize_act(p.mixed, E, N, E, xq, st_);
         CUDA_CHECK(cudaMemcpyAsync(p.items.p, p.h_items, (size_t) p.max_items * sizeof(PfItem), cudaMemcpyHostToDevice, st_));
         const PfItem * dev = (const PfItem *) p.items.p;
-        moe_list(dev, n_items[0], d, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
-        moe_list(dev + half_cap, n_items[1], ds, xq, E, F, p.gu32, p.hq, p.hd, p.dd, st_);
+        for (int kind = 0; kind < nk; ++kind)
+            if (n_items[kind])
+                moe_list(dev + (size_t) kind * half_cap, n_items[kind], kind == 0 ? d : kind == 1 ? ds : dcold[kind - 2], xq, E, F,
+                         p.gu32, p.hq, p.hd, p.dd, st_);
     }
     }   // !pf_tc_
     CUDA_CHECK(cudaEventRecord(p.used[il & 1], st_));
