@@ -1,0 +1,43 @@
+{
+  "notes": "Qwen/Qwen3.8-27B as ISTA-DASLab's GSQ-RCO IQ3_S GGUF (12.1 GB, the -mtp file: block 64 holds the MTP drafter; the plain file has it stripped). The dense engine (src/dense, docs/DENSE.md), tensor parallel over the two V100s, fp16 KV (12 GB of weights leave room for it), 262K context, two slots; the drafter is the model's own MTP block over run.sh's draft vocabulary. Half the bytes per forward of the Q8_0 config: measure decode and quality against it (bnk nll) before preferring one.",
+  "aliases": [
+    "qwen27b-rco",
+    "27b-rco",
+    "rco27b"
+  ],
+  "source": {
+    "repo": "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF",
+    "revision": "d562806dbafae37109975e970aae91b43e73b440",
+    "files": [
+      "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
+    ]
+  },
+  "mtp": "builtin",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0
+  },
+  "speculation": {
+    "draft": 7,
+    "draft_min_p": 0.8
+  },
+  "thinking_loop_guard": true,
+  "server_args": [
+    "--model-id",
+    "Qwen3.8-27B-RCO-IQ3_S",
+    "--ctx",
+    "262144",
+    "--max-tokens",
+    "32768",
+    "--slots",
+    "2",
+    "--park-gib",
+    "0"
+  ],
+  "engine_args": [
+    "--tp",
+    "1"
+  ]
+}
