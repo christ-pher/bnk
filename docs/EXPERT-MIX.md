@@ -29,6 +29,16 @@ fit, at a quality cost paid only by the rare routings into them.
   region; the prompt path builds its tensor-core items per region the same way. CPU misses can only be hot
   experts, so the host expert pool is unchanged.
 
+## Keeping up with the routing
+
+The file fixes which experts are cold. `run.sh` keeps it current without anyone watching: at every start,
+`tools/cold_drift.py` compares the file's bands with the bands today's counts would choose (the share of cold
+slots whose expert changed); over 10%, or when the file is missing, `build/requant_experts` runs in the
+background on 12 threads (the live server keeps its mapped copy; the new file replaces the old one atomically
+and the next start reads it). The config's `cold_bands` sets the bands (default `iq2_s/q2_0:30,iq3_s/q2_0:40`);
+`BNK_COLD_AUTO=0` leaves the file alone. Day-to-day count changes do not cross band boundaries, so in practice the
+rewrite happens after a real change of workload.
+
 ## Bytes
 
 NVFP4 experts are 4.5 bits per weight (2.8 MB each, 63 GiB in all). Per demoted expert the mix saves 46% (IQ2_S
