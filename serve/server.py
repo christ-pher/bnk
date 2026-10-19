@@ -290,6 +290,9 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         timings.update(gen_ms=gen_ms, tps=(len(generated) - 1) / (gen_ms / 1000) if gen_ms and generated else 0)
     if slices:
         timings["slices"] = slices + 1
+    if getattr(REQ, "tokenize_ms", None) is not None:
+        timings["tokenize_ms"] = round(REQ.tokenize_ms, 3)
+        REQ.tokenize_ms = None
     if interventions:
         timings["thinking_loop_guard"] = interventions
     rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
@@ -338,7 +341,10 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     thinking = "<think>" in tail and "</think>" not in tail
     if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
         text, thinking = text + "\n</think>\n\n", False
-    return S.tok.encode_chat(text), thinking
+    t0 = time.perf_counter()
+    ids = S.tok.encode_chat(text)
+    REQ.tokenize_ms = (time.perf_counter() - t0) * 1e3   # reported in the response's timings
+    return ids, thinking
 
 
 # ------------------------------------------------------------------------------------------- HTTP
@@ -769,7 +775,7 @@ def main():
     S.convs.slots = S.engine.slots()
     info = S.engine.info
     print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}"
-          f" | thinking-loop guard {'on' if args.think_guard else 'off'}", flush=True)
+          f" | thinking-loop guard {'on' if args.think_guard else 'off'} | tokenizer {S.tok.backend}", flush=True)
     d = S.defaults
     print(f"bnk: defaults - temperature {d['temperature']} · top_p {d['top_p']} · top_k {d['top_k']}"
           + (f" · draft {S.draft_defaults.get('draft')} (cutoff {S.draft_defaults.get('draft_min_p')})" if S.draft_defaults else "")

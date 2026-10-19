@@ -143,6 +143,29 @@ bold "3/6  Python environment (.venv)"
 "$HERE/.venv/bin/pip" install -q --upgrade pip
 "$HERE/.venv/bin/pip" install -q -r "$HERE/requirements.txt"
 ok "server and tools dependencies installed"
+# the toks tokenizer (github.com/actual-computer/toks: hf-exact ids, 20-45x the Python BPE): its wheel is on GitHub,
+# not PyPI. Optional: without it the server tokenizes in Python (same ids). BNK_NO_TOKS=1 skips it.
+TOKS_VER=0.3.2
+if [[ "${BNK_NO_TOKS:-0}" != 1 ]] && ! "$HERE/.venv/bin/python" -c "import toks" 2>/dev/null; then
+  PYTAG="$("$HERE/.venv/bin/python" -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)  PLAT="manylinux_2_17_x86_64.manylinux2014_x86_64" ;;
+    Linux-aarch64) PLAT="manylinux_2_17_aarch64.manylinux2014_aarch64" ;;
+    Darwin-arm64)  PLAT="macosx_11_0_arm64" ;;
+    *) PLAT="" ;;
+  esac
+  WHL="toks-$TOKS_VER-$PYTAG-$PYTAG-$PLAT.whl"
+  REL="https://github.com/actual-computer/toks/releases/download/v$TOKS_VER"
+  TMPD="$(mktemp -d)"
+  if [[ -n "$PLAT" ]] && curl -fsSL -o "$TMPD/$WHL" "$REL/$WHL" && curl -fsSL -o "$TMPD/SHA256SUMS" "$REL/SHA256SUMS" \
+     && (cd "$TMPD" && grep " $WHL\$" SHA256SUMS | sha256sum -c --quiet) \
+     && "$HERE/.venv/bin/pip" install -q "$TMPD/$WHL"; then
+    ok "toks $TOKS_VER tokenizer ($PYTAG, $PLAT)"
+  else
+    warn "no toks wheel for this Python / platform (or no network): the server tokenizes in Python (same ids, slower)"
+  fi
+  rm -rf "$TMPD"
+fi
 # CMake >= 3.24 and Ninja: the system's if new enough, else from pip
 CMAKE=cmake
 if ! command -v cmake >/dev/null || ! ver_ge "$(cmake --version | head -1 | awk '{print $3}')" 3.24; then

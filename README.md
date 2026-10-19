@@ -77,6 +77,16 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
+### What the toks tokenizer changed (2026-10-19)
+
+The server encodes prompts through [toks](https://github.com/actual-computer/toks), a C tokenizer library (AVX2
+and NEON kernels, Apache-2.0) that returns exactly the ids Hugging Face `tokenizers` returns, loaded over a
+`tokenizer.json` that bnk writes from the GGUF's own vocabulary (`serve/tokenizer_json.py`); without its wheel
+the Python path runs as before, with the same ids (`tools/tok_check.py` checks both). The tokenizer itself is
+18-33x faster on prose and code (a 256K-token prompt: 205 -> 10 ms), which takes 0.1-0.3 s off a cold 64K-256K
+first turn and nothing off follow-up turns, whose encoding was already a few milliseconds. Each response's
+`timings` now carries `tokenize_ms`. Details and the sweep on both models: `docs/TOKS.md`.
+
 ### What v0.4.0 changed: the dense Qwen3.8 models
 
 A second engine (`src/dense/`, behind the `EngineApi` interface in `src/engine/engine_api.h`) runs the dense
