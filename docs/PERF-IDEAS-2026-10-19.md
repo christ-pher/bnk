@@ -100,5 +100,104 @@ nothing here is a new measurement. The numbered items are referred to by number 
 
 ## Status
 
-- 2026-10-19: items 3 (as prompt-lookup drafting; tree verification not done) and 10 done (branch `drafting-prefix`, merged): `docs/LOOKUP-FORK.md`.
-- 2026-10-19: idea C (lookahead pipelining) built on branch `dual-gpu`: `docs/LOOKAHEAD.md`.
+- Item 3: prompt-lookup drafting (merged 2026-10-19, `docs/LOOKUP-FORK.md`); draft 7 for the IQ3_S release and the
+  27B (v0.4.1). Tree verification (idea A) not done.
+- Item 4: FP4-Local's PCIe staging addressed by cold experts in smaller formats (v0.4.1, `docs/EXPERT-MIX.md`):
+  reads +45%, expert misses 3-7% to 1-2%, NLL +0.5%.
+- Item 10: prefix forking (merged 2026-10-19, `docs/LOOKUP-FORK.md`).
+- Item 12: largely moot after the cold experts (CPU experts per forward 9 to 3 ms on code).
+- Item 13: the toks tokenizer (merged 2026-10-19, `docs/TOKS.md`).
+- Idea B: done (prompt-lookup drafting). Idea C: lookahead pipelining (merged 2026-10-19, `docs/LOOKAHEAD.md`).
+- Model-side ideas (same day): 1 done (cold experts); 2 tested as the RCO IQ3_S 27B: same speed as the Q8_0 at
+  half the VRAM, its IQ-format GEMVs are unpack-bound; 4 done (draft 7); 3 and 5 open; 6 declined.
+- Open: items 1, 2, 5, 6, 7, 8, 9, 11; ideas A, D, E (D and E matter much less at ~95% residency).
+
+## Second pass (2026-10-19, evening): in and out of the box
+
+### The dense 27B is where the gap is
+
+One stream's decode speed is about bandwidth / bytes per forward x tokens accepted per round. On the two V100s:
+
+| 27B at | weight bytes per card | floor per forward at 889 GB/s | plain ceiling | with MTP: prose / code / copy |
+|---|---|---|---|---|
+| Q8_0 (what runs) | ~13 GB | 15.7 ms | ~64 tok/s | ~140 / 220 / 400 |
+| a 4-bit format | ~7.5 GB | 8.4 ms | ~110 tok/s | ~250 / 400 / 700 |
+| **measured, Q8_0** | | **23.6 ms** | **42 tok/s** | 80 / 120 / 200 |
+
+So the 27B runs 1.5x off its own Q8 ceiling and about 2.6x off a 4-bit one; published "hundreds of tok/s on a
+27B" numbers (4-bit, EAGLE/MTP drafting on code-heavy output, or batched throughput) are physically within reach
+here. The MoE models are chain-bound, not bandwidth-bound: they reach hundreds only summed over several streams.
+The RCO IQ3_S 27B is the clue: half the bytes gave the same speed, so the IQ-format GEMVs are bound by unpacking
+their codes. Fewer bits pay only in a format that is cheap to unpack.
+
+### In the box: efficiency
+
+Dense 27B:
+
+- **D1. Profile one decode forward** (nsys): split the 23.6 ms into GEMVs, the 128 cross-GPU exchanges (~3 ms)
+  and the rest. Half a day; it orders everything below.
+- **D2. A cheap-to-unpack 4-bit path.** Repack a 4-bit GGUF (unsloth Q4_K_M / UD-Q4_K_XL, values kept exactly) at
+  load into an interleaved layout where one 128-bit load is a whole mma fragment, with the int4-to-fp16 bit-trick
+  conversion ExLlama and Marlin use (architecture-agnostic). First a cheap test: a Q4_0 / Q4_K_M file through
+  today's kernels. If the layout reaches ~80% of bandwidth: plain 42 to ~75 tok/s, MTP prose ~80 to ~170.
+- **D3. Cheaper exchanges:** fp16 in decode windows (item 7), and each exchange's host hop overlapped with the next
+  layer's weight prefetch. 1.5-2 ms per forward.
+- **D4. Wider windows and tree drafting on the dense engine.** A bandwidth-bound forward costs nearly the same for
+  16-32 rows as for 8 (5 vs 8 rows measured 29.6 vs 32.5 ms); tree verification fits here better than on the MoE
+  engine, where each extra row pulls in experts. Prose from ~2.3 toward ~3.5 tokens per round.
+- **D5. More slots for agent fleets.** Weight reads amortize over conversations: 8 streams at 16-32 rows could sum
+  to 400-600 tok/s; today capped by 2 slots and the 8-row window.
+
+MoE models:
+
+- **M1. The 16-row window plus more slots** (item 11): the multi-stream lever, now that FP4-Local is ~95% resident.
+- **M2. Drop the cold experts' NVFP4 copies from pinned RAM** (~30 GB never read).
+- **M3. Trim the forward-graph cache:** up to 48 x ~18 MiB charged to the VRAM budget, up to 0.8 GiB per card.
+
+### In the box: code quality
+
+- **Q1. The nondeterminism under `BNK_EXACT=1`:** two plain runs of the essay prompt diverge at token 175 with exact
+  kernels and a static cache. Every A/B depends on exact mode being exact. Suspects: an atomic float reduction, or
+  CPU-expert ordering when misses vary.
+- **Q2. One conversation-state layer for both engines.** Slots, snapshots, parking, forking and graph caching exist
+  twice; the dense copy has no parking or forking. Extracting them makes item 9 a port and gives the dense engine
+  forking for free.
+- **Q3. An in-repo A/B harness** (`tools/ab.py`): plain against variant, greedy and sampled, NLL / KL, the exactness
+  checks. Six throwaway scripts were written for this on 2026-10-19 alone.
+- **Q4. Benchmark under the configs' sampling** (temperature 1.0), not only greedy: every number this week was
+  greedy, and drafts are accepted less often when sampled.
+- **Q5. Prune the `BNK_*` switches:** a registry printed at start; delete the bisection-only ones
+  (`BNK_LA_SEQ_SVC`, `BNK_MTP_OWN_STREAM`, ...).
+- **Q6. Lookahead's complexity against its payoff:** six bugs to land, pays on copy-heavy output only. The most
+  fragile code in the engine; keep it under the A/B harness.
+
+### Out of the box
+
+- **X1. Out of the VM, or onto NVLink.** The machine is a Proxmox guest (the root filesystem is VM 108's disk).
+  Peer-to-peer copies take 49-51 ms instead of microseconds, and `cudaHostRegister` is 4x slower inside the engine
+  than standalone: both point at the virtualization layer. Bare metal, or passthrough with IOMMU / ACS set up for
+  peer access, could make the cross-GPU exchange ~5x cheaper: an immediate gain for the dense engine, and tensor
+  parallel reopens for the MoE models. Further: dual SXM2-to-PCIe carrier boards with an NVLink bridge exist in the
+  homelab market; NVLink 2.0 between two V100s (~150 GB/s, a few microseconds) changes every multi-GPU tradeoff
+  measured so far. First step, no code: check the GPUs' IOMMU groups and ACS in Proxmox.
+- **X2. Drafting across conversations** ("suffix decoding"): one shared index over all recent conversations'
+  outputs instead of the current conversation's only. Agents repeat tool-call scaffolding and re-read files other
+  agents read. Built on the existing lookup index.
+- **X3. Long-context state on disk.** A 256K cold read costs 124 s (FP4-Local) or 512 s (27B); a parked conversation
+  is 3-4 GB, 1-2 s from NVMe. Saving parked states and shared-prefix snapshots to disk lets a long context survive
+  server restarts and serves the same repo dump to a new agent days later without a re-read.
+- **X4. Fewer thinking tokens.** For time to answer, reasoning tokens often dominate: a per-client reasoning-effort
+  budget beside the loop guard cuts wall-clock time without touching a kernel.
+- **X5. A dense megakernel, last.** Recent work beats CUDA graphs at small batch with single-launch decode kernels
+  using per-layer dependency counters, not the grid barriers the 2026-10-15 attempt used (the reason it lost).
+  Plausible for the 27B's uniform layers; high risk.
+
+### Order
+
+1. D1 (the 27B profile) and the cheap D2 test (a Q4 file through today's kernels): together they decide whether
+   the 4-bit layout is a week of work for ~2x on the 27B.
+2. In parallel, without code: X1's IOMMU / ACS check. If peer access can be fixed in configuration, it is the
+   cheapest multi-GPU win on the list.
+3. Q1 and Q3 before the next round of kernel work: exact mode and the harness make every later change faster to
+   judge.
+4. Then, by measured value: D2, D3, D4 / D5 and M1 (both are the window and slot work), item 9 via Q2, X2, X3.
