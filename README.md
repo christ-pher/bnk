@@ -77,6 +77,19 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
 
+### What v0.4.0 changed: the dense Qwen3.8 models
+
+A second engine (`src/dense/`, behind the `EngineApi` interface in `src/engine/engine_api.h`) runs the dense
+`qwen35` models with every weight in VRAM; `bnk` picks the engine from the GGUF's architecture, so the
+mixture-of-experts path is untouched (its greedy output is identical token for token, its speed within noise).
+What the engine adds: tensor parallelism over the two cards (heads, DeltaNet groups and FFN rows split, partial
+sums exchanged through pinned host memory since peer copies take 51 ms on this PCIe fabric), one CUDA graph
+spanning both devices per window, a tensor-core flash-attention kernel for prompt chunks and a split-KV one for
+decode windows (one pass over the cache per GQA group, 8-bit KV cells dequantized while staging), and the model's
+own MTP block as the drafter. The DeltaNet output gate of this family is SiLU rather than sigmoid: the one place
+the shared kernels gained a variant. Config `qwen27b` (`configs/Qwen3.8-27B-Q8_0.json`): 262K context, 8-bit KV,
+two slots. Design, profiles and open items: `docs/DENSE.md`.
+
 ### What v0.3.1 changed: faster turns on both models
 
 A performance sweep measured with the LocalMaxxing context sweep (`-c 16`), details in `docs/PERF-2026-10-16.md`:
