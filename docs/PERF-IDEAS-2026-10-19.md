@@ -100,4 +100,4 @@ nothing here is a new measurement. The numbered items are referred to by number 
 
 ## Status
 
-- 2026-10-19: items 3 and 10 started on branch `drafting-prefix`.
+- 2026-10-19: items 3 (as prompt-lookup drafting; tree verification not done) and 10 done (branch `drafting-prefix`, merged): `docs/LOOKUP-FORK.md`.
