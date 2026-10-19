@@ -173,13 +173,22 @@ MoE models:
 
 ### Out of the box
 
-- **X1. Out of the VM, or onto NVLink.** The machine is a Proxmox guest (the root filesystem is VM 108's disk).
-  Peer-to-peer copies take 49-51 ms instead of microseconds, and `cudaHostRegister` is 4x slower inside the engine
-  than standalone: both point at the virtualization layer. Bare metal, or passthrough with IOMMU / ACS set up for
-  peer access, could make the cross-GPU exchange ~5x cheaper: an immediate gain for the dense engine, and tensor
-  parallel reopens for the MoE models. Further: dual SXM2-to-PCIe carrier boards with an NVLink bridge exist in the
-  homelab market; NVLink 2.0 between two V100s (~150 GB/s, a few microseconds) changes every multi-GPU tradeoff
-  measured so far. First step, no code: check the GPUs' IOMMU groups and ACS in Proxmox.
+- **X1. Peer-to-peer over PCIe, then NVLink.** (Corrected after checking the host, 2026-10-19.) bnk runs in an LXC
+  container on a Supermicro Proxmox host, not a VM: the host kernel drives the GPUs. Its IOMMU is in translated
+  mode (`iommu: Default domain type: Translated`, no `iommu=` option on the kernel command line), and the kernel
+  log holds 390 `AMD-Vi IO_PAGE_FAULT` events from GPU 0 (01:00.0) at 0x1f8000xxxxx, inside GPU 1's 32 GB
+  BAR1 aperture (81:00.0 at 0x1f800000000): the IOMMU blocks GPU 0's writes into GPU 1's memory. That is why
+  `cudaMemcpyPeerAsync` took 49-51 ms, and likely why `cudaHostRegister` is slow. The driver itself reports peer
+  read and write as supported (`nvidia-smi topo -p2p r` / `w`: OK). Fix to try, on the Proxmox host, with a reboot:
+  `amd_iommu=on iommu=pt` on the kernel command line (passthrough for host-owned devices; VM passthrough still
+  works). Then `build/bench_xfer` for the exchange time and an engine run with peer access.
+  NVLink: these are PG500-216 boards (V100 PCIe 32 GB, OEM; part 900-2G500-0050-000, device 1DF0). The PCB carries
+  the Quadro GV100's two NVLink connector sets under the shroud, but the driver reports NVLink not supported
+  (`nvidia-smi topo -p2p n`: NS; `nvidia-smi nvlink --status`: no links) and no report of NVLink working on a V100
+  PCIe board was found. A GV100 bridge on modified shrouds is a low-odds experiment; cross-flashing a Quadro VBIOS
+  risks the cards. The real NVLink route is SXM2 V100s on a dual SXM2 carrier board with NVLink (one homelab write-up
+  measured ~33 GB/s peer copies; llama.cpp gained +6% single-stream decode, +17-22% concurrent throughput, +45-66%
+  prompt processing).
 - **X2. Drafting across conversations** ("suffix decoding"): one shared index over all recent conversations'
   outputs instead of the current conversation's only. Agents repeat tool-call scaffolding and re-read files other
   agents read. Built on the existing lookup index.
@@ -196,8 +205,8 @@ MoE models:
 
 1. D1 (the 27B profile) and the cheap D2 test (a Q4 file through today's kernels): together they decide whether
    the 4-bit layout is a week of work for ~2x on the 27B.
-2. In parallel, without code: X1's IOMMU / ACS check. If peer access can be fixed in configuration, it is the
-   cheapest multi-GPU win on the list.
+2. In parallel, without code: X1's IOMMU fix (`iommu=pt` on the host, a reboot). The kernel log shows the IOMMU
+   blocking peer writes; fixing it in configuration is the cheapest multi-GPU win on the list.
 3. Q1 and Q3 before the next round of kernel work: exact mode and the harness make every later change faster to
    judge.
 4. Then, by measured value: D2, D3, D4 / D5 and M1 (both are the window and slot work), item 9 via Q2, X2, X3.
