@@ -58,10 +58,13 @@ struct DenseModel {
     ~DenseModel();
     using Ranges = std::vector<std::pair<int64_t, int64_t>>;
 
+    // one tensor of `gguf` to VRAM, as the kernels read it (BF16 matrices as Q8_0, R layout); also the DFlash2
+    // drafter's weights (DenseDFlash keeps a DenseModel for its own file)
+    QMat upload(const std::string & name, bool required = true);
+
 private:
     std::vector<void *> device_allocs_;
     std::vector<void *> host_allocs_;
-    QMat upload(const std::string & name, bool required = true);
     QMat upload_tensor(const TensorRef & t, bool repack);
     // slices: the given row ranges [r0, r1) concatenated, or the given column ranges of every row (ranges in
     // whole quant blocks)

@@ -1,6 +1,7 @@
 // bnk command line: run a tokenized prompt, greedy decode, and compare against llama.cpp dumps.
 //   bnk run   --model M.gguf --tokens-file F [--max-new N] [--ctx N] [--threads N]
 //   bnk check --model M.gguf --tokens-file F --ref PREFIX   (per-layer residual + logits vs llama_ref)
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -122,6 +123,7 @@ int main(int argc, char ** argv) {
         else if (a == "--ref") ref = next();
         else if (a == "--profile") opt.profile = next();
         else if (a == "--mtp") opt.mtp = next();
+        else if (a == "--dflash") opt.dflash = next();
         else if (a == "--ple-gguf") opt.ple_gguf = next();
         else if (a == "--cold-experts") opt.cold_experts = next();
         else if (a == "--draft-vocab") opt.draft_vocab = next();
@@ -177,7 +179,7 @@ int main(int argc, char ** argv) {
         // teacher-forced negative log-likelihood of the tokens through the decode path, in windows of BNK_NLL_T
         // (default 5) rows: how well the model predicts a text, for comparing kernel variants. BNK_NLL_SKIP=N reads
         // the first N tokens as a prompt first and scores the rest (the predictions at that depth)
-        const int T = std::max(1, std::min(env_int("BNK_NLL_T", 5), (int) kMaxWindow));
+        const int T = std::max(1, std::min(env_int("BNK_NLL_T", 5), eng.max_window()));
         const int V = c.n_vocab;
         std::vector<float> lg((size_t) T * V);
         double nll = 0;
@@ -192,10 +194,17 @@ int main(int argc, char ** argv) {
         double kl_sum = 0, kl_max = 0;
         int64_t top1_same = 0;
         std::vector<int> kl_hist(6, 0);
+        double fwd_ms = 0;   // forward plus the logits copy, full windows only
+        int64_t fwd_n = 0;
         for (size_t i = skip; i + 1 < prompt.size(); i += T) {
             const int t = (int) std::min<size_t>(T, prompt.size() - 1 - i);
+            const auto f0 = std::chrono::steady_clock::now();
             eng.forward(prompt.data() + i, t);
             eng.logits_rows_host(t, lg.data());
+            if (t == T) {
+                fwd_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+                ++fwd_n;
+            }
             for (int r = 0; r < t; ++r) {
                 const float * row = lg.data() + (size_t) r * V;
                 const int want = prompt[i + r + 1];
@@ -239,6 +248,7 @@ int main(int argc, char ** argv) {
         }
         printf("nll %.5f per token over %lld tokens (windows of %d), ppl %.4f, top-1 %.2f%%\n", nll / n, (long long) n, T,
                std::exp(nll / n), 100.0 * top1 / n);
+        if (fwd_n) printf("forward of %d rows: %.2f ms (with the logits copy), over %lld windows\n", T, fwd_ms / fwd_n, (long long) fwd_n);
         if (dump) fclose(dump);
         if (reff) {
             fclose(reff);
@@ -286,6 +296,41 @@ int main(int argc, char ** argv) {
         }
         printf("prefill %zu tokens in %.1f ms (%.1f tok/s): last-token argmax bnk %d ref %d, KL %.4f\n", prompt.size(),
                t1 - t0, prompt.size() / ((t1 - t0) / 1000), a, b, kl);
+        return 0;
+    }
+
+    if (mode == "hdump") {
+        // teacher-forced pass in full windows; per position: the residual after each layer of BNK_HDUMP_LAYERS
+        // (default 5,19,33,47,61: DFlash2's taps) as fp32, concatenated, to BNK_HDUMP (.h), and the argmax to .ids
+        std::vector<int> layers;
+        {
+            const char * s = getenv("BNK_HDUMP_LAYERS");
+            std::string v = s ? s : "5,19,33,47,61";
+            for (size_t a = 0; a < v.size();) {
+                size_t b = v.find(',', a);
+                if (b == std::string::npos) b = v.size();
+                layers.push_back(std::stoi(v.substr(a, b - a)));
+                a = b + 1;
+            }
+        }
+        const char * out = getenv("BNK_HDUMP");
+        if (!out) throw std::runtime_error("hdump: set BNK_HDUMP to the output path prefix");
+        FILE * fh = fopen((std::string(out) + ".h").c_str(), "wb");
+        FILE * fi = fopen((std::string(out) + ".ids").c_str(), "wb");
+        const size_t HC = eng.res_dim();
+        eng.dump_all = true;
+        std::vector<int32_t> am(kMaxWindow);
+        for (size_t p = 0; p < prompt.size(); p += kMaxWindow) {
+            const int T = (int) std::min<size_t>(kMaxWindow, prompt.size() - p);
+            eng.forward(prompt.data() + p, T);
+            eng.argmax_all(T, am.data());
+            for (int t = 0; t < T; ++t)
+                for (int il : layers) fwrite(eng.dumped_layers[il].data() + t * HC, 4, HC, fh);
+            fwrite(am.data(), 4, T, fi);
+        }
+        fclose(fh);
+        fclose(fi);
+        printf("hdump: %zu positions x %zu layers x %zu floats\n", prompt.size(), layers.size(), HC);
         return 0;
     }
 
@@ -449,7 +494,7 @@ int main(int argc, char ** argv) {
                 for (int i : act) ga.push_back(gens[i].get());
                 static const bool even = getenv("BNK_EVEN_ROWS") != nullptr;
                 std::vector<int> rows = Generator::share_rows(ga);
-                if (even) rows.assign(act.size(), std::max(1, kMaxWindow / (int) act.size()));
+                if (even) rows.assign(act.size(), std::max(1, eng.max_window() / (int) act.size()));
                 std::vector<EngineApi::BatchWin> wins;
                 for (size_t j = 0; j < act.size(); ++j) {
                     const auto & w = gens[act[j]]->window(rows[j]);

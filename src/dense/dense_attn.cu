@@ -320,7 +320,7 @@ size_t attention_decode_tc_scratch_floats(int T, int H, int D) { return (size_t)
 
 bool attention_decode_tc(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out,
                          int T, int H, int Hkv, int D, const int * pos0, float scale, float * scratch, cudaStream_t s) {
-    if (T < 1 || T > kRows) return false;
+    if (T < 1 || T > 2 * kRows) return false;   // windows of up to 16 rows: two row blocks (grid x)
     const int ns = decode_splits();
     float * part_o = scratch;
     float * part_ml = scratch + (size_t) ns * T * H * D;

@@ -18,10 +18,10 @@ struct GenOptions {
     // Prompt-lookup drafting: when the sequence's last `lookup_n` tokens occurred earlier in it, what followed
     // them then is proposed as the drafts (up to lookup_max, the window's other rows). Agents re-emit file
     // contents, identifiers and tool-call scaffolding; the MTP drafter proposes 4 tokens at ~75% each, a lookup
-    // match proposes 7. The MTP drafter still runs every round (its K/V must follow the conversation) and its
+    // match proposes up to the window's rows less one (7 on the MoE engine, 15 on the dense one). The MTP drafter still runs every round (its K/V must follow the conversation) and its
     // first token decides between the two when the match is short (lookup_agree). 0 turns the lookup off.
     int lookup_n = 3;
-    int lookup_max = 7;
+    int lookup_max = 15;
     int lookup_agree = 6;   // a match with fewer than this many tokens of context needs the MTP's first token to agree
 };
 
@@ -94,7 +94,7 @@ public:
     // The same round in two halves around Engine::forward_batch (several generators in one forward):
     // window() is this round's tokens (the pending one plus up to max_rows-1 drafts), finish() verifies them from
     // this slot's rows of the forward, commits, drafts the next ones and returns the emitted tokens.
-    const std::vector<int32_t> & window(int max_rows = kMaxWindow);
+    const std::vector<int32_t> & window(int max_rows = 0);   // 0: the engine's max_window()
     // draft = false: verify and commit only; the next drafts come from draft_batch() (several generators' drafter
     // passes in one forward)
     std::vector<int32_t> finish(bool draft = true);
@@ -103,7 +103,7 @@ public:
     int drafts() const { return (int) drafts_.size(); }
     // The rows of one batched forward shared out among generators: one each for the pending token, then the
     // drafts, one at a time round-robin, while rows are left (a generator gets no more rows than it has drafts).
-    static std::vector<int> share_rows(const std::vector<Generator *> & gens, int total = kMaxWindow);
+    static std::vector<int> share_rows(const std::vector<Generator *> & gens, int total = 0);   // 0: max_window()
     // Back-compat for the CLI: start with greedy sampling on a fresh state.
     int32_t prefill(const std::vector<int32_t> & prompt) {
         use_slot();
@@ -138,6 +138,9 @@ private:
     std::vector<int32_t> lookup_;       // the lookup's proposal for the next window (empty: none)
     int lookup_ctx_ = 0;                // its context length
     bool drafts_from_lookup_ = false;   // the current drafts_ came from the lookup
+    // the last round's drafts were a lookup's, all accepted: copying; only then may a lookup fill a window wider
+    // than kMaxWindow (a 16-row window costs ~1.5x an 8-row one, so a partly wrong long match loses)
+    bool lookup_streak_ = false;
     int32_t probe_ = -1;                // the drafter's token after the window's last draft (the probe)
     bool probing_ = false;
     // lookahead

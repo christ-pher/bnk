@@ -297,7 +297,7 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
         layer_misses.assign(c.n_layer, 0);
     }
 
-    const int W = kMaxWindow, E = c.n_embd, FF = c.n_ff;
+    const int W = kMaxWindowDense, E = c.n_embd, FF = c.n_ff;
     res_.alloc(W * E); xn_.alloc(W * E); out_.alloc(W * E); ffn_out_.alloc(W * E);
     const int C = c.conv_channels(), VI = c.ssm_vheads * c.ssm_state;
     conv_out_.alloc(W * C); z_.alloc(W * VI); gdn_o_.alloc(W * VI); gdn_n_.alloc(W * VI);
@@ -376,8 +376,15 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     }
     cur_ = seqs_[0].get();
     cur_->used = true;
-    if (want_mtp && model_.mtp.present)
+    if (want_mtp && model_.mtp.present && opt.dflash.empty())
         mtp_.load(model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
+    if (!opt.dflash.empty() && last_) {
+        if (next_ && !tp()) throw std::runtime_error("dflash: needs one stage or tensor parallel (its taps span the layers)");
+        dflash_.load(opt.dflash, model_, (int) seqs_.size(), st_, opt.verbose);
+        tap_acc_.alloc((size_t) kMaxWindowDense * E);
+        tap_tmp_.alloc((size_t) kMaxWindowDense * E);
+        dflash_.bind(tap_acc_, res_);
+    }
     if (opt.verbose)
         fprintf(stderr, "bnk: %scontext %d: %.0f KiB of %sKV per token (%.2f GiB when full, mapped as used), "
                         "recurrent state %.2f GiB%s\n",
@@ -406,7 +413,7 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
 
 void DenseEngine::alloc_seq(Seq & q) {
     const Config & c = model_.lc;
-    const int W = kMaxWindow, C = c.conv_channels();
+    const int W = kMaxWindowDense, C = c.conv_channels();
     q.conv_buf.resize(c.n_layer);
     q.ssm_state.resize(c.n_layer);
     q.kc.resize(c.n_layer);
@@ -453,6 +460,7 @@ void DenseEngine::select_here(int slot) {
     DeviceScope ds(dev_);
     if (slot < 0 || slot >= (int) seqs_.size()) throw std::runtime_error("select: no slot " + std::to_string(slot));
     use(seqs_[slot].get());
+    if (dflash_.loaded()) dflash_.select(slot);
     if (!cur_->used) {
         cur_->used = true;
         reset_here();
@@ -549,6 +557,7 @@ int DenseEngine::rollback_here(int max_pos) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
     cur_->history.resize(best->pos);
     cur_->mtp_cell = best->mtp_cell;
+    if (dflash_.loaded()) dflash_.restart(best->pos);
     best->age = ++ckpt_age_;
     for (auto & k : cur_->ckpts)
         if (k.pos > best->pos) k.pos = -1;
@@ -581,6 +590,7 @@ void DenseEngine::reset_here() {
     cur_->history.clear();
     for (auto & k : cur_->ckpts) k.pos = -1;
     cur_->mtp_cell = -1;
+    if (dflash_.loaded()) dflash_.restart(0);
     for (int il = l0_; il < l1_; ++il) {
         if (!c.is_attn(il)) {
             CUDA_CHECK(cudaMemsetAsync(cur_->conv_buf[il].p, 0, cur_->conv_buf[il].n * 4, st_));
@@ -724,6 +734,7 @@ void DenseEngine::layer_forward(int il, int T) {
     layer_block(il, T);
     layer_ffn(il, T);
     pend_ = ffn_out_;
+    tap(il, T);
     if (il + 1 == l1_ && !last_) {
         add_rows(res_, pend_, (int64_t) T * E, st_);
         pend_ = nullptr;
@@ -840,6 +851,7 @@ void DenseEngine::tp_enqueue_forward(int T) {
             DeviceScope ds(r->dev_);
             r->tp_recv(r->ffn_out_, T, 1, il);
             r->pend_ = r->ffn_out_;
+            r->tap(il, T);
         }
         if (head_->dump_all) {   // the residual after the layer (rank 0's; the peer's is the same)
             DeviceScope ds(dev_);
@@ -903,7 +915,7 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         if (b.T < 1) throw std::runtime_error("forward: bad window");
         R += b.T;
     }
-    if (R > kMaxWindow) throw std::runtime_error("forward: more than kMaxWindow rows");
+    if (R > kMaxWindowDense) throw std::runtime_error("forward: more than kMaxWindowDense rows");
     fwd_t0_ = now_ms();
     wins_.clear();
     ++seq_;
@@ -916,7 +928,7 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         use(q);
         if (!q->used) { q->used = true; reset_here(); }
         if (pos() + b.T > opt_.max_ctx) { use(keep); throw std::runtime_error("context full"); }
-        ensure_ctx_here(pos() + b.T + kMaxWindow);
+        ensure_ctx_here(pos() + b.T + kMaxWindowDense);
         const int r0 = wins_.empty() ? 0 : wins_.back().r0 + wins_.back().T;
         wins_.push_back(Win{q, r0, b.T, pos(), b.commit_all});
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
@@ -1131,14 +1143,35 @@ void DenseEngine::commit_here(int cnt) {
 }
 
 // ------------------------------------------------------------------------------------------------ drafter
+void DenseEngine::tap(int il, int T) {
+    if (!dflash_.loaded()) return;
+    const int i = dflash_.tap_index(il);
+    if (i < 0) return;
+    const int64_t n = (int64_t) T * model_.cfg.n_embd;
+    copy_f32(tap_tmp_, res_, n, st_);
+    if (pend_) add_rows(tap_tmp_, pend_, n, st_);
+    gemv_auto(dflash_.fc(i), tap_tmp_, model_.cfg.n_embd, T, tap_acc_, model_.cfg.n_embd, i > 0, act_, st_);
+}
+
+void DenseEngine::pf_tap(int il, int N) {
+    if (!dflash_.loaded()) return;
+    const int i = dflash_.tap_index(il);
+    if (i < 0) return;
+    gemm_.run(dflash_.fc(i), pf_.res, model_.cfg.n_embd, N, pf_tap_, model_.cfg.n_embd, i > 0);
+}
+
 void DenseEngine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
+    if (dflash_.loaded()) {   // the same rows' tap accumulator (prompt chunk or decode window)
+        dflash_.feed(R_rows == pf_.res.p ? pf_tap_.p : tap_acc_.p, n, pos0);
+        return;
+    }
     if (!mtp_.loaded()) return;
     DeviceScope ds(dev_);
     const int E = model_.cfg.n_embd;
     if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) E * 4));
     if (cur_->mtp_cell >= 0 && cur_->mtp_cell == pos0 - 1) mtp_.run(cur_->mtp_R, tokens, 1, cur_->mtp_cell, false, nullptr);
-    for (int r0 = 0; r0 < n - 1; r0 += kMaxWindow) {
-        const int rr = std::min(kMaxWindow, n - 1 - r0);
+    for (int r0 = 0; r0 < n - 1; r0 += kMaxWindowDense) {
+        const int rr = std::min(kMaxWindowDense, n - 1 - r0);
         mtp_.run(R_rows + (size_t) r0 * E, tokens + r0 + 1, rr, pos0 + r0, false, nullptr);
     }
     CUDA_CHECK(cudaMemcpyAsync(cur_->mtp_R, R_rows + (size_t) (n - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, st_));
@@ -1176,17 +1209,17 @@ void DenseEngine::argmax_all(int T, int32_t * out, int row0) {
 void DenseEngine::topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z, float temp) {
     if (next_ && !tp()) return next_->topk_rows_host(row0, T, K, ids, vals, z, temp);
     DeviceScope ds(dev_);
-    if (K > kTopkMax || T > kMaxWindow) throw std::runtime_error("topk_rows_host: too many");
+    if (K > kTopkMax || T > kMaxWindowDense) throw std::runtime_error("topk_rows_host: too many");
     if (!topk_ids_.p) {
-        topk_ids_.alloc((size_t) kMaxWindow * kTopkMax);
-        topk_vals_.alloc((size_t) kMaxWindow * kTopkMax);
+        topk_ids_.alloc((size_t) kMaxWindowDense * kTopkMax);
+        topk_vals_.alloc((size_t) kMaxWindowDense * kTopkMax);
     }
     const int V = model_.cfg.n_vocab;
     topk_rows(logits_.p + (size_t) row0 * V, T, V, K, topk_ids_, topk_vals_, st_);
     CUDA_CHECK(cudaMemcpyAsync(ids, topk_ids_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(vals, topk_vals_.p, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st_));
     if (z) {
-        if (!topk_z_.p) topk_z_.alloc(kMaxWindow);
+        if (!topk_z_.p) topk_z_.alloc(kMaxWindowDense);
         row_expsum(logits_.p + (size_t) row0 * V, T, V, temp, topk_z_.p, st_);
         CUDA_CHECK(cudaMemcpyAsync(z, topk_z_.p, (size_t) T * sizeof(double), cudaMemcpyDeviceToHost, st_));
     }

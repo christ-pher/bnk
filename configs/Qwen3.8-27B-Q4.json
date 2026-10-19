@@ -19,7 +19,8 @@
   },
   "speculation": {
     "draft": 7,
-    "draft_min_p": 0.8
+    "draft_min_p": 0.8,
+    "dflash_min_p": 0.2
   },
   "thinking_loop_guard": true,
   "server_args": [
@@ -37,5 +38,6 @@
   "engine_args": [
     "--tp",
     "1"
-  ]
+  ],
+  "dflash": "dflash2-27b.gguf"
 }

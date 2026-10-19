@@ -50,6 +50,7 @@ struct EngineOptions {
     std::string profile;             // ranking for the initial cache fill (STRP or BNKC)
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
+    std::string dflash;              // dense engine: a DFlash2 drafter GGUF (tools/dflash_gguf.py) in place of the MTP
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
     std::string cold_experts;        // the least-routed experts in a smaller format (tools/requant_experts), all kept resident
     // chunk size for long prompts (borrows VRAM from the expert cache meanwhile). 4,096 since the experts moved to

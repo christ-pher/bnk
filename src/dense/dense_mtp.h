@@ -60,7 +60,7 @@ private:
     int max_ctx_ = 0;
     size_t kv_cell_bytes_ = 0;
 
-    // buffers (kMaxWindow rows unless noted)
+    // buffers (kMaxWindowDense rows unless noted)
     DevBuf<float> Rin_, emb_, cat_, R_, xn_, qfull_, k_, v_, q_, attn_o_, attn_scratch_, bo_, sg_, su_, y_, sample_,
         logits_, prob_;
     DevBuf<int32_t> tok_dev_, pos_dev_, out_dev_;
@@ -72,14 +72,18 @@ private:
     // batched drafting: the draft rows gathered
     DevBuf<float> Dres_, dattn_, dbo_, dxn_, dsg_, dsu_, dy_, dsample_, dlogits_, dprob_;
     DevBuf<int32_t> dout_, mpos_;
-    int32_t * h_multi_ = nullptr;   // pinned: [0, 8) tokens in, [8, 24) cells (first, last) per item, [24, 32) out
+    // pinned: [0, W) tokens in, then the cells (first, last) of up to kMItems items, then one token out per item
+    static constexpr int kMItems = 8, kMCell = kMaxWindowDense, kMOut = kMCell + 2 * kMItems, kMSize = kMOut + kMItems;
+    int32_t * h_multi_ = nullptr;
     float * h_mprob_ = nullptr;
-    int32_t * h_io_ = nullptr;      // pinned: [0] token out, [8..15] tokens in, [16..17] cells
+    // pinned: [0] token out, [kIoTok, kIoTok + W) tokens in, [kIoCell, kIoCell + 2) cells
+    static constexpr int kIoTok = 8, kIoCell = kIoTok + kMaxWindowDense, kIoSize = kIoCell + 2;
+    int32_t * h_io_ = nullptr;
     float * h_prob_ = nullptr;
     struct Slot {
         ElasticBuf kv_k, kv_v;
         DevBuf<half> kc, vc;
-        cudaGraphExec_t graphs[kMaxWindow + 1][2] = {};
+        cudaGraphExec_t graphs[kMaxWindowDense + 1][2] = {};
     };
     std::vector<Slot> slots_;
     Slot * cur_ = nullptr;

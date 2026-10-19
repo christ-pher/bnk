@@ -54,7 +54,7 @@ void DenseMtp::load(const DenseModel & main, int max_ctx, cudaStream_t st, bool 
     max_ctx_ = max_ctx;
     CUDA_CHECK(cudaGetDevice(&dev_));
     const Config & c = main.cfg;
-    const int E = c.n_embd, W = kMaxWindow, FF = c.n_ff;
+    const int E = c.n_embd, W = kMaxWindowDense, FF = c.n_ff;
     Rin_.alloc(W * E); emb_.alloc(W * E); cat_.alloc((size_t) W * 2 * E); R_.alloc(W * E); xn_.alloc(W * E);
     qfull_.alloc(W * c.n_head * c.head_dim * 2); k_.alloc(W * c.n_head_kv * c.head_dim);
     v_.alloc(W * c.n_head_kv * c.head_dim); q_.alloc(W * c.n_head * c.head_dim); attn_o_.alloc(c.n_head * c.head_dim);
@@ -76,7 +76,7 @@ void DenseMtp::load(const DenseModel & main, int max_ctx, cudaStream_t st, bool 
         sl.vc.view(sl.kv_v.as<half>(), kv);
     }
     cur_ = &slots_[0];
-    CUDA_CHECK(cudaHostAlloc((void **) &h_io_, 64, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_io_, kIoSize * 4, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &h_prob_, 64, cudaHostAllocMapped));
     // optional draft vocabulary: the head rows of a token subset, re-quantized to Q4_K (BNK_DRAFT_HEAD=TYPE another
     // type, =keep the model's own). The 248K-row head is the biggest read of a draft step: the subset halves it.
@@ -146,10 +146,10 @@ void DenseMtp::load(const DenseModel & main, int max_ctx, cudaStream_t st, bool 
 
 int DenseMtp::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
     DeviceScope ds(dev_);
-    if (n < 1 || n > kMaxWindow) throw std::runtime_error("mtp: bad row count");
+    if (n < 1 || n > kMaxWindowDense) throw std::runtime_error("mtp: bad row count");
     const int E = main_->cfg.n_embd;
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_rows, (size_t) n * E * 4, cudaMemcpyDeviceToDevice, st_));
-    memcpy(h_io_ + 8, next_tokens, n * 4);
+    memcpy(h_io_ + kIoTok, next_tokens, n * 4);
     return forward(n, cell0, draft, prob);
 }
 
@@ -157,15 +157,15 @@ int DenseMtp::step(int32_t tok, int cell, float * prob) {
     DeviceScope ds(dev_);
     const int E = main_->cfg.n_embd;
     CUDA_CHECK(cudaMemcpyAsync(Rin_.p, R_.p, (size_t) E * 4, cudaMemcpyDeviceToDevice, st_));
-    h_io_[8] = tok;
+    h_io_[kIoTok] = tok;
     return forward(1, cell, true, prob);
 }
 
 int DenseMtp::forward(int n, int cell0, bool draft, float * prob) {
     const double t0 = now_ms();
     if (cell0 + n > max_ctx_) throw std::runtime_error("mtp: context full");
-    h_io_[16] = cell0;
-    h_io_[17] = cell0 + n - 1;
+    h_io_[kIoCell] = cell0;
+    h_io_[kIoCell + 1] = cell0 + n - 1;
     cudaGraphExec_t & g = cur_->graphs[n][draft ? 1 : 0];
     if (!g) {
         cudaGraph_t gr;
@@ -201,8 +201,8 @@ void DenseMtp::enqueue(int n, bool draft) {
     const Config & c = main_->cfg;
     const DenseLayer & L = main_->mtp.layer;
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim, FF = c.n_ff;
-    CUDA_CHECK(cudaMemcpyAsync(pos_dev_.p, h_io_ + 16, 8, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_io_ + 8, n * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(pos_dev_.p, h_io_ + kIoCell, 8, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_io_ + kIoTok, n * 4, cudaMemcpyHostToDevice, st_));
     inputs(n);
     // K/V for every row
     dense_norm_q(R_, nullptr, F(L.attn_norm), xn_, n, E, c.rms_eps, act_, st_);
@@ -250,13 +250,13 @@ void DenseMtp::enqueue(int n, bool draft) {
 void DenseMtp::ensure_multi() {
     if (h_multi_) return;
     const Config & c = main_->cfg;
-    const int E = c.n_embd, W = kMaxWindow, FF = c.n_ff;
+    const int E = c.n_embd, W = kMaxWindowDense, FF = c.n_ff;
     const int V = n_dvocab_ ? n_dvocab_ : c.n_vocab;
     Dres_.alloc(W * E); dattn_.alloc(W * c.n_head * c.head_dim); dbo_.alloc(W * E); dxn_.alloc(W * E);
     dsg_.alloc(W * FF); dsu_.alloc(W * FF); dy_.alloc(W * E); dsample_.alloc(W * E); dlogits_.alloc((size_t) W * V);
     dprob_.alloc(W); dout_.alloc(W); mpos_.alloc(2 * W);
-    CUDA_CHECK(cudaHostAlloc((void **) &h_multi_, 32 * 4, cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostAlloc((void **) &h_mprob_, 8 * 4, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_multi_, kMSize * 4, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_mprob_, kMItems * 4, cudaHostAllocMapped));
 }
 
 void DenseMtp::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) {
@@ -266,12 +266,12 @@ void DenseMtp::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, 
     std::vector<MItem> mi;
     int r = 0;
     for (const auto & it : items) {
+        if (r + it.n > kMaxWindowDense) throw std::runtime_error("mtp: more than kMaxWindowDense rows");
         CUDA_CHECK(cudaMemcpyAsync(Rin_.p + (size_t) r * E, it.R_rows, (size_t) it.n * E * 4, cudaMemcpyDeviceToDevice, st_));
         memcpy(h_multi_ + r, it.tokens, it.n * 4);
         mi.push_back({it.slot, it.n, it.cell0});
         r += it.n;
     }
-    if (r > kMaxWindow) throw std::runtime_error("mtp: more than kMaxWindow rows");
     forward_multi(mi, tok_out, prob_out);
 }
 
@@ -292,13 +292,13 @@ void DenseMtp::step_multi(const std::vector<StepItem> & items, int32_t * tok_out
 void DenseMtp::forward_multi(const std::vector<MItem> & items, int32_t * tok_out, float * prob_out) {
     const double t0 = now_ms();
     const int S = (int) items.size();
-    if (S < 1 || S > kMaxWindow) throw std::runtime_error("mtp: bad batch");
+    if (S < 1 || S > kMItems) throw std::runtime_error("mtp: bad batch");
     std::vector<int> key;
     for (int i = 0; i < S; ++i) {
         const MItem & it = items[i];
         if (it.cell0 + it.n > max_ctx_) throw std::runtime_error("mtp: context full");
-        h_multi_[8 + 2 * i] = it.cell0;
-        h_multi_[8 + 2 * i + 1] = it.cell0 + it.n - 1;
+        h_multi_[kMCell + 2 * i] = it.cell0;
+        h_multi_[kMCell + 2 * i + 1] = it.cell0 + it.n - 1;
         key.push_back(it.slot);
         key.push_back(it.n);
     }
@@ -325,7 +325,7 @@ void DenseMtp::forward_multi(const std::vector<MItem> & items, int32_t * tok_out
     multi_slots_.clear();
     for (const auto & it : items) multi_slots_.push_back(it.slot);
     for (int i = 0; i < S; ++i) {
-        tok_out[i] = h_multi_[24 + i];
+        tok_out[i] = h_multi_[kMOut + i];
         prob_out[i] = h_mprob_[i];
     }
     ms += now_ms() - t0;
@@ -344,7 +344,7 @@ void DenseMtp::enqueue_multi(const std::vector<MItem> & items) {
         N += items[i].n;
         last[i] = N - 1;
     }
-    CUDA_CHECK(cudaMemcpyAsync(mpos_.p, h_multi_ + 8, 2 * S * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(mpos_.p, h_multi_ + kMCell, 2 * S * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_multi_, N * 4, cudaMemcpyHostToDevice, st_));
     inputs(N);
     // K/V for every row, into each item's own slot
@@ -391,7 +391,7 @@ void DenseMtp::enqueue_multi(const std::vector<MItem> & items) {
     gemv(head, &act_, nullptr, 0, S, dlogits_, (int) head.rows, false, st_);
     argmax_prob_rows(dlogits_, (int) head.rows, S, dout_, dprob_, st_);
     if (n_dvocab_) map_ids(dout_, dvocab_, S, st_);
-    CUDA_CHECK(cudaMemcpyAsync(h_multi_ + 24, dout_.p, S * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(h_multi_ + kMOut, dout_.p, S * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_mprob_, dprob_.p, S * 4, cudaMemcpyDeviceToHost, st_));
 }
 

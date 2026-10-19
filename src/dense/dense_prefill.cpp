@@ -26,6 +26,7 @@ void DenseEngine::prefill_alloc(int N) {
     p.ao.alloc((size_t) N * c.n_head * c.head_dim);
     p.sg.alloc((size_t) N * FF); p.su.alloc((size_t) N * FF);
     p.tok.alloc(N);
+    if (dflash_.loaded()) pf_tap_.alloc((size_t) N * E);
     // GEMM workspace: the largest matrix dequantized at once (gate / up / down: FF x E), and N x max K inputs
     size_t maxw = (size_t) FF * E;
     for (int il = l0_; il < l1_; ++il) {
@@ -171,6 +172,7 @@ void DenseEngine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
         add_rows(p.res, p.out, (int64_t) N * E, st_);
         lap(t_ffn, [&]() { pf_layer_b(il, N); });
         add_rows(p.res, p.out, (int64_t) N * E, st_);
+        pf_tap(il, N);
     }
     if (prof)
         fprintf(stderr, "pf GPU %d: chunk of %d at %d: attention %.1f ms, DeltaNet %.1f ms, FFN %.1f ms\n", dev_, N, pos0,
@@ -209,6 +211,7 @@ void DenseEngine::tp_prefill_chunk(const int32_t * tokens, int N) {
         for (DenseEngine * r : rk) {
             DeviceScope ds(r->dev_);
             r->tp_pf_recv(r->pf_.res, N, 1, il);
+            r->pf_tap(il, N);
         }
     }
     for (DenseEngine * r : rk) {
@@ -228,7 +231,7 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
     DeviceScope ds(dev_);
     join_commit();
     size_t i = 0;
-    ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
+    ensure_ctx(pos() + (int) tokens.size() + kMaxWindowDense);
     const int n = (int) tokens.size();
     DenseEngine * t = tail();
     if (tp()) {   // both ranks together, chunk by chunk
@@ -245,7 +248,7 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
                 pstats.chunks++;
                 i += N;
             } else {
-                const int T = (int) std::min<size_t>(kMaxWindow, left);
+                const int T = (int) std::min<size_t>(kMaxWindowDense, left);
                 forward(tokens.data() + i, T);
                 mtp_feed(res_, tokens.data() + i, T, pos0);
                 i += T;
@@ -320,7 +323,7 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
             t->mtp_feed(t->pf_.res, tokens.data() + i, N, pos0);
             i += N;
         } else {
-            const int T = (int) std::min<size_t>(kMaxWindow, left);
+            const int T = (int) std::min<size_t>(kMaxWindowDense, left);
             forward(tokens.data() + i, T);
             t->mtp_feed(t->res_, tokens.data() + i, T, pos0);
             i += T;

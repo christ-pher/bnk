@@ -56,6 +56,18 @@ class State:
         self.defaults.update(self.config.get("sampling", {}))
         spec = self.config.get("speculation", {})
         self.draft_defaults = {k: spec[k] for k in ("draft", "draft_min_p") if k in spec}
+        # the DFlash2 drafter (configs/*.json "dflash": a file name in the cache directory, or a path; BNK_DFLASH=0
+        # drafts with the MTP instead): its own cut-off ("dflash_min_p") replaces draft_min_p
+        self.dflash = None
+        dfl = self.config.get("dflash")
+        if dfl and os.environ.get("BNK_DFLASH", "1") != "0":
+            dfl = dfl if os.path.isabs(dfl) else os.path.join(os.path.expanduser(args.cache_dir), dfl)
+            if os.path.exists(dfl):
+                self.dflash = dfl
+                if "dflash_min_p" in spec:
+                    self.draft_defaults["draft_min_p"] = spec["dflash_min_p"]
+            else:
+                print(f"bnk: note: no DFlash2 drafter at {dfl}; drafting with the MTP (tools/dflash_gguf.py writes it)", flush=True)
         # the guard: --no-think-guard, else BNK_THINK_GUARD, else the model config, else on
         if args.think_guard is None and os.environ.get("BNK_THINK_GUARD"):
             args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
@@ -77,6 +89,8 @@ class State:
                 eargs += ["--cold-experts", cold]
             else:
                 print(f"bnk: note: no cold-experts file at {cold}; running without (tools/requant_experts writes it)", flush=True)
+        if self.dflash:
+            eargs += ["--dflash", self.dflash]
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
             if args.draft_vocab:

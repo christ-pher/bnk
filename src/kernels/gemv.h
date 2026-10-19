@@ -1,4 +1,4 @@
-// Host API of the decode-window matrix kernels (T <= 8 tokens).
+// Host API of the decode-window matrix kernels (T <= kMaxGemvRows tokens).
 #pragma once
 
 #include <cstddef>
@@ -8,7 +8,9 @@
 
 namespace bnk {
 
-constexpr int kMaxWindow = 8;  // tokens per decode/verify window
+constexpr int kMaxWindow = 8;        // tokens per decode/verify window (the MoE engine; shared defaults)
+constexpr int kMaxWindowDense = 16;  // the dense engine's windows (verifies up to 15 lookup drafts)
+constexpr int kMaxGemvRows = 16;     // the GEMVs: the tensor-core kernel takes 16 tokens in one pass, the others two
 
 // Throws if the last kernel launch failed (bad configuration); no synchronization.
 void check_launch(const char * what);
@@ -33,7 +35,7 @@ struct ActQ8 {
     int8_t * q = nullptr;   // [T][cols_pad]
     float * d = nullptr;    // [T][cols_pad/32]
     int16_t * s = nullptr;  // [T][cols_pad/16] sums of the codes per 16 (optional: kernels fall back to dp4a)
-    half * h = nullptr;     // [kMaxWindow][cols_pad] the activations in fp16 (optional: the tensor-core GEMV)
+    half * h = nullptr;     // [T][cols_pad] the activations in fp16 (optional: the tensor-core GEMV)
     int64_t cols_pad = 0;   // row stride of q, multiple of 32
     int T = 0;
     int64_t cols = 0;
@@ -60,6 +62,22 @@ struct GemvSplit {
     float * y2 = nullptr;
     int64_t ldy2 = 0;
 };
+
+// the same activations / split output from token t0 on (a window of more than 8 tokens as two calls)
+inline ActQ8 act_rows(const ActQ8 & a, int t0) {
+    ActQ8 r = a;
+    r.q = a.q + (int64_t) t0 * a.cols_pad;
+    r.d = a.d + (int64_t) t0 * (a.cols_pad / 32);
+    if (a.s) r.s = a.s + (int64_t) t0 * (a.cols_pad / 16);
+    if (a.h) r.h = a.h + (int64_t) t0 * a.cols_pad;
+    r.T = a.T - t0;
+    return r;
+}
+inline GemvSplit split_rows(const GemvSplit & sp, int t0) {
+    GemvSplit r = sp;
+    if (r.y2) r.y2 += (int64_t) t0 * r.ldy2;
+    return r;
+}
 
 // y[t*ldy + r] (+)= W[r,:] . x_t   for r < W.rows, t < T (rows from sp.r1 on into sp.y2).
 //   quantized W: x comes from `a` (quantize_act first); float W: x comes from `x`/ldx.

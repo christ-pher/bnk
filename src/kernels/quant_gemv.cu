@@ -357,7 +357,7 @@ static void launch_float(const QMat & W, const float * x, int64_t ldx, int T, fl
 
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
           bool accumulate, cudaStream_t s, GemvSplit sp) {
-    if (T < 1 || T > kMaxWindow) throw std::runtime_error("gemv: window out of range");
+    if (T < 1 || T > kMaxGemvRows) throw std::runtime_error("gemv: window out of range");
     if (W.layout == 1) {
         if (!a || a->cols != W.cols) throw std::runtime_error("gemv: activation not quantized for this width");
         gemv_r(W, *a, T, y, ldy, accumulate, s, sp);
@@ -365,6 +365,17 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
     }
     if (is_float_format(W.type) && !getenv("BNK_OLD_FLOAT")) {
         gemv_float2(W, x, ldx, T, y, ldy, accumulate, s, sp);
+        return;
+    }
+    if (T > 8) {   // the paths below hold at most 8 tokens: two calls
+        if (a) {
+            const ActQ8 a2 = act_rows(*a, 8);
+            gemv(W, a, x, ldx, 8, y, ldy, accumulate, s, sp);
+            gemv(W, &a2, nullptr, 0, T - 8, y + 8 * ldy, ldy, accumulate, s, split_rows(sp, 8));
+        } else {
+            gemv(W, nullptr, x, ldx, 8, y, ldy, accumulate, s, sp);
+            gemv(W, nullptr, x + 8 * ldx, ldx, T - 8, y + 8 * ldy, ldy, accumulate, s, split_rows(sp, 8));
+        }
         return;
     }
     if (sp.y2 && sp.r1 < W.rows) {   // the other paths: the two halves as two launches
@@ -400,6 +411,11 @@ void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, i
         return;
     }
     if (!is_float_format(W.type) && use_ref_gemv()) {
+        if (T > 8) {   // the reference kernel holds 8 tokens
+            gemv_auto(W, x, ldx, 8, y, ldy, accumulate, scratch, s, sp);
+            gemv_auto(W, x + 8 * ldx, ldx, T - 8, y + 8 * ldy, ldy, accumulate, scratch, s, split_rows(sp, 8));
+            return;
+        }
         const int grid = grid_for_rows(W.rows, 8);
         const ROff ro{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
         auto f = [&]<int FMT>() {

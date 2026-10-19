@@ -209,12 +209,13 @@ static void launch_r1(const QMat & W, const ActQ8 & a, int T, float * y, int64_t
 // converted on the way; else fp16 (the fp16 copy quantize_act writes). RG row groups of 8 rows per warp share each
 // activation load (RG = 2: half the activation traffic, which was ~2.5x the weight bytes). KS warps split a row
 // block's K (1, 2, 4 or 8); a block holds 8 / KS row blocks of 8 * RG rows.
-template <int FMT, bool XF, int RG>
+// NTG token groups of 8 (2: windows of 9-16 tokens): each unpacked weight fragment feeds NTG mma calls.
+template <int FMT, bool XF, int RG, int NTG>
 __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W, size_t row_bytes, ROff o, int rows,
                                                   int nsb, const void * __restrict__ xv_, int64_t ldx, int T,
                                                   float * __restrict__ y, int64_t ldy, int accumulate, int ks,
                                                   GemvSplit sp) {
-    __shared__ float part[8][64 * RG];
+    __shared__ float part[8][64 * RG * NTG];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int grp = blockIdx.x * (8 / ks) + warp / ks, kp = warp % ks;
     const int qp = (lane >> 2) & 3, j = (lane & 3) | ((lane >> 4) << 2);   // quad pair; row / token within it
@@ -222,30 +223,36 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 #pragma unroll
     for (int g = 0; g < RG; ++g) rowp[g] = W + (size_t) min(grp * 8 * RG + g * 8 + j, rows - 1) * row_bytes;
     const int per = (nsb + ks - 1) / ks, sb0 = kp * per, sb1 = min(nsb, sb0 + per);
-    float c[RG][8];
+    float c[RG][NTG][8];
 #pragma unroll
     for (int g = 0; g < RG; ++g)
 #pragma unroll
-        for (int i = 0; i < 8; ++i) c[g][i] = 0.f;
+        for (int tg = 0; tg < NTG; ++tg)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[g][tg][i] = 0.f;
     for (int s = sb0; s < sb1; s += 4) {
         const int sb = s + qp;
         const bool ok = sb < sb1;
-        uint32_t xw[16];   // token j's 32 activations of this sub-block, fp16
-        if (!ok || j >= T) {   // past K, or a token past the window (its column is not stored): zeros, no loads
+        uint32_t xw[NTG][16];   // token (8 tg + j)'s 32 activations of this sub-block, fp16
 #pragma unroll
-            for (int i = 0; i < 16; ++i) xw[i] = 0;
-        } else if constexpr (XF) {
-            const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
+        for (int tg = 0; tg < NTG; ++tg) {
+            const int tj = 8 * tg + j;
+            if (!ok || tj >= T) {   // past K, or a token past the window (its column is not stored): zeros, no loads
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const float4 f = __ldg(xp + i);
-                xw[2 * i] = h2u(__floats2half2_rn(sat_h(f.x), sat_h(f.y)));
-                xw[2 * i + 1] = h2u(__floats2half2_rn(sat_h(f.z), sat_h(f.w)));
+                for (int i = 0; i < 16; ++i) xw[tg][i] = 0;
+            } else if constexpr (XF) {
+                const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) tj * ldx + (int64_t) sb * 32);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float4 f = __ldg(xp + i);
+                    xw[tg][2 * i] = h2u(__floats2half2_rn(sat_h(f.x), sat_h(f.y)));
+                    xw[tg][2 * i + 1] = h2u(__floats2half2_rn(sat_h(f.z), sat_h(f.w)));
+                }
+            } else {
+                const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) tj * ldx + (int64_t) sb * 32);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) ((uint4 *) xw[tg])[i] = __ldg(xp + i);
             }
-        } else {
-            const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) j * ldx + (int64_t) sb * 32);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) ((uint4 *) xw)[i] = __ldg(xp + i);
         }
 #pragma unroll
         for (int g = 0; g < RG; ++g) {
@@ -255,29 +262,36 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 #pragma unroll
                 for (int i = 0; i < 16; ++i) w[i] = 0;
 #pragma unroll
-            for (int kk = 0; kk < 8; ++kk) mma884(c[g], w[2 * kk], w[2 * kk + 1], xw[2 * kk], xw[2 * kk + 1]);
+            for (int kk = 0; kk < 8; ++kk)
+#pragma unroll
+                for (int tg = 0; tg < NTG; ++tg)
+                    mma884(c[g][tg], w[2 * kk], w[2 * kk + 1], xw[tg][2 * kk], xw[tg][2 * kk + 1]);
         }
     }
     // the 4 quad pairs hold partial sums of the same tiles in the same registers
 #pragma unroll
     for (int g = 0; g < RG; ++g)
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            c[g][i] += __shfl_xor_sync(0xffffffff, c[g][i], 4);
-            c[g][i] += __shfl_xor_sync(0xffffffff, c[g][i], 8);
-        }
+        for (int tg = 0; tg < NTG; ++tg)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                c[g][tg][i] += __shfl_xor_sync(0xffffffff, c[g][tg][i], 4);
+                c[g][tg][i] += __shfl_xor_sync(0xffffffff, c[g][tg][i], 8);
+            }
     if (qp == 0) {
 #pragma unroll
         for (int g = 0; g < RG; ++g)
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int rr = (lane & 1) + (i & 2) + ((lane >> 4) << 2), t = (i & 4) + (lane & 2) + (i & 1);
-                part[warp][t * 8 * RG + g * 8 + rr] = c[g][i];
-            }
+            for (int tg = 0; tg < NTG; ++tg)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int rr = (lane & 1) + (i & 2) + ((lane >> 4) << 2), t = 8 * tg + (i & 4) + (lane & 2) + (i & 1);
+                    part[warp][t * 8 * RG + g * 8 + rr] = c[g][tg][i];
+                }
     }
     __syncthreads();
     // each row block's K parts added in a fixed order (deterministic)
-    constexpr int E = 64 * RG;   // (token, row) pairs per row block
+    constexpr int E = 64 * RG * NTG;   // (token, row) pairs per row block
     for (int idx = threadIdx.x; idx < (8 / ks) * E; idx += 256) {
         const int gg = idx / E, e = idx % E;
         const int t = e / (8 * RG), rr = (blockIdx.x * (8 / ks) + gg) * 8 * RG + e % (8 * RG);
@@ -313,7 +327,8 @@ static void launch_mma_k(const QMat & W, const void * x, int64_t ldx, int T, flo
     const int rg = rg_env == 2 && W.rows >= 2048 ? 2 : 1;
     const int groups = (int) ((W.rows + 8 * rg - 1) / (8 * rg)), per_block = 8 / ks;
     const ROff o{W.r_off[0], W.r_off[1], W.r_off[2], W.r_off[3], W.r_off[4]};
-    auto k = rg == 2 ? gemv_mma_k<FMT, XF, 2> : gemv_mma_k<FMT, XF, 1>;
+    auto k = T > 8 ? (rg == 2 ? gemv_mma_k<FMT, XF, 2, 2> : gemv_mma_k<FMT, XF, 1, 2>)
+                   : (rg == 2 ? gemv_mma_k<FMT, XF, 2, 1> : gemv_mma_k<FMT, XF, 1, 1>);
     k<<<(groups + per_block - 1) / per_block, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, o, (int) W.rows, nsb,
                                                            x, ldx, T, y, ldy, acc ? 1 : 0, ks, sp);
     check_launch("gemv_mma");
@@ -335,6 +350,11 @@ static int mma_min_tokens() {
 
 void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp) {
     if (a.h && T >= mma_min_tokens() && mma_min_tokens() > 0) return launch_mma(W, a, T, y, ldy, accumulate, s, sp);
+    if (T > 8) {   // the dp4a kernels hold at most 8 tokens: two calls (the weights read twice)
+        gemv_r(W, a, 8, y, ldy, accumulate, s, sp);
+        gemv_r(W, act_rows(a, 8), T - 8, y + 8 * ldy, ldy, accumulate, s, split_rows(sp, 8));
+        return;
+    }
     if (T == 1) launch_r1<1>(W, a, T, y, ldy, accumulate, s, sp);
     else if (T == 2) launch_r1<2>(W, a, T, y, ldy, accumulate, s, sp);
     else if (T <= 4) launch_r1<4>(W, a, T, y, ldy, accumulate, s, sp);
@@ -486,6 +506,11 @@ void gemv_float2(const QMat & W, const float * x, int64_t ldx, int T, float * y,
     if (W.type == QT_F16 && W.rows >= 256 && W.cols % 32 == 0 && ldx % 4 == 0 && T >= mma_min_tokens() &&
         mma_min_tokens() > 0)
         return launch_mma_k<QT_F16, true>(W, x, ldx, T, y, ldy, accumulate, s, sp);
+    if (T > 8) {   // as gemv_r
+        gemv_float2(W, x, ldx, 8, y, ldy, accumulate, s, sp);
+        gemv_float2(W, x + 8 * ldx, ldx, T - 8, y + 8 * ldy, ldy, accumulate, s, split_rows(sp, 8));
+        return;
+    }
     if (T == 1) launch_f0<1>(W, x, ldx, T, y, ldy, accumulate, s, sp);
     else if (T == 2) launch_f0<2>(W, x, ldx, T, y, ldy, accumulate, s, sp);
     else if (T <= 4) launch_f0<4>(W, x, ldx, T, y, ldy, accumulate, s, sp);

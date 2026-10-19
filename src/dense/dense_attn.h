@@ -14,7 +14,7 @@ namespace bnk {
 bool attention_prefill_tc(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out,
                           int N, int H, int Hkv, int D, int pos0, float scale, cudaStream_t s);
 
-// The same for a decode window of T <= 8 rows, pos0 in device memory (graph-friendly): the keys are split over
+// The same for a decode window of T <= 16 rows, pos0 in device memory (graph-friendly): the keys are split over
 // decode_splits() blocks per KV head (BNK_DEC_SPLITS, default 64: 85 / 84 / 81 tok/s at 64K for 64 / 128 / 256; at most kDecodeSplitsMax), combined through
 // `scratch` (attention_decode_tc_scratch_floats floats, sized for the maximum).
 constexpr int kDecodeSplitsMax = 256;

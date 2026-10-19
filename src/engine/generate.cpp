@@ -105,7 +105,13 @@ void Generator::lookup_drafts(int32_t bonus) {
     int ctx = 0;
     const int p = index_.find(seq_, &ctx);
     if (p < 0) return;
-    const int L = std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, kMaxWindow - 1 + (probing_ ? 1 : 0)});
+    // BNK_LOOKUP_WIDE: 0 never wider than kMaxWindow, 1 (default) during a streak or when the match shares at least
+    // BNK_LOOKUP_WIDE_CTX tokens of context before its n-gram (a verbatim copy), 2 always
+    static const int wide = getenv("BNK_LOOKUP_WIDE") ? atoi(getenv("BNK_LOOKUP_WIDE")) : 1;
+    static const int wide_ctx = getenv("BNK_LOOKUP_WIDE_CTX") ? atoi(getenv("BNK_LOOKUP_WIDE_CTX")) : 16;
+    const bool w = wide == 2 || (wide == 1 && (lookup_streak_ || ctx >= wide_ctx));
+    const int rows = w ? eng_.max_window() : std::min(eng_.max_window(), kMaxWindow);
+    const int L = std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, rows - 1 + (probing_ ? 1 : 0)});
     if (L <= 0) return;
     lookup_.assign(seq_.begin() + p, seq_.begin() + p + L);
     lookup_ctx_ = ctx;
@@ -129,6 +135,7 @@ bool Generator::choose_drafts(int32_t mtp_first, float mtp_prob) {
 }
 
 void Generator::count_round(int accepted, int drafted) {
+    lookup_streak_ = drafts_from_lookup_ && drafted > 0 && accepted == drafted;
     if (drafts_from_lookup_) {
         stats.lookup_rounds++;
         stats.lookup_drafted += drafted;
@@ -232,7 +239,7 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
 
 std::vector<int32_t> Generator::next() {
     if (la_stage0_done_) fprintf(stderr, "bnk: BUG: a plain round with a half-done lookahead window (la_on %d)\n", (int) la_on_);
-    window(kMaxWindow);
+    window();
     const int T = (int) win_.size();
     use_slot();
     const double t0 = now_ms();
@@ -242,6 +249,7 @@ std::vector<int32_t> Generator::next() {
 }
 
 const std::vector<int32_t> & Generator::window(int max_rows) {
+    if (max_rows <= 0) max_rows = eng_.max_window();
     use_slot();
     win_.clear();
     win_.push_back(pending_);
@@ -255,6 +263,7 @@ const std::vector<int32_t> & Generator::window(int max_rows) {
 
 std::vector<int> Generator::share_rows(const std::vector<Generator *> & gens, int total) {
     const int n = (int) gens.size();
+    if (n && total <= 0) total = gens[0]->eng_.max_window();
     std::vector<int> rows(n, 1);
     int left = total - n;
     for (bool more = true; left > 0 && more;) {
@@ -397,7 +406,7 @@ std::vector<int32_t> Generator::finish(bool draft) {
 // ------------------------------------------------------------------------------------------------- lookahead
 std::vector<int32_t> Generator::next_lookahead() {
     if (!la_stage0_done_ && (!la_on_ || !mtp_ || !eng_.lookahead_ok())) return next();
-    window(kMaxWindow);
+    window();
     const int T = (int) win_.size();
     use_slot();
     if (la_stage0_done_ && (int) la_spec_.size() != T) la_stage0_done_ = false;   // (the context limit truncated it)
@@ -420,11 +429,11 @@ std::vector<int32_t> Generator::next_lookahead() {
         int ctx = 0;   // the table holds the history's n-grams (synced by lookup_drafts): the tail may end in the window
         const int p = index_.find(seq_, &ctx);
         if (p >= 0) {
-            const int L = std::min<int>({opt_.lookup_max + 1, (int) seq_.size() - p, kMaxWindow});
+            const int L = std::min<int>({opt_.lookup_max + 1, (int) seq_.size() - p, eng_.max_window()});
             if (L > 0) la_lookup.assign(seq_.begin() + p, seq_.begin() + p + L);
         }
     }
-    const int chain_T = std::min(kMaxWindow, opt_.max_draft + 1);
+    const int chain_T = std::min(eng_.max_window(), opt_.max_draft + 1);
     const bool spec_from_lookup = !la_lookup.empty();
     const bool worth = spec_from_lookup || la_conf_ >= la_min;
     auto chain = [&](std::vector<int32_t> & out) -> int {

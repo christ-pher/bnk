@@ -1,4 +1,4 @@
-// The dense Qwen3.5-family forward (qwen35: Qwen3.8-27B) over a window of up to kMaxWindow tokens, and its prompt
+// The dense Qwen3.5-family forward (qwen35: Qwen3.8-27B) over a window of up to kMaxWindowDense tokens, and its prompt
 // path. Every weight lives in VRAM: one forward is one CUDA graph launch per pipeline stage (captured per window
 // layout), nothing crosses to the CPU but the window's inputs and the residual rows between GPUs.
 //
@@ -21,6 +21,7 @@
 
 #include "core/util.h"
 #include "core/vmem.h"
+#include "dense/dense_dflash.h"
 #include "dense/dense_model.h"
 #include "dense/dense_mtp.h"
 #include "engine/engine.h"
@@ -46,8 +47,11 @@ public:
     std::string model_name() const override { return model_.gguf.get_str("general.name", "bnk"); }
     const Config & cfg() const override { return model_.cfg; }
     int res_dim() const override { return model_.cfg.n_embd; }
-    Drafter * mtp() override { return next_ && !tp() ? next_->mtp() : mtp_.loaded() ? &mtp_ : nullptr; }
+    Drafter * mtp() override {
+        return next_ && !tp() ? next_->mtp() : dflash_.loaded() ? (Drafter *) &dflash_ : mtp_.loaded() ? &mtp_ : nullptr;
+    }
     int max_ctx() const override { return opt_.max_ctx; }
+    int max_window() const override { return kMaxWindowDense; }
     int cpu_threads() const override { return 0; }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
     size_t graph_bytes() const override { return graph_bytes_ + (next_ ? next_->graph_bytes() : 0); }
@@ -188,6 +192,12 @@ private:
 
     DenseModel model_;
     DenseMtp mtp_;
+    // the DFlash2 drafter (opt.dflash; tensor parallel rank 0 or a single stage): the target adds each tap layer's
+    // fc_i . residual into tap_acc_ (decode windows) / pf_tap_ (prompt chunks)
+    DenseDFlash dflash_;
+    DevBuf<float> tap_acc_, tap_tmp_, pf_tap_;
+    void tap(int il, int T);                 // decode: after layer il's FFN (res_ + pend_ is its residual)
+    void pf_tap(int il, int N);              // prompt chunk: after layer il (pf_.res)
     EngineOptions opt_;
     VramBudget budget_;
     cudaStream_t st_ = nullptr, st_commit_ = nullptr;
@@ -226,7 +236,7 @@ private:
         std::vector<DevBuf<half>> kc, vc;       // [max_ctx][Hkv][D] per attention layer
         std::vector<ElasticBuf> kv_k, kv_v;
         int ctx_mapped = 0;
-        cudaGraphExec_t commit_graphs[kLanes][kMaxWindow][kMaxWindow + 1] = {};
+        cudaGraphExec_t commit_graphs[kLanes][kMaxWindowDense][kMaxWindowDense + 1] = {};
         int last_r0 = 0, last_lane = 0;
         bool used = false;
     };
@@ -254,7 +264,7 @@ private:
     WinParams * d_par_ = nullptr;
     int32_t * h_tok_ = nullptr;
 
-    // device activations (kMaxWindow rows)
+    // device activations (kMaxWindowDense rows)
     DevBuf<float> res_, xn_, out_, ffn_out_;
     DevBuf<float> conv_out_, z_, gdn_o_, gdn_n_;
     DevBuf<float> qfull_, k_, v_, q_, attn_o_, attn_scratch_;
