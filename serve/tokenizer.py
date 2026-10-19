@@ -1,4 +1,8 @@
-"""Byte-level BPE (GPT-2 family) with the qwen35 pre-tokenizer, built from the model's GGUF metadata."""
+"""Byte-level BPE (GPT-2 family) with the qwen35 pre-tokenizer, built from the model's GGUF metadata.
+
+Encoding runs in the toks library (actual-computer/toks: hf-exact ids, AVX2 kernels, 20-45x this module's Python
+BPE on the V100 host) when its wheel is installed and the GGUF's tokenizer family is one serve/tokenizer_json.py
+can write as a tokenizer.json; BNK_TOKS=0 keeps the Python path. Both give the same ids (tools/tok_check.py)."""
 from __future__ import annotations
 
 import codecs
@@ -69,6 +73,9 @@ class Tokenizer:
         self._recent_lock = threading.Lock()
         self.ids = specials
         self.token_bytes = [self._bytes_of(i) for i in range(len(tokens))]
+        self.toks = None          # a toks.Tokenizer over the same vocabulary, or None (the Python path)
+        self.toks_n = 0           # ids the toks table knows: [0, toks_n); the GGUF's padding rows lie beyond
+        self.backend = "python"
 
     # ----------------------------------------------------------------- loading
     @classmethod
@@ -80,7 +87,9 @@ class Tokenizer:
             cp = os.path.join(cache_dir, f"tok-{key}.pkl")
             if os.path.exists(cp):
                 with open(cp, "rb") as f:
-                    return pickle.load(f)
+                    tok = pickle.load(f)
+                tok._attach_toks(path, cache_dir, key)
+                return tok
         md = read_metadata(path, {"tokenizer.ggml.tokens", "tokenizer.ggml.merges", "tokenizer.ggml.token_type",
                                   "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id",
                                   "tokenizer.ggml.bos_token_id", "tokenizer.chat_template", "general.name",
@@ -94,13 +103,38 @@ class Tokenizer:
         if cache_dir:
             with open(cp, "wb") as f:
                 pickle.dump(tok, f)
+        tok._attach_toks(path, cache_dir, key)
         return tok
+
+    def _attach_toks(self, path: str, cache_dir: str | None, key: str) -> None:
+        """Loads the toks library over this vocabulary: the GGUF's tokenizer written as a tokenizer.json beside
+        the pickle (once), then toks_load. Any failure leaves the Python path."""
+        self.toks, self.toks_n, self.backend = None, 0, "python"
+        if os.environ.get("BNK_TOKS", "1") == "0":
+            return
+        try:
+            import toks
+            from .tokenizer_json import write_tokenizer_json
+            jp = os.path.join(cache_dir or os.path.dirname(path), f"tok-{key}.json")
+            if not os.path.exists(jp) and not write_tokenizer_json(path, jp):
+                return
+            tk = toks.Tokenizer.from_file(jp)
+            n = tk.info().get("n_ids", 0)
+            # the toks table must spell every id as this module does (the GGUF's vocabulary, the same bytes)
+            for i in (0, 1, n // 2, n - 1):
+                if tk.token_bytes(i) != self.token_bytes[i]:
+                    return
+            self.toks, self.toks_n = tk, n
+            self.backend = f"toks {toks.__version__} ({tk.info().get('tier', '?')})"
+        except Exception:
+            self.toks, self.toks_n, self.backend = None, 0, "python"
 
     def __getstate__(self):
         d = dict(self.__dict__)
         d.pop("special_re", None)
         d.pop("pre", None)
         d.pop("_recent_lock", None)
+        d.pop("toks", None)
         d["cache"] = {}
         d["wcache"] = {}
         d["_recent"] = []
@@ -108,6 +142,7 @@ class Tokenizer:
 
     def __setstate__(self, d):
         self.__dict__.update(d)
+        self.toks, self.toks_n, self.backend = None, 0, "python"
         self.wcache = {}
         self.byte_table = {i: c for i, c in self.byte_enc.items()}
         self._recent = []
@@ -142,6 +177,9 @@ class Tokenizer:
         return out
 
     def _encode_plain(self, text: str) -> list[int]:
+        if self.toks is not None:
+            # a segment between added tokens: hf's pipeline without added-token extraction, no template
+            return self.toks.encode(text, add_special_tokens=False, added_tokens="none")
         # the cache is keyed by the word as written: a hit skips the byte mapping too (most words, after the first
         # few requests); the mapping itself is a str.translate over the word's UTF-8 bytes read as Latin-1
         out, wcache, bpe, table = [], self.wcache, self._bpe, self.byte_table
@@ -212,6 +250,8 @@ class Tokenizer:
             return t.encode("utf-8")
 
     def decode(self, ids: list[int]) -> str:
+        if self.toks is not None and all(0 <= i < self.toks_n for i in ids):
+            return self.toks.decode(ids, skip_special_tokens=False)
         return b"".join(self.token_bytes[i] for i in ids if 0 <= i < len(self.tokens)).decode("utf-8", errors="replace")
 
     def id_of(self, text: str) -> int | None:
