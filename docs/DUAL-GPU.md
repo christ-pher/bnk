@@ -69,7 +69,10 @@ reserve (`--vram-reserve-gib 1.5`) or cap the expert cache on the GPU Plex uses 
   order deadlocked).
 * **Between stages** the residual rows (4 x 2560 floats per token, 40 KiB) go through pinned host memory: the
   first graph ends with a device-to-host copy, the next one starts with a host-to-device copy. Prompt chunks
-  have their own pair of buffers (up to 8,192 rows each).
+  have their own pair of buffers (up to 8,192 rows each). Peer copies work since the host's IOMMU went to
+  passthrough (2026-10-19, docs/DENSE.md) but are not used here: one handoff per forward saves ~15 us of a
+  10-20 ms decode forward, and a 2,048-token chunk's 84 MB (~8 ms each way) overlaps ~4 s of compute, while
+  device-side prompt buffers would take ~0.7 GB from the second GPU's expert cache.
 * **Prompts are pipelined.** While the first GPU reads chunk k+1, a worker thread runs chunk k through the later
   GPUs (and feeds the drafter's KV). Between chunks both are idle, and the server's other conversations decode
   then, as before. `BNK_PIPE_PROMPT=0` reads chunk by chunk through all GPUs.
