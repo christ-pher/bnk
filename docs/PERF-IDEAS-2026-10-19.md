@@ -182,6 +182,8 @@ MoE models:
   read and write as supported (`nvidia-smi topo -p2p r` / `w`: OK). Fix to try, on the Proxmox host, with a reboot:
   `amd_iommu=on iommu=pt` on the kernel command line (passthrough for host-owned devices; VM passthrough still
   works). Then `build/bench_xfer` for the exchange time and an engine run with peer access.
+  **Done 2026-10-19:** `iommu=pt` set on the host; `bench_xfer` 9.4 us per exchange (host path 22.9 us); the dense
+  engine's tensor parallel exchange uses peer copies: decode +6-7%, prompts +11% (docs/DENSE.md).
   NVLink: these are PG500-216 boards (V100 PCIe 32 GB, OEM; part 900-2G500-0050-000, device 1DF0). The PCB carries
   the Quadro GV100's two NVLink connector sets under the shroud, but the driver reports NVLink not supported
   (`nvidia-smi topo -p2p n`: NS; `nvidia-smi nvlink --status`: no links) and no report of NVLink working on a V100

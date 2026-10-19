@@ -123,6 +123,13 @@ private:
     DevBuf<float> tp_tmp_;
     DevBuf<half> tp_mine16_, tp_peer16_;
     cudaEvent_t tp_fork_ = nullptr, tp_join_ = nullptr;
+    // peer copies instead (needs the host's IOMMU in passthrough, docs/DENSE.md), plain device copies across devices
+    // (unified addressing; cudaMemcpyPeerAsync does not capture). Per point and parity: decode pushes this rank's
+    // partial into the peer's tp_d_ (an inbox); prompt chunks convert into this rank's tp_pfd_ and the peer pulls it.
+    bool tp_p2p_ = false;
+    DevBuf<float> tp_d_[2][2];
+    DevBuf<half> tp_pfd_[2][2];
+    static void tp_enable_p2p(DenseEngine * a, DenseEngine * b, bool verbose);
     void tp_send(const float * buf, int rows, int point, int il);
     void tp_recv(float * buf, int rows, int point, int il);
     void tp_pf_send(const float * partial, int rows, int point, int il);   // as fp16, from partial

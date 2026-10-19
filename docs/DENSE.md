@@ -61,10 +61,14 @@ k+1 while the other finishes chunk k).
 **Tensor parallel (`--tp 1`, the config's setting):** every layer is split across both cards: half the attention
 heads and KV heads, half the DeltaNet key groups with their value heads (the KV cache and recurrent state follow
 their heads), half the FFN rows. Both cards stream their half at once; after the attention / DeltaNet and after
-the FFN the two partial sums are all-reduced. Peer-to-peer copies between these two V100s take 51 ms whatever the
-size (the PCIe topology under the hypervisor), so the exchange goes through pinned host memory: each rank copies
-its partial out, waits for the peer's event, copies the peer's partial in and adds it. 23 us per exchange at one
-row, 43 us at five; 128 of them per forward. Both ranks add the same two values, so their residual streams stay
+the FFN the two partial sums are all-reduced. With peer access (the host's IOMMU in passthrough, `iommu=pt` on
+the Proxmox kernel command line; BNK_TP_P2P=0 turns it off) each rank pushes its decode partial straight into the
+peer's inbox and waits for the peer's event before adding; prompt chunks convert to fp16 and the peer pulls them.
+Without it (a translating IOMMU blocks peer writes: 51 ms per copy) the exchange goes through pinned host memory:
+each rank copies its partial out, waits for the peer's event, copies the peer's partial in and adds it. 23 us per
+exchange at one row, 43 us at five; 128 of them per forward. Peer copies against the host path (Q8_0, 2026-10-19):
+greedy decode 43.4 -> 46.4 tok/s, MTP draft 7 72.7 -> 77.0, a 3,000-token prompt 1,340 -> 1,490 tok/s; the same
+tokens. Pushing the prompt partials too measured the same as pulling them (and needs four more fp16 buffers). Both ranks add the same two values, so their residual streams stay
 identical bit for bit (prompt chunks exchange fp16 partials, and both ranks add the two rounded halves). One CUDA
 graph per window layout spans both devices (rank 0 captures, the peer's stream joins through an event). Rank 0
 holds the head and the drafter; the peer's residual is identical, so nothing needs to cross for them.

@@ -227,6 +227,7 @@ void DenseEngine::load(const std::string & path, const EngineOptions & opt) {
             s->peer_ = prev;
         }
         s->load_stage(path, opt);
+        if (prev && tpar) tp_enable_p2p(prev, s, opt.verbose);
         if (prev && !tpar) {
             for (int l = 0; l < kLanes; ++l) prev->xfer_out_[l] = s->xfer_in_[l];
             prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
@@ -239,6 +240,31 @@ void DenseEngine::load(const std::string & path, const EngineOptions & opt) {
         }
     }
     CUDA_CHECK(cudaSetDevice(dev_));
+}
+
+// Both ranks loaded: peer access both ways if the driver allows it (BNK_TP_P2P=0 keeps the pinned host path).
+// With the host IOMMU translating, peer writes are blocked and a copy takes ~50 ms, so check the exchange time
+// (build/bench_xfer) before trusting it.
+void DenseEngine::tp_enable_p2p(DenseEngine * a, DenseEngine * b, bool verbose) {
+    if (getenv("BNK_TP_P2P") && atoi(getenv("BNK_TP_P2P")) == 0) return;
+    int ab = 0, ba = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&ab, a->dev_, b->dev_));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&ba, b->dev_, a->dev_));
+    if (!ab || !ba) return;
+    for (DenseEngine * r : {a, b}) {
+        DeviceScope ds(r->dev_);
+        const cudaError_t e = cudaDeviceEnablePeerAccess((r == a ? b : a)->dev_, 0);
+        if (e == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+        else CUDA_CHECK(e);
+        for (int pt = 0; pt < 2; ++pt) {
+            for (int par = 0; par < 2; ++par) {
+                r->tp_d_[pt][par].alloc(r->tp_tmp_.n);
+                if (r->tp_mine16_.n) r->tp_pfd_[pt][par].alloc(r->tp_mine16_.n);
+            }
+        }
+        r->tp_p2p_ = true;
+    }
+    if (verbose) fprintf(stderr, "bnk: tensor parallel exchange: peer copies GPU %d <-> GPU %d\n", a->dev_, b->dev_);
 }
 
 void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt) {
@@ -740,7 +766,11 @@ void DenseEngine::enqueue_forward(int T) {
 // residuals stay bit for bit identical.
 void DenseEngine::tp_send(const float * buf, int rows, int point, int il) {
     const int par = il & 1;
-    CUDA_CHECK(cudaMemcpyAsync(tp_h_[point][par], buf, (size_t) rows * model_.cfg.n_embd * 4, cudaMemcpyDeviceToHost, st_));
+    const size_t bytes = (size_t) rows * model_.cfg.n_embd * 4;
+    if (tp_p2p_)   // pushed straight into the peer's inbox (it adds from there; one copy instead of two)
+        CUDA_CHECK(cudaMemcpyAsync(peer_->tp_d_[point][par].p, buf, bytes, cudaMemcpyDeviceToDevice, st_));
+    else
+        CUDA_CHECK(cudaMemcpyAsync(tp_h_[point][par], buf, bytes, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaEventRecord(tp_ev_[point][il], st_));
 }
 
@@ -748,6 +778,10 @@ void DenseEngine::tp_recv(float * buf, int rows, int point, int il) {
     const int par = il & 1;
     const size_t n = (size_t) rows * model_.cfg.n_embd;
     CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_ev_[point][il], 0));
+    if (tp_p2p_) {
+        add_rows(buf, tp_d_[point][par], (int64_t) n, st_);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(tp_tmp_.p, peer_->tp_h_[point][par], n * 4, cudaMemcpyHostToDevice, st_));
     add_rows(buf, tp_tmp_, (int64_t) n, st_);
 }
@@ -756,8 +790,12 @@ void DenseEngine::tp_recv(float * buf, int rows, int point, int il) {
 void DenseEngine::tp_pf_send(const float * partial, int rows, int point, int il) {
     const int par = il & 1;
     const size_t n = (size_t) rows * model_.cfg.n_embd;
-    f32_to_f16(partial, tp_mine16_, (int64_t) n, st_);
-    CUDA_CHECK(cudaMemcpyAsync(tp_pfh_[point][par], tp_mine16_.p, n * 2, cudaMemcpyDeviceToHost, st_));
+    if (tp_p2p_) {   // converted straight into the staging buffer the peer pulls from
+        f32_to_f16(partial, tp_pfd_[point][par], (int64_t) n, st_);
+    } else {
+        f32_to_f16(partial, tp_mine16_, (int64_t) n, st_);
+        CUDA_CHECK(cudaMemcpyAsync(tp_pfh_[point][par], tp_mine16_.p, n * 2, cudaMemcpyDeviceToHost, st_));
+    }
     CUDA_CHECK(cudaEventRecord(tp_pfev_[point][il], st_));
 }
 
@@ -765,8 +803,13 @@ void DenseEngine::tp_pf_recv(float * res, int rows, int point, int il) {
     const int par = il & 1;
     const size_t n = (size_t) rows * model_.cfg.n_embd;
     CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->tp_pfev_[point][il], 0));
-    CUDA_CHECK(cudaMemcpyAsync(tp_peer16_.p, peer_->tp_pfh_[point][par], n * 2, cudaMemcpyHostToDevice, st_));
-    add_rows_f16x2(res, tp_mine16_, tp_peer16_, (int64_t) n, st_);
+    if (tp_p2p_) {
+        CUDA_CHECK(cudaMemcpyAsync(tp_peer16_.p, peer_->tp_pfd_[point][par].p, n * 2, cudaMemcpyDeviceToDevice, st_));
+        add_rows_f16x2(res, tp_pfd_[point][par], tp_peer16_, (int64_t) n, st_);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(tp_peer16_.p, peer_->tp_pfh_[point][par], n * 2, cudaMemcpyHostToDevice, st_));
+        add_rows_f16x2(res, tp_mine16_, tp_peer16_, (int64_t) n, st_);
+    }
 }
 
 // Rank 0 drives both ranks' streams layer by layer (each phase on each rank, then the exchange): captured into

@@ -95,8 +95,9 @@ becomes a `__device__` function `stage_X(block_id, n_blocks, ...)` taking the sa
 * `kMaxWindow = 8` is baked into ~78 sites; the persistent kernel should keep T <= 8.
 * Cooperative launch needs all blocks co-resident: shared memory and registers per block bound the grid
   (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`); the IQ tables in shared memory (8 KB for IQ2_S) count.
-* Never enable CUDA peer access on this host: `cudaMemcpyPeerAsync` then takes 49 ms per copy. Pinned host +
-  events costs 15-28 us per exchange.
+* Peer access needs the Proxmox host's IOMMU in passthrough (`iommu=pt`, set 2026-10-19): with it translating,
+  a peer copy took 49 ms. Now 9.4 us per exchange (`build/bench_xfer`) against 23 us through pinned host memory.
+  `cudaMemcpyPeerAsync` does not capture into a graph; a plain `cudaMemcpyAsync` across devices does.
 * The expert cache's `slot_of` uses -2 for "the other card's expert" on the TP branch; master has only -1.
 * GPU 0 has ECC enabled with `pending: Enabled` (the disable did not register); V100 HBM2 ECC costs no
   bandwidth, so it is not a performance factor; `nvidia-smi -i 0 -e 0` then reboot if the user wants it off.
