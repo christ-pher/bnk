@@ -363,6 +363,7 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         if (eng.pos() + 2 >= eng.max_ctx()) { a.stop = true; a.reason = "context"; }
     };
     auto finish_request = [&](Active & a) {
+        try { a.gen->lookahead_abort(); } catch (...) {}   // a half-done next window dies with the request
         const double tg1 = now_ms();
         const auto & gs = a.gen->stats;
         const double gms = tg1 - a.tg0;
@@ -488,29 +489,58 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         }
     };
 
+    // a confirmed speculation leaves a request's next window half done on the first GPU: before anything else
+    // runs on the engine (a batched round, a prompt read), that request's round is completed on its own
+    auto la_drain = [&]() {
+        for (auto & a : active) {
+            if (!a->gen->lookahead_pending()) continue;
+            try {
+                a->gen->set_lookahead(false);
+                a->out = a->gen->next_lookahead();
+                deliver(*a);
+            } catch (const std::exception & e) {
+                emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
+                exit_if_gpu_lost(eng);
+                try { eng.select(a->slot); eng.reset(); } catch (...) {}
+            }
+        }
+    };
     // one round for every request in flight: their windows in one batched forward; finished requests leave
     auto run_round = [&]() {
         try {
-            std::vector<Generator *> gens;
-            for (auto & a : active) gens.push_back(a->gen.get());
-            const std::vector<int> rows = Generator::share_rows(gens);
-            std::vector<EngineApi::BatchWin> wins;
-            for (size_t i = 0; i < active.size(); ++i) {
-                const auto & w = active[i]->gen->window(rows[i]);
-                wins.push_back({active[i]->slot, w.data(), (int) w.size(), w.size() == 1});
+            // one request on a two-GPU pipeline: the lookahead round (the first GPU runs the next window while the
+            // second verifies this one; BNK_LOOKAHEAD=0 turns it off)
+            static const bool lookahead = !getenv("BNK_LOOKAHEAD") || atoi(getenv("BNK_LOOKAHEAD")) != 0;
+            if (lookahead && active.size() == 1 && eng.lookahead_ok()) {
+                Active & a = *active[0];
+                a.gen->set_lookahead(true);
+                a.out = a.gen->next_lookahead();
+                deliver(a);
+            } else {
+                la_drain();
+                std::vector<Generator *> gens;
+                for (auto & a : active) gens.push_back(a->gen.get());
+                if (!gens.empty()) {
+                    const std::vector<int> rows = Generator::share_rows(gens);
+                    std::vector<EngineApi::BatchWin> wins;
+                    for (size_t i = 0; i < active.size(); ++i) {
+                        const auto & w = active[i]->gen->window(rows[i]);
+                        wins.push_back({active[i]->slot, w.data(), (int) w.size(), w.size() == 1});
+                    }
+                    const double f0 = now_ms();
+                    eng.forward_batch(wins);
+                    const double f1 = now_ms();
+                    // verify and commit every request, then all their drafts in one drafter pass (BNK_DRAFT_BATCH=0:
+                    // each request drafts on its own)
+                    static const bool draft_batch = !getenv("BNK_DRAFT_BATCH") || atoi(getenv("BNK_DRAFT_BATCH")) != 0;
+                    for (auto & a : active) {
+                        a->gen->stats.verify_ms += f1 - f0;
+                        a->out = a->gen->finish(!draft_batch);
+                    }
+                    if (draft_batch) Generator::draft_batch(gens);
+                    for (auto & a : active) deliver(*a);
+                }
             }
-            const double f0 = now_ms();
-            eng.forward_batch(wins);
-            const double f1 = now_ms();
-            // verify and commit every request, then all their drafts in one drafter pass (BNK_DRAFT_BATCH=0:
-            // each request drafts on its own)
-            static const bool draft_batch = !getenv("BNK_DRAFT_BATCH") || atoi(getenv("BNK_DRAFT_BATCH")) != 0;
-            for (auto & a : active) {
-                a->gen->stats.verify_ms += f1 - f0;
-                a->out = a->gen->finish(!draft_batch);
-            }
-            if (draft_batch) Generator::draft_batch(gens);
-            for (auto & a : active) deliver(*a);
         } catch (const std::exception & e) {
             for (auto & a : active)
                 emit(JsonOut().kv("type", "error").kv("id", a->id).kv("message", e.what()).done());
@@ -650,6 +680,7 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         }
         const double t0 = now_ms(), budget = read_share * (t0 - (chunk_t0 > shown->t0 ? chunk_t0 : shown->t0));
         while (!active.empty() && now_ms() - t0 < budget) run_round();
+        la_drain();
         eng.select(shown->slot);   // back to the prompt being read
         shown->interleave_ms += now_ms() - t0;
         chunk_t0 = now_ms();
@@ -678,6 +709,7 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         }
         if (have) {
             pipe_drain();   // a request's prompt is read on both GPUs, with nothing in flight
+            la_drain();
             const std::string op = req["op"].str();
             const std::string id = req["id"].str();
             if (op == "reset") {

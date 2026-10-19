@@ -198,6 +198,14 @@ public:
     // tokens of `prompt` the current slot's state can keep (its history, or its last snapshot inside the prefix)
     int reusable(const std::vector<int32_t> & prompt) const;
     bool can_fork() const override;
+    bool lookahead_ok() const override { return first() && !last_ && next_ && next_->last_ && !seqs_.empty() && !seqs_[0]->ssm_shadow.empty(); }
+    void forward_lookahead(const BatchWin & win, int lane, const std::function<int(std::vector<int32_t> &)> & chain,
+                           bool stage0_done) override;
+    bool spec_pending() const override { return spec_inflight_ || cur_->spec_T > 0; }
+    int spec_lane() const override { return spec_inflight_ || cur_->spec_T > 0 ? cur_->spec_lane : -1; }
+    void spec_confirm() override;
+    void spec_discard() override;
+    void spec_abort() override;
     int park_min() const override { return opt_.park_min; }
     // slots with a request in flight (decoding, or the prompt being read): never moved off the GPU to make room
     void set_busy(const std::vector<int> & slots);
@@ -259,6 +267,10 @@ private:
     };
     std::unique_ptr<Worker> worker_;
     std::unique_ptr<Worker> svc_;   // forward_pipe: answers the second stage's CPU experts meanwhile
+    std::unique_ptr<Worker> la_worker_;   // lookahead: the drafter's chain-ahead (the service must run beside it)
+    std::unique_ptr<Worker> spec_worker_;  // lookahead: the speculative forward's CPU experts and its end, while the verdict is processed
+    bool spec_inflight_ = false;
+    void spec_join();                      // waits for the speculative forward (its end records spec_T)
     std::mutex stats_mu_;   // the first stage's counters, updated by the prompt path of every stage
     cudaEvent_t ev_out_ = nullptr;   // this stage's part of the forward is done (the next stage's stream waits)
     cudaEvent_t ev_t0_ = nullptr, ev_t1_ = nullptr;   // timing of this stage's part
@@ -275,7 +287,11 @@ private:
     void save_counts_here();
     // forward_batch in four steps per stage: book the windows (and capture the graph); launch it after the previous
     // stage's; service the CPU experts; wait
-    void fwd_prepare(const std::vector<BatchWin> & batch, int lane = 0);
+    void fwd_prepare(const std::vector<BatchWin> & batch, int lane = 0, bool spec = false);
+    bool spec_ = false;   // the forward being prepared / ended is a speculative one
+    struct Seq;
+    void swap_shadow(Seq & q);   // the slot's recurrent state pointers <-> its shadows (around a speculative forward)
+    void spec_begin(Seq * q, const std::vector<int32_t> & tokens, int lane);   // first stage: shadow := real + the pending window committed in full, then the speculative forward launched
     void fwd_launch(cudaEvent_t after);
     bool fwd_graph_ = true;   // the forward in flight runs as a graph (else eagerly, the CPU part inside)
     cudaGraphExec_t fwd_exec_ = nullptr;
@@ -295,7 +311,7 @@ private:
     void moe(int il, int T);
     void head(int T);
     void service_cpu(uint32_t seq, int T);
-    void enqueue_commit(int c);
+    void enqueue_commit(int c, bool shadow = false);
     void prefill_alloc(int max_n);
     void prefill_staging_alloc();
     void pf_hc_pre(const HcWeights & w, int N, bool inject);
@@ -358,6 +374,12 @@ private:
         int last_r0 = 0;     // where its rows were in the last forward (for its commit)
         int last_lane = 0;   // ... and in which lane's buffers
         bool used = false;   // ever held a conversation (an unused slot maps no context)
+        // lookahead (the first stage of a two-stage pipeline): the speculative window's intermediates live in
+        // the other lane, its recurrent state in these shadow copies (promoted when the speculation held)
+        std::vector<DevBuf<float>> ssm_shadow, conv_shadow;
+        DevBuf<float> ple_shadow;
+        DevBuf<float *> conv_ptrs_shadow;
+        int spec_T = 0, spec_r0 = 0, spec_lane = -1;   // the speculative window run (spec_T 0: none)
     };
     std::vector<std::unique_ptr<Seq>> seqs_;
     Seq * cur_ = nullptr;
@@ -371,7 +393,7 @@ private:
     uint64_t fwd_graph_age_ = 0;
     int64_t graph_captures_ = 0;
     size_t graph_bytes_ = 0;   // device memory the instantiated graphs took (measured at capture)
-    static constexpr int kMaxFwdGraphs = 32;
+    int max_fwd_graphs_ = 32;   // 48 with lookahead (its layouts in the other lane; BNK_FWD_GRAPHS)
     static constexpr size_t kGraphBytesEst = 24ull << 20;   // ~18 MiB measured per instantiated forward graph
     static constexpr int kMaxSlots = 8;
     void alloc_seq(Seq & q);

@@ -1,6 +1,8 @@
 #include "engine/engine.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <cmath>
 #include <cstring>
 
@@ -552,6 +554,19 @@ void Engine::alloc_seq(Seq & q) {
         }
     }
     if (c.ple_layer >= 0 && owns(c.ple_layer)) q.ple_hist.alloc((size_t) ((c.ple_conv - 1) * c.ple_ngram + W) * HC);
+    // lookahead shadows (the first stage of a pipeline, unless BNK_LOOKAHEAD=0)
+    static const bool la = !getenv("BNK_LOOKAHEAD") || atoi(getenv("BNK_LOOKAHEAD")) != 0;
+    if (la && first() && !last_) {
+        q.ssm_shadow.resize(c.n_layer);
+        q.conv_shadow.resize(c.n_layer);
+        for (int il = l0_; il < l1_; ++il)
+            if (!c.is_attn(il)) {
+                q.conv_shadow[il].alloc(q.conv_buf[il].n);
+                q.ssm_shadow[il].alloc(q.ssm_state[il].n);
+            }
+        if (q.ple_hist.p) q.ple_shadow.alloc(q.ple_hist.n);
+        max_fwd_graphs_ = getenv("BNK_FWD_GRAPHS") ? atoi(getenv("BNK_FWD_GRAPHS")) : 48;
+    }
 }
 
 void Engine::use(Seq * q) {
@@ -745,6 +760,9 @@ void Engine::reset_here() {
     join_commit_here();
     const Config & c = model_.cfg;
     cur_->history.clear();
+    cur_->pending_T = 0;   // a half-done lookahead window dies with the conversation
+    cur_->spec_T = 0;
+    cur_->spec_lane = -1;
     for (auto & k : cur_->ckpts) k.pos = -1;
     cur_->mtp_cell = -1;
     for (int il = l0_; il < l1_; ++il) {
@@ -938,18 +956,222 @@ void Engine::gdn(int il, int T) {
 }
 
 // Keep the first c rows of the last verify window: replay the delta rule over them and shift the histories.
-void Engine::enqueue_commit(int cnt) {
+// shadow: the pending window applied to the slot's shadow state (a speculative commit) instead of its real one
+void Engine::enqueue_commit(int cnt, bool shadow) {
     const Config & c = model_.cfg;
     const int C = c.conv_channels(), K = c.ssm_conv, S = c.ssm_state, nv = c.ssm_vheads;
     const size_t r0 = (size_t) cur_->last_r0;
     for (int il = l0_; il < l1_; ++il) {
         if (c.is_attn(il)) continue;
         const int ln = cur_->last_lane;
-        gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv, cur_->ssm_state[il],
-                       nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
+        gdn_recurrence(gdn_co_[ln][il].p + r0 * C, C, gdn_g_[ln][il].p + r0 * nv, gdn_b_[ln][il].p + r0 * nv,
+                       shadow ? cur_->ssm_shadow[il] : cur_->ssm_state[il], nullptr, cnt, c.ssm_groups, nv, S, cnt, st_);
     }
-    if (n_gdn_) shift_rows_multi(cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
-    if (cur_->ple_hist.p) shift_rows(cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
+    if (n_gdn_) shift_rows_multi(shadow ? cur_->conv_ptrs_shadow : cur_->conv_ptrs, n_gdn_, C, cnt, K - 1, st_);
+    if (cur_->ple_hist.p) shift_rows(shadow ? cur_->ple_shadow : cur_->ple_hist, c.hc_dim(), cnt, (c.ple_conv - 1) * c.ple_ngram, st_);
+}
+
+// ---------------------------------------------------------------------------------------------------- lookahead
+void Engine::swap_shadow(Seq & q) {
+    const Config & c = model_.cfg;
+    for (int il = l0_; il < l1_; ++il)
+        if (!c.is_attn(il)) {
+            std::swap(q.ssm_state[il].p, q.ssm_shadow[il].p);
+            std::swap(q.conv_buf[il].p, q.conv_shadow[il].p);
+        }
+    std::swap(q.ple_hist.p, q.ple_shadow.p);
+}
+
+// The first stage: the shadow state becomes the real one with the pending window (the one the second stage is
+// verifying) committed in full, and the window that would follow is run against it in `lane`, its
+// intermediates in that lane's buffers. The real state and the pending window's intermediates stay untouched.
+void Engine::spec_begin(Seq * q, const std::vector<int32_t> & tokens, int lane) {
+    DeviceScope ds(dev_);
+    const Config & c = model_.cfg;
+    if (q != cur_) throw std::runtime_error("lookahead: the speculative window must be the current slot's");
+    if (!q->conv_ptrs_shadow.p) {   // the shadow conv buffers' pointer table, once (they never move)
+        std::vector<float *> ptrs;
+        for (int il = l0_; il < l1_; ++il)
+            if (!c.is_attn(il)) ptrs.push_back(q->conv_shadow[il].p);
+        q->conv_ptrs_shadow.alloc(ptrs.size());
+        CUDA_CHECK(cudaMemcpy(q->conv_ptrs_shadow.p, ptrs.data(), ptrs.size() * sizeof(float *), cudaMemcpyHostToDevice));
+        if (!q->conv_ptrs.p) {   // commit_here builds the real one lazily too
+            ptrs.clear();
+            for (int il = l0_; il < l1_; ++il)
+                if (!c.is_attn(il)) ptrs.push_back(q->conv_buf[il].p);
+            n_gdn_ = (int) ptrs.size();
+            q->conv_ptrs.alloc(ptrs.size());
+            CUDA_CHECK(cudaMemcpy(q->conv_ptrs.p, ptrs.data(), ptrs.size() * sizeof(float *), cudaMemcpyHostToDevice));
+        }
+    }
+    // shadow := real (after the pending window's forward, which wrote the window rows into the conv buffers)
+    for (int il = l0_; il < l1_; ++il)
+        if (!c.is_attn(il)) {
+            CUDA_CHECK(cudaMemcpyAsync(q->ssm_shadow[il].p, q->ssm_state[il].p, q->ssm_state[il].n * 4, cudaMemcpyDeviceToDevice, st_));
+            CUDA_CHECK(cudaMemcpyAsync(q->conv_shadow[il].p, q->conv_buf[il].p, q->conv_buf[il].n * 4, cudaMemcpyDeviceToDevice, st_));
+        }
+    if (q->ple_hist.p) CUDA_CHECK(cudaMemcpyAsync(q->ple_shadow.p, q->ple_hist.p, q->ple_hist.n * 4, cudaMemcpyDeviceToDevice, st_));
+    enqueue_commit(q->pending_T, true);   // the pending window, every row kept, into the shadow
+    // the speculative forward reads the shadow: captured (or run) with the pointers swapped
+    swap_shadow(*q);
+    try {
+        const BatchWin w{current_slot(), tokens.data(), (int) tokens.size(), false};
+        fwd_prepare({w}, lane, true);
+        fwd_launch(nullptr);
+    } catch (...) {
+        swap_shadow(*q);
+        spec_ = false;
+        throw;
+    }
+    swap_shadow(*q);
+}
+
+void Engine::forward_lookahead(const BatchWin & win, int lane, const std::function<int(std::vector<int32_t> &)> & chain,
+                               bool stage0_done) {
+    if (!lookahead_ok()) throw std::runtime_error("lookahead: needs a two-stage pipeline with shadows");
+    Engine * s1 = next_.get();
+    Seq * q = seqs_.at(win.slot).get();
+    if (q != cur_) select(win.slot);
+    if (q->spec_T) throw std::runtime_error("lookahead: a speculative window is still pending");
+    const double t0 = now_ms();
+    static const bool dbg = getenv("BNK_LA_DEBUG") != nullptr;
+    auto say = [&](const char * what) { if (dbg) fprintf(stderr, "la %7.1f ms: %s (pos %d pending %d spec %d)\n", now_ms() - t0, what, pos(), cur_->pending_T, cur_->spec_T); };
+    const std::vector<BatchWin> batch{win};
+    if (!stage0_done) fwd_prepare(batch, lane);
+    s1->fwd_prepare(batch, lane);
+    say("prepared");
+    if (!stage0_done) fwd_launch(nullptr);
+    s1->fwd_launch(stage0_done ? nullptr : ev_out_);
+    say("launched");
+    // the drafter chains ahead on a worker (GPU 1's drafter stream), then the second stage's CPU experts
+    std::vector<int32_t> spec;
+    int nspec = 0;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool chained = false;
+    if (!svc_) svc_ = std::make_unique<Worker>();
+    if (!la_worker_) la_worker_ = std::make_unique<Worker>();
+    // the second stage's CPU experts answered from the start: its forward may already be running (a confirmed
+    // speculation) and its kernels wait on them, with the drafter's chain needing that GPU too
+    static const bool seq_svc = getenv("BNK_LA_SEQ_SVC") != nullptr;   // bisection: the second stage served after the first, on this thread
+    if (!seq_svc)
+        svc_->post([&]() {
+            s1->fwd_service();
+            say("worker: stage 1 serviced");
+        });
+    la_worker_->post([&]() {
+        say("chain: start");
+        try {
+            nspec = chain(spec);
+        } catch (...) {
+            nspec = 0;
+        }
+        say("chain: done");
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            chained = true;
+        }
+        cv.notify_all();
+    });
+    std::exception_ptr err;
+    try {
+        if (!stage0_done) {
+            fwd_service();
+            say("stage 0 serviced");
+            fwd_end();   // the first stage's half is done: its rows wait in the hand-off buffer, the window is pending
+            say("stage 0 done");
+        }
+        if (seq_svc) s1->fwd_service();
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&]() { return chained; });
+        }
+        say("chain received");
+        if (nspec > 0 && nspec <= kMaxWindow && pos() + nspec + kMaxWindow <= opt_.max_ctx) {
+            spec.resize(nspec);
+            spec_begin(q, spec, 1 - lane);
+            say("spec launched");
+            // its CPU experts and its end on a worker: the verdict (the second stage's logits) is processed
+            // meanwhile; a miss then only waits for what is left of it
+            if (!spec_worker_) spec_worker_ = std::make_unique<Worker>();
+            spec_inflight_ = true;
+            spec_worker_->post([this]() {
+                fwd_service();
+                fwd_end();   // records spec_T
+                spec_ = false;
+            });
+        }
+    } catch (...) {
+        err = std::current_exception();
+    }
+    la_worker_->wait();
+    svc_->wait();
+    say("workers joined");
+    if (err) {
+        spec_join();
+        std::rethrow_exception(err);
+    }
+    s1->fwd_end();
+    say("stage 1 done");
+    times.total_ms += now_ms() - t0;
+    times.calls++;
+}
+
+void Engine::spec_join() {
+    if (!spec_inflight_) return;
+    spec_worker_->wait();
+    spec_inflight_ = false;
+}
+
+// The speculation held: the shadow (the pending window committed in full, then the speculative window's inputs)
+// is the real state now, the speculative window is the pending one on this stage; the second stage commits
+// the window it verified. Nothing to replay anywhere.
+void Engine::spec_confirm() {
+    spec_join();
+    Seq * q = cur_;
+    if (!q->spec_T) throw std::runtime_error("lookahead: nothing to confirm");
+    {
+        DeviceScope ds(dev_);
+        join_commit_here();
+        const Config & c = model_.cfg;
+        for (int il = l0_; il < l1_; ++il)
+            if (!c.is_attn(il)) {
+                CUDA_CHECK(cudaMemcpyAsync(q->ssm_state[il].p, q->ssm_shadow[il].p, q->ssm_state[il].n * 4, cudaMemcpyDeviceToDevice, st_));
+                CUDA_CHECK(cudaMemcpyAsync(q->conv_buf[il].p, q->conv_shadow[il].p, q->conv_buf[il].n * 4, cudaMemcpyDeviceToDevice, st_));
+            }
+        if (q->ple_hist.p) CUDA_CHECK(cudaMemcpyAsync(q->ple_hist.p, q->ple_shadow.p, q->ple_hist.n * 4, cudaMemcpyDeviceToDevice, st_));
+        q->pending_T = q->spec_T;
+        q->last_r0 = q->spec_r0;
+        q->last_lane = q->spec_lane;
+        q->spec_T = 0;
+        q->spec_lane = -1;
+    }
+    next_->commit_here(next_->cur_->pending_T);
+}
+
+void Engine::spec_abort() {
+    spec_join();
+    spec_discard();
+    Seq * q = cur_;
+    if (!q->pending_T || !first() || last_) return;
+    DeviceScope ds(dev_);
+    join_commit_here();
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    // the pending half window: its tokens leave the history (the second stage never ran it; this stage's state
+    // is the shadow promoted at the confirmation, i.e. every verified window committed)
+    q->history.resize(q->history.size() - q->pending_T);
+    q->pending_T = 0;
+}
+
+void Engine::spec_discard() {
+    spec_join();
+    Seq * q = cur_;
+    if (!q->spec_T) return;
+    DeviceScope ds(dev_);
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    q->history.resize(q->history.size() - q->spec_T);   // the speculative tokens; the real state was never touched
+    q->spec_T = 0;
+    q->spec_lane = -1;
 }
 
 void Engine::join_commit() {
@@ -1315,9 +1537,10 @@ void Engine::forward_batch(const std::vector<BatchWin> & batch_in) {
     times.calls++;
 }
 
-void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
+void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane, bool spec) {
     DeviceScope ds(dev_);
     join_commit_here();
+    spec_ = spec;
     if (lane < 0 || lane >= kLanes || !gdn_co_[lane].size() || (l1_ > l0_ && lane > 0 && first() && last_))
         throw std::runtime_error("forward: no lane " + std::to_string(lane));
     lane_ = lane;
@@ -1334,7 +1557,8 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     std::vector<int> key{(int) batch.size()};
     for (const auto & b : batch) {
         Seq * q = seqs_.at(b.slot).get();
-        if (q->pending_T) throw std::runtime_error("forward: the previous verify window was not committed");
+        if (q->pending_T && !spec) throw std::runtime_error("forward: the previous verify window was not committed");
+        if (spec && (q->spec_T || !q->pending_T)) throw std::runtime_error("forward: a speculative window needs a pending one and no other");
         for (const Win & w : wins_)
             if (w.q == q) throw std::runtime_error("forward: a slot twice in one batch");
         use(q);
@@ -1344,13 +1568,19 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         const int r0 = wins_.empty() ? 0 : wins_.back().r0 + wins_.back().T;
         wins_.push_back(Win{q, r0, b.T, pos(), b.commit_all});
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
-        q->last_r0 = r0;
-        q->last_lane = lane;
+        if (spec) {
+            q->spec_r0 = r0;
+            q->spec_lane = lane;
+        } else {
+            q->last_r0 = r0;
+            q->last_lane = lane;
+        }
         memcpy(h_tok_ + r0, b.tokens, b.T * 4);
         h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
         key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
     }
     key.push_back(lane);
+    key.push_back(spec ? 1 : 0);
     use(keep);
     last_T = R;
     ple_gather();
@@ -1359,7 +1589,7 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     if (fwd_graph_) {
         FwdGraph & fg = fwd_graphs_[key];
         if (!fg.exec) {
-            while ((int) fwd_graphs_.size() > kMaxFwdGraphs) {   // the least recently used layout goes
+            while ((int) fwd_graphs_.size() > max_fwd_graphs_) {   // the least recently used layout goes
                 auto lru = fwd_graphs_.end();
                 for (auto it = fwd_graphs_.begin(); it != fwd_graphs_.end(); ++it)
                     if (it->second.exec && (lru == fwd_graphs_.end() || it->second.used < lru->second.used)) lru = it;
@@ -1470,7 +1700,10 @@ void Engine::fwd_end() {
         cudaGetLastError();
     }
     if (route_log_ && fwd_graph_) write_route_log(last_T, wins_[0].pos0, wins_[0].commit, fwd_t0_, now_ms());
-    for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
+    for (const Win & w : wins_) {
+        if (spec_) w.q->spec_T = w.T;
+        else w.q->pending_T = w.commit ? 0 : w.T;
+    }
     if (opt_.adapt_every > 0 && ++fwd_count_ % opt_.adapt_every == 0) cache_.adapt(counts_, st_, opt_.adapt_swaps);
 }
 
