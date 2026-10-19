@@ -52,6 +52,10 @@ public:
     }
     int max_ctx() const override { return opt_.max_ctx; }
     int max_window() const override { return kMaxWindowDense; }
+    int snap_every() const override {
+        static const int n = getenv("BNK_SNAP_EVERY") ? atoi(getenv("BNK_SNAP_EVERY")) : 8192;
+        return n;
+    }
     int cpu_threads() const override { return 0; }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
     size_t graph_bytes() const override { return graph_bytes_ + (next_ ? next_->graph_bytes() : 0); }
@@ -221,7 +225,7 @@ private:
 
     struct Checkpoint { int pos = -1, mtp_cell = -1; uint64_t age = 0; float * host = nullptr; };
     uint64_t ckpt_age_ = 0;
-    static constexpr int kMaxCheckpoints = 6;
+    static constexpr int kMaxCheckpoints = 12;   // the caller's (2 per request) and up to 8 periodic ones
     // One conversation's state on this stage: history, KV cache of its attention layers, DeltaNet recurrences and
     // conv histories, snapshots, and the graphs that bake its buffers' addresses.
     struct Seq {

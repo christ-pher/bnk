@@ -105,6 +105,9 @@ public:
     // Lookahead on a two-stage pipeline (docs/LOOKAHEAD.md): while the second stage runs a verify window, the
     // first stage runs the window that follows if every draft is accepted. false: unsupported (the calls throw).
     virtual int max_window() const { return kMaxWindow; }   // rows of a decode / verify window (all slots together)
+    // snapshot a long prompt every this many tokens too (0: only where the caller asks), so that a later prompt
+    // sharing a prefix that ends inside a message resumes near its end instead of reading it all again
+    virtual int snap_every() const { return 0; }
     virtual bool lookahead_ok() const { return false; }
     // `win` through both stages; `chain` is called on a worker thread while the GPUs work and may fill the
     // tokens of the window that would follow full acceptance (returns their count, 0 = none), which the first

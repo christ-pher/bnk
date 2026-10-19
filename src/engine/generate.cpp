@@ -196,6 +196,16 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
         if (c < 0 || (size_t) c >= prompt.size()) { at_end = true; continue; }
         if ((size_t) c > keep && (cps.empty() || (size_t) c > cps.back())) cps.push_back((size_t) c);
     }
+    // and evenly through a long prompt (the engine's snap_every, wider spacing past 8 snapshots)
+    if (const int every = eng_.snap_every(); every > 0 && prompt.size() > (size_t) every) {
+        const size_t step = std::max<size_t>(every, ((prompt.size() + 7) / 8 + every - 1) / every * every);
+        std::vector<size_t> all = cps;
+        for (size_t c = step; c < prompt.size(); c += step)
+            if (c > keep) all.push_back(c);
+        std::sort(all.begin(), all.end());
+        all.erase(std::unique(all.begin(), all.end()), all.end());
+        cps = all;
+    }
     size_t from = keep;
     for (size_t cp : cps) {
         const double a = now_ms();
