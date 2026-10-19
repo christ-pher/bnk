@@ -75,7 +75,22 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 | Served (sampled, thinking, 545-token answer) | | 87.5 tok/s |
 
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
-stream at once, with 128 host-memory exchanges of the partial sums per forward (23 us each) in between.
+stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
+each) since v0.4.2, 23 us each through host memory before.
+
+### What v0.4.2 changed: GPU peer-to-peer for the 27B
+
+* **Peer copies between the V100s.** The Proxmox host's IOMMU translated every DMA and blocked GPU-to-GPU writes,
+  so a peer copy took ~50 ms and the 27B's tensor parallel exchange went through host memory. With `iommu=pt` on
+  the host's kernel command line (a reboot), an exchange takes 9.4 us instead of 23. The dense engine now pushes
+  its decode partials straight into the other card's memory (`BNK_TP_P2P=0` restores the host path). Q8_0 27B,
+  the same tokens: greedy decode 43.4 -> 46.4 tok/s, with MTP 72.7 -> 77.0, a 3,000-token prompt 1,340 -> 1,490
+  tok/s. FP4-Local's pipeline hands over once per forward and keeps its host path (under 0.5% to gain:
+  `docs/DUAL-GPU.md`). Without passthrough the engine still enables peer access when the driver reports it, so
+  check `build/bench_xfer` on a new host (`docs/DENSE.md`).
+* **Qwen3.8-27B UD-Q4_K_XL** (`./run.sh qwen27b-q4`): unsloth's 17.6 GB 4-bit GGUF through the dense engine,
+  tensor parallel, two slots; quality against the Q8_0 config not yet measured.
+* The Q8_0 27B config now keeps its KV cache in fp16 (`--kv8` dropped).
 
 ### What v0.4.1 changed: the day's performance work, and cold experts in smaller formats
 
