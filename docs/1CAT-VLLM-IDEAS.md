@@ -5,6 +5,19 @@ modern models fast on V100 / SM70, including both families bnk runs (Qwen3.8-27B
 so its code can be ported with attribution. This note records what it does, how it compares, and what bnk can take.
 Reviewed at commit `6f3557c` (2026-10-11). Companion to `docs/PERF-IDEAS-2026-10-19.md`.
 
+## Results (2026-10-20, branch `1cat-ideas`; details in docs/DENSE.md)
+
+| # | Item | Outcome |
+|---|---|---|
+| 1 | DFlash2 drafter | **Done.** Q8_0 27B greedy code 108 -> 150 tok/s, maths 112 -> 156, prose and copies unchanged; served (temperature 1.0, thinking) 70.8 -> 82.1 tok/s (+16%) once drafts are sampled and verified by rejection sampling. Same tokens greedy. |
+| 3 | FlashAttention-V100 | **Measured, not done.** Attention is ~37% of a 4K chunk at 28K depth, ~50% at 64K; the kernel is bound by shared-memory traffic (Nsight: L1/shared 70%, DRAM 0.7%, one 384-thread block per SM at 168 registers), not by K/V reads: 16 rows per K/V tile (RB=2) and 16-byte P/V loads changed nothing. A 2x kernel needs D split across warps (their design); worth ~15% at 32K, ~30% at 64K. Their kernel is per query head over [head][pos] K/V, without our gate or 8-bit KV: a port, not a drop-in. |
+| 4 | Grouped QSA | **Already measured in bnk** (ROADMAP 2026-10-05): row sharing over the union of selections was slower than the pipelined one-row kernel bnk has (1.77x before); QSA attention is ~10% of a 78K read, so <= 8% is left. |
+| 5 | 128-bit decode loads | **Already in bnk** (`kv_load8`, no paging). At 60K the decode attention moves ~470 GB/s per GPU; 64 splits is the best count (32/128/256 slower). <= ~2 ms per forward left at 60K. |
+| 6 | Snapshots every N | **Done.** Every 8,192 tokens: a second ~20K-token request sharing the document 18.7 -> 6.8 s. |
+| 7 | 16-row lookup windows | **Done.** Copy +27% (186 -> 237 tok/s), others unchanged (dense engine; the MoE engine keeps 8). |
+| 8 | Process | Temperature 0.6 (per request; the configs keep the model's recommended 1.0): served DFlash2 82.1 -> 86.8 tok/s (3.10 per round), MTP 70.8 -> 76.1. A quality gate (Q3/Q4 in PERF-IDEAS) is still to build. |
+| - | Sampled MTP drafts | Tried (the DFlash2 verification for the MTP): 70.4 vs 70.8 tok/s, not kept. |
+
 ## How it compares
 
 Their headline numbers use **4 V100 SXM2 32 GB cards with NVLink** (TP4): twice bnk's memory bandwidth, and cheap

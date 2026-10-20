@@ -137,6 +137,46 @@ add ~10 ms). A follow-up turn reads only its new tokens: the engine snapshots th
 turn began and resumes from there, as the MoE engine does. The engine has no parking: a third conversation
 arriving while two slots are full is read from scratch, and the slots are not moved to host RAM.
 
+## Drafting: DFlash2, 16-row windows, periodic snapshots (2026-10-20, from docs/1CAT-VLLM-IDEAS.md)
+
+**DFlash2** (`src/dense/dense_dflash.*`, `--dflash FILE`, the configs' `"dflash"` key; `BNK_DFLASH=0` drafts with
+the MTP). incoai/Qwen3.8-27B-DFlash2 converted by `tools/dflash_gguf.py` (BF16 safetensors -> GGUF, 3.85 GB; Q8_0
+at load, 2.1 GiB on GPU 0 with 80 MiB of K/V per slot). A 5-layer block drafter: the target's residuals after
+layers 5/19/33/47/61 of every verified position are its context (`fc` split per tap, each `fc_i . h_i` added into
+an accumulator as the forward passes the tap, so no 25,600-wide rows are kept); a block of the bonus token and 7
+mask tokens attends to that context (sliding window 2,048, a 4,096-position ring per slot) and to itself (not
+causal), each layer wrapped in a grouped two-tap convolution whose kernels come from the rows; the target's head
+scores the 7 positions and a rank-256 selector walks their top 16 candidates, each scored against the token chosen
+before it. One pass drafts all 7 (6.4 ms per round).
+
+| Q8_0 27B, 512 tokens | MTP (draft 7, min-p 0.8) | DFlash2 (min-p 0.2) |
+|---|---|---|
+| Greedy prose | 77.3 tok/s, 2.28 tokens per round | 77.1, 2.81 |
+| Greedy code | 108.1, 3.95 | **150.0, 5.58** (+39%) |
+| Greedy maths (thinking) | 111.6, 4.23 | **156.1, 5.76** (+40%) |
+| Greedy copy (lookup drafts) | 215.3 | 215.8 |
+| Served, temperature 1.0, thinking, 8 prompts x 2 x 1,024 tokens | 70.8, 2.11 | **82.1, 2.87** (+16%) |
+
+Greedy output is the same token for token as without drafting. Under sampling the drafter samples each position
+from softmax(selector scores / temperature) over its candidates and hands that distribution to the verifier
+(`Drafter::draft_dist`), which accepts with min(1, p/q) and otherwise draws from max(0, p - q): the target's
+distribution exactly. With greedy (argmax) drafts at temperature 1 DFlash2 was 67.1 tok/s, slower than the MTP;
+the same sampled verification for the MTP drafter gave nothing (70.4 tok/s, 2.08 per round: its distribution is
+too sharp), so it was not kept. The window cut-off uses the draft logits' softmax over the 16 candidates (the
+selector's own softmax is ~1 always). An offline check predicted the greedy numbers before the port (z-lab's
+reference drafter in fp32 on the CPU against `bnk hdump`'s tap residuals): prose 2.86, code 5.74, maths 6.23
+tokens per round.
+
+**16-row windows** (`kMaxWindowDense`, `EngineApi::max_window()`; the MoE engine stays at 8): the tensor-core GEMV
+feeds each unpacked weight fragment to two token groups; the other GEMV paths run two calls; a lookup match fills
+more than 8 rows only while copying (the last lookup round fully accepted, or 16+ tokens of shared context:
+`BNK_LOOKUP_WIDE`, `BNK_LOOKUP_WIDE_CTX`) since a 16-row forward costs 45 ms against 30 ms for 8. Copy task
+(rename a function across a 2,600-character file) 186 -> 237 tok/s (+27%); prose, code and maths unchanged.
+
+**Snapshots every 8,192 tokens** of a long prompt (`snap_every`, `BNK_SNAP_EVERY`; at most 8 per prompt, 12
+snapshot slots per conversation): the same ~20K-token document with another question in the same message, second
+request 18.7 -> 6.8 s.
+
 ## Serving
 
 `./run.sh qwen27b` (the config's `server_args`: context 131,072, 2 slots, no parking: parking exists for the MoE
