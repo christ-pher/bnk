@@ -167,6 +167,23 @@ selector's own softmax is ~1 always). An offline check predicted the greedy numb
 reference drafter in fp32 on the CPU against `bnk hdump`'s tap residuals): prose 2.86, code 5.74, maths 6.23
 tokens per round.
 
+**The drafter on both GPUs** (tensor parallel with peer access): half of each drafter layer's FFN and half of the
+head's rows run on GPU 1 in the same graph (forks and joins by events; each side's top 16 merged). Draft 6.5 -> 4.6
+ms per round, greedy code 144 -> 153.5 tok/s; GPU 1 holds 1.3 GB more. With the GEMV split below, the Q8_0 27B
+serves 88-91 tok/s (temperature 1.0, thinking; MTP 70.8) and decodes greedy code at 157.6, prose at 86.5.
+
+**NVFP4** (`configs/Qwen3.8-27B-NVFP4.json`, nvidia/Qwen3.8-27B-NVFP4 through llama.cpp's converter with
+`--outtype q8_0`: FFN and head NVFP4, the FP8 attention / DeltaNet projections as Q8_0, 19.8 GB). The loader reads
+each matrix's `.scale` (ModelOpt's weight_scale_2) into `QMat::scale`, applied in the GEMV epilogues. Quality
+against Q8_0 (3,000 tokens of text): NLL +0.65%, mean KL 0.018, same top token 92.3% (unsloth's UD-Q4_K_XL: +0.19%,
+0.0064, 96.2%); keeping the FP8 weights exact (F16) changed nothing (KL 0.0181), so the gap is the checkpoint's own.
+Speed: a 1-row forward 21.6 -> 17.5 ms (the bytes), an 8-row one only 28.95 -> 27.4 ms; served with DFlash2 95.7
+tok/s against 88.0 for Q8_0 (MTP: 81.8 / 70.8), greedy code 173 vs 158, prose the same. The 8-row tensor-core GEMV
+is bound by latency, not instructions: Nsight shows NVFP4 gate/up at 41% and down at 28% of DRAM bandwidth with
+~15-20 cycles per issued instruction; a shift-built fp16 unpack with half the instructions, one-step prefetch and
+two accumulator sets each gave nothing or lost (registers). What helped: splitting K over 8 warps whenever K
+allows (both formats -5% at 4-16 rows, `BNK_GEMV_MMA_KS_EVEN=1` restores the old rule).
+
 **16-row windows** (`kMaxWindowDense`, `EngineApi::max_window()`; the MoE engine stays at 8): the tensor-core GEMV
 feeds each unpacked weight fragment to two token groups; the other GEMV paths run two calls; a lookup match fills
 more than 8 rows only while copying (the last lookup round fully accepted, or 16+ tokens of shared context:
