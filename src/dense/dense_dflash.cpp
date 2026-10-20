@@ -14,7 +14,15 @@ static const float * F(const QMat & m) { return (const float *) m.data; }
 
 DenseDFlash::~DenseDFlash() {
     if (!loaded_) return;
+    if (pdev_ >= 0) {
+        DeviceScope dp(pdev_);
+        for (cudaEvent_t e : ev_back_) cudaEventDestroy(e);
+        if (pst_) cudaStreamDestroy(pst_);
+        for (auto * b : {&px_, &pg_, &pu_, &ph_, &pd_, &pxn_, &plogits_, &pvals_}) b->free();
+        pids_.free(); pactq_.free(); pactd_.free(); pacts_.free(); pacth_.free();
+    }
     DeviceScope ds(dev_);
+    for (cudaEvent_t e : ev_to_) cudaEventDestroy(e);
     for (cudaGraphExec_t g : graphs_)
         if (g) cudaGraphExecDestroy(g);
     if (h_par_) cudaFreeHost(h_par_);
@@ -38,8 +46,10 @@ size_t DenseDFlash::vram_bytes() const {
     return b;
 }
 
-void DenseDFlash::load(const std::string & path, const DenseModel & main, int slots, cudaStream_t st, bool verbose) {
+void DenseDFlash::load(const std::string & path, const DenseModel & main, int slots, cudaStream_t st, bool verbose,
+                       int peer_dev) {
     CUDA_CHECK(cudaGetDevice(&dev_));
+    pdev_ = peer_dev;
     st_ = st;
     main_ = &main;
     if (!main.output.valid() || !main.tok_embd.valid()) throw std::runtime_error("dflash: needs the target's head and token table on its GPU");
@@ -74,6 +84,9 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
     sel_succ_ = (half *) w_.upload("candidate_selector.successor_codebook").data;
     const int NL = (int) g.get_u64("dflash2.num_hidden_layers");
     layers_.resize(NL);
+    FF2_ = pdev_ >= 0 ? FF / 2 : FF;
+    V0_ = pdev_ >= 0 ? nvocab_ / 2 : nvocab_;
+    if (pdev_ >= 0 && (FF2_ % 32 || V0_ % 32)) pdev_ = -1, FF2_ = FF, V0_ = nvocab_;
     for (int l = 0; l < NL; ++l) {
         Layer & L = layers_[l];
         const std::string b = "layers." + std::to_string(l) + ".";
@@ -85,9 +98,9 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
         L.wo = w_.upload(b + "self_attn.o_proj.weight");
         L.q_norm = w_.upload(b + "self_attn.q_norm.weight");
         L.k_norm = w_.upload(b + "self_attn.k_norm.weight");
-        L.gate = w_.upload(b + "mlp.gate_proj.weight");
-        L.up = w_.upload(b + "mlp.up_proj.weight");
-        L.down = w_.upload(b + "mlp.down_proj.weight");
+        L.gate = w_.upload_rows(b + "mlp.gate_proj.weight", {{0, FF2_}});
+        L.up = w_.upload_rows(b + "mlp.up_proj.weight", {{0, FF2_}});
+        L.down = w_.upload_cols(b + "mlp.down_proj.weight", {{0, FF2_}});
         L.aconv_proj = w_.upload(b + "attention_conv.kernel_projection.weight");
         L.mconv_proj = w_.upload(b + "mlp_conv.kernel_projection.weight");
         L.aconv_base = (float *) w_.upload(b + "attention_conv.base_kernel").data;
@@ -125,6 +138,35 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
         kc_[s].alloc((size_t) NL * kRing * HKV * D);
         vc_[s].alloc((size_t) NL * kRing * HKV * D);
     }
+    if (pdev_ >= 0) {   // the peer's halves, buffers and stream; events for the forks and joins
+        ev_to_.resize(NL + 1);
+        for (auto & e : ev_to_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        DeviceScope dp(pdev_);
+        pw_.gguf.open(path);
+        pt_.gguf.open(main.gguf.shard_paths().at(0));
+        players_.resize(NL);
+        for (int l = 0; l < NL; ++l) {
+            const std::string b = "layers." + std::to_string(l) + ".mlp.";
+            players_[l].gate = pw_.upload_rows(b + "gate_proj.weight", {{FF2_, FF}});
+            players_[l].up = pw_.upload_rows(b + "up_proj.weight", {{FF2_, FF}});
+            players_[l].down = pw_.upload_cols(b + "down_proj.weight", {{FF2_, FF}});
+        }
+        phead_ = pt_.upload_rows("output.weight", {{V0_, nvocab_}});
+        const int Vp = nvocab_ - V0_;
+        px_.alloc(B * E); pg_.alloc(B * (FF - FF2_)); pu_.alloc(B * (FF - FF2_)); ph_.alloc(B * (FF - FF2_)); pd_.alloc(B * E);
+        pxn_.alloc((B - 1) * E); plogits_.alloc((size_t) (B - 1) * Vp); pids_.alloc((B - 1) * topk_); pvals_.alloc((B - 1) * topk_);
+        const int64_t pc = std::max<int64_t>(E, FF - FF2_);
+        pactq_.alloc(B * pc); pactd_.alloc(B * pc / 32); pacts_.alloc(B * pc / 16); pacth_.alloc(B * pc);
+        pact_.q = pactq_; pact_.d = pactd_; pact_.s = pacts_; pact_.h = pacth_;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&pst_, cudaStreamNonBlocking));
+        ev_back_.resize(NL + 1);
+        for (auto & e : ev_back_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+    if (pdev_ >= 0) {
+        din_.alloc(B * E);
+        rids_.alloc((B - 1) * topk_);
+        rvals_.alloc((B - 1) * topk_);
+    }
     fed_.assign(slots, 0);
     dists_.assign(slots, {});
     valid_lo_.assign(slots, 0);
@@ -134,9 +176,11 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
     multi_next_.assign(slots, 0);
     loaded_ = true;
     if (verbose)
-        fprintf(stderr, "bnk: DFlash2 drafter %s: %d layers, taps %d/%d/%d/%d/%d, block %d, %.2f GiB (K/V %.0f MiB per slot)\n",
+        fprintf(stderr, "bnk: DFlash2 drafter %s: %d layers, taps %d/%d/%d/%d/%d, block %d, %.2f GiB (K/V %.0f MiB per slot)%s\n",
                 path.c_str(), NL, taps_[0], taps_[1], taps_[2], taps_[3], taps_[4], kBlock, vram_bytes() / 1073741824.0,
-                2.0 * kc_[0].n * sizeof(half) / 1048576.0);
+                2.0 * kc_[0].n * sizeof(half) / 1048576.0,
+                pdev_ >= 0 ? (", FFN and head halves on GPU " + std::to_string(pdev_) + " (" +
+                              std::to_string((int) ((pw_.vram_bytes + pt_.vram_bytes) >> 20)) + " MiB)").c_str() : "");
 }
 
 // context rows (at most kMaxWindowDense): hidden_norm, then each layer's K and V (normed, roped) into the ring
@@ -193,23 +237,72 @@ void DenseDFlash::enqueue_block() {
         rmsnorm_rows(x_, F(L.post_norm), xn_, B, E, E, E, eps_, st_);
         gemv_auto(L.mconv_proj, xn_, E, B, dyn_, 4 * G, false, act_, st_);
         dflash_conv(xn_, dyn_, L.mconv_base, xc_, B, E, gsize_, 0, st_);
-        gemv_auto(L.gate, xc_, E, B, g_, FF, false, act_, st_);
-        gemv_auto(L.up, xc_, E, B, u_, FF, false, act_, st_);
-        silu_mul(g_, u_, h_, (int64_t) B * FF, st_);
-        gemv_auto(L.down, h_, FF, B, a_, E, false, act_, st_);
+        ffn(l);
         dflash_conv(a_, dyn_, L.mconv_base, xc_, B, E, gsize_, 1, st_);
         add_rows(x_, xc_, (int64_t) B * E, st_);
     }
     // the drafted rows (all but the anchor's): norm, the target's head, the selector
     rmsnorm_rows(x_ + E, F(norm_), xn_, B - 1, E, E, E, eps_, st_);
-    gemv_auto(main_->output, xn_, E, B - 1, logits_, nvocab_, false, act_, st_);
-    topk_rows(logits_, B - 1, nvocab_, topk_, cids_, cvals_, st_);
+    head();
     gemv_auto(sel_proj_, xn_, E, B - 1, hp_, rank_, false, act_, st_);
     dflash_select(cids_, cvals_, hp_, sel_pre_, sel_succ_, par_, B - 1, topk_, rank_, out_, prob_, qout_, st_);
     CUDA_CHECK(cudaMemcpyAsync(h_out_, out_.p, (B - 1) * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_prob_, prob_.p, (B - 1) * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_q_, qout_.p, (B - 1) * topk_ * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_cand_, cids_.p, (B - 1) * topk_ * 4, cudaMemcpyDeviceToHost, st_));
+}
+
+// a_ = the layer's FFN of xc_: the rows [0, FF2) here; with a peer, rows [FF2, FF) there at the same time (xc_
+// pushed over, its partial sum pushed back and added)
+void DenseDFlash::ffn(int l) {
+    const Layer & L = layers_[l];
+    const int B = kBlock;
+    if (pdev_ >= 0) {
+        const int FP = FF - FF2_;
+        CUDA_CHECK(cudaMemcpyAsync(px_.p, xc_.p, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, st_));
+        CUDA_CHECK(cudaEventRecord(ev_to_[l], st_));
+        DeviceScope dp(pdev_);
+        CUDA_CHECK(cudaStreamWaitEvent(pst_, ev_to_[l], 0));
+        const PeerLayer & P = players_[l];
+        gemv_auto(P.gate, px_, E, B, pg_, FP, false, pact_, pst_);
+        gemv_auto(P.up, px_, E, B, pu_, FP, false, pact_, pst_);
+        silu_mul(pg_, pu_, ph_, (int64_t) B * FP, pst_);
+        gemv_auto(P.down, ph_, FP, B, pd_, E, false, pact_, pst_);
+        CUDA_CHECK(cudaMemcpyAsync(din_.p, pd_.p, (size_t) B * E * 4, cudaMemcpyDeviceToDevice, pst_));
+        CUDA_CHECK(cudaEventRecord(ev_back_[l], pst_));
+    }
+    gemv_auto(L.gate, xc_, E, B, g_, FF2_, false, act_, st_);
+    gemv_auto(L.up, xc_, E, B, u_, FF2_, false, act_, st_);
+    silu_mul(g_, u_, h_, (int64_t) B * FF2_, st_);
+    gemv_auto(L.down, h_, FF2_, B, a_, E, false, act_, st_);
+    if (pdev_ >= 0) {
+        CUDA_CHECK(cudaStreamWaitEvent(st_, ev_back_[l], 0));
+        add_rows(a_, din_, (int64_t) B * E, st_);
+    }
+}
+
+// the drafted rows' logits and their top candidates (cids_, cvals_): rows [0, V0) of the head here, the rest on the
+// peer, each side's top-k merged
+void DenseDFlash::head() {
+    const int R = kBlock - 1, NL = (int) layers_.size();
+    if (pdev_ >= 0) {
+        const int Vp = nvocab_ - V0_;
+        CUDA_CHECK(cudaMemcpyAsync(pxn_.p, xn_.p, (size_t) R * E * 4, cudaMemcpyDeviceToDevice, st_));
+        CUDA_CHECK(cudaEventRecord(ev_to_[NL], st_));
+        DeviceScope dp(pdev_);
+        CUDA_CHECK(cudaStreamWaitEvent(pst_, ev_to_[NL], 0));
+        gemv_auto(phead_, pxn_, E, R, plogits_, Vp, false, pact_, pst_);
+        topk_rows(plogits_, R, Vp, topk_, pids_, pvals_, pst_);
+        CUDA_CHECK(cudaMemcpyAsync(rids_.p, pids_.p, (size_t) R * topk_ * 4, cudaMemcpyDeviceToDevice, pst_));
+        CUDA_CHECK(cudaMemcpyAsync(rvals_.p, pvals_.p, (size_t) R * topk_ * 4, cudaMemcpyDeviceToDevice, pst_));
+        CUDA_CHECK(cudaEventRecord(ev_back_[NL], pst_));
+    }
+    gemv_auto(pdev_ >= 0 ? qmat_rows(main_->output, 0, V0_) : main_->output, xn_, E, R, logits_, V0_, false, act_, st_);
+    topk_rows(logits_, R, V0_, topk_, cids_, cvals_, st_);
+    if (pdev_ >= 0) {
+        CUDA_CHECK(cudaStreamWaitEvent(st_, ev_back_[NL], 0));
+        dflash_merge_topk(cids_, cvals_, rids_, rvals_, V0_, R, topk_, st_);
+    }
 }
 
 void DenseDFlash::draft_block(int anchor, int s) {

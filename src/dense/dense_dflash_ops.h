@@ -21,6 +21,9 @@ void dflash_kv_store(const float * k, const float * v, half * kring, half * vrin
 void dflash_attention(const float * q, const half * kring, const half * vring, float * S, float * out,
                       const DFlashParams * par_dev, int R, int H, int HKV, int D, int ring, int win, int maxk,
                       cudaStream_t s);
+// per row: the top K of the 2K candidates (ids, vals) and (rids + off, rvals), into ids / vals (K <= 16)
+void dflash_merge_topk(int32_t * ids, float * vals, const int32_t * rids, const float * rvals, int off, int rows, int K,
+                       cudaStream_t s);
 // qout [n][K]: each position's distribution over its candidates (sampled drafts)
 void dflash_select(const int32_t * cand, const float * unary, const float * hp, const half * pre, const half * succ,
                    const DFlashParams * par_dev, int n, int K, int rank, int32_t * out, float * prob, float * qout,

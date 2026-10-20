@@ -61,6 +61,7 @@ struct GemvSplit {
     int r1 = 0x7fffffff;
     float * y2 = nullptr;
     int64_t ldy2 = 0;
+    float wscale = 1.f;   // the matrix's global scale (QMat::scale, NVFP4's), applied as each output is written
 };
 
 // the same activations / split output from token t0 on (a window of more than 8 tokens as two calls)

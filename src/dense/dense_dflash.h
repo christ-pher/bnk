@@ -32,7 +32,10 @@ public:
     ~DenseDFlash();
     // `main`: the target (its token table and head; both must be on this GPU); `acc`: the target's decode tap
     // accumulator [kMaxWindowDense][E] and `res`: its residual rows (run() locates its rows by R_rows - res)
-    void load(const std::string & path, const DenseModel & main, int slots, cudaStream_t st, bool verbose);
+    // peer_dev >= 0: a second GPU with peer access (tensor parallel rank 1): half of every layer's FFN and half
+    // of the head's rows run there, in the same graph (the drafter's weight reads split between the cards)
+    void load(const std::string & path, const DenseModel & main, int slots, cudaStream_t st, bool verbose,
+              int peer_dev = -1);
     void bind(const float * acc, const float * res) { acc_ = acc; res_ = res; }
     bool loaded() const { return loaded_; }
     size_t vram_bytes() const;
@@ -63,6 +66,23 @@ public:
     }
 
 private:
+    // the peer's half: FFN rows [FF/2, FF) of gate and up, columns of down; head rows [V0, V)
+    struct PeerLayer { QMat gate, up, down; };
+    int pdev_ = -1, FF2_ = 0, V0_ = 0;
+    cudaStream_t pst_ = nullptr;
+    DenseModel pw_, pt_;   // the drafter's and the target's files, their uploads on the peer
+    std::vector<PeerLayer> players_;
+    QMat phead_;
+    DevBuf<float> px_, pg_, pu_, ph_, pd_, pxn_, plogits_, pvals_, din_, rvals_;
+    DevBuf<int32_t> pids_, rids_;
+    DevBuf<int8_t> pactq_;
+    DevBuf<float> pactd_;
+    DevBuf<int16_t> pacts_;
+    DevBuf<half> pacth_;
+    ActQ8 pact_;
+    std::vector<cudaEvent_t> ev_to_, ev_back_;   // per layer (and the head): here -> peer, peer -> here
+    void ffn(int l);
+    void head();
     struct Layer {
         QMat in_norm, post_norm, wq, wk, wv, wo, q_norm, k_norm, gate, up, down;
         QMat aconv_proj, mconv_proj;

@@ -363,6 +363,7 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
         gemv_r(W, *a, T, y, ldy, accumulate, s, sp);
         return;
     }
+    if (W.scale != 1.f) throw std::runtime_error("gemv: a global scale needs an R-layout matrix");
     if (is_float_format(W.type) && !getenv("BNK_OLD_FLOAT")) {
         gemv_float2(W, x, ldx, T, y, ldy, accumulate, s, sp);
         return;

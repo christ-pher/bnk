@@ -70,7 +70,25 @@ static bool gemv_format(int t) {
     }
 }
 
+// a matrix's global scale: the side tensor `<name>.scale` (F32[1]) an NVFP4 checkpoint's converter writes beside
+// `<name>.weight` (ModelOpt's weight_scale_2); 1 when absent. The GEMVs and the prompt path's dequantization apply it.
+float DenseModel::global_scale(const std::string & wname) const {
+    const std::string suf = ".weight";
+    if (wname.size() <= suf.size() || wname.compare(wname.size() - suf.size(), suf.size(), suf)) return 1.f;
+    const TensorRef * s = gguf.find(wname.substr(0, wname.size() - suf.size()) + ".scale");
+    if (!s || s->type != GGML_TYPE_F32 || s->nbytes < 4) return 1.f;
+    float v;
+    memcpy(&v, s->data, 4);
+    return v;
+}
+
 QMat DenseModel::upload_tensor(const TensorRef & t, bool repack) {
+    QMat m = upload_tensor_raw(t, repack);
+    m.scale = global_scale(t.name);
+    return m;
+}
+
+QMat DenseModel::upload_tensor_raw(const TensorRef & t, bool repack) {
     // BF16 matrices become Q8_0 too (what the Q8_0 release ships them as; the F16 path below is for files that
     // carry F16 matrices), as do the formats the kernels do not read
     if ((!gemv_format((int) t.type) || t.type == GGML_TYPE_BF16) && t.ne[0] % 32 == 0 && t.nrows() >= 2 && t.name != "token_embd.weight") {
@@ -209,7 +227,7 @@ QMat DenseModel::upload_cols(const std::string & name, const Ranges & cols) {
 QMat DenseModel::upload_rows2(const std::string & na, const std::string & nb, const Ranges & ra, const Ranges & rb,
                               QMat & a, QMat & b) {
     const TensorRef & ta = gguf.get(na), & tb = gguf.get(nb);
-    if (ta.type != tb.type || ta.ne[0] != tb.ne[0]) {
+    if (ta.type != tb.type || ta.ne[0] != tb.ne[0] || global_scale(na) != global_scale(nb)) {
         a = upload_rows(na, ra);
         b = upload_rows(nb, rb);
         return QMat{};
@@ -224,6 +242,7 @@ QMat DenseModel::upload_rows2(const std::string & na, const std::string & nb, co
     tt.ne[2] = tt.ne[3] = 1;
     tt.nbytes = b1.size();
     QMat ab = upload_tensor(tt, true);
+    ab.scale = global_scale(na);
     a = qmat_rows(ab, 0, n1);
     b = qmat_rows(ab, n1, n2);
     return ab;
@@ -234,6 +253,7 @@ bool DenseModel::stack(const std::string & na, const std::string & nb, QMat & a,
     if (!stacks) return false;
     const TensorRef * ta = gguf.find(na), * tb = gguf.find(nb);
     if (!ta || !tb || ta->type != tb->type || ta->ne[0] != tb->ne[0] || ta->row_bytes() != tb->row_bytes()) return false;
+    if (global_scale(na) != global_scale(nb)) return false;   // one stacked matrix has one global scale
     if (!a.valid() || !b.valid()) return false;
     std::vector<uint8_t> buf((size_t) (ta->nrows() + tb->nrows()) * ta->row_bytes());
     memcpy(buf.data(), ta->data, (size_t) ta->nrows() * ta->row_bytes());
@@ -253,6 +273,7 @@ bool DenseModel::stack(const std::string & na, const std::string & nb, QMat & a,
     tt.ne[2] = tt.ne[3] = 1;
     tt.nbytes = buf.size();
     ab = upload_tensor(tt, true);
+    ab.scale = global_scale(na);
     if (ab.layout != a.layout || ab.type != a.type) {   // (converted differently after all: keep them apart)
         a = upload(na);
         b = upload(nb);

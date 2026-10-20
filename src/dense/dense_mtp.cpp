@@ -119,6 +119,7 @@ void DenseMtp::load(const DenseModel & main, int max_ctx, cudaStream_t st, bool 
                 for (auto & t : th) t.join();
                 void * d;
                 dhead_ = upload_matrix(q.data(), dt, n, cols, rb, true, &d);
+                dhead_.scale = H.scale;   // the rows were dequantized without the head's global scale
                 allocs_.push_back(d);
                 vram_ += dhead_.row_bytes * n;
             } else if (!ids.empty() && H.row_bytes % 16 == 0) {

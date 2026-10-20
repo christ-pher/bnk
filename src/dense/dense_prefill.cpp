@@ -26,7 +26,6 @@ void DenseEngine::prefill_alloc(int N) {
     p.ao.alloc((size_t) N * c.n_head * c.head_dim);
     p.sg.alloc((size_t) N * FF); p.su.alloc((size_t) N * FF);
     p.tok.alloc(N);
-    if (dflash_.loaded()) pf_tap_.alloc((size_t) N * E);
     // GEMM workspace: the largest matrix dequantized at once (gate / up / down: FF x E), and N x max K inputs
     size_t maxw = (size_t) FF * E;
     for (int il = l0_; il < l1_; ++il) {

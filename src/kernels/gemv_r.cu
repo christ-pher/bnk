@@ -138,6 +138,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
 #pragma unroll
                         for (int w = 0; w < 8; ++w) s += red[w][rsel][t];
                         float * yp = gemv_out(sp, y, ldy, t, r);
+                        s *= sp.wscale;
                         *yp = accumulate ? *yp + s : s;
                     }
                 }
@@ -148,7 +149,8 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
             for (int t = 0; t < NT; ++t) {
                 if (t < T) {
                     float * yp = gemv_out(sp, y, ldy, t, r);
-                    *yp = accumulate ? *yp + acc[t] : acc[t];
+                    const float v = acc[t] * sp.wscale;
+                    *yp = accumulate ? *yp + v : v;
                 }
             }
         }
@@ -298,6 +300,7 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
         if (t < T && rr < rows) {
             float v = 0.f;
             for (int w = 0; w < ks; ++w) v += part[gg * ks + w][e];
+            v *= sp.wscale;
             float * yp = gemv_out(sp, y, ldy, t, rr);
             *yp = accumulate ? *yp + v : v;
         }
@@ -349,6 +352,7 @@ static int mma_min_tokens() {
 }
 
 void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp) {
+    sp.wscale = W.scale;
     if (a.h && T >= mma_min_tokens() && mma_min_tokens() > 0) return launch_mma(W, a, T, y, ldy, accumulate, s, sp);
     if (T > 8) {   // the dp4a kernels hold at most 8 tokens: two calls (the weights read twice)
         gemv_r(W, a, 8, y, ldy, accumulate, s, sp);
@@ -448,6 +452,7 @@ __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, 
 #pragma unroll
                         for (int w = 0; w < 8; ++w) s += red[w][rsel][t];
                         float * yp = gemv_out(sp, y, ldy, t, r);
+                        s *= sp.wscale;
                         *yp = accumulate ? *yp + s : s;
                     }
                 }
@@ -458,7 +463,8 @@ __global__ void __launch_bounds__(256) gemv_f_k(const uint8_t * __restrict__ W, 
             for (int t = 0; t < NT; ++t) {
                 if (t < T) {
                     float * yp = gemv_out(sp, y, ldy, t, r);
-                    *yp = accumulate ? *yp + acc[t] : acc[t];
+                    const float v = acc[t] * sp.wscale;
+                    *yp = accumulate ? *yp + v : v;
                 }
             }
         }

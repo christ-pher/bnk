@@ -149,6 +149,30 @@ void dflash_attention(const float * q, const half * kring, const half * vring, f
     dflash_pv_k<<<H * R, D, 0, s>>>(S, vring, out, par_dev, R, H, HKV, D, ring, maxk);
 }
 
+// one warp per row: lane j < K holds the local candidate j, lane K + j the peer's; each lane's rank among the 2K
+// (value, then local before peer, then index) is its slot, the first K are kept
+__global__ void dflash_merge_topk_k(int32_t * ids, float * vals, const int32_t * rids, const float * rvals, int off, int K) {
+    const int row = blockIdx.x, lane = threadIdx.x;
+    const bool mine = lane < K, have = lane < 2 * K;
+    const float v = mine ? vals[row * K + lane] : have ? rvals[row * K + lane - K] : -FLT_MAX;
+    const int id = mine ? ids[row * K + lane] : have ? rids[row * K + lane - K] + off : -1;
+    int rank = 0;
+    for (int o = 0; o < 2 * K; ++o) {
+        const float ov = __shfl_sync(0xffffffff, v, o);
+        if (ov > v || (ov == v && o < lane)) ++rank;
+    }
+    __syncwarp();
+    if (have && rank < K) {
+        ids[row * K + rank] = id;
+        vals[row * K + rank] = v;
+    }
+}
+
+void dflash_merge_topk(int32_t * ids, float * vals, const int32_t * rids, const float * rvals, int off, int rows, int K,
+                       cudaStream_t s) {
+    dflash_merge_topk_k<<<rows, 32, 0, s>>>(ids, vals, rids, rvals, off, K);
+}
+
 // ---- the selector: one warp; for each of the n positions, candidate j (lane < K) scores
 // unary[j] + sum_r pre[prev][r] * hp[r] * succ[cand_j][r]; the best becomes prev
 __global__ void dflash_select_k(const int32_t * __restrict__ cand, const float * __restrict__ unary,

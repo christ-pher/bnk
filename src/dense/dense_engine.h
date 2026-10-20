@@ -200,6 +200,7 @@ private:
     // fc_i . residual into tap_acc_ (decode windows) / pf_tap_ (prompt chunks)
     DenseDFlash dflash_;
     DevBuf<float> tap_acc_, tap_tmp_, pf_tap_;
+    void load_dflash(int peer_dev);
     void tap(int il, int T);                 // decode: after layer il's FFN (res_ + pend_ is its residual)
     void pf_tap(int il, int N);              // prompt chunk: after layer il (pf_.res)
     EngineOptions opt_;

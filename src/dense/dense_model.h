@@ -61,15 +61,17 @@ struct DenseModel {
     // one tensor of `gguf` to VRAM, as the kernels read it (BF16 matrices as Q8_0, R layout); also the DFlash2
     // drafter's weights (DenseDFlash keeps a DenseModel for its own file)
     QMat upload(const std::string & name, bool required = true);
+    // slices: the given row ranges [r0, r1) concatenated, or the given column ranges of every row (ranges in
+    // whole quant blocks)
+    QMat upload_rows(const std::string & name, const Ranges & rows);
+    QMat upload_cols(const std::string & name, const Ranges & cols);
 
 private:
     std::vector<void *> device_allocs_;
     std::vector<void *> host_allocs_;
     QMat upload_tensor(const TensorRef & t, bool repack);
-    // slices: the given row ranges [r0, r1) concatenated, or the given column ranges of every row (ranges in
-    // whole quant blocks)
-    QMat upload_rows(const std::string & name, const Ranges & rows);
-    QMat upload_cols(const std::string & name, const Ranges & cols);
+    QMat upload_tensor_raw(const TensorRef & t, bool repack);
+    float global_scale(const std::string & wname) const;
     QMat upload_rows2(const std::string & na, const std::string & nb, const Ranges & ra, const Ranges & rb, QMat & a, QMat & b);
     // two matrices of the same format and width stacked (a | b): one upload; a and b become row views of it
     bool stack(const std::string & na, const std::string & nb, QMat & a, QMat & b, QMat & ab);

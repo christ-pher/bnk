@@ -227,7 +227,13 @@ void DenseEngine::load(const std::string & path, const EngineOptions & opt) {
             s->peer_ = prev;
         }
         s->load_stage(path, opt);
-        if (prev && tpar) tp_enable_p2p(prev, s, opt.verbose);
+        if (prev && tpar) {
+            tp_enable_p2p(prev, s, opt.verbose);
+            if (!opt.dflash.empty()) {   // rank 0's drafter, half its FFN and head on the peer when it can reach it
+                DeviceScope ds(prev->dev_);
+                prev->load_dflash(prev->tp_p2p_ ? s->dev_ : -1);
+            }
+        }
         if (prev && !tpar) {
             for (int l = 0; l < kLanes; ++l) prev->xfer_out_[l] = s->xfer_in_[l];
             prev->pf_xfer_out_[0] = s->pf_xfer_in_[0];
@@ -378,12 +384,9 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     cur_->used = true;
     if (want_mtp && model_.mtp.present && opt.dflash.empty())
         mtp_.load(model_, opt.max_ctx, st_, opt.verbose, opt.draft_vocab, &budget_, (int) seqs_.size());
-    if (!opt.dflash.empty() && last_) {
-        if (next_ && !tp()) throw std::runtime_error("dflash: needs one stage or tensor parallel (its taps span the layers)");
-        dflash_.load(opt.dflash, model_, (int) seqs_.size(), st_, opt.verbose);
-        tap_acc_.alloc((size_t) kMaxWindowDense * E);
-        tap_tmp_.alloc((size_t) kMaxWindowDense * E);
-        dflash_.bind(tap_acc_, res_);
+    if (!opt.dflash.empty() && last_ && !tp()) {   // tensor parallel: after both ranks loaded (load_dflash)
+        if (next_) throw std::runtime_error("dflash: needs one stage or tensor parallel (its taps span the layers)");
+        load_dflash(-1);
     }
     if (opt.verbose)
         fprintf(stderr, "bnk: %scontext %d: %.0f KiB of %sKV per token (%.2f GiB when full, mapped as used), "
@@ -1143,6 +1146,17 @@ void DenseEngine::commit_here(int cnt) {
 }
 
 // ------------------------------------------------------------------------------------------------ drafter
+void DenseEngine::load_dflash(int peer_dev) {
+    const int E = model_.cfg.n_embd;
+    dflash_.load(opt_.dflash, model_, (int) seqs_.size(), st_, opt_.verbose, peer_dev);
+    tap_acc_.alloc((size_t) kMaxWindowDense * E);
+    tap_tmp_.alloc((size_t) kMaxWindowDense * E);
+    dflash_.bind(tap_acc_, res_);
+    if (pf_max_ > 0) pf_tap_.alloc((size_t) pf_max_ * E);
+    for (int i = 0; i < (int) seqs_.size(); ++i)
+        if (seqs_[i].get() == cur_) dflash_.select(i);
+}
+
 void DenseEngine::tap(int il, int T) {
     if (!dflash_.loaded()) return;
     const int i = dflash_.tap_index(il);
