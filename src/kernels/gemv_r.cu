@@ -77,7 +77,6 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
                 sb0 = warp * per + sub;
                 sb1 = min(nsb, (warp + 1) * per);
             }
-#pragma unroll 2
             for (int sb = sb0; sb < sb1; sb += step) {
                 Unpacked u;
                 RT<FMT>::unpack(row, o, sb, u);
@@ -314,8 +313,12 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 static int mma_ks(int nsb) {
     static const int env = getenv("BNK_GEMV_MMA_KS") ? atoi(getenv("BNK_GEMV_MMA_KS")) : 0;
     if (env) return env;
-    for (int ks = 8; ks >= 2; ks >>= 1)
-        if (nsb >= ks * 8 && nsb % (4 * ks) == 0) return ks;
+    // BNK_GEMV_MMA_KS_EVEN=1: the share per warp a multiple of 4 sub-blocks first (the rule before 2026-10-20; more
+    // warps in flight measured faster since: 8 rows, Q8_0 and NVFP4 27B forwards -4-5%)
+    static const bool even = getenv("BNK_GEMV_MMA_KS_EVEN") && atoi(getenv("BNK_GEMV_MMA_KS_EVEN"));
+    if (even)
+        for (int ks = 8; ks >= 2; ks >>= 1)
+            if (nsb >= ks * 8 && nsb % (4 * ks) == 0) return ks;
     int ks = 8;
     while (ks > 1 && nsb < ks * 8) ks >>= 1;
     return ks;
@@ -349,6 +352,13 @@ static int mma_min_tokens() {
     static const int n = getenv("BNK_GEMV_MMA_MIN") ? atoi(getenv("BNK_GEMV_MMA_MIN"))
                          : getenv("BNK_EXACT") && atoi(getenv("BNK_EXACT")) ? 1 : 4;
     return n;
+}
+
+// an F16 matrix given only the quantized activations (their fp16 copy, a.h): the tensor-core kernel
+void gemv_f16_act(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s,
+                  GemvSplit sp) {
+    sp.wscale = W.scale;
+    launch_mma_k<QT_F16, false>(W, a.h, a.cols_pad, T, y, ldy, accumulate, s, sp);
 }
 
 void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp) {

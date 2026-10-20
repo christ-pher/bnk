@@ -93,6 +93,8 @@ void gemv_auto(const QMat & W, const float * x, int64_t ldx, int T, float * y, i
                bool accumulate, ActQ8 & scratch, cudaStream_t s, GemvSplit sp = {});
 
 // GEMV v2 kernels (gemv_r.cu): R-layout quant rows and float rows.
+void gemv_f16_act(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s,
+                  GemvSplit sp = {});
 void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s,
             GemvSplit sp = {});
 void gemv_float2(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool accumulate,

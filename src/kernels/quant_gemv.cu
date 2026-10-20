@@ -364,6 +364,11 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
         return;
     }
     if (W.scale != 1.f) throw std::runtime_error("gemv: a global scale needs an R-layout matrix");
+    if (is_float_format(W.type) && !x) {   // a float matrix where the caller quantized the activations
+        if (W.type != QT_F16 || !a || !a->h || W.cols % 32) throw std::runtime_error("gemv: float matrix without float activations");
+        gemv_f16_act(W, *a, T, y, ldy, accumulate, s, sp);
+        return;
+    }
     if (is_float_format(W.type) && !getenv("BNK_OLD_FLOAT")) {
         gemv_float2(W, x, ldx, T, y, ldy, accumulate, s, sp);
         return;
