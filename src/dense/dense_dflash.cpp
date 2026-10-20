@@ -22,6 +22,8 @@ DenseDFlash::~DenseDFlash() {
     if (h_out_) cudaFreeHost(h_out_);
     if (h_prob_) cudaFreeHost(h_prob_);
     if (h_tok_) cudaFreeHost(h_tok_);
+    if (h_q_) cudaFreeHost(h_q_);
+    if (h_cand_) cudaFreeHost(h_cand_);
 }
 
 int DenseDFlash::tap_index(int il) const {
@@ -101,7 +103,9 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
     logits_.alloc((size_t) (B - 1) * nvocab_);
     hp_.alloc((B - 1) * rank_);
     cids_.alloc((B - 1) * topk_); cvals_.alloc((B - 1) * topk_);
-    out_.alloc(B); prob_.alloc(B);
+    out_.alloc(B); prob_.alloc(B); qout_.alloc((B - 1) * topk_);
+    CUDA_CHECK(cudaHostAlloc((void **) &h_q_, (B - 1) * topk_ * 4, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_cand_, (B - 1) * topk_ * 4, cudaHostAllocMapped));
     cn_.alloc(W * E);
     const int64_t maxcols = std::max<int64_t>({(int64_t) E, (int64_t) FF, (int64_t) H * D});
     actq_.alloc(W * maxcols); actd_.alloc(W * maxcols / 32); acts_.alloc(W * maxcols / 16); acth_.alloc(W * maxcols);
@@ -122,6 +126,7 @@ void DenseDFlash::load(const std::string & path, const DenseModel & main, int sl
         vc_[s].alloc((size_t) NL * kRing * HKV * D);
     }
     fed_.assign(slots, 0);
+    dists_.assign(slots, {});
     valid_lo_.assign(slots, 0);
     graphs_.assign(slots, nullptr);
     multi_drafts_.assign(slots, {});
@@ -200,9 +205,11 @@ void DenseDFlash::enqueue_block() {
     gemv_auto(main_->output, xn_, E, B - 1, logits_, nvocab_, false, act_, st_);
     topk_rows(logits_, B - 1, nvocab_, topk_, cids_, cvals_, st_);
     gemv_auto(sel_proj_, xn_, E, B - 1, hp_, rank_, false, act_, st_);
-    dflash_select(cids_, cvals_, hp_, sel_pre_, sel_succ_, par_, B - 1, topk_, rank_, out_, prob_, st_);
+    dflash_select(cids_, cvals_, hp_, sel_pre_, sel_succ_, par_, B - 1, topk_, rank_, out_, prob_, qout_, st_);
     CUDA_CHECK(cudaMemcpyAsync(h_out_, out_.p, (B - 1) * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_prob_, prob_.p, (B - 1) * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(h_q_, qout_.p, (B - 1) * topk_ * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(h_cand_, cids_.p, (B - 1) * topk_ * 4, cudaMemcpyDeviceToHost, st_));
 }
 
 void DenseDFlash::draft_block(int anchor, int s) {
@@ -211,6 +218,13 @@ void DenseDFlash::draft_block(int anchor, int s) {
     h_par_->lo = std::max(valid_lo_[cur_], s - (win_ - 1));
     h_par_->nkeys = s + kBlock - h_par_->lo;
     h_par_->anchor = anchor;
+    h_par_->temp = temp_;
+    for (int i = 0; i < kBlock; ++i) {   // splitmix64 uniforms in [0, 1)
+        uint64_t z = (rng_ += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        h_par_->u[i] = (float) ((z ^ (z >> 31)) >> 40) / 16777216.f;
+    }
     CUDA_CHECK(cudaMemcpyAsync(par_.p, h_par_, sizeof(DFlashParams), cudaMemcpyHostToDevice, st_));
     static const bool graphs = !getenv("BNK_DFLASH_GRAPH") || atoi(getenv("BNK_DFLASH_GRAPH")) != 0;
     cudaGraphExec_t & ge = graphs_[cur_];
@@ -230,6 +244,11 @@ void DenseDFlash::draft_block(int anchor, int s) {
         drafts_[i] = h_out_[i];
         probs_[i] = h_prob_[i];
     }
+    auto & ds = dists_[cur_];
+    ds.assign(temp_ > 0.f ? ndrafts_ : 0, {});
+    for (int i = 0; i < (int) ds.size(); ++i)
+        for (int j = 0; j < topk_; ++j)
+            if (h_q_[i * topk_ + j] > 0.f) ds[i].emplace_back(h_cand_[i * topk_ + j], h_q_[i * topk_ + j]);
     next_ = 0;
 }
 

@@ -150,13 +150,14 @@ void dflash_attention(const float * q, const half * kring, const half * vring, f
 }
 
 // ---- the selector: one warp; for each of the n positions, candidate j (lane < K) scores
-// unary[j] + sum_r pre[prev][r] * hp[r] * succ[cand_j][r]; the best becomes prev; prob = its softmax over the K
+// unary[j] + sum_r pre[prev][r] * hp[r] * succ[cand_j][r]; the best becomes prev
 __global__ void dflash_select_k(const int32_t * __restrict__ cand, const float * __restrict__ unary,
                                 const float * __restrict__ hp, const half * __restrict__ pre, const half * __restrict__ succ,
                                 const DFlashParams * __restrict__ par, int n, int K, int rank, int32_t * __restrict__ out,
-                                float * __restrict__ prob) {
+                                float * __restrict__ prob, float * __restrict__ qout) {
     const int lane = threadIdx.x;
     int prev = par->anchor;
+    const float temp = par->temp;
     for (int i = 0; i < n; ++i) {
         float sc = -FLT_MAX;
         int c = -1;
@@ -176,19 +177,40 @@ __global__ void dflash_select_k(const int32_t * __restrict__ cand, const float *
             const int ol = __shfl_xor_sync(0xffffffff, bl, o);
             if (ob > best || (ob == best && ol < bl)) best = ob, bl = ol;
         }
-        float e = lane < K ? __expf(sc - best) : 0.f;
+        if (temp > 0.f) {   // sampled: q = softmax(scores / temp) over the candidates, drawn with the uniform u[i]
+            const float w = lane < K ? __expf((sc - best) / temp) : 0.f;
+            float ws = w;
+            for (int o = 16; o > 0; o >>= 1) ws += __shfl_xor_sync(0xffffffff, ws, o);
+            float cum = w;   // inclusive prefix over the lanes
+            for (int o = 1; o < 32; o <<= 1) {
+                const float t = __shfl_up_sync(0xffffffff, cum, o);
+                if (lane >= o) cum += t;
+            }
+            const float target = par->u[i] * ws;
+            const unsigned hit = __ballot_sync(0xffffffff, lane < K && cum >= target);
+            bl = hit ? __ffs(hit) - 1 : 0;
+            if (lane < K) qout[i * K + lane] = w / ws;
+        }
+        // prob: the chosen candidate's share of the draft logits' softmax over the K (the selector's own softmax
+        // is near 1 almost always; this one tracks how often the target accepts)
+        const float u = lane < K ? unary[i * K + lane] : -FLT_MAX;
+        float um = u;
+        for (int o = 16; o > 0; o >>= 1) um = fmaxf(um, __shfl_xor_sync(0xffffffff, um, o));
+        float e = lane < K ? __expf(u - um) : 0.f;
         for (int o = 16; o > 0; o >>= 1) e += __shfl_xor_sync(0xffffffff, e, o);
+        const float uc = __shfl_sync(0xffffffff, u, bl);
         prev = __shfl_sync(0xffffffff, c, bl);
         if (lane == 0) {
             out[i] = prev;
-            prob[i] = 1.f / e;
+            prob[i] = __expf(uc - um) / e;
         }
     }
 }
 
 void dflash_select(const int32_t * cand, const float * unary, const float * hp, const half * pre, const half * succ,
-                   const DFlashParams * par_dev, int n, int K, int rank, int32_t * out, float * prob, cudaStream_t s) {
-    dflash_select_k<<<1, 32, 0, s>>>(cand, unary, hp, pre, succ, par_dev, n, K, rank, out, prob);
+                   const DFlashParams * par_dev, int n, int K, int rank, int32_t * out, float * prob, float * qout,
+                   cudaStream_t s) {
+    dflash_select_k<<<1, 32, 0, s>>>(cand, unary, hp, pre, succ, par_dev, n, K, rank, out, prob, qout);
 }
 
 }  // namespace bnk

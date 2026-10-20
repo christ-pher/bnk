@@ -102,6 +102,18 @@ bool Sampler::finish(const SamplingParams & sp, std::vector<std::pair<int32_t, f
     return true;
 }
 
+int32_t Sampler::draw_residual(const std::vector<std::pair<int32_t, float>> & p, const std::vector<std::pair<int32_t, float>> & q) {
+    std::vector<std::pair<int32_t, float>> r;
+    r.reserve(p.size());
+    for (auto & c : p) {
+        float qc = 0.f;
+        for (auto & d : q)
+            if (d.first == c.first) { qc = d.second; break; }
+        if (c.second > qc) r.emplace_back(c.first, c.second - qc);
+    }
+    return r.empty() ? draw(p) : draw(r);
+}
+
 int32_t Sampler::draw(const std::vector<std::pair<int32_t, float>> & dist, int32_t exclude) {
     double total = 0;
     for (auto & c : dist)

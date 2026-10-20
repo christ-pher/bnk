@@ -50,6 +50,12 @@ public:
     struct StepItem { int prev; int32_t tok; int cell; };   // prev: the item's index in the previous call
     virtual void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) = 0;
     virtual void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) = 0;
+    // A drafter that samples its drafts (at the request's temperature, set_temperature; 0 = greedy): draft i of
+    // slot's last block came from this distribution (token, prob), and the verifier accepts it with probability
+    // min(1, p/q), else draws from max(0, p - q): the target's distribution exactly. nullptr: a greedy draft
+    // (a point mass: accepted with probability p).
+    virtual void set_temperature(float) {}
+    virtual const std::vector<std::pair<int32_t, float>> * draft_dist(int /*slot*/, int /*i*/) const { return nullptr; }
     double ms = 0;
     int64_t calls = 0;
 };

@@ -170,6 +170,7 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
         set_lookup(en ? atoi(en) : opt_.lookup_n, em ? atoi(em) : opt_.lookup_max, ea ? atoi(ea) : opt_.lookup_agree);
     use_slot();
     sp_ = sp;
+    if (mtp_) mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
     drafts_.clear();
@@ -330,12 +331,21 @@ int Generator::verify_window(int T, int r0, int32_t * bonus_out) {
             float pd = 0.f;
             for (auto & c : dist_)
                 if (c.first == d) { pd = c.second; break; }
-            if (sampler_.uniform() < pd) {
+            // a sampled draft (its distribution q): accept with min(1, p/q), else draw from max(0, p - q)
+            const auto * q = drafts_from_lookup_ || !mtp_ ? nullptr : mtp_->draft_dist(eng_.current_slot(), i);
+            float qd = 1.f;
+            if (q) {
+                qd = 0.f;
+                for (auto & c : *q)
+                    if (c.first == d) { qd = c.second; break; }
+                if (qd <= 0.f) q = nullptr, qd = 1.f;   // not one of its candidates: a point mass after all
+            }
+            if (sampler_.uniform() * qd < pd) {
                 emitted_tail_.push_back(d);
                 ++a;
                 continue;
             }
-            bonus = sampler_.draw(dist_, d);
+            bonus = q ? sampler_.draw_residual(dist_, *q) : sampler_.draw(dist_, d);
             break;
         }
         stats.sample_ms += now_ms() - t0;

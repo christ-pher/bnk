@@ -8,7 +8,8 @@
 
 namespace bnk {
 
-struct DFlashParams { int s, lo, nkeys, anchor; };   // block start, first key position, keys, anchor token
+// block start, first key position, keys, anchor token; temperature (0: greedy drafts) and a uniform per draft
+struct DFlashParams { int s, lo, nkeys, anchor; float temp, u[8]; };
 
 void dflash_conv(const float * in, const float * dyn, const float * base, float * out, int T, int E, int gsize, int side,
                  cudaStream_t s);
@@ -20,7 +21,9 @@ void dflash_kv_store(const float * k, const float * v, half * kring, half * vrin
 void dflash_attention(const float * q, const half * kring, const half * vring, float * S, float * out,
                       const DFlashParams * par_dev, int R, int H, int HKV, int D, int ring, int win, int maxk,
                       cudaStream_t s);
+// qout [n][K]: each position's distribution over its candidates (sampled drafts)
 void dflash_select(const int32_t * cand, const float * unary, const float * hp, const half * pre, const half * succ,
-                   const DFlashParams * par_dev, int n, int K, int rank, int32_t * out, float * prob, cudaStream_t s);
+                   const DFlashParams * par_dev, int n, int K, int rank, int32_t * out, float * prob, float * qout,
+                   cudaStream_t s);
 
 }  // namespace bnk

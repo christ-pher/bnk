@@ -56,6 +56,11 @@ public:
     int step(int32_t tok, int cell, float * prob) override;
     void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) override;
     void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) override;
+    void set_temperature(float t) override { temp_ = t; }
+    const std::vector<std::pair<int32_t, float>> * draft_dist(int slot, int i) const override {
+        if (temp_ <= 0.f || slot < 0 || slot >= (int) dists_.size() || i < 0 || i >= (int) dists_[slot].size()) return nullptr;
+        return &dists_[slot][i];
+    }
 
 private:
     struct Layer {
@@ -110,6 +115,12 @@ private:
     std::vector<std::vector<float>> multi_probs_;
     std::vector<int> multi_next_;
     std::vector<int> mmap_;   // the last multi call's items: their run_multi index
+    float temp_ = 0.f;        // the drafts' sampling temperature (0: greedy)
+    std::vector<std::vector<std::vector<std::pair<int32_t, float>>>> dists_;   // [slot][draft]: q over its candidates
+    DevBuf<float> qout_;
+    float * h_q_ = nullptr;
+    int32_t * h_cand_ = nullptr;
+    uint64_t rng_ = 0x9E3779B97F4A7C15ull;
 };
 
 }  // namespace bnk

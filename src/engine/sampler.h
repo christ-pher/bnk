@@ -43,6 +43,8 @@ public:
         return sp.top_k > 0 && sp.top_k <= max_k && sp.repetition_penalty == 1.f && sp.presence_penalty == 0.f;
     }
     int32_t draw(const std::vector<std::pair<int32_t, float>> & dist, int32_t exclude = -1);
+    // from max(0, p - q), normalized (p: dist; q: a sampled draft's distribution); p itself when that is empty
+    int32_t draw_residual(const std::vector<std::pair<int32_t, float>> & p, const std::vector<std::pair<int32_t, float>> & q);
     float uniform() { return std::uniform_real_distribution<float>(0.f, 1.f)(rng_); }
 
 private:
