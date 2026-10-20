@@ -14,6 +14,8 @@
 
 namespace bnk {
 
+class ImageStore;
+
 struct StageTimes {
     double total_ms = 0, cpu_experts_ms = 0, ple_ms = 0, wait_ms = 0;
     int64_t misses = 0, routed = 0;
@@ -161,6 +163,9 @@ public:
     virtual int cache_resident() const = 0;
     virtual size_t cache_bytes() const = 0;
     virtual size_t kv_bytes_mapped() const = 0;
+
+    // ---- images (vision/images.h): the store the server registers a prompt's images with; nullptr: no vision
+    virtual ImageStore * images() { return nullptr; }
 };
 
 }  // namespace bnk

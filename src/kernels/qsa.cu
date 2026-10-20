@@ -33,12 +33,12 @@ __device__ __forceinline__ float qsa_block_sum(float v, float * sh) {
 }
 __device__ __forceinline__ float qsa_sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 
-// NeoX rotation of x[0..n_rot) in shared memory at position pos; thread i owns element i
-__device__ __forceinline__ float qsa_rope(const float * x, int i, int n_rot, float base, int pos) {
+// NeoX rotation of x[0..n_rot) in shared memory at cell `cell` (its M-RoPE position); thread i owns element i
+__device__ __forceinline__ float qsa_rope(const float * x, int i, int n_rot, float base, int cell, const MRope & mr) {
     if (i >= n_rot) return x[i];
     const int half = n_rot / 2;
     const int p = i < half ? i : i - half;
-    const float theta = (float) pos * powf(base, -2.f * p / n_rot);
+    const float theta = mrope_pos(mr, cell, p) * powf(base, -2.f * p / n_rot);
     float sn, cs;
     sincosf(theta, &sn, &cs);
     return i < half ? x[i] * cs - x[i + half] * sn : x[i] * cs + x[i - half] * sn;
@@ -56,7 +56,7 @@ void qsa_store_keys(const float * k, half * kraw, int T, int id, const int * pos
 
 // grid: candidate blocks [floor(pos0/r), floor(pos0/r) + gridDim.x); the ones ending inside the window pool
 __global__ void qsa_pool_k(const half * kraw, const float * k_norm, float * pooled, int T, int id, int r, int n_rot,
-                           float base, float eps, const int * pos0p) {
+                           float base, float eps, const int * pos0p, MRope mr) {
     __shared__ float sh[32];
     __shared__ float x[512];
     const int pos0 = *pos0p;
@@ -72,17 +72,17 @@ __global__ void qsa_pool_k(const half * kraw, const float * k_norm, float * pool
     const float ss = qsa_block_sum(i < id ? m * m : 0.f, sh);
     if (i < id) x[i] = m * rsqrtf(ss / id + eps) * k_norm[i];
     __syncthreads();
-    if (i < id) pooled[(int64_t) b * id + i] = qsa_rope(x, i, n_rot, base, b * r);
+    if (i < id) pooled[(int64_t) b * id + i] = qsa_rope(x, i, n_rot, base, b * r, mr);
 }
 void qsa_pool(const half * kraw, const float * k_norm, float * pooled, int T, const QsaShape & sh, const int * pos0,
-              cudaStream_t s) {
+              cudaStream_t s, const MRope & mr) {
     qsa_pool_k<<<T / sh.ratio + 2, 128, 0, s>>>(kraw, k_norm, pooled, T, sh.id, sh.ratio, sh.n_rot, sh.rope_base,
-                                                sh.eps, pos0);
+                                                sh.eps, pos0, mr);
 }
 
 // grid (T, ih), id threads
 __global__ void qsa_q_k(float * q, const float * q_norm, int ih, int id, int n_rot, float base, float eps,
-                        const int * pos0p) {
+                        const int * pos0p, MRope mr) {
     __shared__ float sh[32];
     __shared__ float x[512];
     const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
@@ -91,10 +91,11 @@ __global__ void qsa_q_k(float * q, const float * q_norm, int ih, int id, int n_r
     const float ss = qsa_block_sum(v * v, sh);
     if (i < id) x[i] = v * rsqrtf(ss / id + eps) * q_norm[i];
     __syncthreads();
-    if (i < id) qp[i] = qsa_rope(x, i, n_rot, base, *pos0p + t);
+    if (i < id) qp[i] = qsa_rope(x, i, n_rot, base, *pos0p + t, mr);
 }
-void qsa_queries(float * q, const float * q_norm, int T, const QsaShape & sh, const int * pos0, cudaStream_t s) {
-    qsa_q_k<<<dim3(T, sh.ih), 128, 0, s>>>(q, q_norm, sh.ih, sh.id, sh.n_rot, sh.rope_base, sh.eps, pos0);
+void qsa_queries(float * q, const float * q_norm, int T, const QsaShape & sh, const int * pos0, cudaStream_t s,
+                 const MRope & mr) {
+    qsa_q_k<<<dim3(T, sh.ih), 128, 0, s>>>(q, q_norm, sh.ih, sh.id, sh.n_rot, sh.rope_base, sh.eps, pos0, mr);
 }
 
 // ------------------------------------------------------------------------------------------- selection

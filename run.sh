@@ -120,6 +120,14 @@ if [[ -z "$PLE" && -f "$HERE/configs/$NAME.json" ]]; then
   PLE=$("$HERE/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ple_gguf",""))' "$HERE/configs/$NAME.json")
   [[ -n "$PLE" && ! -f "$PLE" ]] && { echo "the PLE table $PLE (configs/$NAME.json) is missing" >&2; exit 1; }
 fi
+# the vision encoder (images in chat requests) when the config names one; BNK_VISION=0 serves text only
+MMPROJ=""
+if [[ "${BNK_VISION:-1}" != 0 && -f "$HERE/configs/$NAME.json" ]]; then
+  MMPROJ="$("${MODELS_PY[@]}" mmproj "$NAME" 2>/dev/null || true)"
+  if [[ -z "$MMPROJ" ]] && "$HERE/.venv/bin/python" -c 'import json,sys; s=json.load(open(sys.argv[1])).get("source",{}); sys.exit(0 if s.get("mmproj") or s.get("mmproj_path") or s.get("mmproj_from") else 1)' "$HERE/configs/$NAME.json"; then
+    echo "note: the vision encoder is not downloaded; serving text only (./models.sh download $NAME fetches it)"
+  fi
+fi
 COUNTS="$CACHE/counts-$NAME.bnkc"
 # cold experts (docs/EXPERT-MIX.md): the config's "cold_experts" names a file in the cache directory. Missing, it is
 # written in the background (build/requant_experts, ~16 min on 24 threads) and used from the next start on; present,
@@ -150,6 +158,7 @@ ARGS=(--model "$MODEL" --counts "$COUNTS" --log "$CACHE/engine-$NAME.log")
 [[ -f "$HERE/configs/$NAME.json" ]] && ARGS+=(--config "$HERE/configs/$NAME.json")
 [[ -n "$MTP" ]] && ARGS+=(--mtp "$MTP")
 [[ -n "$PLE" ]] && ARGS+=(--ple-gguf "$PLE")
+[[ -n "$MMPROJ" ]] && ARGS+=(--mmproj "$MMPROJ")
 [[ -n "$MTP" && -n "$DRAFT_VOCAB" && -f "$DRAFT_VOCAB" ]] && ARGS+=(--draft-vocab "$DRAFT_VOCAB")
 # the learned routing counts (written as the server runs) rank the initial VRAM cache; on a model's first run the
 # cache starts unranked and adapts to the traffic

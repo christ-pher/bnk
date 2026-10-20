@@ -246,6 +246,20 @@ void DenseEngine::load(const std::string & path, const EngineOptions & opt) {
         }
     }
     CUDA_CHECK(cudaSetDevice(dev_));
+    if (!opt.mmproj.empty()) {   // as Engine::load: the encoder on the first GPU, its scratch from that budget
+        const Config & c = model_.cfg;
+        if (c.rope_sec[0] <= 0) throw std::runtime_error("vision: the model has no M-RoPE sections (rope.dimension_sections)");
+        const auto vocab = model_.gguf.get_str_arr("tokenizer.ggml.tokens");
+        for (size_t i = 0; i < vocab.size(); ++i)
+            if (vocab[i] == "<|image_pad|>") image_token_ = (int32_t) i;
+        if (image_token_ <= 0) throw std::runtime_error("vision: the vocabulary has no <|image_pad|> token");
+        images_ = std::make_unique<ImageStore>();
+        images_->cache_limit = (size_t) (opt.vision_cache_gib * 1073741824.0);
+        images_->open(opt.mmproj, dev_, &budget_, opt.verbose);
+        if (images_->cfg().out_dim != c.n_embd)
+            throw std::runtime_error("vision: the encoder's output (" + std::to_string(images_->cfg().out_dim) +
+                                     ") does not match the model's width (" + std::to_string(c.n_embd) + ")");
+    }
 }
 
 // Both ranks loaded: peer access both ways if the driver allows it (BNK_TP_P2P=0 keeps the pinned host path).
@@ -375,6 +389,7 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     const size_t reserve = (size_t) (opt.vram_reserve_gib * 1073741824.0);
     budget_.set_limit(free_b > reserve ? free_b - reserve : 0);
     budget_.set_reserve(reserve);
+    mrope_ = !opt.mmproj.empty() && model_.cfg.rope_sec[0] > 0;
     seqs_.clear();
     for (int i = 0; i < std::max(1, opt.slots); ++i) {
         seqs_.push_back(std::make_unique<Seq>());
@@ -417,6 +432,13 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
 void DenseEngine::alloc_seq(Seq & q) {
     const Config & c = model_.lc;
     const int W = kMaxWindowDense, C = c.conv_channels();
+    if (mrope_) {
+        std::vector<int32_t> id((size_t) opt_.max_ctx * 3);
+        for (size_t i = 0; i < id.size(); ++i) id[i] = (int32_t) (i / 3);
+        q.rpos.alloc(id.size());
+        CUDA_CHECK(cudaMemcpy(q.rpos.p, id.data(), id.size() * 4, cudaMemcpyHostToDevice));
+        q.rpos_plain = true;
+    }
     q.conv_buf.resize(c.n_layer);
     q.ssm_state.resize(c.n_layer);
     q.kc.resize(c.n_layer);
@@ -670,7 +692,7 @@ void DenseEngine::attn(int il, int T) {
         const size_t r = (size_t) w.r0;
         float * qw = q_.p + r * H * D, * qf = qfull_.p + r * H * D * 2, * ao = attn_o_.p + r * H * D;
         attn_prep(qf, k_.p + r * Hkv * D, v_.p + r * Hkv * D, F(L.q_norm), F(L.k_norm), qw, w.q->kc[il], w.q->vc[il],
-                  w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_);
+                  w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_, mrope_of(w.q));
         // the tensor-core split-KV kernel (one pass over the cache for the window's rows and the KV head's
         // query heads); BNK_ATTN_TC=0: the one-row-per-block kernel
         static const bool tc = !getenv("BNK_ATTN_TC") || atoi(getenv("BNK_ATTN_TC")) != 0;
@@ -937,7 +959,7 @@ void DenseEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
         q->last_r0 = r0;
         q->last_lane = lane;
-        memcpy(h_tok_ + r0, b.tokens, b.T * 4);
+        for (int j = 0; j < b.T; ++j) h_tok_[r0 + j] = vocab_id(b.tokens[j]);   // an image id never indexes the embeddings
         h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
         key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
     }
@@ -1175,6 +1197,12 @@ void DenseEngine::pf_tap(int il, int N) {
 }
 
 void DenseEngine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
+    std::vector<int32_t> mapped;   // image cells: the drafter sees the image token
+    if (std::any_of(tokens, tokens + n, is_image_id)) {
+        mapped.assign(tokens, tokens + n);
+        for (auto & t : mapped) t = vocab_id(t);
+        tokens = mapped.data();
+    }
     if (dflash_.loaded()) {   // the same rows' tap accumulator (prompt chunk or decode window)
         dflash_.feed(R_rows == pf_.res.p ? pf_tap_.p : tap_acc_.p, n, pos0);
         return;

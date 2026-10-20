@@ -126,6 +126,8 @@ int main(int argc, char ** argv) {
         else if (a == "--dflash") opt.dflash = next();
         else if (a == "--ple-gguf") opt.ple_gguf = next();
         else if (a == "--cold-experts") opt.cold_experts = next();
+        else if (a == "--mmproj") opt.mmproj = next();
+        else if (a == "--vision-cache-gib") opt.vision_cache_gib = std::stod(next());
         else if (a == "--draft-vocab") opt.draft_vocab = next();
         else if (a == "--prefill-chunk-max") opt.prefill_chunk_max = std::stoi(next());
         else if (a == "--prefill-small") opt.prefill_small = std::stoi(next());

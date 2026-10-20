@@ -2,7 +2,7 @@
 //
 //   in : {"op":"generate","id":..,"prompt":[ids],"max_tokens":N,"temperature":..,"top_p":..,"top_k":..,
 //         "min_p":..,"presence_penalty":..,"repetition_penalty":..,"seed":..,"stop_ids":[ids],"draft":n,
-//         "draft_min_p":p,"checkpoint":pos}  (checkpoint: where to snapshot state for the next request to resume)  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
+//         "draft_min_p":p,"checkpoint":pos,"images":[{"id":..,"path":..,"h":..,"w":..}]}  (checkpoint: where to snapshot state for the next request to resume)  (draft: tokens the drafter may propose per round; draft_min_p: it stops below this)
 //        {"op":"cancel","id":..}   {"op":"stats"}   {"op":"reset"}   {"op":"quit"}
 //   Up to `slots` generate requests run at once (each in a conversation slot of its own; --slots): one is admitted
 //   (its prompt read) while the others keep decoding between its prompt chunks (BNK_READ_SHARE of each chunk's
@@ -34,6 +34,7 @@
 #include "core/util.h"
 #include "engine/generate.h"
 #include "server/json.h"
+#include "vision/images.h"
 
 namespace bnk {
 
@@ -427,6 +428,12 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         try {
             for (const auto & v : req["prompt"].a) a->prompt.push_back((int32_t) v.num());
             if (a->prompt.empty()) throw std::runtime_error("empty prompt");
+            // the prompt's images: their placeholder id, preprocessed pixels (a raw RGB file) and size
+            for (const auto & im : req["images"].a) {
+                ImageStore * st = eng.images();
+                if (!st) throw std::runtime_error("this model has no vision encoder (no mmproj in its config)");
+                st->add((int32_t) im["id"].num(), im["path"].str(), (int) im["h"].num(), (int) im["w"].num());
+            }
             if ((int) a->prompt.size() >= eng.max_ctx()) throw std::runtime_error("prompt longer than the context");
             for (const auto & v : req["stop_ids"].a) a->stop_ids.push_back((int32_t) v.num());
             if (a->stop_ids.empty()) a->stop_ids.push_back(eng.cfg().eos_token);

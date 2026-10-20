@@ -10,7 +10,8 @@
     "revision": "d562806dbafae37109975e970aae91b43e73b440",
     "files": [
       "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
-    ]
+    ],
+    "mmproj": "mmproj-Qwen3.8-27B-BF16.gguf"
   },
   "mtp": "builtin",
   "sampling": {

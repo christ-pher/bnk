@@ -37,6 +37,7 @@
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
 #include "kernels/qsa.h"
+#include "vision/images.h"
 
 namespace bnk {
 
@@ -53,6 +54,8 @@ struct EngineOptions {
     std::string dflash;              // dense engine: a DFlash2 drafter GGUF (tools/dflash_gguf.py) in place of the MTP
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
     std::string cold_experts;        // the least-routed experts in a smaller format (tools/requant_experts), all kept resident
+    std::string mmproj;              // the vision encoder GGUF (empty: text only); docs/VISION.md
+    double vision_cache_gib = 2;     // host RAM for encoded images (reused by later turns that resend them)
     // chunk size for long prompts (borrows VRAM from the expert cache meanwhile). 4,096 since the experts moved to
     // the tensor cores: 8,192-token chunks evicted experts that then streamed back every chunk, and left the
     // pipeline fewer chunks to overlap (two V100s, cold reads: 64K 2,587 -> 2,901 tok/s, 128K 1,375 -> 2,905)
@@ -170,6 +173,7 @@ public:
     void rebalance();
     size_t vram_budget() const { return budget_.limit() + (next_ ? next_->vram_budget() : 0); }
     size_t kv_bytes_mapped() const;
+    ImageStore * images() override { return images_ && images_->enabled() ? images_.get() : nullptr; }
     // One batched prompt pass over N tokens (commits; logits of the last token in row 0).
     void prefill_chunk(const int32_t * tokens, int N);
     struct PrefillStats { double ms = 0, copy_wait_ms = 0; int64_t tokens = 0, chunks = 0; } pstats;
@@ -361,6 +365,10 @@ private:
     // (prefill, forward, commit, checkpoint, park ...) works on.
     struct Seq {
         std::vector<int32_t> history;
+        // M-RoPE positions of every cell ([max_ctx][3], with vision only): the cell index three times until the
+        // conversation has an image (rpos_plain), then what ImageStore::positions gives (synced per prompt)
+        DevBuf<int32_t> rpos;
+        bool rpos_plain = true;
         std::vector<Checkpoint> ckpts;
         float * mtp_R = nullptr;
         int mtp_cell = -1;
@@ -505,6 +513,24 @@ private:
     QsaShape qsh_{};
     int max_blocks_ = 0;
     bool qsa_on_ = false;
+
+    // ---- images (the first stage's store; every stage keeps its slots' M-RoPE positions)
+    std::unique_ptr<ImageStore> images_;
+    int32_t image_token_ = 0;   // the vocabulary's image placeholder token
+    bool mrope_ = false;        // positions come from the slots' rpos tables
+    MRope mrope_of(const Seq * q) const {
+        MRope m;
+        if (mrope_) {
+            m.pos = q->rpos.p;
+            for (int i = 0; i < 3; ++i) m.sec[i] = model_.cfg.rope_sec[i];
+        }
+        return m;
+    }
+    int32_t vocab_id(int32_t t) const { return is_image_id(t) ? image_token_ : t; }
+    // before a prompt's tokens are read into the current slot: its positions for history + tokens (every stage)
+    void sync_positions(const std::vector<int32_t> & tokens);
+    // the chunk's image cells: the encoder's embeddings over the token embeddings in pf_.x (first stage)
+    void inject_images(int pos0, int N);
 
     // ---- batched prompt processing
     Gemm gemm_;

@@ -5,7 +5,8 @@
     "nvfp4"
   ],
   "source": {
-    "path": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local.gguf"
+    "path": "/root/.cache/bnk/gguf/Qwen3.8-Flash-Next-FP4-Local.gguf",
+    "mmproj_from": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"
   },
   "sampling": {
     "temperature": 1.0,

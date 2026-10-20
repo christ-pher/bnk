@@ -31,6 +31,10 @@ Config load_config(const GgufModel & g) {
     c.head_dim = (int) g.get_u64(k("attention.key_length"));
     c.n_rot = (int) g.get_u64(k("rope.dimension_count"), c.head_dim);
     c.rope_base = (float) g.get_f64(k("rope.freq_base"), 1e7);
+    {
+        const auto sec = g.get_int_arr(k("rope.dimension_sections"));
+        for (int i = 0; i < 3 && i < (int) sec.size(); ++i) c.rope_sec[i] = (int) sec[i];
+    }
     c.rms_eps = (float) g.get_f64(k("attention.layer_norm_rms_epsilon"), 1e-6);
     c.n_expert = (int) g.get_u64(k("expert_count"));
     c.n_expert_used = (int) g.get_u64(k("expert_used_count"));

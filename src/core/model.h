@@ -17,6 +17,7 @@ struct Config {
     int n_head = 0, n_head_kv = 0, head_dim = 0;           // full attention
     int n_rot = 0;                                         // rotary dims per head (NeoX pairing)
     float rope_base = 1e7f;
+    int rope_sec[3] = {0, 0, 0};                           // M-RoPE: rotary pairs for time / row / column
     float rms_eps = 1e-6f;
     int n_ff = 0;                                          // dense FFN width (0: MoE layers)
     int n_expert = 0, n_expert_used = 0, n_ff_exp = 0, n_ff_shexp = 0;

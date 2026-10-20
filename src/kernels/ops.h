@@ -1,6 +1,7 @@
 // Elementwise / normalization / attention / routing kernels. Activations are fp32, token-major [T][...].
 #pragma once
 #include "kernels/gemv.h"
+#include "kernels/mrope.h"
 
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -60,10 +61,10 @@ void kv_set_q8(bool on);
 bool kv_q8();
 inline int64_t kv_row_halves(int D) { return kv_q8() ? D / 2 + D / 32 : D; }
 // From qfull [T][H][2*D] (q|gate per head) and k/v [T][Hkv][D]: normalizes, rotates (NeoX, n_rot dims) and
-// writes q [T][H][D] and the cache rows at positions pos0+t.
+// writes q [T][H][D] and the cache rows at positions pos0+t (rotated at those cells' M-RoPE positions with `mr`).
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,
                float * q, half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base,
-               const int * pos0, float eps, cudaStream_t s);
+               const int * pos0, float eps, cudaStream_t s, const MRope & mr = {});
 // out[t][h][:] = softmax(q k^T * scale) v over cache rows [0, pos0+t]   (causal), then *= sigmoid(gate)
 // pos0 lives in device memory (graph-friendly); the split count is fixed.
 void attention(const float * q, const half * kcache, const half * vcache, const float * qfull_gate, float * out,

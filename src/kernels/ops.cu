@@ -514,7 +514,7 @@ bool kv_q8() { return g_kv_q8; }
 template <bool Q8>
 __global__ void attn_prep_k(const float * qfull, const float * k, const float * v, const float * qn, const float * kn,
                             float * q, half * kc, half * vc, int H, int Hkv, int D, int n_rot, float base,
-                            const int * pos0p, float eps) {
+                            const int * pos0p, float eps, MRope mr) {
     const int pos0 = *pos0p;
     __shared__ float sh[32];
     __shared__ float buf[512];
@@ -532,7 +532,7 @@ __global__ void attn_prep_k(const float * qfull, const float * k, const float * 
     const int half_rot = n_rot / 2;
     if (i < n_rot) {
         const int p = i < half_rot ? i : i - half_rot;
-        const float theta = (float) (pos0 + t) * powf(base, -2.f * p / n_rot);
+        const float theta = mrope_pos(mr, pos0 + t, p) * powf(base, -2.f * p / n_rot);
         float sn, cs;
         sincosf(theta, &sn, &cs);
         r = i < half_rot ? buf[i] * cs - buf[i + half_rot] * sn : buf[i] * cs + buf[i - half_rot] * sn;
@@ -547,10 +547,10 @@ __global__ void attn_prep_k(const float * qfull, const float * k, const float * 
 }
 void attn_prep(const float * qfull, const float * k, const float * v, const float * qn, const float * kn, float * q,
                half * kcache, half * vcache, int T, int H, int Hkv, int D, int n_rot, float base, const int * pos0,
-               float eps, cudaStream_t s) {
+               float eps, cudaStream_t s, const MRope & mr) {
     if (kv_q8() && D % 32 != 0) { fprintf(stderr, "attn_prep: 8-bit KV needs a head dim divisible by 32\n"); abort(); }
     (kv_q8() ? attn_prep_k<true> : attn_prep_k<false>)<<<dim3(T, H + Hkv), D, 0, s>>>(
-        qfull, k, v, qn, kn, q, kcache, vcache, H, Hkv, D, n_rot, base, pos0, eps);
+        qfull, k, v, qn, kn, q, kcache, vcache, H, Hkv, D, n_rot, base, pos0, eps, mr);
 }
 
 // Split-KV flash decoding. grid (T*H, nsplit), 256 threads = 8 warps; each warp takes keys in turn.
