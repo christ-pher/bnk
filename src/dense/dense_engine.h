@@ -100,6 +100,7 @@ public:
     int cache_resident() const override { return 0; }
     size_t cache_bytes() const override { return 0; }
     size_t kv_bytes_mapped() const override;
+    ImageStore * images() override { return images_ && images_->enabled() ? images_.get() : nullptr; }
 
     // this stage's timings (stage_info)
     double gpu_ms() const { return gpu_ms_; }
@@ -202,6 +203,20 @@ private:
     DevBuf<float> tap_acc_, tap_tmp_, pf_tap_;
     void load_dflash(int peer_dev);
     void tap(int il, int T);                 // decode: after layer il's FFN (res_ + pend_ is its residual)
+    // images: the first stage's store; every stage / rank keeps its slots' M-RoPE positions (see Engine)
+    std::unique_ptr<ImageStore> images_;
+    int32_t image_token_ = 0;
+    bool mrope_ = false;
+    template <typename S> MRope mrope_of(const S * q) const {
+        MRope m;
+        if (mrope_) {
+            m.pos = q->rpos.p;
+            for (int i = 0; i < 3; ++i) m.sec[i] = model_.cfg.rope_sec[i];
+        }
+        return m;
+    }
+    int32_t vocab_id(int32_t t) const { return is_image_id(t) ? image_token_ : t; }
+    void sync_positions(const std::vector<int32_t> & tokens);
     void pf_tap(int il, int N);              // prompt chunk: after layer il (pf_.res)
     EngineOptions opt_;
     VramBudget budget_;
@@ -231,6 +246,8 @@ private:
     // conv histories, snapshots, and the graphs that bake its buffers' addresses.
     struct Seq {
         std::vector<int32_t> history;
+        DevBuf<int32_t> rpos;      // M-RoPE positions [max_ctx][3] (with vision; as the MoE engine's Seq::rpos)
+        bool rpos_plain = true;
         std::vector<Checkpoint> ckpts;
         float * mtp_R = nullptr;
         int mtp_cell = -1;

@@ -24,6 +24,7 @@ from .conversations import Conversations
 from .engine import Engine, EngineError
 from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary
 from .telemetry import Telemetry
+from .vision import ImageError, Images, anthropic_image, image_parts
 from .tokenizer import StreamDecoder, Tokenizer
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +44,12 @@ class State:
         self.waiting = 0
         self.lock = threading.Lock()
         self.im_start = self.tok.id_of("<|im_start|>")
+        # images (--mmproj): prepared here, encoded by the engine; their raw pixels go to a folder it reads
+        self.images = None
+        self.image_pad = self.tok.id_of("<|image_pad|>")
+        if args.mmproj and self.image_pad is not None:
+            self.images = Images(str(Path(args.cache_dir).expanduser() / "images"), max_tokens=args.image_max_tokens,
+                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0")
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})
@@ -81,6 +88,8 @@ class State:
             eargs += ["--split", args.split]
         if args.ple_gguf:
             eargs += ["--ple-gguf", args.ple_gguf]
+        if args.mmproj:
+            eargs += ["--mmproj", args.mmproj]
         # the cold-experts file (configs/*.json "cold_experts": a file name in the cache directory, or a path)
         cold = self.config.get("cold_experts")
         if cold and os.environ.get("BNK_COLD_EXPERTS", "1") != "0":
@@ -375,6 +384,12 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
         text, thinking = text + "\n</think>\n\n", False
     t0 = time.perf_counter()
     ids = S.tok.encode_chat(text)
+    # each image's pad token becomes its run of placeholder ids (one per merged 32x32 block)
+    REQ.images = []
+    if S.images:
+        ids, REQ.images = S.images.expand(ids, S.image_pad, body.get("messages", []))
+    elif image_parts(body.get("messages", [])):
+        raise ImageError("this model has no vision encoder (no mmproj in its config)")
     REQ.tokenize_ms = (time.perf_counter() - t0) * 1e3   # reported in the response's timings
     return ids, thinking
 
@@ -555,7 +570,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- OpenAI chat
     def _chat(self, body):
-        prompt, thinking = chat_prompt(body)
+        try:
+            prompt, thinking = chat_prompt(body)
+        except ImageError as e:
+            return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
         if len(prompt) >= S.engine.info.get("n_ctx", 1 << 30):
             return self._json(400, {"error": {"message": f"prompt of {len(prompt)} tokens exceeds the context"}})
         max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or S.args.max_tokens)
@@ -563,6 +581,8 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(stops, str):
             stops = [stops]
         params = sampling_from(body)
+        if REQ.images:
+            params["images"] = REQ.images
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = now()
         model = S.model_id
@@ -642,10 +662,17 @@ class Handler(BaseHTTPRequestHandler):
                 msgs.append({"role": m["role"], "content": c})
                 continue
             text, reasoning, calls, results = [], "", [], []
+            images = []   # OpenAI parts, in order with the text (a message with images keeps its content a list)
             for b in c or []:
                 t = b.get("type")
                 if t == "text":
                     text.append(b.get("text", ""))
+                    images.append({"type": "text", "text": b.get("text", "")})
+                elif t == "image":
+                    try:
+                        images.append(anthropic_image(b))
+                    except ImageError as e:
+                        return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}})
                 elif t == "thinking":
                     reasoning += b.get("thinking", "")
                 elif t == "tool_use":
@@ -654,15 +681,24 @@ class Handler(BaseHTTPRequestHandler):
                 elif t == "tool_result":
                     rc = b.get("content")
                     if isinstance(rc, list):
-                        rc = "\n".join(x.get("text", "") for x in rc if x.get("type") == "text")
+                        if any(x.get("type") == "image" for x in rc):   # a screenshot tool: the parts stay a list
+                            try:
+                                rc = [anthropic_image(x) if x.get("type") == "image" else {"type": "text", "text": x.get("text", "")}
+                                      for x in rc if x.get("type") in ("text", "image")]
+                            except ImageError as e:
+                                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}})
+                        else:
+                            rc = "\n".join(x.get("text", "") for x in rc if x.get("type") == "text")
                     results.append(rc or "")
             if results:
                 for r in results:
                     msgs.append({"role": "tool", "content": r})
-                if text:
+                if any(p["type"] != "text" for p in images):
+                    msgs.append({"role": "user", "content": images})
+                elif text:
                     msgs.append({"role": "user", "content": "\n".join(text)})
                 continue
-            mm = {"role": m["role"], "content": "\n".join(text)}
+            mm = {"role": m["role"], "content": images if any(p["type"] != "text" for p in images) else "\n".join(text)}
             if reasoning:
                 mm["reasoning_content"] = reasoning
             if calls:
@@ -673,9 +709,14 @@ class Handler(BaseHTTPRequestHandler):
                  for t in body.get("tools") or []]
         thinking = (body.get("thinking") or {}).get("type") == "enabled"
         oa = {"messages": msgs, "tools": tools or None, "chat_template_kwargs": {"enable_thinking": thinking}}
-        prompt, thinking = chat_prompt(oa)
+        try:
+            prompt, thinking = chat_prompt(oa)
+        except ImageError as e:
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}})
         max_tokens = int(body.get("max_tokens") or S.args.max_tokens)
         params = sampling_from(body)
+        if REQ.images:
+            params["images"] = REQ.images
         stops = body.get("stop_sequences") or []
         mid = "msg_" + uuid.uuid4().hex[:24]
 
@@ -746,6 +787,9 @@ def main():
     ap.add_argument("--model", required=True, help="first GGUF shard of the model")
     ap.add_argument("--mtp", default="", help="MTP draft layer GGUF (speculative decoding)")
     ap.add_argument("--ple-gguf", default="", help="GGUF holding the PLE table when the model file has none")
+    ap.add_argument("--mmproj", default="", help="the vision encoder GGUF (images in chat requests)")
+    ap.add_argument("--image-max-tokens", type=int, default=int(os.environ.get("BNK_IMAGE_MAX_TOKENS", "4096")),
+                    help="largest image in tokens (one per 32x32 pixels; bigger images are scaled down)")
     ap.add_argument("--draft", type=int, default=3)
     ap.add_argument("--draft-vocab", default="", help="int32 token ids the drafter may propose (faster drafts)")
     ap.add_argument("--ctx", type=int, default=262144, help="maximum context (the model's native 256K by default)")

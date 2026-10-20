@@ -11,6 +11,9 @@ expert, so the CPU leaves the decode path and prompts are read on both cards at 
 It also runs the **dense Qwen3.8 models** (`qwen35`: Qwen3.8-27B) through a second engine that keeps every weight
 in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s with its own MTP drafter.
 
+Both read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
+`image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`).
+
 On top of that: speculative decoding with the model's own MTP layer, a 256K context whose memory is lent to the
 expert cache until it is needed, **several agents served at once** (their conversations decoded together in one
 batch, and parked in host RAM between turns so a turn reads only its new tokens), a thinking-loop guard, an
@@ -620,6 +623,7 @@ expert cache starts warm after the first session.
 | `BNK_LOG_LEVEL=quiet\|info\|debug` | terminal output: `info` prints a line per request and a live status line |
 | `BNK_VRAM_LOG=1`, `BNK_VMEM_LOG=1` | log to the engine log when the VRAM budget corrects itself against the driver / when the expert cache shrinks or grows |
 | `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
+| `BNK_VISION=0`, `BNK_IMAGE_MAX_TOKENS=4096`, `BNK_IMAGE_URLS=0` | serve text only (no vision encoder) / the largest image in tokens (one per 32x32 pixels) / refuse image URLs (data URLs only) |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | a models folder (instead of the Hugging Face cache) and the MTP layer (`setup.sh` and `models.sh` save them to `bnk.env`) |
 | `BNK_API_KEY` | require this key from API clients |
@@ -725,11 +729,13 @@ src/cpu/       expert store, CPU expert pool, AVX2 multi-token kernels
 src/engine/    engine (decode, batched decode, prefill, parking), MTP drafter, generator (speculation, sampling);
                engine_api.h: the interface both engines implement
 src/dense/     the dense engine (qwen35: Qwen3.8-27B): weights in VRAM, pipeline or tensor parallel, its MTP block
+src/vision/    the vision encoder (ViT + merger, weights streamed from host RAM) and the prompt images' store
 src/server/    the engine's JSON-lines protocol and request scheduler (bnk serve)
 serve/         HTTP server: APIs, chat templates, tokenizer, conversations, telemetry, loop guard, console
 serve/web/     dashboard (React + Tailwind + shadcn/ui)
 configs/       the models: settings and download source, one file each (models.sh manages them)
-docs/          ROADMAP.md: what was measured, what changed, what is next; DUAL-GPU.md: several GPUs; DENSE.md: the dense engine
+docs/          ROADMAP.md: what was measured, what changed, what is next; DUAL-GPU.md: several GPUs; DENSE.md: the dense engine;
+               VISION.md: images
 tools/         CLI, models.py (behind models.sh), MTP builder, draft-vocabulary builder, agent benchmarks, batching simulator, checks
 tests/         kernel tests and benchmarks
 third_party/   ggml (CPU backend: quantization formats, GGUF), MIT

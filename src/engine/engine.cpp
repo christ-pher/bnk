@@ -300,6 +300,22 @@ void Engine::load(const std::string & path, const EngineOptions & opt) {
         }
     }
     CUDA_CHECK(cudaSetDevice(dev_));
+    if (!opt.mmproj.empty()) {
+        // the encoder runs on the first stage, its activations borrowed from that GPU's expert cache per image
+        const Config & c = model_.cfg;
+        if (c.rope_sec[0] <= 0) throw std::runtime_error("vision: the model has no M-RoPE sections (rope.dimension_sections)");
+        image_token_ = c.ple_image;
+        const auto vocab = model_.gguf.get_str_arr("tokenizer.ggml.tokens");
+        for (size_t i = 0; i < vocab.size(); ++i)
+            if (vocab[i] == "<|image_pad|>") image_token_ = (int32_t) i;
+        if (image_token_ <= 0) throw std::runtime_error("vision: the vocabulary has no <|image_pad|> token");
+        images_ = std::make_unique<ImageStore>();
+        images_->cache_limit = (size_t) (opt.vision_cache_gib * 1073741824.0);
+        images_->open(opt.mmproj, dev_, &budget_, opt.verbose);
+        if (images_->cfg().out_dim != c.n_embd)
+            throw std::runtime_error("vision: the encoder's output (" + std::to_string(images_->cfg().out_dim) +
+                                     ") does not match the model's width (" + std::to_string(c.n_embd) + ")");
+    }
 }
 
 void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
@@ -414,6 +430,8 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
             state_bytes += ((size_t) (c.ssm_conv - 1 + W) * C + (size_t) c.ssm_vheads * c.ssm_state * c.ssm_state) * 4;
         }
     }
+    // vision: M-RoPE positions per slot (the model's rotary sections say how pairs split over time / row / column)
+    mrope_ = !opt.mmproj.empty() && c.rope_sec[0] > 0;
     // the conversation slots: address space for every one, VRAM for the KV only as a conversation uses it
     seqs_.clear();
     for (int i = 0; i < std::max(1, opt.slots); ++i) {
@@ -526,6 +544,13 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
 void Engine::alloc_seq(Seq & q) {
     const Config & c = model_.cfg;
     const int W = kMaxWindow, C = c.conv_channels(), HC = c.hc_dim();
+    if (mrope_) {
+        std::vector<int32_t> id((size_t) opt_.max_ctx * 3);
+        for (size_t i = 0; i < id.size(); ++i) id[i] = (int32_t) (i / 3);
+        q.rpos.alloc(id.size());
+        CUDA_CHECK(cudaMemcpy(q.rpos.p, id.data(), id.size() * 4, cudaMemcpyHostToDevice));
+        q.rpos_plain = true;
+    }
     q.conv_buf.resize(c.n_layer);
     q.ssm_state.resize(c.n_layer);
     q.kraw.resize(c.n_layer);
@@ -859,11 +884,11 @@ void Engine::ple_gather() {
         const int p = w.pos0 + tw, t = w.r0 + tw;
         const std::vector<int32_t> & hist = w.q->history;
         int64_t ctx[8];
-        ctx[0] = hist[p];
+        ctx[0] = vocab_id(hist[p]);
         bool cut = false;
         for (int s = 1; s < c.ple_ngram; ++s) {
             const int q = p - s;
-            const int64_t tok = (cut || q < 0) ? -1 : hist[q];
+            const int64_t tok = (cut || q < 0) ? -1 : vocab_id(hist[q]);
             cut = cut || tok < 0 || tok == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tok;
         }
@@ -1267,14 +1292,15 @@ void Engine::attn(int il, int T) {
         const int * pos0 = &d_par_[wi].pos0;
         const size_t r = (size_t) w.r0;
         float * qw = q_.p + r * H * D, * qf = qfull_.p + r * H * D * 2, * ao = attn_o_.p + r * H * D;
+        const MRope mr = mrope_of(w.q);
         attn_prep(qf, k_.p + r * Hkv * D, v_.p + r * Hkv * D, F(L.q_norm), F(L.k_norm), qw, w.q->kc[il], w.q->vc[il],
-                  w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_);
+                  w.T, H, Hkv, D, c.n_rot, c.rope_base, pos0, c.rms_eps, st_, mr);
         if (qsa) {
             // QSA: indexer keys and queries, pooled blocks, the per-query block selection, sparse attention
             float * iqw = iq_.p + r * c.idx_heads * c.idx_dim;
             qsa_store_keys(ik_.p + r * c.idx_dim, w.q->kraw[il], w.T, c.idx_dim, pos0, st_);
-            qsa_queries(iqw, F(L.idx_q_norm), w.T, qsh_, pos0, st_);
-            qsa_pool(w.q->kraw[il], F(L.idx_k_norm), w.q->pooled[il], w.T, qsh_, pos0, st_);
+            qsa_queries(iqw, F(L.idx_q_norm), w.T, qsh_, pos0, st_, mr);
+            qsa_pool(w.q->kraw[il], F(L.idx_k_norm), w.q->pooled[il], w.T, qsh_, pos0, st_, mr);
             qsa_select(iqw, w.q->pooled[il], qsa_scores_, max_blocks_, qsa_sel_, qsa_nsel_, w.T, qsh_, pos0, 0, st_);
             qsa_attention(qw, w.q->kc[il], w.q->vc[il], qf, qsa_sel_, qsa_nsel_, ao, w.T, qsh_, pos0,
                           1.f / sqrtf((float) D), attn_scratch_, st_);
@@ -1725,6 +1751,13 @@ void Engine::fwd_end() {
 void Engine::mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0) {
     if (!mtp_.loaded()) return;
     DeviceScope ds(dev_);
+    // image cells: the drafter sees the image token (its embedding row; the encoder's rows are the main model's)
+    std::vector<int32_t> mapped;
+    if (std::any_of(tokens, tokens + n, is_image_id)) {
+        mapped.assign(tokens, tokens + n);
+        for (auto & t : mapped) t = vocab_id(t);
+        tokens = mapped.data();
+    }
     const int HC = model_.cfg.hc_dim();
     if (!cur_->mtp_R) CUDA_CHECK(cudaMalloc(&cur_->mtp_R, (size_t) HC * 4));
     if (cur_->mtp_cell >= 0 && cur_->mtp_cell == pos0 - 1) mtp_.run(cur_->mtp_R, tokens, 1, cur_->mtp_cell, false, nullptr);
@@ -1743,9 +1776,36 @@ size_t Engine::kv_bytes_mapped() const {
     return b + (next_ ? next_->kv_bytes_mapped() : 0);
 }
 
+void Engine::sync_positions(const std::vector<int32_t> & tokens) {
+    if (!mrope_) return;
+    const auto & h = cur_->history;
+    const bool img = std::any_of(h.begin(), h.end(), is_image_id) || std::any_of(tokens.begin(), tokens.end(), is_image_id);
+    if (!img && cur_->rpos_plain) return;   // every stage holds the same history, so the same flag
+    std::vector<int32_t> pos;
+    if (img) {
+        std::vector<int32_t> seq(h);
+        seq.insert(seq.end(), tokens.begin(), tokens.end());
+        images_->positions(seq, opt_.max_ctx, pos);
+    } else {
+        pos.resize((size_t) opt_.max_ctx * 3);
+        for (size_t k = 0; k < pos.size(); ++k) pos[k] = (int32_t) (k / 3);
+    }
+    for (Engine * s = this; s; s = s->next_.get()) {
+        DeviceScope d2(s->dev_);
+        CUDA_CHECK(cudaMemcpy(s->cur_->rpos.p, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice));
+        s->cur_->rpos_plain = !img;
+    }
+}
+
 void Engine::prefill(const std::vector<int32_t> & tokens) {
     DeviceScope ds(dev_);
     join_commit();
+    sync_positions(tokens);
+    // image cells go through prompt chunks however few they are (their embeddings are put in there)
+    size_t img_end = 0;
+    for (size_t k = tokens.size(); k > 0 && !img_end; --k)
+        if (is_image_id(tokens[k - 1])) img_end = k;
+    if (img_end && (opt_.prefill_chunk <= 0 || !images_)) throw std::runtime_error("images need the prompt path and a vision encoder (--mmproj)");
     size_t i = 0;
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindow);
     // the chunk layout for this read, borrowing VRAM from the expert cache meanwhile: a short turn keeps the
@@ -1826,7 +1886,8 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
     while (i < tokens.size()) try {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
-        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
+        const bool chunked = (int) left >= opt_.prefill_min || i < img_end;
+        if (pf_max_ > 0 && chunked && next_ && pipe) {
             const int N = (int) std::min<size_t>(chunk, left);
             const int32_t * tk = tokens.data() + i;
             const double c0 = now_ms();
@@ -1849,7 +1910,7 @@ void Engine::prefill(const std::vector<int32_t> & tokens) {
             continue;
         }
         drain();   // a short tail or no pipeline: every stage idle first
-        if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+        if (pf_max_ > 0 && chunked) {
             const int N = (int) std::min<size_t>(pf_max_, left);
             prefill_chunk(tokens.data() + i, N);
             t->mtp_feed(t->pf_.res, tokens.data() + i, N, pos0);

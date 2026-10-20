@@ -8,7 +8,8 @@
     "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
     "files": [
       "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-    ]
+    ],
+    "mmproj": "mmproj-BF16.gguf"
   },
   "mtp": "builtin",
   "sampling": {

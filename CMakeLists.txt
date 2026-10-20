@@ -70,6 +70,8 @@ add_library(bnk_core STATIC
   src/dense/dense_attn.cu
   src/dense/dense_dflash.cpp
   src/dense/dense_dflash_ops.cu
+  src/vision/vision.cu
+  src/vision/images.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
@@ -122,3 +124,5 @@ target_compile_options(test_moe_tc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA
 add_executable(test_topk tests/test_topk.cu)
 target_link_libraries(test_topk PRIVATE bnk_core)
 target_compile_options(test_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(test_vision tests/test_vision.cpp)
+target_link_libraries(test_vision PRIVATE bnk_core)

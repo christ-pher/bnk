@@ -11,6 +11,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "kernels/mrope.h"
+
 namespace bnk {
 
 struct QsaShape {
@@ -24,11 +26,13 @@ struct QsaShape {
 
 // raw indexer keys k [T][id] into kraw rows pos0+t (fp16)
 void qsa_store_keys(const float * k, half * kraw, int T, int id, const int * pos0, cudaStream_t s);
-// pooled block keys for the blocks that end inside [pos0, pos0 + T): pooled[b][id]
+// pooled block keys for the blocks that end inside [pos0, pos0 + T): pooled[b][id] (rotated at the block's
+// first cell)
 void qsa_pool(const half * kraw, const float * k_norm, float * pooled, int T, const QsaShape & sh, const int * pos0,
-              cudaStream_t s);
-// indexer queries in place: q [T][ih][id] normalized and rotated at pos0 + t
-void qsa_queries(float * q, const float * q_norm, int T, const QsaShape & sh, const int * pos0, cudaStream_t s);
+              cudaStream_t s, const MRope & mr = {});
+// indexer queries in place: q [T][ih][id] normalized and rotated at cell pos0 + t
+void qsa_queries(float * q, const float * q_norm, int T, const QsaShape & sh, const int * pos0, cudaStream_t s,
+                 const MRope & mr = {});
 // for queries t < T that need it (q + 1 > dense_cells): block scores and the top block list sel[t][top_blocks]
 // (scratch: scores [T][max_blocks]); n_sel[t] = number of selected blocks (0 = dense row)
 void qsa_select(const float * q, const float * pooled, float * scores, int max_blocks, int32_t * sel, int32_t * n_sel,

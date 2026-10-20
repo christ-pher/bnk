@@ -237,11 +237,11 @@ void Engine::pf_ple(int il, int N) {
     for (int t = 0; t < N; ++t) {
         const int ps = pos0 + t;
         int64_t ctx[8];
-        ctx[0] = cur_->history[ps];
+        ctx[0] = vocab_id(cur_->history[ps]);
         bool cut = false;
         for (int s = 1; s < c.ple_ngram; ++s) {
             const int q = ps - s;
-            const int64_t tok = (cut || q < 0) ? -1 : cur_->history[q];
+            const int64_t tok = (cut || q < 0) ? -1 : vocab_id(cur_->history[q]);
             cut = cut || tok < 0 || tok == c.ple_eos;
             ctx[s] = cut ? c.ple_eos : tok;
         }
@@ -309,14 +309,15 @@ void Engine::pf_attn(int il, int N) {
     gemm_.run_h(L.wq, gemm_.xbuf(), E, N, p.qfull, H * D * 2);
     gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
+    const MRope mr = mrope_of(cur_);
     attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
-              &d_par_->pos0, c.rms_eps, st_);
+              &d_par_->pos0, c.rms_eps, st_, mr);
     if (cur_->kraw[il].p) {
         gemm_.run_h(L.idx_k, gemm_.xbuf(), E, N, p.ik, c.idx_dim);
         gemm_.run_h(L.idx_q, gemm_.xbuf(), E, N, p.iq, c.idx_heads * c.idx_dim);
         qsa_store_keys(p.ik, cur_->kraw[il], N, c.idx_dim, &d_par_->pos0, st_);
-        qsa_queries(p.iq, F(L.idx_q_norm), N, qsh_, &d_par_->pos0, st_);
-        qsa_pool(cur_->kraw[il], F(L.idx_k_norm), cur_->pooled[il], N, qsh_, &d_par_->pos0, st_);
+        qsa_queries(p.iq, F(L.idx_q_norm), N, qsh_, &d_par_->pos0, st_, mr);
+        qsa_pool(cur_->kraw[il], F(L.idx_k_norm), cur_->pooled[il], N, qsh_, &d_par_->pos0, st_, mr);
         // Rows up to the dense limit attend to everything; the others select blocks (64 rows at a time bound the
         // score scratch) and then attend in one launch, each block a row (BNK_QSA_PER64: per 64 rows, as before).
         static const bool old = getenv("BNK_QSA_PER64") != nullptr;
@@ -637,8 +638,15 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     *h_par_ = WinParams{pos0, N, ++seq_, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     if (first()) {
-        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
+        const bool img = std::any_of(tokens, tokens + N, is_image_id);
+        std::vector<int32_t> mapped;
+        if (img) {
+            mapped.assign(tokens, tokens + N);
+            for (auto & t : mapped) t = vocab_id(t);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, img ? mapped.data() : tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
         dequant_gather(model_.tok_embd, p.tok, N, p.x, st_);
+        if (img) inject_images(pos0, N);
         hc_init(p.x, p.res, N, c.hc, E, st_);
     } else {
         CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_[buf], (size_t) N * HC * 4, cudaMemcpyHostToDevice, st_));
@@ -666,6 +674,12 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     last_T = 1;
     pf_ms_ += now_ms() - t0;
     pf_tokens_ += N;
+}
+
+void Engine::inject_images(int pos0, int N) {
+    ImageStore * st = head_->images_.get();
+    if (!st) throw std::runtime_error("the prompt has images but no vision encoder is loaded (--mmproj)");
+    st->put_rows(cur_->history, pos0, N, pf_.x.p, st_);
 }
 
 }  // namespace bnk

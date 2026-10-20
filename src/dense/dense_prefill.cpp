@@ -67,7 +67,7 @@ void DenseEngine::pf_attn(int il, int N) {
     gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
     attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
-              &d_par_->pos0, c.rms_eps, st_);
+              &d_par_->pos0, c.rms_eps, st_, mrope_of(cur_));
     // the tensor-core kernel (head dim 256); BNK_PF_ATTN_TC=0: the one-warp-per-row kernel
     static const bool tc = !getenv("BNK_PF_ATTN_TC") || atoi(getenv("BNK_PF_ATTN_TC")) != 0;
     if (!(tc &&
@@ -110,8 +110,18 @@ void DenseEngine::pf_in(const int32_t * tokens, int N, int buf) {
     *h_par_ = WinParams{pos0, N, ++seq_, 0};
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     if (first()) {
-        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
+        const bool img = std::any_of(tokens, tokens + N, is_image_id);
+        std::vector<int32_t> mapped;
+        if (img) {
+            mapped.assign(tokens, tokens + N);
+            for (auto & t : mapped) t = vocab_id(t);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, img ? mapped.data() : tokens, (size_t) N * 4, cudaMemcpyHostToDevice, st_));
         dequant_gather(model_.tok_embd, p.tok, N, p.res, st_);
+        if (img) {   // the encoder's rows over the image cells' (every tensor-parallel rank embeds)
+            if (!head_->images_) throw std::runtime_error("the prompt has images but no vision encoder is loaded (--mmproj)");
+            head_->images_->put_rows(cur_->history, pos0, N, p.res.p, st_);
+        }
     } else {
         CUDA_CHECK(cudaMemcpyAsync(p.res.p, pf_xfer_in_[buf], (size_t) N * E * 4, cudaMemcpyHostToDevice, st_));
     }
@@ -226,9 +236,36 @@ void DenseEngine::tp_prefill_chunk(const int32_t * tokens, int N) {
 // Processes a prompt (batched chunks for long stretches, decode windows for short tails) and commits it; the
 // logits of its last token are in logits row 0. Several stages: chunk k+1 on the first stage while a worker runs
 // chunk k through the others.
+void DenseEngine::sync_positions(const std::vector<int32_t> & tokens) {
+    if (!mrope_) return;
+    const auto & h = cur_->history;
+    const bool img = std::any_of(h.begin(), h.end(), is_image_id) || std::any_of(tokens.begin(), tokens.end(), is_image_id);
+    if (!img && cur_->rpos_plain) return;
+    std::vector<int32_t> pos;
+    if (img) {
+        std::vector<int32_t> seq(h);
+        seq.insert(seq.end(), tokens.begin(), tokens.end());
+        images_->positions(seq, opt_.max_ctx, pos);
+    } else {
+        pos.resize((size_t) opt_.max_ctx * 3);
+        for (size_t k = 0; k < pos.size(); ++k) pos[k] = (int32_t) (k / 3);
+    }
+    for (DenseEngine * s = this; s; s = s->next_.get()) {
+        DeviceScope d2(s->dev_);
+        CUDA_CHECK(cudaMemcpy(s->cur_->rpos.p, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice));
+        s->cur_->rpos_plain = !img;
+    }
+}
+
 void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
     DeviceScope ds(dev_);
     join_commit();
+    sync_positions(tokens);
+    // image cells go through prompt chunks however few they are (their embeddings are put in there)
+    size_t img_end = 0;
+    for (size_t k = tokens.size(); k > 0 && !img_end; --k)
+        if (is_image_id(tokens[k - 1])) img_end = k;
+    if (img_end && (opt_.prefill_chunk <= 0 || !images_)) throw std::runtime_error("images need the prompt path and a vision encoder (--mmproj)");
     size_t i = 0;
     ensure_ctx(pos() + (int) tokens.size() + kMaxWindowDense);
     const int n = (int) tokens.size();
@@ -237,7 +274,7 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
         while (i < tokens.size()) {
             const size_t left = tokens.size() - i;
             const int pos0 = pos();
-            if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+            if (pf_max_ > 0 && ((int) left >= opt_.prefill_min || i < img_end)) {
                 const int N = (int) std::min<size_t>(pf_max_, left);
                 const double c0 = now_ms();
                 tp_prefill_chunk(tokens.data() + i, N);
@@ -293,7 +330,8 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
     while (i < tokens.size()) try {
         const size_t left = tokens.size() - i;
         const int pos0 = pos();
-        if (pf_max_ > 0 && (int) left >= opt_.prefill_min && next_ && pipe) {
+        const bool chunked = (int) left >= opt_.prefill_min || i < img_end;
+        if (pf_max_ > 0 && chunked && next_ && pipe) {
             const int N = (int) std::min<size_t>(chunk, left);
             const int32_t * tk = tokens.data() + i;
             const double c0 = now_ms();
@@ -316,7 +354,7 @@ void DenseEngine::prefill(const std::vector<int32_t> & tokens) {
             continue;
         }
         drain();
-        if (pf_max_ > 0 && (int) left >= opt_.prefill_min) {
+        if (pf_max_ > 0 && chunked) {
             const int N = (int) std::min<size_t>(pf_max_, left);
             prefill_chunk(tokens.data() + i, N);
             t->mtp_feed(t->pf_.res, tokens.data() + i, N, pos0);

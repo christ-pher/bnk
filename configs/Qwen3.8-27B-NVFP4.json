@@ -1,7 +1,7 @@
 {
   "notes": "nvidia/Qwen3.8-27B-NVFP4 (ModelOpt: FFN and head NVFP4, attention and DeltaNet FP8 per tensor) converted by llama.cpp's convert_hf_to_gguf.py --outtype q8_0 (the FP8 projections as Q8_0: KL to the F16 copy unchanged), 19.8 GB; the dense engine, tensor parallel. Against Q8_0 on 3,000 tokens of text: NLL +0.65%, KL 0.018, same top-1 92.3% (unsloth's UD-Q4_K_XL: +0.19%, 0.0064, 96.2%). See docs/1CAT-VLLM-IDEAS.md.",
   "aliases": ["qwen27b-nvfp4"],
-  "source": {"path": "/root/.cache/bnk/gguf/Qwen3.8-27B-NVFP4.gguf"},
+  "source": {"path": "/root/.cache/bnk/gguf/Qwen3.8-27B-NVFP4.gguf", "mmproj_from": "Qwen3.8-27B-Q8_0"},
   "mtp": "builtin",
   "dflash": "dflash2-27b.gguf",
   "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0},

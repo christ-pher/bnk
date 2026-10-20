@@ -17,6 +17,8 @@ A config's "source" says what to download:
 
 `files` lists every shard, the first one first; `revision` pins the commit (omit it to follow the repo's main).
 A model downloaded some other way can be given by path instead: "source": {"path": "/models/x-00001-of-00002.gguf"}.
+`mmproj` names the repo's vision encoder file (images in chat requests; downloaded with the model);
+"mmproj_path" gives one on disk, "mmproj_from" another config's (a converted copy of the same model).
 
 Gated repos need a Hugging Face account that accepted the model's terms and a token: `.venv/bin/hf auth login`.
 run.sh also uses `resolve CHOICE` (prints the config name and the first shard's path) and `menu` (one line per model
@@ -95,6 +97,24 @@ def locate(name: str, cfg: dict) -> Path | None:
     if all(isinstance(p, str) for p in paths):
         return Path(paths[0])
     return None
+
+
+def locate_mmproj(name: str, cfg: dict) -> Path | None:
+    """The model's vision encoder file when its config names one and it is downloaded."""
+    src = cfg.get("source", {})
+    if src.get("mmproj_from"):   # the same model in another config (a converted file shares the original's encoder)
+        return locate_mmproj(*find(src["mmproj_from"]))
+    if src.get("mmproj_path"):
+        p = Path(src["mmproj_path"]).expanduser()
+        return p if p.exists() else None
+    f = src.get("mmproj")
+    if not f or "repo" not in src:
+        return None
+    if env_models() and (Path(env_models()).expanduser() / name / f).exists():
+        return Path(env_models()).expanduser() / name / f
+    from huggingface_hub import try_to_load_from_cache
+    p = try_to_load_from_cache(src["repo"], f, revision=src.get("revision"))
+    return Path(p) if isinstance(p, str) else None
 
 
 def remote_files(repo: str, revision: str | None) -> tuple[str, dict[str, dict]]:
@@ -184,6 +204,13 @@ def cmd_resolve(a) -> int:
     return 0 if p else 2
 
 
+def cmd_mmproj(a) -> int:
+    name, cfg = find(a.choice)
+    p = locate_mmproj(name, cfg)
+    print(p or "")
+    return 0
+
+
 def cmd_download(a) -> int:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
@@ -208,11 +235,12 @@ def cmd_download(a) -> int:
     except RepositoryNotFoundError:
         print(f"  {src['repo']} is not reachable (renamed, private, or a token is needed: .venv/bin/hf auth login)")
         return 1
-    missing = [f for f in src["files"] if f not in info]
+    files = src["files"] + ([src["mmproj"]] if src.get("mmproj") else [])
+    missing = [f for f in files if f not in info]
     if missing:
         print(f"  not in the repo at {commit[:12]}: {', '.join(missing)}")
         return 1
-    need = sum(info[f]["size"] or 0 for f in src["files"])
+    need = sum(info[f]["size"] or 0 for f in files)
     disk = root or Path(os.environ.get("HF_HUB_CACHE") or Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub")
     disk.mkdir(parents=True, exist_ok=True)
     have = locate(name, cfg)
@@ -220,7 +248,7 @@ def cmd_download(a) -> int:
     if not have and need > free:
         print(f"  not enough disk space: up to {gb(need)} to download, {gb(free)} free on {disk}")
         return 1
-    for f in src["files"]:
+    for f in files:
         want = info[f]
         print(f"  {f} ({gb(want['size'] or 0)})")
         try:
@@ -251,6 +279,9 @@ def cmd_add(a) -> int:
     for f in ggufs:
         groups.setdefault(SHARD.sub("", f).removesuffix(".gguf"), []).append(f)
     groups = {k: v for k, v in groups.items() if "mmproj" not in k.lower() and "mtp" not in Path(k).name.lower()}
+    # the vision encoder, when the repo has one (the 16-bit file: the engine converts it to fp16 anyway)
+    mm = sorted((f for f in info if f.endswith(".gguf") and "mmproj" in Path(f).name.lower()),
+                key=lambda f: (not any(t in f.upper() for t in ("BF16", "F16")), f))
     if len(groups) != 1:
         print(f"{a.repo} has {len(groups)} GGUF models{' matching ' + a.include if a.include else ''}"
               + (": pick one with --include, for example" if groups else "."))
@@ -265,7 +296,7 @@ def cmd_add(a) -> int:
         return 1
     cfg = {"notes": f"{a.repo} ({Path(stem).name}). Sampling and speculation are bnk's defaults; not tuned yet.",
            "aliases": a.alias,
-           "source": {"repo": a.repo, "revision": commit, "files": files},
+           "source": {"repo": a.repo, "revision": commit, "files": files, **({"mmproj": mm[0]} if mm else {})},
            **DEFAULTS,
            "server_args": ["--model-id", name, "--max-tokens", "32768", "--slots", "2"]}
     if not a.alias:
@@ -293,6 +324,9 @@ def main() -> int:
     p.add_argument("--revision", help="pin this branch or commit (default: main, pinned to its current commit)")
     p.add_argument("--force", action="store_true", help="replace an existing config")
     p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("mmproj", help=argparse.SUPPRESS)
+    p.add_argument("choice")
+    p.set_defaults(fn=cmd_mmproj)
     p = sub.add_parser("resolve", help=argparse.SUPPRESS)
     p.add_argument("choice")
     p.set_defaults(fn=cmd_resolve)

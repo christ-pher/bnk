@@ -9,7 +9,8 @@
     "files": [
       "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
       "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"
-    ]
+    ],
+    "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
   },
   "sampling": {
     "temperature": 1.0,
