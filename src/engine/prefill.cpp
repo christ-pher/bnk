@@ -624,6 +624,12 @@ void Engine::prefill_chunk_here(const int32_t * tokens, int N, int buf) {
     DeviceScope ds(dev_);
     const double t0 = now_ms();
     join_commit_here();
+    // the chunk's images are encoded first: the encoder's scratch comes out of the expert cache, which leaves
+    // more experts outside VRAM than a staging sized before it holds
+    if (first() && std::any_of(tokens, tokens + N, is_image_id)) {
+        if (!head_->images_) throw std::runtime_error("the prompt has images but no vision encoder is loaded (--mmproj)");
+        head_->images_->encode_all(tokens, N);
+    }
     // the expert cache may have changed since the read began (other conversations decode between its chunks:
     // their cache adaptation and growing KV leave more experts outside VRAM), so the staging is checked again
     staging_fit();

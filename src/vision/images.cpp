@@ -60,6 +60,11 @@ const float * ImageStore::rows(int32_t id) {
     return c.rows.data();
 }
 
+void ImageStore::encode_all(const int32_t * t, int n) {
+    for (int i = 0; i < n; ++i)
+        if (is_image_id(t[i]) && (i == 0 || t[i - 1] != t[i])) rows(t[i]);
+}
+
 void ImageStore::put_rows(const std::vector<int32_t> & h, int pos0, int N, float * dst, cudaStream_t s) {
     const int E = enc_.cfg().out_dim;
     for (int t = 0; t < N;) {

@@ -1614,7 +1614,7 @@ void Engine::fwd_prepare(const std::vector<BatchWin> & batch, int lane, bool spe
             q->last_r0 = r0;
             q->last_lane = lane;
         }
-        memcpy(h_tok_ + r0, b.tokens, b.T * 4);
+        for (int j = 0; j < b.T; ++j) h_tok_[r0 + j] = vocab_id(b.tokens[j]);   // an image id never indexes the embeddings
         h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
         key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
     }

@@ -31,6 +31,8 @@ public:
     bool grid(int32_t id, int * gh, int * gw) const;
     // its embeddings, [gh * gw][out_dim] (encoded now if not cached); valid until the next call
     const float * rows(int32_t id);
+    // encodes the images among tokens[0, n) not cached yet (before buffers are sized around the VRAM it borrows)
+    void encode_all(const int32_t * tokens, int n);
     size_t cache_limit = (size_t) 2 << 30;   // bytes of embeddings kept
     VisionEncoder & encoder() { return enc_; }
 

@@ -111,7 +111,11 @@ void Generator::lookup_drafts(int32_t bonus) {
     static const int wide_ctx = getenv("BNK_LOOKUP_WIDE_CTX") ? atoi(getenv("BNK_LOOKUP_WIDE_CTX")) : 16;
     const bool w = wide == 2 || (wide == 1 && (lookup_streak_ || ctx >= wide_ctx));
     const int rows = w ? eng_.max_window() : std::min(eng_.max_window(), kMaxWindow);
-    const int L = std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, rows - 1 + (probing_ ? 1 : 0)});
+    int L = std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, rows - 1 + (probing_ ? 1 : 0)});
+    // a copy stops before an image's cells (negative placeholder ids, never tokens: as window tokens they would
+    // index the embeddings out of bounds)
+    for (int i = 0; i < L; ++i)
+        if (seq_[p + i] < 0) L = i;
     if (L <= 0) return;
     lookup_.assign(seq_.begin() + p, seq_.begin() + p + L);
     lookup_ctx_ = ctx;
