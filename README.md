@@ -73,10 +73,29 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 | 64K / 250K-token cold read | | 970 / 531 tok/s |
 | Decode with drafting at 64K / 250K of context | | 85 / 54 tok/s |
 | Served (sampled, thinking, 545-token answer) | | 87.5 tok/s |
+| Served with DFlash2 (v0.4.3; sampled, thinking, 8 prompts x 2) | | **88-91 tok/s** (MTP: 70.8); NVFP4 27B 95.7 |
 
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
 each) since v0.4.2, 23 us each through host memory before.
+
+### What v0.4.3 changed: the DFlash2 drafter and NVFP4 for the 27B
+
+All of it is the dense engine (the MoE models run the shared kernels unchanged: FP4-Local and IQ3_S Flash-Next
+measured the same speed, identical copy output). Details and every measurement in `docs/1CAT-VLLM-IDEAS.md` and
+`docs/DENSE.md`.
+
+* **DFlash2 drafter** (`incoai/Qwen3.8-27B-DFlash2`, converted by `tools/dflash_gguf.py` to
+  `~/.cache/bnk/dflash2-27b.gguf`; the 27B configs' `"dflash"` key, `BNK_DFLASH=0` drafts with the MTP). Sampled
+  drafts verified by rejection sampling, so the output distribution is exactly the model's; the drafter is split
+  over both GPUs. Served 27B Q8_0 (temperature 1, thinking, 8 prompts x 2): 70.8 -> 88-91 tok/s; greedy code
+  108 -> 158 tok/s. Without the drafter file the server notes it and drafts with the MTP.
+* **NVFP4 27B** (`./run.sh qwen27b-nvfp4`): `nvidia/Qwen3.8-27B-NVFP4` converted by llama.cpp's
+  `convert_hf_to_gguf.py --outtype q8_0` (19.8 GB); the loader applies NVFP4's per-tensor global scales. Served
+  95.7 tok/s with DFlash2. Against Q8_0: NLL +0.65%, same top token 92.3% (UD-Q4_K_XL: +0.19%, 96.2%).
+* **16-row verify windows** for lookup drafts (copies, edits, tool calls): +27% on a copy task.
+* **Snapshots every 8,192 tokens** of a long prompt: a second request on a shared 20K-token document 18.7 -> 6.8 s.
+* **Tensor-core GEMV** splits K over 8 warps: 4-16-row forwards ~5% faster for Q8_0 and NVFP4.
 
 ### What v0.4.2 changed: GPU peer-to-peer for the 27B
 
@@ -474,6 +493,7 @@ exactly these models, and `./models.sh` manages them:
 | `cyber-frost` | [peasantsmith CYBER-FROST-3.8-PS-GUFF Q5_K_M](https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF) (Blackfrost-AI's cybersecurity fine-tune) | 112.5 GB, 1 file; needs ~110 GB of RAM |
 | `fp4-local` | [nvidia Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (NVFP4, quantization-aware distilled), converted locally with `tools/convert_nvfp4.py` and `tools/convert_ple_nvfp4.py` (`docs/NVFP4.md`) | 75 GB + 29 GB table, two local GGUFs; the config's paths point at them |
 | `qwen27b` | [unsloth Qwen3.8-27B-GGUF Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (the dense 27B; `docs/DENSE.md`) | 29 GB, 1 file; needs two V100s |
+| `qwen27b-nvfp4` | [nvidia Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), converted locally with llama.cpp's `convert_hf_to_gguf.py --outtype q8_0` (`docs/DENSE.md`) | 19.8 GB, one local GGUF; needs two V100s |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
 `$HF_HUB_CACHE`), the same place `hf download` uses, so a model already downloaded with `hf` is found as it is. With
