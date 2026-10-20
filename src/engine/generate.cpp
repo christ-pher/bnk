@@ -12,11 +12,20 @@ void Generator::recent_tail(std::vector<int32_t> & out) const {
     out.clear();
     const auto & h = eng_.history();
     const size_t n = std::min<size_t>(h.size(), 64);
-    out.insert(out.end(), h.end() - n, h.end());
+    for (auto it = h.end() - n; it != h.end(); ++it)
+        if (*it >= 0) out.push_back(*it);   // image cells are placeholders, not tokens to penalize
     out.insert(out.end(), emitted_tail_.begin(), emitted_tail_.end());
 }
 
 int Generator::gpu_k() const { return sp_.top_k > 0 ? sp_.top_k : EngineApi::kTopkMax; }
+
+// How many of seq[p, p + L) a lookup copy may take: it stops before an image's cells (negative placeholder ids,
+// never tokens: drafted, they would index the embeddings out of bounds in the main model and the drafter)
+static int until_image(const std::vector<int32_t> & seq, int p, int L) {
+    for (int i = 0; i < L; ++i)
+        if (seq[p + i] < 0) return i;
+    return L;
+}
 
 void Generator::gpu_candidates(int row0, int T) {
     const int K = gpu_k();
@@ -111,11 +120,7 @@ void Generator::lookup_drafts(int32_t bonus) {
     static const int wide_ctx = getenv("BNK_LOOKUP_WIDE_CTX") ? atoi(getenv("BNK_LOOKUP_WIDE_CTX")) : 16;
     const bool w = wide == 2 || (wide == 1 && (lookup_streak_ || ctx >= wide_ctx));
     const int rows = w ? eng_.max_window() : std::min(eng_.max_window(), kMaxWindow);
-    int L = std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, rows - 1 + (probing_ ? 1 : 0)});
-    // a copy stops before an image's cells (negative placeholder ids, never tokens: as window tokens they would
-    // index the embeddings out of bounds)
-    for (int i = 0; i < L; ++i)
-        if (seq_[p + i] < 0) L = i;
+    const int L = until_image(seq_, p, std::min<int>({opt_.lookup_max + (probing_ ? 1 : 0), (int) seq_.size() - p, rows - 1 + (probing_ ? 1 : 0)}));
     if (L <= 0) return;
     lookup_.assign(seq_.begin() + p, seq_.begin() + p + L);
     lookup_ctx_ = ctx;
@@ -453,7 +458,7 @@ std::vector<int32_t> Generator::next_lookahead() {
         int ctx = 0;   // the table holds the history's n-grams (synced by lookup_drafts): the tail may end in the window
         const int p = index_.find(seq_, &ctx);
         if (p >= 0) {
-            const int L = std::min<int>({opt_.lookup_max + 1, (int) seq_.size() - p, eng_.max_window()});
+            const int L = until_image(seq_, p, std::min<int>({opt_.lookup_max + 1, (int) seq_.size() - p, eng_.max_window()}));
             if (L > 0) la_lookup.assign(seq_.begin() + p, seq_.begin() + p + L);
         }
     }
