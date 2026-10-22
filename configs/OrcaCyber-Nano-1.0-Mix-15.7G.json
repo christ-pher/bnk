@@ -1,0 +1,46 @@
+{
+  "notes": "orcarouter/OrcaCyber-Nano-1.0: a cybersecurity post-train of Qwen3.8-27B (qwen35 dense hybrid, 48 GDN + 16 gated-attention layers) as the card's best-quality GGUF, Mix-15.7G (IQ4_XS / Q5_K / Q6_K with a few IQ3_S / Q4_K; MTP block in block 64). The dense engine (src/dense, docs/DENSE.md), tensor parallel over the two V100s, fp16 KV, 262K context, two slots. Drafts with the repo's own DFlash2 drafter (llama.cpp 'dflash' GGUF rewritten by tools/dflash_from_llamacpp.py into ~/.cache/bnk/dflash2-orcacyber-nano.gguf; it is incoai's drafter in Q8_0 with the FFN and o_proj weights changed ~3%); without the file it drafts with the MTP block. Served, temperature 1.0, 8 x 1,500 tokens of security prompts: MTP 97.7 tok/s, incoai DFlash2 105.5, this drafter 103.2 (the two DFlash2 within noise). Sampling as the card recommends.",
+  "aliases": [
+    "orca",
+    "orcacyber",
+    "ocn"
+  ],
+  "source": {
+    "repo": "orcarouter/OrcaCyber-Nano-1.0",
+    "revision": "1af1635aa22b97e965450c2d69525761d9bd463f",
+    "files": [
+      "OrcaCyber-Nano-1.0-AI-Defense-Mix-15.7G.gguf"
+    ],
+    "mmproj": "mmproj-OrcaCyber-Nano-1.0-AI-Defense-F16.gguf"
+  },
+  "mtp": "builtin",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0
+  },
+  "speculation": {
+    "draft": 7,
+    "draft_min_p": 0.8,
+    "dflash_min_p": 0.2
+  },
+  "thinking_loop_guard": true,
+  "server_args": [
+    "--model-id",
+    "OrcaCyber-Nano-1.0",
+    "--ctx",
+    "262144",
+    "--max-tokens",
+    "32768",
+    "--slots",
+    "2",
+    "--park-gib",
+    "0"
+  ],
+  "engine_args": [
+    "--tp",
+    "1"
+  ],
+  "dflash": "dflash2-orcacyber-nano.gguf"
+}
