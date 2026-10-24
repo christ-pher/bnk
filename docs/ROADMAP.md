@@ -21,6 +21,10 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-10-24, v0.5.0: DeepSeek-V4.1-Flash** (`docs/DEEPSEEK.md`, plan in `docs/DEEPSEEK-NEXT.md`): a third engine
+  for the 763B model with the Engram tables on the NVMe and experts placed disjointly between the two cards and
+  host RAM. 13 tok/s decode, ~100 tok/s prompts, exact tokenizer, tool calls.
+
 * **Prompt-path experts on the tensor cores** (2026-10-15, `src/kernels/moe_tc.cu`): nsys on a cold 32K read showed
   61% of GPU 0's busy time in the routed experts' grouped GEMM path: `cublasGemmGroupedBatchedEx` runs one kernel
   per expert (64 us for a 1280 x 2560 x ~40 product, ~4 TFLOPS) after two `dequant_r_k` launches per expert (an

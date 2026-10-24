@@ -37,6 +37,29 @@ def _common_chars(a: str, b: str) -> int:
 # llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 expression (the tokenizer.json original, with (?i:) expanded)
 QWEN35 = (r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
           r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM (DeepSeek-V4.1): three expressions applied in turn, each splitting the
+# pieces the previous one left (text between matches stays a piece of its own)
+JOYAI_LLM = [r"\p{N}{1,3}",
+             r"[一-龥぀-ゟ゠-ヿ]+",
+             r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"]
+PRE_SEQUENCES = {"joyai-llm": JOYAI_LLM}
+
+
+def _split_sequence(text: str, pres: list) -> list[str]:
+    pieces = [text]
+    for pre in pres:
+        nxt = []
+        for p in pieces:
+            pos = 0
+            for m in pre.finditer(p):
+                if m.start() > pos:
+                    nxt.append(p[pos:m.start()])
+                nxt.append(m.group(0))
+                pos = m.end()
+            if pos < len(p):
+                nxt.append(p[pos:])
+        pieces = nxt
+    return pieces
 
 
 def bytes_to_unicode() -> dict[int, str]:
@@ -52,8 +75,9 @@ def bytes_to_unicode() -> dict[int, str]:
 
 
 class Tokenizer:
-    def __init__(self, tokens: list[str], merges: list[str], types: list[int], specials: dict[str, int]):
+    def __init__(self, tokens: list[str], merges: list[str], types: list[int], specials: dict[str, int], pre: str = ""):
         self.tokens = tokens
+        self.pre_name = pre
         self.vocab = {t: i for i, t in enumerate(tokens)}
         self.ranks = {}
         for i, m in enumerate(merges):
@@ -66,6 +90,7 @@ class Tokenizer:
         self.special = {t: i for i, t in enumerate(tokens) if types and types[i] in (3, 4)}
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
         self.pre = regex.compile(QWEN35)
+        self.pre_seq = [regex.compile(r) for r in PRE_SEQUENCES.get(pre, [])]
         self.cache: dict[str, list[int]] = {}
         self.wcache: dict[str, list[int]] = {}
         self.byte_table = {i: c for i, c in self.byte_enc.items()}
@@ -93,10 +118,11 @@ class Tokenizer:
         md = read_metadata(path, {"tokenizer.ggml.tokens", "tokenizer.ggml.merges", "tokenizer.ggml.token_type",
                                   "tokenizer.ggml.eos_token_id", "tokenizer.ggml.padding_token_id",
                                   "tokenizer.ggml.bos_token_id", "tokenizer.chat_template", "general.name",
-                                  "general.sampling.temp", "general.sampling.top_k", "general.sampling.top_p"})
+                                  "general.sampling.temp", "general.sampling.top_k", "general.sampling.top_p",
+                                  "tokenizer.ggml.pre"})
         specials = {k.split(".")[-1]: v for k, v in md.items() if k.endswith("_token_id")}
         tok = cls(md["tokenizer.ggml.tokens"], md["tokenizer.ggml.merges"], md.get("tokenizer.ggml.token_type") or [],
-                  specials)
+                  specials, md.get("tokenizer.ggml.pre", ""))
         tok.chat_template = md.get("tokenizer.chat_template", "")
         tok.model_name = md.get("general.name", "model")
         tok.sampling = {k.split(".")[-1]: v for k, v in md.items() if k.startswith("general.sampling.")}
@@ -133,6 +159,7 @@ class Tokenizer:
         d = dict(self.__dict__)
         d.pop("special_re", None)
         d.pop("pre", None)
+        d.pop("pre_seq", None)
         d.pop("_recent_lock", None)
         d.pop("toks", None)
         d["cache"] = {}
@@ -149,6 +176,7 @@ class Tokenizer:
         self._recent_lock = threading.Lock()
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
         self.pre = regex.compile(QWEN35)
+        self.pre_seq = [regex.compile(r) for r in PRE_SEQUENCES.get(getattr(self, "pre_name", ""), [])]
 
     # ----------------------------------------------------------------- encode
     def _bpe(self, word: str) -> list[int]:
@@ -183,7 +211,8 @@ class Tokenizer:
         # the cache is keyed by the word as written: a hit skips the byte mapping too (most words, after the first
         # few requests); the mapping itself is a str.translate over the word's UTF-8 bytes read as Latin-1
         out, wcache, bpe, table = [], self.wcache, self._bpe, self.byte_table
-        for w in self.pre.findall(text):
+        words = _split_sequence(text, self.pre_seq) if self.pre_seq else self.pre.findall(text)
+        for w in words:
             ids = wcache.get(w)
             if ids is None:
                 ids = bpe(w.encode("utf-8").decode("latin-1").translate(table))

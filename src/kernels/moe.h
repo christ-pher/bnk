@@ -156,5 +156,8 @@ void moe_tc_down(const TcItem * items, const TcBlock * blocks, int nblocks, cons
 
 // seq += 1 (first kernel of a forward)
 void bump_seq(uint32_t * seq, cudaStream_t st);
+// the decode path's SwiGLU clamp (moe_act: up to [-limit, limit], gate to <= limit; DeepSeek-V4), 0 = none
+void moe_set_swiglu_limit(float limit);
+void moe_tc_set_swiglu_limit(float limit);   // the same for the prompt path's tensor-core experts (moe_tc_gu)
 
 }  // namespace bnk

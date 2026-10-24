@@ -69,6 +69,16 @@ class ChatTemplate:
 
 _TOOL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
+# DeepSeek-V4.1's DSML calls. The template describes them as <｜DSML｜tool_calls> ... but the model writes them as its
+# encoder does: "<｜DSML｜ calls>", "<｜DSML｜ invoke name=..>", "<｜DSML｜ parameter name=.. string=..>" (｜DSML｜ is one
+# token, id 128825, followed by a space-prefixed word; "tool_calls" / "function_calls" accepted too). string="true"
+# keeps the value as text, "false" parses it as JSON.
+DSML = "｜DSML｜"
+_DSML_BLOCK_RE = re.compile(r"<｜DSML｜\s*(?:tool_|function_)?calls\s*>(.*?)</｜DSML｜\s*(?:tool_|function_)?calls\s*>", re.S)
+_DSML_INVOKE_RE = re.compile(r"<｜DSML｜\s*invoke\s+name\s*=\s*\"([^\"\n]*)\"\s*>(.*?)</｜DSML｜\s*invoke\s*>", re.S)
+_DSML_PARAM_RE = re.compile(r"<｜DSML｜\s*parameter\s+name\s*=\s*\"([^\"\n]*)\"(?:\s+string\s*=\s*\"(true|false)\")?\s*>(.*?)</｜DSML｜\s*parameter\s*>", re.S)
+# what opens a tool call in the stream (held back from the content until the end): Qwen's tag, or any DSML tag
+TOOL_STARTS = ("<tool_call>", "<" + DSML)
 
 
 def _param_types(tools) -> dict:
@@ -93,6 +103,24 @@ def parse_tool_calls(text: str, tools=None):
     a parameter, JSON is tried first, text is the fallback."""
     calls = []
     types = _param_types(tools)
+    for blk in _DSML_BLOCK_RE.finditer(text):
+        for m in _DSML_INVOKE_RE.finditer(blk.group(1)):
+            args = {}
+            name = m.group(1).strip()
+            for p in _DSML_PARAM_RE.finditer(m.group(2)):
+                pname, is_str, raw = p.group(1).strip(), p.group(2), p.group(3)
+                as_text = is_str == "true" if is_str else types.get(name, {}).get(pname) == "string"
+                if as_text:
+                    args[pname] = raw
+                    continue
+                try:
+                    args[pname] = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    args[pname] = raw
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if calls:
+        return _DSML_BLOCK_RE.sub("", text).strip(), calls
     for m in _TOOL_RE.finditer(text):
         args = {}
         name = m.group(1).strip()
@@ -148,7 +176,7 @@ class OutputParser:
                 self.content_all += self.buf
                 self.buf = ""
                 break
-            i = self.buf.find("<tool_call>")
+            i = min((j for j in (self.buf.find(t) for t in TOOL_STARTS) if j >= 0), default=-1)
             if i >= 0:
                 if i:
                     out.append(("content", self.buf[:i]))
@@ -165,7 +193,7 @@ class OutputParser:
                 self.buf = self.buf.lstrip()[len("<think>"):]
                 self.mode = "reasoning"
                 continue
-            keep = max(_partial_suffix(self.buf, "<tool_call>"), _partial_suffix(self.buf, "<think>"))
+            keep = max(_partial_suffix(self.buf, "<think>"), *(_partial_suffix(self.buf, t) for t in TOOL_STARTS))
             emit, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
             if emit:
                 out.append(("content", emit))

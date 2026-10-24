@@ -1,0 +1,34 @@
+{
+  "notes": "DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS (ISTA DASLab): 763B parameters, 384 experts top-6, through the DeepSeek engine (docs/DEEPSEEK.md). The Engram tables (DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf, 110.6 GB, shared by every build) stay on disk and are read by rows. Sampling is the model card's (temperature 1.0, top_p 1.0). No drafter yet (DSpark is a separate GGUF not converted). Experts are placed disjointly between the two GPUs' caches and host RAM: the first run places them unranked; the routing counts written while serving rank the next start.",
+  "aliases": [
+    "ds-xxs",
+    "deepseek-iq2_xxs"
+  ],
+  "source": {
+    "repo": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+    "revision": "a5ea793fd71f9c25382c8ec0d204c936b6f4e024",
+    "files": [
+      "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf",
+      "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf",
+      "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf",
+      "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf",
+      "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+    ]
+  },
+  "mtp": "",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0
+  },
+  "thinking_loop_guard": true,
+  "server_args": [
+    "--model-id",
+    "DeepSeek-V4.1-Flash",
+    "--max-tokens",
+    "32768",
+    "--slots",
+    "1"
+  ]
+}

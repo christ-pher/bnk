@@ -373,12 +373,15 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
         eff = body["reasoning_effort"]
         if eff == "none":
             thinking = False
+        elif "DSML" in S.tok.chat_template:
+            # DeepSeek-V4.1: an integer budget 1-100 or low / high / max (50 / 75 / 100); OpenAI's other levels mapped
+            kwargs["reasoning_effort"] = {"minimal": "25", "medium": "62", "xhigh": "max"}.get(eff, eff)
         else:
             kwargs["reasoning_effort"] = {"high": "xhigh", "minimal": "low"}.get(eff, eff)
     kwargs["enable_thinking"] = bool(thinking)
     text = S.template.render(body.get("messages", []), tools=body.get("tools"), add_generation_prompt=True, **kwargs)
     # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
-    tail = text[text.rfind("<|im_start|>assistant"):]
+    tail = text[max(text.rfind("<|im_start|>assistant"), text.rfind("<｜Assistant｜>")):]
     thinking = "<think>" in tail and "</think>" not in tail
     if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
         text, thinking = text + "\n</think>\n\n", False
