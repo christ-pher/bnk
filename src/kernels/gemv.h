@@ -64,6 +64,12 @@ struct GemvSplit {
     float * y2 = nullptr;
     int64_t ldy2 = 0;
     float wscale = 1.f;   // the matrix's global scale (QMat::scale, NVFP4's), applied as each output is written
+    // grp_rows > 0: a block-diagonal product in one launch. Rows [g grp_rows, (g+1) grp_rows) read the activation
+    // columns from g * grp_cols on (the activation quantized over all the groups' columns at once, its `cols` set to
+    // W.cols). DeepSeek's grouped output projection: 8 groups of o_lora rows over 8 slices of the heads. R layout only;
+    // grp_rows a multiple of 16.
+    int grp_rows = 0;
+    int64_t grp_cols = 0;
 };
 
 // the same activations / split output from token t0 on (a window of more than 8 tokens as two calls)

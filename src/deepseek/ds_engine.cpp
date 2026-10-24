@@ -6,7 +6,11 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "ggml-cpu.h"
+#include "ggml.h"
 #include "kernels/ops.h"
 
 namespace bnk {
@@ -159,7 +163,10 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
             for (int e : st->cache_.slot_experts(il)) { skip[(size_t) il * c.n_expert + e] = 1; ++resident; }
     }
     store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip);
-    cpu_->init(model_.ev, *store_, opt.cpu_threads);
+    // pinned one worker a physical core (the container on all 48 CPUs: decode 19-20 -> 21.8 tok/s, the CPU experts
+    // 30-33 -> 26.5 ms a token); BNK_CPU_PIN=0 leaves the placement to the scheduler
+    cpu_->init(model_.ev, *store_, opt.cpu_threads, true);
+    for (DsEngine * st = this; st; st = st->next_.get()) st->pull_init();
     cpu_->set_chunks(8);
     if (env_int("BNK_DS_LOOKUP", 1) != 0) lookup_drafter_ = std::make_unique<LookupOnlyDrafter>();
     if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
@@ -193,7 +200,10 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     const bool head = head_ == this;
     CUDA_CHECK(cudaSetDevice(dev_));
     if (cudaSetDeviceFlags(cudaDeviceMapHost) != cudaSuccess) cudaGetLastError();
-    CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
+    // the forward's stream at the highest priority: the PCIe lane's pull kernels (st_pull_, the lowest) yield to it
+    int prio_lo = 0, prio_hi = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&st_, cudaStreamNonBlocking, prio_hi));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_commit_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_verified_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_committed_, cudaEventDisableTiming));
@@ -227,7 +237,8 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     const int W = kMaxWindow, E = c.n_embd, HC = c.hc_dim(), H = c.n_head, D = c.head_dim;
     x_.alloc(W * E); res_.alloc(W * HC); mixed_.alloc(W * E); xn_.alloc(W * E); out_.alloc(W * E);
     pre_a_.alloc(W * c.hc); pre_b_.alloc(W * c.hc); attn_pre_.alloc(W * c.hc); post_.alloc(W * c.hc); comb_.alloc(W * c.hc * c.hc);
-    mix_scratch_.alloc((size_t) W * (c.mix_dim() + 1));
+    mix_scratch_.alloc(kDsMixScratch);   // (its counters must start at zero)
+    CUDA_CHECK(cudaMemset(mix_scratch_.p, 0, kDsMixScratch * sizeof(float)));
     qr_.alloc(W * c.q_lora); qrn_.alloc(W * c.q_lora); q_.alloc((size_t) W * H * D); kvr_.alloc(W * D);
     attn_o_.alloc((size_t) W * H * D); oa_.alloc((size_t) W * c.o_groups * c.o_lora);
     int max_ratio = 1;
@@ -364,7 +375,17 @@ void DsEngine::init_cache(const Ranking & rank) {
         for (auto & e : q->ikc_buf) mapped += e.mapped();
     }
     const size_t graphs = (size_t) kMaxFwdGraphs * kGraphBytesEst + (size_t) seqs_.size() * kMaxWindow * kMaxWindow * (4ull << 20);
-    const size_t hold = (ctx_full > mapped ? ctx_full - mapped : 0) + graphs;
+    // the PCIe lane's staging slots (pull_init, after the cache): P slots a layer plus P blobs in flight
+    size_t lane = 0;
+    if (const int P = std::min(8, env_int("BNK_DS_PULL", 0)); P > 0 && l1_ - l0_ >= 2) {
+        size_t mb = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            lane += (size_t) P * ExpertCache::slot_bytes(model_.ev, il);
+            mb = std::max(mb, store_->blob_bytes(il));
+        }
+        lane += (size_t) P * mb;
+    }
+    const size_t hold = (ctx_full > mapped ? ctx_full - mapped : 0) + graphs + lane;
     const size_t avail = budget_.free();
     size_t budget = avail > hold ? avail - hold : 0;
     double cap = opt_.expert_cache_gib;
@@ -375,8 +396,8 @@ void DsEngine::init_cache(const Ranking & rank) {
     }
     if (cap >= 0) budget = std::min(budget, (size_t) (cap * 1073741824.0));
     if (opt_.verbose)
-        fprintf(stderr, "bnk: layers %d-%d: expert cache budget %.2f GiB (%.2f free, %.2f held for the context and graphs)\n", l0_,
-                l1_ - 1, budget / 1073741824.0, avail / 1073741824.0, hold / 1073741824.0);
+        fprintf(stderr, "bnk: layers %d-%d: expert cache budget %.2f GiB (%.2f free, %.2f held for the context, graphs and the PCIe lane)\n",
+                l0_, l1_ - 1, budget / 1073741824.0, avail / 1073741824.0, hold / 1073741824.0);
     cache_.init(model_.ev, *store_, budget, rank, st_, opt_.verbose, &budget_, l0_, l1_, nullptr);
 }
 
@@ -604,6 +625,25 @@ void DsEngine::engram_gather() {
             for (int tw = 0; tw < w.T; ++tw) jobs.push_back({(int) e, w.r0 + tw, w.pos0 + tw, &w.q->history});
     }
     if (jobs.empty()) return;
+    // The tables (103 GB) are memory-mapped from the NVMe and the page cache cannot hold them beside the pinned expert
+    // store, so a token whose rows are cold pays a page fault per row, one after another (8 threads: 50 ms a token
+    // measured, against 2 ms warm). First ask the kernel for every row's pages at once (MADV_WILLNEED starts the reads
+    // and returns), so the copies below find them landing together: one NVMe round trip instead of a chain of them.
+    // BNK_DS_EG_WILLNEED=0 turns it off.
+    static const bool willneed = env_int("BNK_DS_EG_WILLNEED", 1) != 0;
+    if (willneed) {
+        const long page = sysconf(_SC_PAGESIZE);
+        uint64_t rows[64];
+        for (const Job & jb : jobs) {
+            const TensorRef & tab = *model_.engram_tab[jb.e];
+            const size_t rb = tab.row_bytes();
+            engram_hash(jb.e, *jb.hist, jb.p, rows);
+            for (int col = 0; col < cols; ++col) {
+                const uintptr_t a = (uintptr_t) (tab.data + rows[col] * rb), a0 = a & ~(uintptr_t) (page - 1);
+                madvise((void *) a0, (size_t) (a - a0) + rb, MADV_WILLNEED);
+            }
+        }
+    }
     auto run = [&](size_t j0, size_t j1, int c0, int c1) {   // jobs [j0, j1), columns [c0, c1)
         uint64_t rows[64];
         for (size_t j = j0; j < j1; ++j) {
@@ -615,10 +655,21 @@ void DsEngine::engram_gather() {
                 memcpy(h_eg_rows_[jb.e] + ((size_t) jb.t * cols + col) * rb, tab.data + rows[col] * rb, rb);
         }
     };
-    static const int nth = std::max(1, std::min(16, env_int("BNK_DS_EG_THREADS_DECODE", 8)));
+    // on the CPU pool's threads (spinning, ready): BNK_DS_EG_THREADS_DECODE=1 runs it here, N > 1 the old way (N
+    // threads spawned per token, which measured 2 ms or 50 ms a token depending on where the scheduler put them)
+    static const int nth = std::max(0, std::min(64, env_int("BNK_DS_EG_THREADS_DECODE", 0)));
     if (nth == 1 || jobs.size() * cols < 16) run(0, jobs.size(), 0, cols);
-    else {
-        // the columns of every job split over the threads (each job's hash is cheap to repeat)
+    else if (nth == 0) {
+        const int total = (int) jobs.size() * cols;   // (job, column) units split over the pool
+        cpu_->parallel([&](int part, int nparts) {
+            const int u0 = (int) ((int64_t) total * part / nparts), u1 = (int) ((int64_t) total * (part + 1) / nparts);
+            for (int u = u0; u < u1;) {
+                const int j = u / cols, c0 = u % cols, c1 = std::min(cols, c0 + (u1 - u));
+                run(j, j + 1, c0, c1);
+                u += c1 - c0;
+            }
+        });
+    } else {
         std::vector<std::thread> th;
         for (int i = 0; i < nth; ++i) th.emplace_back(run, 0, jobs.size(), cols * i / nth, cols * (i + 1) / nth);
         for (auto & t : th) t.join();
@@ -668,8 +719,7 @@ void DsEngine::attn(int il, int T) {
         const Win & w = wins_[wi];
         const int * pos0 = &d_par_[wi].pos0;
         const size_t r = (size_t) w.r0;
-        ds_rope_heads(q_.p + r * H * D, w.T, H, D, R, pos0, rope_of(il), st_);
-        ds_kv_prep(kvr_.p + r * D, F(L.kv_norm), w.q->ring[il], w.T, D, R, pos0, rope_of(il), c.eps, st_);
+        ds_rope_kv_prep(q_.p + r * H * D, H, kvr_.p + r * D, F(L.kv_norm), w.q->ring[il], w.T, D, R, pos0, rope_of(il), c.eps, st_);
         if (src) {
             const float * ckv = ckv_raw_[lane_][il].p + r * D, * sc = ratio > 1 ? sc_raw_[lane_][il].p + r * D : nullptr;
             ds_compress(ckv, sc, w.q->st_kv[il], w.q->st_sc[il], F(L.comp_norm), (const half *) L.idx_k.data, F(L.idx_k_norm),
@@ -698,11 +748,21 @@ void DsEngine::attn(int il, int T) {
     }
     trace(st_, il, "attn_o", attn_o_, T, (int64_t) H * D);
     // the grouped low-rank output projection: group g takes heads [g * H/G, (g+1) * H/G)
+    // (one quantization of the whole row, one block-diagonal GEMV: 8 x 2 launches were 16)
     const int G = c.o_groups, GW = H * D / G, OL = c.o_lora;
-    for (int g = 0; g < G; ++g) {
-        quantize_act(attn_o_.p + (size_t) g * GW, (int64_t) H * D, T, GW, act2_, st_);
-        gemv(qmat_rows(L.o_a, (int64_t) g * OL, OL), &act2_, nullptr, 0, T, oa_.p + (size_t) g * OL, (int64_t) G * OL, false, st_);
-    }
+    quantize_act(attn_o_, (int64_t) H * D, T, (int64_t) H * D, act2_, st_);
+    if (L.o_a.layout == 1 && OL % 16 == 0) {
+        ActQ8 av = act2_;
+        av.cols = GW;
+        GemvSplit sp;
+        sp.grp_rows = OL;
+        sp.grp_cols = GW;
+        gemv(L.o_a, &av, nullptr, 0, T, oa_, (int64_t) G * OL, false, st_, sp);
+    } else
+        for (int g = 0; g < G; ++g) {
+            quantize_act(attn_o_.p + (size_t) g * GW, (int64_t) H * D, T, GW, act2_, st_);
+            gemv(qmat_rows(L.o_a, (int64_t) g * OL, OL), &act2_, nullptr, 0, T, oa_.p + (size_t) g * OL, (int64_t) G * OL, false, st_);
+        }
     quantize_act(oa_, (int64_t) G * OL, T, (int64_t) G * OL, act2_, st_);
     gemv(L.o_b, &act2_, nullptr, 0, T, out_, E, false, st_);
     trace(st_, il, "oa", oa_, T, (int64_t) G * OL);
@@ -715,8 +775,14 @@ void DsEngine::moe(int il, int T) {
     const int E = c.n_embd, k = c.n_used, Fx = c.n_ff;
     const MoeLayerDesc d = cache_.desc(il);
     gemv(L.router, nullptr, xn_, E, T, rlogits_, c.n_expert, false, st_);
-    ds_route(rlogits_, F(L.probs_b), T, c.n_expert, k, c.route_scale, c.route_norm, rids_, rw_, st_);
-    moe_plan(rids_, rw_, T, k, d, moes_, msg(il), xn_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
+    if (T <= 8 && c.n_expert <= 512)
+        moe_route_plan_ds(rlogits_, F(L.probs_b), c.n_expert, k, c.route_scale, c.route_norm, rids_, rw_, T, d, moes_, msg(il), xn_, E,
+                          &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
+    else {
+        ds_route(rlogits_, F(L.probs_b), T, c.n_expert, k, c.route_scale, c.route_norm, rids_, rw_, st_);
+        moe_plan(rids_, rw_, T, k, d, moes_, msg(il), xn_, E, &d_par_->seq, counts_.p + (size_t) il * c.n_expert, st_);
+    }
+    if (pull_P_) pull_launch(il);   // (after the plan's mailbox writes: see pull_launch)
     if (!opt_.use_graphs || head_->dump_all) {   // eager: answer the CPU part right here
         CUDA_CHECK(cudaStreamSynchronize(st_));
         MoeMsg * m = msg(il);
@@ -757,8 +823,11 @@ void DsEngine::moe(int il, int T) {
     }
     quantize_act_silu_mul(sg_, su_, Fx, T, Fx, act2_, st_);
     gemv(L.sh_down, &act2_, nullptr, 0, T, shared_out_, E, false, st_);
-    moe_hits(d, moes_, act_, T, k, E, Fx, st_);
+    moe_hits(d, moes_, act_, T, k, E, Fx, st_);   // (a pulled expert sits in a spare slot of the same region)
     moe_reduce(moes_, msg(il), shared_out_, ones_, moe_out_, T, k, E, st_, &d_par_->seq, false);
+    if (pull_P_ && il > l0_)
+        ds_pull_restore(pull_staged_.p + (size_t) il * pull_P_, pull_P_, const_cast<int32_t *>(d.slot_of), cache_.spare_slot(il, 0),
+                        moes_.hits, pull_stats_.p, st_, pull_state_.p + il);
     trace(st_, il, "rlogits", rlogits_, T, c.n_expert);
     trace(st_, il, "rw", rw_, T, k);
     trace(st_, il, "shared_out", shared_out_, T, E);
@@ -774,9 +843,7 @@ void DsEngine::moe(int il, int T) {
 
 void DsEngine::head(int T) {
     const DsConfig & c = model_.ds;
-    ds_hc_pre(res_, pre_, mixed_, T, c.hc, c.n_embd, st_);
-    rmsnorm_rows(mixed_, F(model_.output_norm), xn_, T, c.n_embd, c.n_embd, c.n_embd, c.eps, st_);
-    quantize_act(xn_, c.n_embd, T, c.n_embd, act_, st_);
+    ds_hc_pre_norm_q(res_, pre_, F(model_.output_norm), mixed_, xn_, T, c.hc, c.n_embd, c.eps, act_, st_);
     gemv(model_.output, &act_, nullptr, 0, T, logits_, c.n_vocab, false, st_);
 }
 
@@ -792,20 +859,22 @@ void DsEngine::layer_forward(int il, int T) {
     trace(st_, il, "attn_pre", attn_pre_, T, c.hc);
     trace(st_, il, "post", post_, T, c.hc);
     trace(st_, il, "comb", comb_, T, c.hc * c.hc);
-    ds_hc_pre(res_, pre_, mixed_, T, c.hc, E, st_);
+    ds_hc_pre_norm_q(res_, pre_, F(L.attn_norm), mixed_, xn_, T, c.hc, E, c.eps, act_, st_);
     trace(st_, il, "mixed", mixed_, T, E);
-    rmsnorm_rows(mixed_, F(L.attn_norm), xn_, T, E, E, E, c.eps, st_);
     trace(st_, il, "xn", xn_, T, E);
-    quantize_act(xn_, E, T, E, act_, st_);
     attn(il, T);
     ds_hc_post(out_, res_, post_, comb_, T, c.hc, E, st_);
     trace(st_, il, "res_attn", res_, T, c.hc_dim());
     ds_hc_mixes(res_, F(L.hc_ffn_fn), F(L.hc_ffn_scale), F(L.hc_ffn_base), pre_next_, post_, comb_, T, c.hc, E, c.eps, c.hc_eps,
                 c.sinkhorn, st_, mix_scratch_.p);
-    ds_hc_pre(res_, attn_pre_, mixed_, T, c.hc, E, st_);
-    rmsnorm_rows(mixed_, F(L.ffn_norm), xn_, T, E, E, E, c.eps, st_);
-    quantize_act(xn_, E, T, E, act_, st_);
+    ds_hc_pre_norm_q(res_, attn_pre_, F(L.ffn_norm), mixed_, xn_, T, c.hc, E, c.eps, act_, st_);
     trace(st_, il, "xn_ffn", xn_, T, E);
+    if (pull_P_) {
+        // the first design waited for this layer's pull here; now the plan takes what has landed and the restore
+        // (after the FFN) waits for a straggler, so a late pull costs the CPU an expert, not the GPU a stall
+        if (pull_wait_ && il > l0_) CUDA_CHECK(cudaStreamWaitEvent(st_, ev_pull_join_, 0));
+        if (il + 1 < l1_) pull_predict(il, T);
+    }
     moe(il, T);
     ds_hc_post(moe_out_, res_, post_, comb_, T, c.hc, E, st_);
     trace(st_, il, "res_out", res_, T, c.hc_dim());
@@ -825,6 +894,7 @@ void DsEngine::enqueue_forward(int T) {
     CUDA_CHECK(cudaMemcpyAsync(d_par_, h_par_, wins_.size() * sizeof(WinParams), cudaMemcpyHostToDevice, st_));
     pre_ = pre_a_;
     pre_next_ = pre_b_;
+    pull_pending_ = -1;
     if (first()) {
         dequant_gather(model_.tok_embd, h_tok_, T, x_, st_);
         hc_init(x_, res_, T, c.hc, c.n_embd, st_);
@@ -834,6 +904,7 @@ void DsEngine::enqueue_forward(int T) {
         CUDA_CHECK(cudaMemcpyAsync(pre_, xfer_in_[lane_] + (size_t) kMaxWindow * HC, (size_t) T * c.hc * 4, cudaMemcpyHostToDevice, st_));
     }
     for (int il = l0_; il < l1_; ++il) layer_forward(il, T);
+    if (pull_P_ && l1_ - l0_ >= 2) CUDA_CHECK(cudaStreamWaitEvent(st_, ev_pull_join_, 0));   // the pull stream rejoins
     if (last_) head(T);
     else {
         CUDA_CHECK(cudaMemcpyAsync(xfer_out_[lane_], res_.p, (size_t) T * HC * 4, cudaMemcpyDeviceToHost, st_));
@@ -1029,6 +1100,119 @@ void DsEngine::fwd_end() {
         cudaGetLastError();
     }
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
+    if (pull_P_) {
+        uint32_t v[3];
+        CUDA_CHECK(cudaMemcpy(v, pull_stats_.p, sizeof(v), cudaMemcpyDeviceToHost));
+        std::lock_guard<std::mutex> lk(head_->stats_mu_);
+        head_->times.pulled += v[0] - pull_stats_seen_[0];
+        head_->times.pull_used += v[1] - pull_stats_seen_[1];
+        head_->times.pull_late += v[2] - pull_stats_seen_[2];
+        for (int i = 0; i < 3; ++i) pull_stats_seen_[i] = v[i];
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ the PCIe lane
+void DsEngine::pull_init() {
+    DeviceScope ds(dev_);
+    const DsConfig & c = model_.ds;
+    const int NE = c.n_expert;
+    // off by default: measured 17.6 tok/s against 19-20 with it off (docs/DEEPSEEK-NEXT.md: the plan kernel's host
+    // mailbox traffic and the pull's reads share the link); BNK_DS_PULL=1 or 2 turns it on
+    pull_P_ = env_int("BNK_DS_PULL", 0);
+    if (pull_P_ <= 0 || l1_ - l0_ < 2) { pull_P_ = 0; return; }
+    if (pull_P_ > 8) pull_P_ = 8;
+    if (!store_->pinned()) {
+        if (opt_.verbose) fprintf(stderr, "bnk: GPU %d: PCIe lane off (the experts' host memory is not page-locked)\n", dev_);
+        pull_P_ = 0;
+        return;
+    }
+    for (int il = l0_; il < l1_; ++il)
+        if (cache_.n_cold_groups(il)) { pull_P_ = 0; return; }   // (the staging slots take the cold bands' numbers)
+    std::vector<uint64_t> ptrs((size_t) c.n_layer * NE, 0);
+    size_t slots = 0, max_blob = 0;
+    for (int il = l0_; il < l1_; ++il) {
+        if (store_->blob_bytes(il) % 16 || cache_.slots(il) + pull_P_ > NE) { pull_P_ = 0; return; }
+        slots += (size_t) pull_P_ * cache_.desc(il).blob;
+        max_blob = std::max(max_blob, store_->blob_bytes(il));
+        for (int e = 0; e < NE; ++e) {
+            const uint8_t * b = store_->blob(il, e);
+            if (!b) continue;
+            void * dp = nullptr;
+            if (cudaHostGetDevicePointer(&dp, (void *) b, 0) != cudaSuccess) {
+                cudaGetLastError();
+                if (opt_.verbose) fprintf(stderr, "bnk: GPU %d: PCIe lane off (the experts' host memory is not mapped)\n", dev_);
+                pull_P_ = 0;
+                return;
+            }
+            ptrs[(size_t) il * NE + e] = (uint64_t) dp;
+        }
+    }
+    pull_blob_ptr_.alloc(ptrs.size());
+    CUDA_CHECK(cudaMemcpy(pull_blob_ptr_.p, ptrs.data(), ptrs.size() * 8, cudaMemcpyHostToDevice));
+    pull_raw_.alloc(max_blob * pull_P_);
+    std::vector<uint8_t *> dst((size_t) (l1_ - l0_) * pull_P_);
+    for (int il = l0_; il < l1_; ++il) {
+        cache_.reserve_spare(il, pull_P_);
+        const MoeLayerDesc d = cache_.desc(il);
+        for (int p = 0; p < pull_P_; ++p) dst[(size_t) (il - l0_) * pull_P_ + p] = (uint8_t *) d.base + (size_t) cache_.spare_slot(il, p) * d.blob;
+    }
+    pull_dst_.alloc(dst.size());
+    CUDA_CHECK(cudaMemcpy(pull_dst_.p, dst.data(), dst.size() * sizeof(uint8_t *), cudaMemcpyHostToDevice));
+    pull_picks_.alloc((size_t) c.n_layer * pull_P_);
+    pull_staged_.alloc((size_t) c.n_layer * pull_P_);
+    CUDA_CHECK(cudaMemset(pull_picks_.p, 0xff, (size_t) c.n_layer * pull_P_ * 4));
+    CUDA_CHECK(cudaMemset(pull_staged_.p, 0xff, (size_t) c.n_layer * pull_P_ * 4));
+    pull_logits_.alloc((size_t) kMaxWindow * NE);
+    pull_ids_.alloc((size_t) kMaxWindow * c.n_used);
+    pull_w_.alloc((size_t) kMaxWindow * c.n_used);
+    pull_stats_.alloc(3);
+    CUDA_CHECK(cudaMemset(pull_stats_.p, 0, 12));
+    pull_state_.alloc(c.n_layer);
+    CUDA_CHECK(cudaMemset(pull_state_.p, 0, (size_t) c.n_layer * 4));
+    pull_wait_ = env_int("BNK_DS_PULL_WAIT", 0) != 0;
+    {   // BNK_DS_PULL_PRIO=1: the pull stream at the lowest priority (its blocks run only beside the forward's kernels;
+        // measured late for the window), 0 (default): the forward's own priority
+        int prio_lo = 0, prio_hi = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&st_pull_, cudaStreamNonBlocking, env_int("BNK_DS_PULL_PRIO", 0) ? prio_lo : prio_hi));
+    }
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_pull_fork_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev_pull_join_, cudaEventDisableTiming));
+    if (opt_.verbose)
+        fprintf(stderr, "bnk: GPU %d: PCIe lane: %d expert%s a layer predicted a layer ahead, %.0f MiB of spare slots\n", dev_,
+                pull_P_, pull_P_ > 1 ? "s" : "", (slots + max_blob * pull_P_) / 1048576.0);
+}
+
+void DsEngine::pull_predict(int il, int T) {
+    const DsConfig & c = model_.ds;
+    const DsLayer & L1 = model_.layers[il + 1];
+    const int E = c.n_embd, k = c.n_used, NE = c.n_expert;
+    const MoeLayerDesc d1 = cache_.desc(il + 1);
+    // layer il + 1's routing of this layer's FFN input
+    gemv(L1.router, nullptr, xn_, E, T, pull_logits_, NE, false, st_);
+    ds_route(pull_logits_, F(L1.probs_b), T, NE, k, c.route_scale, c.route_norm, pull_ids_, pull_w_, st_);
+    int32_t * picks = pull_picks_.p + (size_t) (il + 1) * pull_P_;
+    ds_pull_pick(pull_ids_, pull_w_, T, k, d1.slot_of, picks, pull_P_, st_, pull_state_.p + il + 1);
+    pull_pending_ = il;
+}
+
+void DsEngine::pull_launch(int il) {
+    if (pull_pending_ != il) return;
+    pull_pending_ = -1;
+    const DsConfig & c = model_.ds;
+    const int E = c.n_embd, NE = c.n_expert;
+    const MoeLayerDesc d1 = cache_.desc(il + 1);
+    int32_t * picks = pull_picks_.p + (size_t) (il + 1) * pull_P_;
+    // the pull on the side stream: the blobs over PCIe, repacked into the slots, the slot table patched
+    CUDA_CHECK(cudaEventRecord(ev_pull_fork_, st_));
+    CUDA_CHECK(cudaStreamWaitEvent(st_pull_, ev_pull_fork_, 0));
+    const size_t bb = store_->blob_bytes(il + 1);
+    ds_pull_copy(picks, pull_P_, pull_blob_ptr_.p + (size_t) (il + 1) * NE, bb, pull_raw_.p, st_pull_);
+    moe_repack_blobs(pull_raw_.p, bb, pull_dst_.p + (size_t) (il + 1 - l0_) * pull_P_, pull_P_, c.n_ff, E, d1.gate_type,
+                     ggml_row_size((ggml_type) d1.gate_type, E), d1.down_type, ggml_row_size((ggml_type) d1.down_type, c.n_ff), st_pull_);
+    ds_pull_commit(picks, pull_P_, const_cast<int32_t *>(d1.slot_of), cache_.spare_slot(il + 1, 0),
+                   pull_staged_.p + (size_t) (il + 1) * pull_P_, st_pull_, pull_state_.p + il + 1);
+    CUDA_CHECK(cudaEventRecord(ev_pull_join_, st_pull_));
 }
 
 // ------------------------------------------------------------------------------------------------ commit

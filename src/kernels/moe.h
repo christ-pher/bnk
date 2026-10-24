@@ -85,6 +85,10 @@ struct MoeScratch {
 void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * ids, float * w, int T, int k,
                     const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg, const float * x, int E, const uint32_t * seq,
                     uint32_t * counts_layer, cudaStream_t st);
+// DeepSeek-V4's routing (ds_route) and moe_plan in one launch (T <= 8, n_exp <= 512)
+void moe_route_plan_ds(const float * logits, const float * bias, int n_exp, int k, float scale, bool norm, int32_t * ids,
+                       float * w, int T, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg, const float * x, int E,
+                       const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);
 // Builds the hit list and the CPU request (mailbox `msg`, host-mapped), then signals seq.
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s,
               MoeMsg * msg, const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st);

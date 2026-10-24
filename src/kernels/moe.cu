@@ -150,6 +150,28 @@ void moe_route_plan(const float * logits, int n_exp, float w_scale, int32_t * id
                                                counts_layer);
 }
 
+// DeepSeek's routing (route.cuh: ds_route_warp) and the plan in one launch: warp t picks token t's experts
+__global__ void __launch_bounds__(256) moe_route_plan_ds_k(const float * logits, const float * bias, int n_exp, int k,
+                                                           float scale, int norm, int32_t * ids, float * w, int T,
+                                                           const int32_t * slot_of, HitList * hits, MoeMsg * msg,
+                                                           const float * x, int E, const uint32_t * seq, uint32_t * counts) {
+    const int t = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (t < T) ds_route_warp(logits, bias, n_exp, k, scale, norm, ids, w, t, lane);
+    __syncthreads();   // the ids / weights (global, this block's writes) for the plan
+    moe_plan_body(ids, w, T, k, slot_of, hits, msg, x, E, seq, counts);
+}
+
+void moe_route_plan_ds(const float * logits, const float * bias, int n_exp, int k, float scale, bool norm, int32_t * ids,
+                       float * w, int T, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg, const float * x, int E,
+                       const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st) {
+    if (T * k > kMaxRouted || T > 8 || k > 32 || n_exp > 512) {
+        fprintf(stderr, "moe_route_plan_ds: unsupported shape\n");
+        abort();
+    }
+    moe_route_plan_ds_k<<<1, 256, 0, st>>>(logits, bias, n_exp, k, scale, norm ? 1 : 0, ids, w, T, d.slot_of, s.hits, msg, x, E,
+                                           seq, counts_layer);
+}
+
 void moe_plan(const int32_t * ids, const float * w, int T, int k, const MoeLayerDesc & d, MoeScratch & s, MoeMsg * msg,
               const float * x, int E, const uint32_t * seq, uint32_t * counts_layer, cudaStream_t st) {
     if (T * k > kMaxRouted) { fprintf(stderr, "moe_plan: %d pairs exceed %d\n", T * k, kMaxRouted); abort(); }

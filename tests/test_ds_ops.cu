@@ -71,9 +71,12 @@ int main() {
         float * d_res = up(res), * d_fn = up(fn), * d_scale = up(scale), * d_base = up(base), * d_x = up(x);
         float * d_pre, * d_post, * d_comb;
         CUDA_CHECK(cudaMalloc(&d_pre, T * hc * 4)); CUDA_CHECK(cudaMalloc(&d_post, T * hc * 4)); CUDA_CHECK(cudaMalloc(&d_comb, T * hc * hc * 4));
-        float * d_scr = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_scr, (size_t) T * 25 * 4));
-        ds_hc_mixes(d_res, d_fn, d_scale, d_base, d_pre, d_post, d_comb, T, hc, E, eps, hc_eps, 20, st, getenv("BNK_TEST_MIX_PLAIN") ? nullptr : d_scr);
+        float * d_scr = nullptr;   // the small-window path's scratch: dots then counters, zero at rest (kDsMixScratch)
+        CUDA_CHECK(cudaMalloc(&d_scr, kDsMixScratch * 4));
+        CUDA_CHECK(cudaMemset(d_scr, 0, kDsMixScratch * 4));
+        // twice: the fused finish resets its counters, so the second call must see them at zero
+        for (int rep = 0; rep < 2; ++rep)
+            ds_hc_mixes(d_res, d_fn, d_scale, d_base, d_pre, d_post, d_comb, T, hc, E, eps, hc_eps, 20, st, getenv("BNK_TEST_MIX_PLAIN") ? nullptr : d_scr);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<double> rpre(T * hc), rpost(T * hc), rcomb(T * hc * hc);
         for (int t = 0; t < T; ++t) {
@@ -163,8 +166,11 @@ int main() {
         if (bad || werr > 1e-5) ++fails;
     }
 
-    // ---- attention: q rope, kv prep into the ring, compressed rows, sinks
-    {
+    // ---- attention: q rope, kv prep into the ring, compressed rows, sinks; at T = 5 (the small-window kernel) and
+    // T = 40 (the chunk kernels: tensor cores by default, BNK_DS_ATTN_TC=0 the fp32 one)
+    for (const int Ta : {5, 40}) {
+        const int T = Ta;
+        printf("-- attention at T = %d\n", T);
         const int pos0 = 300, n_comp = 700, k_sel = 512;
         std::vector<float> q((size_t) T * H * D), kv((size_t) T * D), kvw(D), sinks(H);
         for (auto & v : q) v = rnd();

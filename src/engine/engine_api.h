@@ -19,6 +19,8 @@ class ImageStore;
 struct StageTimes {
     double total_ms = 0, cpu_experts_ms = 0, ple_ms = 0, wait_ms = 0;
     int64_t misses = 0, routed = 0;
+    int64_t pulled = 0, pull_used = 0, pull_late = 0;   // decode's PCIe lane: experts pulled into staging slots, those the
+                                                        // routing used, pulls still in flight after the layer's FFN
     int calls = 0;
 };
 

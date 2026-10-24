@@ -60,6 +60,10 @@ public:
     int resident() const { return resident_; }
     size_t bytes() const;
     int slots(int il) const { return (int) slot_expert_[il].size(); }
+    // n slots past the layer's resident ones, mapped (the budget charged) but unassigned: a decode-time staging area
+    // whose slots the hit kernels address like any other (base + slot * blob). spare_slot(il, p) is slot p of them.
+    void reserve_spare(int il, int n);
+    int spare_slot(int il, int p) const { return (int) slot_expert_[il].size() + p; }
 
     // Adaptive tier. Call between forwards on the compute stream: finishes copies that are done, then
     // plans new swaps from routing counts (device [n_layer][n_expert], cumulative) and starts their

@@ -583,6 +583,12 @@ size_t ExpertCache::grow(size_t avail, cudaStream_t s) {
     return done;
 }
 
+void ExpertCache::reserve_spare(int il, int n) {
+    if (!owns(il) || n <= 0) return;
+    if (slot_expert_[il].size() + n > (size_t) n_expert_) throw std::runtime_error("expert cache: no room for spare slots");
+    layer_buf_[il].ensure((slot_expert_[il].size() + n) * sb_[il]);
+}
+
 MoeLayerDesc ExpertCache::desc(int il) const {
     const LayerWeights & L = m_->layers[il];
     const Config & c = m_->cfg;

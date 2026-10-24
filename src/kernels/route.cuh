@@ -66,4 +66,49 @@ __device__ __forceinline__ void route_topk_warp(const float * logits, int n_exp,
     }
 }
 
+
+// DeepSeek-V4's routing of one token by one warp: s = sqrt(softplus(logit)), the k largest of s + bias (lowest id on
+// ties), w = s * scale / (sum + 1e-20) (norm) or s * scale. n_exp <= 512.
+__device__ __forceinline__ float ds_softplusf(float x) { return x > 20.f ? x : x < -20.f ? __expf(x) : log1pf(__expf(x)); }
+__device__ __forceinline__ void ds_route_warp(const float * logits, const float * bias, int n_exp, int k, float scale,
+                                              int norm, int32_t * ids, float * w, int t, int lane) {
+    constexpr int PER = 16;
+    float s[PER], sc[PER];
+    bool taken[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int e = lane + 32 * j;
+        s[j] = e < n_exp ? sqrtf(ds_softplusf(logits[(int64_t) t * n_exp + e])) : 0.f;
+        sc[j] = e < n_exp ? s[j] + bias[e] : -FLT_MAX;
+        taken[j] = e >= n_exp;
+    }
+    float sum = 0.f;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int bj = -1;
+#pragma unroll
+        for (int j = 0; j < PER; ++j)
+            if (!taken[j] && sc[j] > best) { best = sc[j]; bj = j; }
+        const float wb = rt_warp_max(best);
+        int cand = (best == wb && bj >= 0) ? lane + 32 * bj : 0x7fffffff;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, o));
+        const int e = cand;
+        const int owner = e & 31, j = e >> 5;
+        float sv = 0.f;
+        if (lane == owner) {
+#pragma unroll
+            for (int jj = 0; jj < PER; ++jj)
+                if (jj == j) { taken[jj] = true; sv = s[jj]; }
+        }
+        sv = __shfl_sync(0xffffffffu, sv, owner);
+        sum += sv;
+        if (lane == 0) { ids[t * k + r] = e; w[t * k + r] = sv; }
+    }
+    if (lane == 0) {
+        const float f = (norm && k > 1) ? scale / (sum + 1e-20f) : scale;
+        for (int r = 0; r < k; ++r) w[t * k + r] *= f;
+    }
+}
+
 }  // namespace bnk

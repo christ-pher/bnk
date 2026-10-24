@@ -11,10 +11,14 @@
 #include <cuda_runtime.h>
 
 #include "kernels/gemv.h"
+#include "kernels/moe.h"
 
 namespace bnk {
 
 constexpr int kDsRing = 128 + kMaxWindow;   // slots of the sliding-window ring: the window plus a decode window
+constexpr int kDsMixSlots = 16;              // tokens the small-window mixes' scratch holds (ds_hc_mixes)
+// the scratch of ds_hc_mixes' small-window path: kDsMixSlots x 25 dots, then kDsMixSlots counters (zero at rest)
+constexpr size_t kDsMixScratch = (size_t) kDsMixSlots * 25 + kDsMixSlots;
 
 // rotary inverse frequencies for `n_rot` dims (n_rot/2 pairs); yarn_orig > 0 applies YaRN
 std::vector<float> ds_rope_inv_freq(int n_rot, float base, float factor, int yarn_orig, float beta_fast, float beta_slow);
@@ -27,6 +31,9 @@ void ds_hc_mixes(const float * res, const float * fn, const float * scale, const
                  float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s, float * scratch = nullptr);
 // out[t][e] = sum_s pre[t][s] * res[t][s*E + e]
 void ds_hc_pre(const float * res, const float * pre, float * out, int T, int hc, int E, cudaStream_t s);
+// the same into `mixed` (may be null), then xn = rmsnorm(mixed) * w and xn quantized into q, in one launch
+void ds_hc_pre_norm_q(const float * res, const float * pre, const float * w, float * mixed, float * xn, int T, int hc, int E,
+                      float eps, ActQ8 & q, cudaStream_t s);
 // res[t][k][e] = post[t][k] * x[t][e] + sum_j comb[t][j*hc + k] * res[t][j][e]   (in place)
 void ds_hc_post(const float * x, float * res, const float * post, const float * comb, int T, int hc, int E, cudaStream_t s);
 // pre[t][s] = (s == 0)
@@ -39,6 +46,9 @@ void ds_rope_heads(float * q, int T, int H, int D, int n_rot, const int * pos0, 
 // the destination is a linear buffer instead: row (pos0 + t - origin) (a prompt chunk's window buffer)
 void ds_kv_prep(const float * kv, const float * w, half * ring, int T, int D, int n_rot, const int * pos0,
                 const float * inv_freq, float eps, cudaStream_t s, int origin = -1);
+// ds_rope_heads(q) and ds_kv_prep(kv) in one launch (a decode window)
+void ds_rope_kv_prep(float * q, int H, const float * kv, const float * w, half * ring, int T, int D, int n_rot, const int * pos0,
+                     const float * inv_freq, float eps, cudaStream_t s, int origin = -1);
 // out[t][h][:] over the window (ring slots of positions max(0, p-W+1)..p; with origin >= 0 the rows p - origin of a
 // linear buffer) and the selected compressed rows (idx[t][k] into comp [.][D], -1 = none; idx may be null: window
 // only), with the per-head sink in the softmax denominator; the output's last n_rot dims get the query's rotation
@@ -90,6 +100,23 @@ void ds_engram_gate(float * res, const float * key, int64_t ldk, const float * v
 void ds_route(const float * logits, const float * bias, int T, int n_exp, int k, float scale, bool norm, int32_t * ids,
               float * w, cudaStream_t s);
 
+// ---- the PCIe lane of decode: the next layer's non-resident experts, predicted from this layer's FFN input, pulled
+// from their host copies into staging slots while this layer's FFN and the next layer's attention run
+// out[0..P): the experts of ids/w [T][k] (a predicted routing) that slot_of says are not resident, highest weight (the
+// max over the window's tokens) first; -1 past them
+// state (optional, one int per layer): 1 = a pull in flight after the pick, 2 = committed, 0 = restored
+void ds_pull_pick(const int32_t * ids, const float * w, int T, int k, const int32_t * slot_of, int32_t * out, int P, cudaStream_t s,
+                  int32_t * state = nullptr);
+// raw + p * bytes = the blob of expert picks[p] (blob_ptr[e]: the device alias of its host copy); nothing for -1
+void ds_pull_copy(const int32_t * picks, int P, const uint64_t * blob_ptr, size_t bytes, uint8_t * raw, cudaStream_t s);
+// after the repack into the slots: slot_of[picks[p]] = slot0 + p, staged[p] = picks[p]
+void ds_pull_commit(const int32_t * picks, int P, int32_t * slot_of, int slot0, int32_t * staged, cudaStream_t s,
+                    int32_t * state = nullptr);
+// after the layer: slot_of[staged[p]] = -1 again; stats[0] += experts staged, stats[1] += those the hit list used,
+// stats[2] += pulls still in flight here (waited for)
+void ds_pull_restore(int32_t * staged, int P, int32_t * slot_of, int slot0, const HitList * hits, uint32_t * stats, cudaStream_t s,
+                     int32_t * state = nullptr);
+
 // ---- misc
 // y[t][:] = x[t][:] (n floats per row) for rows [0, T): a strided copy helper for the pipeline transfers
 void ds_copy_rows(const float * x, int64_t ldx, float * y, int64_t ldy, int T, int n, cudaStream_t s);
@@ -98,7 +125,10 @@ void ds_copy_rows(const float * x, int64_t ldx, float * y, int64_t ldy, int T, i
 // stream until it is through). src is the device alias of mapped pinned host memory.
 void ds_copy_from_host(const void * src, void * dst, size_t bytes, cudaStream_t s);
 // dst[t][:] = map[t] >= 0 ? src[t][:] : 0 for t < N (src, map: mapped host; the CPU experts' rows for the tokens that had CPU tasks)
+// dst[t][:] = map[t] >= 0 ? src[map[t]][:] : 0 (src: the CPU's answer rows, host-mapped; map: a token's row in it)
 void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int N, int E, cudaStream_t s);
+// xc[m][:] = x[tok[m]][:] for m < M (tok: host-mapped): the rows the CPU needs, compact, before their copy out
+void ds_rows_gather(const float * x, const int32_t * tok, float * xc, int M, int E, cudaStream_t s);
 void ds_zero_half(half * p, size_t n, cudaStream_t s);
 // kwin[p - origin][:] = ring[p % kDsRing][:] for p in [p_from, p_to): a chunk's window rows before it, out of the ring
 void ds_ring_read(const half * ring, int origin, half * kwin, int p_from, int p_to, int D, cudaStream_t s);

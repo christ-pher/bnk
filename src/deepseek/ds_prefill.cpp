@@ -142,6 +142,12 @@ void DsEngine::prefill_alloc(int N, int G) {
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_x, (size_t) NG * E * 4, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_cpu, (size_t) NG * E * 4, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_cpu_map, (size_t) NG * 4, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc((void **) &p.h_cpu_tok, (size_t) NG * 4, cudaHostAllocMapped));
+    // the CPU's rows go out compact: a copy of every row (168 MB at 8,192 tokens) took 52 ms on the compute stream
+    // per layer beside the expert stream, and everything behind it waited. A quarter of the group's rows is room enough
+    // (the CPU takes a few hundred tokens' experts a layer); more falls back to the whole copy.
+    p.xc_rows = std::max(1, NG / 4);
+    p.xc.alloc((size_t) p.xc_rows * E);
     p.max_blocks = P / kTcTile + NE + 1;
     p.items_bytes = ((size_t) NE * sizeof(TcItem) + (size_t) p.max_blocks * sizeof(TcBlock) + 15) / 16 * 16;
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_items, p.items_bytes, cudaHostAllocMapped));
@@ -150,6 +156,7 @@ void DsEngine::prefill_alloc(int N, int G) {
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.d_h_inv, p.h_inv, 0));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.d_h_cpu, p.h_cpu, 0));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.d_h_cpu_map, p.h_cpu_map, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.d_h_cpu_tok, p.h_cpu_tok, 0));
     CUDA_CHECK(cudaHostGetDevicePointer((void **) &p.d_h_items, p.h_items, 0));
     p.stage_idx.assign(NE, -1);
     p.stage_buf.assign(NE, 0);
@@ -481,8 +488,21 @@ void DsEngine::pf_moe(int il, int N) {
     ds_copy_from_host(p.d_h_inv, p.inv.p, ((size_t) P * 4 + 15) / 16 * 16, st_);
     ds_zero_half(p.dd.p + (size_t) P * E, (size_t) E, st_);
     f32_to_f16(p.xn, p.xg, (int64_t) N * E, st_);
+    // the CPU tokens' rows (h_cpu_map: a token's row among them, -1 none), compact when they fit xc
+    int M = 0;
+    bool compact = false;
     if (!cpu_tasks.empty()) {
-        CUDA_CHECK(cudaMemcpyAsync(p.h_x, p.xn.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
+        for (int t = 0; t < N; ++t) p.h_cpu_map[t] = -1;
+        for (const auto & t : cpu_tasks)
+            if (p.h_cpu_map[t.t] < 0) { p.h_cpu_map[t.t] = M; p.h_cpu_tok[M++] = t.t; }
+        compact = M <= p.xc_rows;
+        if (compact) {
+            ds_rows_gather(p.xn.p, p.d_h_cpu_tok, p.xc.p, M, E, st_);
+            CUDA_CHECK(cudaMemcpyAsync(p.h_x, p.xc.p, (size_t) M * E * 4, cudaMemcpyDeviceToHost, st_));
+        } else {
+            for (int t = 0; t < N; ++t) p.h_cpu_map[t] = p.h_cpu_map[t] >= 0 ? t : -1;
+            CUDA_CHECK(cudaMemcpyAsync(p.h_x, p.xn.p, (size_t) N * E * 4, cudaMemcpyDeviceToHost, st_));
+        }
         CUDA_CHECK(cudaMemcpyAsync(p.h_w, p.w.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaEventRecord(p.xready, st_));
     }
@@ -589,7 +609,12 @@ void DsEngine::pf_moe(int il, int N) {
         for (const auto & t : cpu_tasks)
             if (!store_->blob(il, t.expert)) throw std::runtime_error("prefill: an expert without a host copy was sent to the CPU");
         const double tc = now_ms();
-        cpu_->run(il, N, p.h_x, cpu_tasks, p.h_cpu);
+        if (compact) {
+            std::vector<ExpertTask> ct = cpu_tasks;   // the tasks on the compact rows
+            for (auto & t : ct) t.t = p.h_cpu_map[t.t];
+            cpu_->run(il, M, p.h_x, ct, p.h_cpu);
+        } else
+            cpu_->run(il, N, p.h_x, cpu_tasks, p.h_cpu);
         const double ms = now_ms() - tc;
         p.cpu_meas_ms = ms;
         p.cpu_pred_ms = cpu_total;
@@ -600,8 +625,6 @@ void DsEngine::pf_moe(int il, int N) {
             head_->times.misses += (int64_t) cpu_tasks.size();
             head_->layer_misses[il] += (int64_t) cpu_tasks.size();
         }
-        for (int t = 0; t < N; ++t) p.h_cpu_map[t] = -1;
-        for (const auto & t : cpu_tasks) p.h_cpu_map[t.t] = 1;
         ds_rows_from_host(p.d_h_cpu, p.d_h_cpu_map, p.cpu.p, N, E, st_);
         extra = p.cpu.p;
     }

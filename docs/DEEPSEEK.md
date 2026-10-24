@@ -89,3 +89,10 @@ See the bottom of this file as the work progresses.
   dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
   12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
   windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.
+* 2026-10-24, v0.5.2 (`docs/DEEPSEEK-NEXT.md`): the prompt attention runs on the tensor cores (a fused single pass,
+  40 -> 9.5 ms per 2,048-token layer-chunk), the CPU tasks' rows go out compact (a 168 MB device-to-host copy per layer
+  had stalled the compute stream 52 ms), decode's launches are fused (48 -> 28 a layer), and a PCIe lane pulls the next
+  layer's predicted non-resident experts into spare cache slots while the layer runs (measured 17.6 tok/s against 19-20 with it off, so it ships off by default (`BNK_DS_PULL=1` turns it on)). Prompts 8,192
+  tokens 467 -> 652 tok/s, 16,000 tokens 828 tok/s (groups of 8 chunks measured worse); decode 22.4 tok/s with the
+  container on all 48 CPUs and the pool pinned one worker a core (default now); the copy test unchanged
+  (ppl 1.037, top-1 99.61%). Project Maya's table IQ2_XXS CPU dot was bit-exact but slower on this Zen 2 (off).

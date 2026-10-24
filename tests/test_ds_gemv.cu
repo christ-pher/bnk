@@ -122,7 +122,61 @@ static void run_split(int rows, int cols) {
     cudaFree(dev); cudaFree(d_x); cudaFree(d_g); cudaFree(d_u);
 }
 
+// the grouped output projection (GemvSplit::grp_rows): G groups of OL rows, group g over activation columns
+// [g GW, (g+1) GW) of one quantized row of G GW columns, in one launch, against the reference
+static void run_grouped(ggml_type type, int G, int OL, int GW) {
+    const int rows = G * OL, cols = GW;
+    std::vector<float> w((size_t) rows * cols);
+    for (auto & v : w) v = rnd();
+    const size_t rb = ggml_row_size(type, cols);
+    std::vector<uint8_t> q(rb * rows);
+    std::vector<float> wd((size_t) rows * cols);
+    ggml_quantize_chunk(type, w.data(), q.data(), 0, rows, cols, nullptr);
+    ggml_get_type_traits(type)->to_float(q.data(), wd.data(), (int64_t) rows * cols);
+    void * dev = nullptr;
+    QMat W = upload_matrix(q.data(), type, rows, cols, rb, true, &dev);
+    const int Tmax = 8;
+    const int64_t XC = (int64_t) G * GW;
+    std::vector<float> x((size_t) Tmax * XC);
+    for (auto & v : x) v = rnd();
+    float * d_x, * d_y;
+    CUDA_CHECK(cudaMalloc(&d_x, x.size() * 4)); CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_y, (size_t) Tmax * rows * 4));
+    DevBuf<int8_t> aq; DevBuf<float> ad; DevBuf<int16_t> as; DevBuf<half> ah;
+    aq.alloc((size_t) Tmax * XC); ad.alloc((size_t) Tmax * XC / 32); as.alloc((size_t) Tmax * XC / 16); ah.alloc((size_t) Tmax * XC);
+    ActQ8 a; a.q = aq; a.d = ad; a.s = as; a.h = ah;
+    for (int T : {1, 2, 4, 8}) {
+        quantize_act(d_x, XC, T, XC, a, nullptr);
+        ActQ8 av = a;
+        av.cols = GW;
+        GemvSplit sp;
+        sp.grp_rows = OL;
+        sp.grp_cols = GW;
+        gemv(W, &av, nullptr, 0, T, d_y, rows, false, nullptr, sp);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> y((size_t) T * rows);
+        CUDA_CHECK(cudaMemcpy(y.data(), d_y, y.size() * 4, cudaMemcpyDeviceToHost));
+        double err = 0, mx = 0;
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < rows; ++r) {
+                const int g = r / OL;
+                double s = 0;
+                for (int c = 0; c < cols; ++c) s += (double) wd[(size_t) r * cols + c] * x[(size_t) t * XC + (size_t) g * GW + c];
+                err = std::max(err, std::fabs(y[(size_t) t * rows + r] - s));
+                mx = std::max(mx, std::fabs(s));
+            }
+        const bool ok = err <= 0.01 * mx;
+        printf("%s grouped %dx%d rows x %d cols T=%d  max err %.3e (ref max %.2f)%s\n", ggml_type_name(type), G, OL, GW, T, err, mx,
+               ok ? "" : "  FAIL");
+        if (!ok) ++fails;
+    }
+    cudaFree(dev); cudaFree(d_x); cudaFree(d_y);
+}
+
 int main() {
+    run_grouped(GGML_TYPE_Q8_0, 8, 64, 256);
+    run_grouped(GGML_TYPE_Q5_K, 8, 48, 512);
+
     run_split(2304, 5120);
     run_case("Q5_K", GGML_TYPE_Q5_K, 1024, 5120, true);
     run_case("Q5_K", GGML_TYPE_Q5_K, 2048, 1280, true);
