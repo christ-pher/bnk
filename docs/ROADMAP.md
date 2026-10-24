@@ -21,6 +21,13 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-10-24, v0.5.1: DeepSeek prompt path and decode kernels** (`docs/DEEPSEEK-NEXT.md`): the prompt path
+  runs layer-major over groups of chunks (each non-resident expert crosses PCIe once per layer per group, the next
+  layer's experts prefetched during attention from its router applied a layer early), the compute stream no longer
+  queues behind the copy engine, one conversion kernel instead of 16K per layer in the grouped output projection,
+  split-K decode attention and spread Sinkhorn mixes, dynamic CPU expert chunking, prompt-lookup drafts. Prompts
+  111 -> 279 (2K) / 467 (8K) tok/s, decode 13 -> 17-19.6 tok/s, copy tasks 32 tok/s; quality unchanged.
+
 * **2026-10-24, v0.5.0: DeepSeek-V4.1-Flash** (`docs/DEEPSEEK.md`, plan in `docs/DEEPSEEK-NEXT.md`): a third engine
   for the 763B model with the Engram tables on the NVMe and experts placed disjointly between the two cards and
   host RAM. 13 tok/s decode, ~100 tok/s prompts, exact tokenizer, tool calls.
