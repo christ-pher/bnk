@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash: where things stand and what comes next (2026-10-24, after the first performance pass)
 
 Read this first when resuming. `docs/DEEPSEEK.md` describes the model, the memory plan and the code; this file is
-the state and the plan. The first pass (branch `ds-perf`) rewrote the prompt path and tuned the CPU pool; the numbers
+the state and the plan. The first pass (branch `ds-perf`, merged as v0.5.1) rewrote the prompt path and tuned the CPU pool; the numbers
 below are from it.
 
 ## Where things stand
