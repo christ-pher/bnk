@@ -2,7 +2,7 @@
 
 Read this first when resuming. `docs/DEEPSEEK.md` describes the model, the memory plan and the code; this file is
 the state and the plan. The first pass (branch `ds-perf`, merged as v0.5.1) rewrote the prompt path and tuned the CPU
-pool; the second (branch `ds-perf2`) put the prompt attention on the tensor cores, fused the decode launches and added
+pool; the second (branch `ds-perf2`, merged as v0.5.2) put the prompt attention on the tensor cores, fused the decode launches and added
 the PCIe lane for decode's missed experts. The numbers below are from it.
 
 ## Where things stand
@@ -128,7 +128,7 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
 ## Commands
 
 ```bash
-cd /opt/engines/bnk-deepseek      # branch ds-perf2 (the second pass; master holds v0.5.1 until it is merged)
+cd /opt/engines/bnk               # master holds v0.5.2 (both passes merged); branch work goes in a worktree
 cmake --build build --target bnk test_ds_ops test_ds_gemv test_ds_cpu bench_ds_cpu bench_ds_attn -j 24
 CUDA_VISIBLE_DEVICES=1 ./build/test_ds_ops && CUDA_VISIBLE_DEVICES=1 ./build/test_ds_gemv
 ./run.sh ds-xs --port 8081        # production (master, 8080) must not be running: both GPUs are needed
