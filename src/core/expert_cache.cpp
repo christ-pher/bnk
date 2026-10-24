@@ -73,13 +73,30 @@ std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_e
 // DMA the ggml blobs of (slot, expert) pairs into the stage and repack them into their R slots, in batches.
 void ExpertCache::fill(int il, const std::vector<int> & slots, const std::vector<int> & experts, cudaStream_t s) {
     const LayerWeights & L = m_->layers[il];
+    const Config & c = m_->cfg;
+    const size_t bb = st_->blob_bytes(il);
+    if (bb > stage_bytes_) throw std::runtime_error("expert cache: a blob larger than the stage");
+    const size_t grb = ggml_row_size((ggml_type) L.gate_type, c.n_embd), drb = ggml_row_size((ggml_type) L.down_type, c.n_ff_exp);
     std::vector<uint8_t *> dst(slots.size());
-    std::vector<const uint8_t *> src(slots.size());
-    for (size_t i = 0; i < slots.size(); ++i) {
-        dst[i] = layer_base_[il] + (size_t) slots[i] * sb_[il];
-        src[i] = st_->blob(il, experts[i]);
+    for (size_t i = 0; i < slots.size(); ++i) dst[i] = layer_base_[il] + (size_t) slots[i] * sb_[il];
+    for (size_t i0 = 0; i0 < dst.size(); i0 += stage_n_) {
+        const int n = (int) std::min<size_t>(stage_n_, dst.size() - i0);
+        for (int j = 0; j < n; ++j) {
+            const int e = experts[i0 + j];
+            uint8_t * sg = stage_ + (size_t) j * bb;
+            if (const uint8_t * src = st_->blob(il, e)) {
+                CUDA_CHECK(cudaMemcpyAsync(sg, src, bb, cudaMemcpyHostToDevice, s));
+            } else {   // no host copy (a VRAM-only expert): the three matrices straight from the mapped file
+                CUDA_CHECK(cudaMemcpyAsync(sg, L.gate_src + (size_t) e * L.gate_bytes, L.gate_bytes, cudaMemcpyHostToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(sg + L.gate_bytes, L.up_src + (size_t) e * L.up_bytes, L.up_bytes, cudaMemcpyHostToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(sg + L.gate_bytes + L.up_bytes, L.down_src + (size_t) e * L.down_bytes, L.down_bytes,
+                                           cudaMemcpyHostToDevice, s));
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst_ptrs_, dst.data() + i0, n * sizeof(uint8_t *), cudaMemcpyHostToDevice, s));
+        moe_repack_blobs(stage_, bb, dst_ptrs_, n, c.n_ff_exp, c.n_embd, L.gate_type, grb, L.down_type, drb, s);
+        CUDA_CHECK(cudaStreamSynchronize(s));
     }
-    fill_blobs(dst, src, st_->blob_bytes(il), L.gate_type, L.down_type, s);
 }
 
 void ExpertCache::fill_blobs(const std::vector<uint8_t *> & dst, const std::vector<const uint8_t *> & src, size_t bb,
@@ -258,6 +275,10 @@ size_t ExpertCache::slot_bytes(const Model & m, int il) {
 size_t ExpertCache::slot_bytes_for(const Model & m, int gate_type, int down_type) {
     const RLayout gl = r_layout(gate_type, m.cfg.n_embd), dl = r_layout(down_type, m.cfg.n_ff_exp);
     return ((size_t) 2 * m.cfg.n_ff_exp * gl.row_bytes + (size_t) m.cfg.n_embd * dl.row_bytes + 63) / 64 * 64;
+}
+
+Ranking complete_ranking_public(const Ranking & rank, int n_layer, int n_expert, int l0, int l1) {
+    return complete_ranking(rank, n_layer, n_expert, l0, l1);
 }
 
 // pairs in ranking order while they fit; a layer's region is mapped in whole granules

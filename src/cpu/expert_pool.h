@@ -17,11 +17,20 @@ namespace bnk {
 class ExpertStore {
 public:
     ~ExpertStore();
-    void build(const Model & m, int threads, bool verbose = true);
-    const uint8_t * blob(int il, int e) const { return base_ + layer_off_[il] + (size_t) e * blob_[il]; }
+    // skip (optional, [n_layer * n_expert]): experts that get no host copy (they are resident in VRAM instead);
+    // blob() returns nullptr for them
+    void build(const Model & m, int threads, bool verbose = true, const std::vector<char> * skip = nullptr);
+    // the blob sizes alone (no arena, blob() returns nullptr): what the VRAM cache needs to plan and fill from the file
+    void layout(const Model & m);
+    const uint8_t * blob(int il, int e) const {
+        if (!base_) return nullptr;
+        const int b = index_.empty() ? e : index_[il][e];
+        return b < 0 ? nullptr : base_ + layer_off_[il] + (size_t) b * blob_[il];
+    }
     size_t blob_bytes(int il) const { return blob_[il]; }
     size_t max_blob_bytes() const { return max_blob_; }
     size_t total_bytes() const { return total_; }
+    int kept() const { return n_kept_; }
     bool pinned() const { return pinned_; }
     uint8_t * base() const { return base_; }
     size_t layer_offset(int il) const { return layer_off_[il]; }
@@ -29,9 +38,14 @@ public:
 private:
     uint8_t * base_ = nullptr;
     size_t total_ = 0, max_blob_ = 0;
+    int n_kept_ = 0;
     bool pinned_ = false;
     std::vector<size_t> layer_off_, blob_;
+    std::vector<std::vector<int>> index_;
 };
+
+// the CPU experts' SwiGLU clamp (DeepSeek-V4: up to [-limit, limit], gate to <= limit), 0 = none
+void cpu_experts_set_swiglu_limit(float limit);
 
 // The cold experts' blobs (model.h ColdGroup), pinned host memory like the store's: per layer and group, each
 // expert's gate | up | down ggml blocks, 64-byte aligned; blob(il, g, i) is the i-th expert of the group.

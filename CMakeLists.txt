@@ -72,6 +72,10 @@ add_library(bnk_core STATIC
   src/dense/dense_dflash_ops.cu
   src/vision/vision.cu
   src/vision/images.cpp
+  src/deepseek/ds_model.cpp
+  src/deepseek/ds_ops.cu
+  src/deepseek/ds_engine.cpp
+  src/deepseek/ds_prefill.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
@@ -80,6 +84,14 @@ target_compile_options(bnk_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wno-unused-function>)
 set_target_properties(bnk_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+add_executable(test_ds_ops tests/test_ds_ops.cu)
+target_link_libraries(test_ds_ops PRIVATE bnk_core)
+target_compile_options(test_ds_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(test_ds_gemv tests/test_ds_gemv.cu)
+target_link_libraries(test_ds_gemv PRIVATE bnk_core)
+target_compile_options(test_ds_gemv PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${BNK_CUDA_FLAGS_QUIET}>)
+add_executable(test_ds_cpu tests/test_ds_cpu.cpp)
+target_link_libraries(test_ds_cpu PRIVATE bnk_core)
 add_executable(bnk tools/bnk_main.cpp)
 target_link_libraries(bnk PRIVATE bnk_core)
 add_executable(requant_experts tools/requant_experts.cpp)

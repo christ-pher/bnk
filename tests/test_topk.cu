@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -12,7 +13,7 @@
 using namespace bnk;
 
 int main() {
-    const int V = 248320, T = 8;
+    const int V = getenv("V") ? atoi(getenv("V")) : 248320, T = 8;
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 4.f);
     std::vector<float> x((size_t) T * V);

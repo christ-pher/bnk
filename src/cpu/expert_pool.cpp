@@ -83,11 +83,12 @@ void ColdStore::build(const Model & m, int threads, bool verbose) {
                 (t1 - t0) / 1000, pinned_ ? "page-locked for DMA" : "not page-locked");
 }
 
-void ExpertStore::build(const Model & m, int threads, bool verbose) {
+void ExpertStore::layout(const Model & m) {
     const Config & c = m.cfg;
     layer_off_.resize(c.n_layer);
     blob_.resize(c.n_layer);
     total_ = 0;
+    max_blob_ = 0;
     for (int il = 0; il < c.n_layer; ++il) {
         const LayerWeights & L = m.layers[il];
         blob_[il] = (L.gate_bytes + L.up_bytes + L.down_bytes + 63) / 64 * 64;
@@ -95,6 +96,31 @@ void ExpertStore::build(const Model & m, int threads, bool verbose) {
         total_ += blob_[il] * c.n_expert;
         max_blob_ = std::max(max_blob_, blob_[il]);
     }
+    total_ = 0;
+}
+
+void ExpertStore::build(const Model & m, int threads, bool verbose, const std::vector<char> * skip) {
+    const Config & c = m.cfg;
+    layer_off_.resize(c.n_layer);
+    blob_.resize(c.n_layer);
+    total_ = 0;
+    // with a skip list the arena holds only the experts not skipped (those resident in VRAM without a host copy:
+    // docs/DEEPSEEK.md); index_[il][e] is the expert's blob number in its layer, -1 when skipped
+    index_.assign(c.n_layer, {});
+    int kept = 0;
+    for (int il = 0; il < c.n_layer; ++il) {
+        const LayerWeights & L = m.layers[il];
+        blob_[il] = (L.gate_bytes + L.up_bytes + L.down_bytes + 63) / 64 * 64;
+        layer_off_[il] = total_;
+        index_[il].assign(c.n_expert, -1);
+        int n = 0;
+        for (int e = 0; e < c.n_expert; ++e)
+            if (!skip || !(*skip)[(size_t) il * c.n_expert + e]) index_[il][e] = n++;
+        kept += n;
+        total_ += blob_[il] * n;
+        max_blob_ = std::max(max_blob_, blob_[il]);
+    }
+    n_kept_ = kept;
     const double t0 = now_ms();
     void * p = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("cannot reserve the expert arena");
@@ -119,8 +145,10 @@ void ExpertStore::build(const Model & m, int threads, bool verbose) {
             const uintptr_t pa = (uintptr_t) s0 & ~(uintptr_t) 4095;
             madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_SEQUENTIAL);
             madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_WILLNEED);
-            for (int e = e0; e < e1; ++e)
-                memcpy(base_ + layer_off_[il] + (size_t) e * blob_[il] + dst_off, src + (size_t) e * sz, sz);
+            for (int e = e0; e < e1; ++e) {
+                const int b = index_[il][e];
+                if (b >= 0) memcpy(base_ + layer_off_[il] + (size_t) b * blob_[il] + dst_off, src + (size_t) e * sz, sz);
+            }
         }
     };
     std::vector<std::thread> th;
@@ -130,7 +158,7 @@ void ExpertStore::build(const Model & m, int threads, bool verbose) {
     pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
     if (verbose)
-        fprintf(stderr, "bnk: experts: %.2f GiB in RAM (copied in %.1f s, %.2f GiB/s), %s\n", total_ / 1073741824.0,
+        fprintf(stderr, "bnk: experts: %d in RAM, %.2f GiB (copied in %.1f s, %.2f GiB/s), %s\n", n_kept_, total_ / 1073741824.0,
                 (t1 - t0) / 1000, total_ / 1073741824.0 / ((t1 - t0) / 1000),
                 pinned_ ? "page-locked for DMA" : "NOT page-locked (DMA falls back to staging)");
 }
@@ -191,6 +219,8 @@ void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads)
 }
 
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
+static float g_cpu_limit = 0.f;   // SwiGLU clamp (DeepSeek-V4), 0 = none
+void cpu_experts_set_swiglu_limit(float limit) { g_cpu_limit = limit; }
 
 static inline void split(int n, int part, int nparts, int & b, int & e) {
     b = (int) ((int64_t) n * part / nparts);
@@ -286,7 +316,13 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 const float sg = L.exp_sgate.empty() ? 1.f : L.exp_sgate[ex0], su = L.exp_sup.empty() ? 1.f : L.exp_sup[ex0];
                 for (int k = 0; k < n; ++k) {
                     float * gu = gu_.data() + (size_t) grp[k] * 2 * F;
-                    for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r] * su;
+                    if (g_cpu_limit > 0.f) {
+                        const float lim = g_cpu_limit;
+                        for (int r = 0; r < F; ++r)
+                            gu[r] = silu(std::min(gu[r] * sg, lim)) * std::min(std::max(gu[F + r] * su, -lim), lim);
+                    } else {
+                        for (int r = 0; r < F; ++r) gu[r] = silu(gu[r] * sg) * gu[F + r] * su;
+                    }
                     if (down_q2) quantize_a8p64(gu, F, (A8P64 *) (hq_.data() + grp[k] * hrow));
                     else hfrom(gu, hq_.data() + grp[k] * hrow, F);
                 }

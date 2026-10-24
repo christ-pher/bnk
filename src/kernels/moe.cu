@@ -197,6 +197,9 @@ __global__ void __launch_bounds__(256) moe_gu_k(const HitList * __restrict__ hit
     }
 }
 
+__device__ float g_moe_limit = 0.f;   // SwiGLU clamp (DeepSeek-V4), 0 = none
+void moe_set_swiglu_limit(float limit) { cudaMemcpyToSymbol(g_moe_limit, &limit, sizeof(float)); }
+
 // grid (kMaxRouted, W); block F threads (F % 32 == 0): h = silu(g)*u quantized per 32
 __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __restrict__ gu, int F,
                           int8_t * __restrict__ hq, float * __restrict__ hd, ExpScales es, int cold_lo) {
@@ -207,9 +210,11 @@ __global__ void moe_act_k(const HitList * __restrict__ hits, const float * __res
     const int ex = hits->e[ent].expert;
     const bool cold = hits->e[ent].slot >= cold_lo;   // a cold band's blocks carry the global scale already
     const float sg = es.gate && !cold ? es.gate[ex] : 1.f, sud = es.up && !cold ? es.up[ex] * es.down[ex] : 1.f;
+    const float lim = g_moe_limit;
     for (int r = threadIdx.x; r < F; r += blockDim.x) {
-        const float gv = g[r] * sg;
-        const float h = gv / (1.f + __expf(-gv)) * g[F + r] * sud;
+        float gv = g[r] * sg, uv = g[F + r];
+        if (lim > 0.f) { gv = fminf(gv, lim); uv = fminf(fmaxf(uv, -lim), lim); }
+        const float h = gv / (1.f + __expf(-gv)) * uv * sud;
         float d;
         const int8_t q = quant_lane(h, d);
         hq[base * F + r] = q;

@@ -11,6 +11,10 @@ expert, so the CPU leaves the decode path and prompts are read on both cards at 
 It also runs the **dense Qwen3.8 models** (`qwen35`: Qwen3.8-27B) through a second engine that keeps every weight
 in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s with its own MTP drafter.
 
+Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384 experts) through a third engine
+(`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
+tables read from the NVMe, experts split between VRAM and RAM without a copy; ~13 tok/s decode, ~100 tok/s prompts.
+
 Both read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
 `image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`).
 
@@ -81,6 +85,41 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
 each) since v0.4.2, 23 us each through host memory before.
+
+### What v0.5.0 changed: DeepSeek-V4.1-Flash
+
+A third engine, `src/deepseek/` (`docs/DEEPSEEK.md`; the handoff and plan in `docs/DEEPSEEK-NEXT.md`), for the GGUF
+architecture `deepseek41`: 40 layers of latent attention with one shared 512-wide KV head, a 128-token sliding
+window plus compressed KV (2:1 or 1:1) shared from four source layers and selected per query by an indexer (top
+512, candidate blocks of 8 at layer 20), 4-stream hyper-connections mixed by 20 Sinkhorn iterations, 384 routed
+experts (top 6, sqrt-softplus routing, a clamped SwiGLU) plus a shared one, and Engram: two hashed n-gram tables of
+98 GB each, read 48 rows per token. The files are
+[ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+(IQ2_XS 155 GB, `./run.sh ds-xs`; IQ2_XXS 138 GB, `./run.sh ds-xxs`, the build ISTA recommends) with the shared
+Engram file (110.6 GB, IQ4_NL) beside them.
+
+* **Memory plan.** The Engram tables stay memory-mapped on the NVMe (a token reads 48 rows of 144 bytes). The
+  dense weights (2.7 + 2.9 GiB) go to the two cards as a layer pipeline split at layer 20 (the compressed-KV
+  source stays with its consumers). The routed experts are placed *disjointly*: each card's cache takes the
+  hottest ~4,900 experts straight from the file (no host copy), the pinned host arena holds only the other
+  ~10,400 (90 GiB), the CPU computes those as in the Qwen engine (`ExpertStore` skip list, `ExpertCache` fill from
+  the file). The cache is static; the routing counts of each session rank the next load.
+* **Measured (IQ2_XS, two V100s):** decode 12.6-13.8 tok/s without a drafter; prompts 100-118 tok/s in batched
+  chunks of up to 2,048 tokens (the chunk's window keys in a linear buffer, experts on the tensor cores: resident
+  from the cache, the most-used others streamed into a 1 GiB staging arena per buffer, the rest on the CPU pool);
+  prose perplexity 2.88; a passage repeated twice is copied with every token right (the compressed-KV path over
+  336+ tokens). Load ~4 minutes. Strata 0.2.4 reports 5-11 tok/s on single 12 GB cards for the same files.
+* **Kernels** (`src/deepseek/ds_ops.cu`, each checked against a CPU reference in `tests/test_ds_ops.cu`):
+  Sinkhorn mixes, pre/post mixing, pair RoPE with YaRN (angles reduced in double), window + compressed attention
+  with sinks and the query's rotation removed from the output, the compressor with its open-group state across
+  windows, indexer scores, candidate blocks and top-k by radix select, the Engram gate, sqrt-softplus routing.
+* **Server:** the tokenizer's `joyai-llm` pre-tokenizer (exact against DeepSeek's tokenizer.json), the model's
+  DSML tool calls (it writes `<｜DSML｜ calls>`, not the template's `tool_calls`; both parse), thinking and
+  `reasoning_effort` (1-100, low/high/max) through the GGUF's own template.
+* The bug of the night: a new engine must call `ggml_cpu_init()`, or ggml's single-token `vec_dot` kernels (the
+  CPU pool's path for an expert with one token) return zeros; decode scored ppl 17 against 3 for 8-token windows
+  until found. `bnk hdump` now takes `BNK_HDUMP_T` / `BNK_HDUMP_T2` (two window sizes in one load) and the engine
+  `BNK_DS_TRACE` for the next hunt. Not done yet: the DSpark drafter, prompt-path overlap of the two GPUs, vision.
 
 ### What v0.4.3 changed: the DFlash2 drafter and NVFP4 for the 27B
 
@@ -478,6 +517,10 @@ MTP block (`nextn_predict_layers`) load their trunk.
 It also runs GGUFs of the `qwen35` architecture (the dense Qwen3.8 models: 27B) through the dense engine of
 `src/dense/` (`docs/DENSE.md`): every weight in VRAM, any quant the R layouts support (Q8_0 is the one measured),
 the model's own MTP block as the drafter.
+
+And GGUFs of the `deepseek41` architecture (DeepSeek-V4.1-Flash) through `src/deepseek/` (`docs/DEEPSEEK.md`):
+ISTA-DASLab's GSQ-RCO builds with their separate Engram file (routed experts in IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS
+mixes, dense weights Q5_K / Q8_0); the llama.cpp PR 30817 layout with the Engram tables as their own GGUF.
 
 Each model is one file in `configs/`: its settings and the Hugging Face files it comes from. `./run.sh` lists
 exactly these models, and `./models.sh` manages them:

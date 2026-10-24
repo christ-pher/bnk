@@ -46,6 +46,8 @@ void quantize_act(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a, 
 // ... of silu(x * scale), and of silu(g) * u (the elementwise step folded into the quantization pass)
 void quantize_act_silu(const float * x, float scale, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s);
 void quantize_act_silu_mul(const float * g, const float * u, int64_t ldx, int T, int64_t cols, ActQ8 & a, cudaStream_t s);
+// quantize_act_silu_mul clamps up to [-limit, limit] and the gate to <= limit first (DeepSeek-V4; 0 = none, the default)
+void quantize_set_swiglu_limit(float limit);
 // ... of rmsnorm(o[t][h]) * w * sigmoid(z[t][h]) over T x H heads of S values (gated_rmsnorm folded in); false
 // when S is not 128 (then run gated_rmsnorm and quantize_act)
 bool quantize_gated_norm(const float * o, const float * z, const float * w, int T, int H, int S, float eps, ActQ8 & a,

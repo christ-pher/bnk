@@ -19,6 +19,8 @@ Ranking load_ranking(const std::string & path, int n_layer, int n_expert);
 // Ranking from routing counts [n_layer][n_expert]: most routed first, ties interleaved across layers.
 Ranking ranking_from_counts(const std::vector<uint32_t> & counts, int n_layer, int n_expert);
 bool save_counts(const std::string & path, const std::vector<uint32_t> & counts, int n_layer, int n_expert);
+// `rank` restricted to layers [l0, l1) and completed with every missing pair (the order plan()/init() fill in)
+Ranking complete_ranking_public(const Ranking & rank, int n_layer, int n_expert, int l0, int l1);
 std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_expert);
 
 class ExpertCache {

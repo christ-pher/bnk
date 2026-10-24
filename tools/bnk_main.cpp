@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "dense/dense_engine.h"
+#include "deepseek/ds_engine.h"
 #include "engine/engine.h"
 #include "engine/engine_api.h"
 #include "engine/generate.h"
@@ -89,6 +90,11 @@ static std::unique_ptr<EngineApi> make_engine(const std::string & model, const E
     }
     if (arch == "qwen35") {
         auto e = std::make_unique<DenseEngine>();
+        e->load(model, opt);
+        return e;
+    }
+    if (arch == "deepseek41") {   // docs/DEEPSEEK.md; --ple-gguf names the Engram file (default: beside the model)
+        auto e = std::make_unique<DsEngine>();
         e->load(model, opt);
         return e;
     }
@@ -322,13 +328,24 @@ int main(int argc, char ** argv) {
         const size_t HC = eng.res_dim();
         eng.dump_all = true;
         std::vector<int32_t> am(kMaxWindow);
-        for (size_t p = 0; p < prompt.size(); p += kMaxWindow) {
-            const int T = (int) std::min<size_t>(kMaxWindow, prompt.size() - p);
+        const int hdT = std::max(1, std::min(env_int("BNK_HDUMP_T", kMaxWindow), kMaxWindow));   // rows per window
+        const int hdT2 = env_int("BNK_HDUMP_T2", 0);   // a second pass with this window size, to <out>_2.h / .ids
+        for (int pass = 0; pass < (hdT2 > 0 ? 2 : 1); ++pass) {
+        const int wT = pass == 0 ? hdT : hdT2;
+        if (pass == 1) {
+            fclose(fh); fclose(fi);
+            fh = fopen((std::string(out) + "_2.h").c_str(), "wb");
+            fi = fopen((std::string(out) + "_2.ids").c_str(), "wb");
+            eng.reset();
+        }
+        for (size_t p = 0; p < prompt.size(); p += wT) {
+            const int T = (int) std::min<size_t>(wT, prompt.size() - p);
             eng.forward(prompt.data() + p, T);
             eng.argmax_all(T, am.data());
             for (int t = 0; t < T; ++t)
                 for (int il : layers) fwrite(eng.dumped_layers[il].data() + t * HC, 4, HC, fh);
             fwrite(am.data(), 4, T, fi);
+        }
         }
         fclose(fh);
         fclose(fi);
@@ -599,6 +616,7 @@ int main(int argc, char ** argv) {
                        gs.draft_ms / std::max<int64_t>(1, gs.rounds));
             printf("       expert misses %lld, cache swaps %lld\n", (long long) (eng.times.misses - m0),
                    (long long) (eng.cache_swaps() - sw0));
+            eng.save_counts();   // the routing counts rank the next load's expert placement (--counts)
             fflush(stdout);
             // BNK_PB_DRAFTS="4:0.8,6:0.5": the same turn decoded again with other speculation settings (from the
             // snapshot where it starts)

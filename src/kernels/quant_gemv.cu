@@ -23,6 +23,10 @@ void bnk_unsupported_format(int fmt) {
 // ------------------------------------------------------------------------------ activation quantize
 // One warp per 32-value block: d = amax/127, q = round(x/d). PRO: the value is x (0), silu(x * scale) (1), or
 // silu(x) * x2 (2), computed on the way (the elementwise kernel it replaces ran as its own launch).
+// SwiGLU clamp (DeepSeek-V4: up clamped to [-limit, limit], gate to <= limit before silu); 0 = none
+__device__ float g_act_limit = 0.f;
+void quantize_set_swiglu_limit(float limit) { cudaMemcpyToSymbol(g_act_limit, &limit, sizeof(float)); }
+
 template <int PRO>
 __global__ void quantize_act_k(const float * __restrict__ x, const float * __restrict__ x2, float scale, int64_t ldx,
                                int64_t cols, int8_t * __restrict__ q, float * __restrict__ d,
@@ -39,7 +43,10 @@ __global__ void quantize_act_k(const float * __restrict__ x, const float * __res
         v *= scale;
         v = v / (1.f + __expf(-v));
     } else if constexpr (PRO == 2) {
-        v = v / (1.f + __expf(-v)) * (c < cols ? x2[t * ldx + c] : 0.f);
+        float u = c < cols ? x2[t * ldx + c] : 0.f;
+        const float lim = g_act_limit;
+        if (lim > 0.f) { v = fminf(v, lim); u = fminf(fmaxf(u, -lim), lim); }
+        v = v / (1.f + __expf(-v)) * u;
     }
     float amax = fabsf(v);
 #pragma unroll

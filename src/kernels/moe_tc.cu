@@ -16,6 +16,9 @@
 
 namespace bnk {
 
+__device__ float g_tc_limit = 0.f;   // SwiGLU clamp (DeepSeek-V4), 0 = none
+
+
 constexpr int kTcK = 128;         // K per step: 4 sub-blocks, one per quad pair
 constexpr int kTcLd = kTcK + 8;   // shared-memory row stride (halfs): 8 tokens' 16-byte reads hit 8 different banks
 // 8 warps per block, one block per SM (the gate/up kernel takes 255 registers). 4 warps and two blocks per SM
@@ -211,7 +214,8 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
             if constexpr (GU) {
                 const int row = blockIdx.y * kTcRows + warp * 8 + rr;
                 if (row < nrows) {
-                    const float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
+                    float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
+                    if (g_tc_limit > 0.f) { gv = fminf(gv, g_tc_limit); uv = fminf(fmaxf(uv, -g_tc_limit), g_tc_limit); }
                     o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
                 }
             } else {
@@ -224,6 +228,8 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
         }
     }
 }
+
+void moe_tc_set_swiglu_limit(float limit) { cudaMemcpyToSymbol(g_tc_limit, &limit, sizeof(float)); }
 
 void moe_tc_gu(const TcItem * items, const TcBlock * blocks, int nblocks, const MoeLayerDesc & d, const half * x,
                int64_t ldx, const int32_t * perm, half * h, int E, int F, cudaStream_t st) {
