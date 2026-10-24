@@ -215,7 +215,12 @@ void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads)
     // inherit a single-core mask); BNK_CPU_CHUNKS=n: n work ranges per thread, claimed dynamically
     const bool pin = env_int("BNK_CPU_PIN", 0) != 0;
     chunks_per_thread_ = std::max(1, env_int("BNK_CPU_CHUNKS", 1));
+    chunks_env_ = getenv("BNK_CPU_CHUNKS") != nullptr;
     pool_ = std::make_unique<SpinPool>(n_threads - 1, pin ? 1 : -1);
+}
+
+void CpuExpertPool::set_chunks(int n) {
+    if (!chunks_env_) chunks_per_thread_ = std::max(1, n);
 }
 
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
@@ -244,6 +249,9 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     if (tg->vec_dot_type != tu->vec_dot_type) throw std::runtime_error("gate/up vec_dot types differ");
     const ggml_type xt = tg->vec_dot_type;
     const bool down_q2 = L.down_type == GGML_TYPE_Q2_0;
+    // BNK_CPU_MDOT1=1: the multi-token kernels for single-token experts too (one decode of the row either way)
+    static const bool mdot1 = env_int("BNK_CPU_MDOT1", 0) != 0;
+    const int multi_min = mdot1 ? 1 : 2;
     const bool gu_multi = mdot_supported(L.gate_type) && L.gate_type == L.up_type;
     const bool dn_multi = mdot_supported(L.down_type);
     const size_t xrow = ggml_row_size(xt, E);
@@ -265,7 +273,6 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     }
     const int ng = (int) groups_.size();
 
-    xq_.resize(xrow * T);
     gu_.resize((size_t) nt * 2 * F);
     hq_.resize(hrow * nt + 64);
     if (rows_done_n_ < ng) {
@@ -273,7 +280,24 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
         rows_done_n_ = ng;
     }
     for (int i = 0; i < ng; ++i) rows_done_[i].store(0, std::memory_order_relaxed);
-    for (int t = 0; t < T; ++t) xfrom(x + (size_t) t * E, xq_.data() + t * xrow, E);
+    // only the tokens the tasks name are quantized (a prompt group hands in thousands of rows for a few tasks), on
+    // every thread; the output is zeroed the same way (the rows of unnamed tokens stay zero)
+    std::vector<int> tok_used;
+    {
+        std::vector<int> mark(T, -1);
+        for (int i = 0; i < nt; ++i)
+            if (mark[tasks[i].t] < 0) { mark[tasks[i].t] = (int) tok_used.size(); tok_used.push_back(tasks[i].t); }
+        xq_.resize(xrow * tok_used.size());
+        tok_slot_.assign(mark.begin(), mark.end());
+    }
+    const int nu = (int) tok_used.size();
+    pool_->run([&](int part, int nparts) {
+        int b, e;
+        split(nu, part, nparts, b, e);
+        for (int u = b; u < e; ++u) xfrom(x + (size_t) tok_used[u] * E, xq_.data() + (size_t) u * xrow, E);
+        split(T, part, nparts, b, e);
+        if (e > b) memset(out + (size_t) b * E, 0, sizeof(float) * (size_t) (e - b) * E);
+    });
 
     // phase 1: the gate/up rows of every expert group, split evenly
     const int R = ng * 2 * F;
@@ -298,11 +322,11 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             const std::vector<int> & grp = groups_[gi];
             const int n = (int) grp.size();
             const uint8_t * blob = st_->blob(il, tasks[grp[0]].expert);
-            for (int k = 0; k < n; ++k) ys[k] = xq_.data() + tasks[grp[k]].t * xrow;
+            for (int k = 0; k < n; ++k) ys[k] = xq_.data() + (size_t) tok_slot_[tasks[grp[k]].t] * xrow;
             for (; g < r_end; ++g) {
                 const int r = g - gi * 2 * F;
                 const uint8_t * w = r < F ? blob + (size_t) r * grow : blob + L.gate_bytes + (size_t) (r - F) * urow;
-                if (gu_multi && n > 1) {
+                if (gu_multi && n >= multi_min) {
                     mdot(L.gate_type, E, w, ys, n, vals);
                 } else {
                     for (int k = 0; k < n; ++k) (r < F ? tg : tu)->vec_dot(E, &vals[k], 0, w, 0, ys[k], 0, 1);
@@ -354,7 +378,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 const int n = (int) grp.size();
                 const uint8_t * w = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
                 for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
-                if (dn_multi && n > 1) {
+                if (dn_multi && n >= multi_min) {
                     mdot(L.down_type, F, w, hs, n, vals);
                 } else if (down_q2) {
                     for (int k = 0; k < n; ++k) vals[k] = dot_q2_0(w, (const A8P64 *) hs[k], F);
@@ -364,7 +388,6 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 const float sd = L.exp_sdown.empty() ? 1.f : L.exp_sdown[tasks[grp[0]].expert];
                 for (int k = 0; k < n; ++k) tv[grp[k]] = vals[k] * sd;
             }
-            for (int t = 0; t < T; ++t) out[(size_t) t * E + r] = 0.f;
             for (int i = 0; i < nt; ++i) out[(size_t) tasks[i].t * E + r] += tasks[i].w * tv[i];
         }
       }

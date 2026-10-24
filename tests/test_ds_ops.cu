@@ -71,7 +71,9 @@ int main() {
         float * d_res = up(res), * d_fn = up(fn), * d_scale = up(scale), * d_base = up(base), * d_x = up(x);
         float * d_pre, * d_post, * d_comb;
         CUDA_CHECK(cudaMalloc(&d_pre, T * hc * 4)); CUDA_CHECK(cudaMalloc(&d_post, T * hc * 4)); CUDA_CHECK(cudaMalloc(&d_comb, T * hc * hc * 4));
-        ds_hc_mixes(d_res, d_fn, d_scale, d_base, d_pre, d_post, d_comb, T, hc, E, eps, hc_eps, 20, st);
+        float * d_scr = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_scr, (size_t) T * 25 * 4));
+        ds_hc_mixes(d_res, d_fn, d_scale, d_base, d_pre, d_post, d_comb, T, hc, E, eps, hc_eps, 20, st, getenv("BNK_TEST_MIX_PLAIN") ? nullptr : d_scr);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<double> rpre(T * hc), rpost(T * hc), rcomb(T * hc * hc);
         for (int t = 0; t < T; ++t) {

@@ -98,6 +98,10 @@ public:
     // time (pipeline stages reading a prompt run on two threads).
     void run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
     int threads() const { return pool_ ? pool_->size() : 0; }
+    // work ranges per thread, claimed dynamically (an engine's default; BNK_CPU_CHUNKS in the environment wins). The
+    // DeepSeek experts (9.4 MiB, 2-bit) measured 0.91 -> 0.64 ms per 3-expert decode step going from 1 to 8: the
+    // static split leaves cores idle while the slowest finishes.
+    void set_chunks(int n);
     double last_ms = 0;
 
 private:
@@ -105,12 +109,14 @@ private:
     const ExpertStore * st_ = nullptr;
     std::unique_ptr<SpinPool> pool_;
     // scratch
-    std::vector<uint8_t> xq_;      // per token: x quantized for the gate/up vec_dot type
+    std::vector<uint8_t> xq_;      // per used token: x quantized for the gate/up vec_dot type
+    std::vector<int> tok_slot_;    // token -> its row of xq_ (-1: no task)
     std::vector<float> gu_;        // per task: [2*n_ff]
     std::vector<uint8_t> hq_;      // per task: h quantized for the down product
     std::unique_ptr<std::atomic<int>[]> rows_done_;
     std::vector<std::vector<int>> groups_;   // tasks of the same expert
     int chunks_per_thread_ = 1;
+    bool chunks_env_ = false;
     int rows_done_n_ = 0;
     std::mutex mu_;
 };

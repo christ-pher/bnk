@@ -13,6 +13,8 @@
 namespace bnk {
 
 void f32_to_f16(const float * x, half * y, int64_t n, cudaStream_t s);
+// y[r][c] = (half) x[r * ldx + c] for r < rows, c < cols (y contiguous)
+void f32_to_f16_rows(const float * x, int64_t ldx, int rows, int64_t cols, half * y, cudaStream_t s);
 // y[i] = (half) x[rows[i]] for a row gather (cols floats per row)
 void gather_rows_f16(const float * x, int64_t cols, const int32_t * rows, int n, half * y, cudaStream_t s);
 // h[p][f] = silu(gu[p][f]) * gu[p][F+f]   (fp16 rows of 2F -> F)

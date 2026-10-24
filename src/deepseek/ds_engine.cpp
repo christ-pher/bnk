@@ -50,7 +50,8 @@ std::vector<int> DsEngine::devices() const {
 
 StageInfo DsEngine::stage_info(int i) const {
     const DsEngine * s = stage(i);
-    return StageInfo{s->dev_, s->l0_, s->l1_, s->cache_.resident(), s->cache_.bytes(), s->gpu_ms_, s->gpu_forwards_, 0, 0};
+    return StageInfo{s->dev_, s->l0_, s->l1_, s->cache_.resident(), s->cache_.bytes(), s->gpu_ms_, s->gpu_forwards_, s->pf_ms_,
+                     s->pf_tokens_};
 }
 
 int DsEngine::cache_slots(int il) const {
@@ -68,6 +69,8 @@ size_t DsEngine::kv_bytes_mapped() const {
 }
 
 DsEngine::~DsEngine() {
+    pf_worker_.reset();
+    if (first()) for (float * b : pf_xfer_) if (b) cudaFreeHost(b);
     for (auto & kv : fwd_graphs_) if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts) if (k.host) cudaFreeHost(k.host);
@@ -157,9 +160,27 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
     }
     store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip);
     cpu_->init(model_.ev, *store_, opt.cpu_threads);
-    if (pf_max_ > 0) {   // one chunk transfer buffer for the whole pipeline (stages run a chunk one after another)
-        CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_, (size_t) pf_max_ * (c.hc * model_.ds.n_embd + model_.ds.hc) * 4, cudaHostAllocPortable));
-        for (DsEngine * st = next_.get(); st; st = st->next_.get()) st->pf_xfer_ = pf_xfer_;
+    cpu_->set_chunks(8);
+    if (env_int("BNK_DS_LOOKUP", 1) != 0) lookup_drafter_ = std::make_unique<LookupOnlyDrafter>();
+    if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
+        for (int b = 0; b < 2; ++b) {
+            CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_[b], (size_t) pf_group_ * (c.hc * model_.ds.n_embd + model_.ds.hc) * 4,
+                                     cudaHostAllocPortable));
+            for (DsEngine * st = next_.get(); st; st = st->next_.get()) st->pf_xfer_[b] = pf_xfer_[b];
+        }
+    }
+    // the prompt path's prefetch order: each layer's non-resident experts, hottest first (the ranking, then the rest)
+    for (DsEngine * st = this; st; st = st->next_.get()) {
+        st->pf_rank_.assign(c.n_layer, {});
+        std::vector<char> seen((size_t) c.n_layer * c.n_expert, 0);
+        for (const auto & le : rank)
+            if (st->owns(le.first) && st->cache_.slot_of(le.first, le.second) < 0) {
+                st->pf_rank_[le.first].push_back(le.second);
+                seen[(size_t) le.first * c.n_expert + le.second] = 1;
+            }
+        for (int il = st->l0_; il < st->l1_; ++il)
+            for (int e = 0; e < c.n_expert; ++e)
+                if (!seen[(size_t) il * c.n_expert + e] && st->cache_.slot_of(il, e) < 0) st->pf_rank_[il].push_back(e);
     }
     if (opt.verbose)
         fprintf(stderr, "bnk: experts: %d of %d resident in VRAM (no host copy), %d in RAM\n", resident, c.n_layer * c.n_expert,
@@ -206,6 +227,7 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     const int W = kMaxWindow, E = c.n_embd, HC = c.hc_dim(), H = c.n_head, D = c.head_dim;
     x_.alloc(W * E); res_.alloc(W * HC); mixed_.alloc(W * E); xn_.alloc(W * E); out_.alloc(W * E);
     pre_a_.alloc(W * c.hc); pre_b_.alloc(W * c.hc); attn_pre_.alloc(W * c.hc); post_.alloc(W * c.hc); comb_.alloc(W * c.hc * c.hc);
+    mix_scratch_.alloc((size_t) W * (c.mix_dim() + 1));
     qr_.alloc(W * c.q_lora); qrn_.alloc(W * c.q_lora); q_.alloc((size_t) W * H * D); kvr_.alloc(W * D);
     attn_o_.alloc((size_t) W * H * D); oa_.alloc((size_t) W * c.o_groups * c.o_lora);
     int max_ratio = 1;
@@ -270,7 +292,11 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
                                      cudaHostAllocMapped));
     // the prompt path's buffers (before the budget is measured: they are not elastic)
     pf_max_ = std::max(0, std::min(opt.prefill_chunk, opt.prefill_chunk_max));
-    if (pf_max_ > 0) prefill_alloc(pf_max_);
+    if (pf_max_ > 0) {   // BNK_DS_PF_CHUNKS chunks run layer-major as one group (its MoE buffers grow with it)
+        const int G = std::max(1, std::min(64, env_int("BNK_DS_PF_CHUNKS", 4)));
+        pf_group_ = pf_max_ * G;
+        prefill_alloc(pf_max_, G);
+    }
     // the VRAM budget: what is free now less the reserve; the context's compressed caches draw on it as a
     // conversation grows, so the full context of every slot is kept out of the expert cache's share (a resident
     // expert has no host copy: the cache never shrinks)
@@ -563,23 +589,39 @@ void DsEngine::engram_hash(int e, const std::vector<int32_t> & hist, int p, uint
     }
 }
 
-// the window's table rows into the mapped host buffers (before the graph runs)
+// the window's table rows into the mapped host buffers (before the graph runs). The rows sit in the memory-mapped
+// table on the NVMe: a row not in the page cache costs a ~100 us fault, so the rows are read on several threads at
+// once (48 rows a token: one thread took ~5 ms a token on a cold table).
 void DsEngine::engram_gather() {
     const DsConfig & c = model_.ds;
     const double t0 = now_ms();
     const int cols = c.eg_cols();
-    uint64_t rows[64];
+    struct Job { int e, t, p; const std::vector<int32_t> * hist; };
+    std::vector<Job> jobs;
     for (size_t e = 0; e < c.engram_layers.size(); ++e) {
         if (!h_eg_rows_[e]) continue;
-        const TensorRef & tab = *model_.engram_tab[e];
-        const size_t rb = tab.row_bytes();
         for (const Win & w : wins_)
-            for (int tw = 0; tw < w.T; ++tw) {
-                const int p = w.pos0 + tw, t = w.r0 + tw;
-                engram_hash((int) e, w.q->history, p, rows);
-                for (int col = 0; col < cols; ++col)
-                    memcpy(h_eg_rows_[e] + ((size_t) t * cols + col) * rb, tab.data + rows[col] * rb, rb);
-            }
+            for (int tw = 0; tw < w.T; ++tw) jobs.push_back({(int) e, w.r0 + tw, w.pos0 + tw, &w.q->history});
+    }
+    if (jobs.empty()) return;
+    auto run = [&](size_t j0, size_t j1, int c0, int c1) {   // jobs [j0, j1), columns [c0, c1)
+        uint64_t rows[64];
+        for (size_t j = j0; j < j1; ++j) {
+            const Job & jb = jobs[j];
+            const TensorRef & tab = *model_.engram_tab[jb.e];
+            const size_t rb = tab.row_bytes();
+            engram_hash(jb.e, *jb.hist, jb.p, rows);
+            for (int col = c0; col < c1; ++col)
+                memcpy(h_eg_rows_[jb.e] + ((size_t) jb.t * cols + col) * rb, tab.data + rows[col] * rb, rb);
+        }
+    };
+    static const int nth = std::max(1, std::min(16, env_int("BNK_DS_EG_THREADS_DECODE", 8)));
+    if (nth == 1 || jobs.size() * cols < 16) run(0, jobs.size(), 0, cols);
+    else {
+        // the columns of every job split over the threads (each job's hash is cheap to repeat)
+        std::vector<std::thread> th;
+        for (int i = 0; i < nth; ++i) th.emplace_back(run, 0, jobs.size(), cols * i / nth, cols * (i + 1) / nth);
+        for (auto & t : th) t.join();
     }
     head_->times.ple_ms += now_ms() - t0;
 }
@@ -745,7 +787,7 @@ void DsEngine::layer_forward(int il, int T) {
     if (c.engram_index(il) >= 0) engram(il, T);
     // the attention's mixes (its pre-mix is for the FFN; the attention collapses with the previous sublayer's)
     ds_hc_mixes(res_, F(L.hc_attn_fn), F(L.hc_attn_scale), F(L.hc_attn_base), attn_pre_, post_, comb_, T, c.hc, E, c.eps, c.hc_eps,
-                c.sinkhorn, st_);
+                c.sinkhorn, st_, mix_scratch_.p);
     trace(st_, il, "res_in", res_, T, c.hc_dim());
     trace(st_, il, "attn_pre", attn_pre_, T, c.hc);
     trace(st_, il, "post", post_, T, c.hc);
@@ -759,7 +801,7 @@ void DsEngine::layer_forward(int il, int T) {
     ds_hc_post(out_, res_, post_, comb_, T, c.hc, E, st_);
     trace(st_, il, "res_attn", res_, T, c.hc_dim());
     ds_hc_mixes(res_, F(L.hc_ffn_fn), F(L.hc_ffn_scale), F(L.hc_ffn_base), pre_next_, post_, comb_, T, c.hc, E, c.eps, c.hc_eps,
-                c.sinkhorn, st_);
+                c.sinkhorn, st_, mix_scratch_.p);
     ds_hc_pre(res_, attn_pre_, mixed_, T, c.hc, E, st_);
     rmsnorm_rows(mixed_, F(L.ffn_norm), xn_, T, E, E, E, c.eps, st_);
     quantize_act(xn_, E, T, E, act_, st_);
@@ -987,25 +1029,6 @@ void DsEngine::fwd_end() {
         cudaGetLastError();
     }
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
-}
-
-void DsEngine::prefill(const std::vector<int32_t> & tokens) {
-    const int n = (int) tokens.size();
-    if (n == 0) return;
-    if (on_prefill_progress) on_prefill_progress(0, n);
-    int i = 0;
-    // long stretches in batched chunks, short ones (and short tails) through decode windows
-    if (pf_max_ > 0)
-        while (n - i >= std::max(1, opt_.prefill_min)) {
-            const int N = std::min(pf_max_, n - i);
-            prefill_chunk(tokens.data() + i, N);
-            i += N;
-            if (on_prefill_progress) on_prefill_progress(i, n);
-        }
-    for (; i < n; i += kMaxWindow) {
-        forward(tokens.data() + i, std::min(kMaxWindow, n - i), true);
-        if (on_prefill_progress) on_prefill_progress(std::min(n, i + kMaxWindow), n);
-    }
 }
 
 // ------------------------------------------------------------------------------------------------ commit

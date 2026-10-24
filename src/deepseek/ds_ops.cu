@@ -1,5 +1,6 @@
 #include "deepseek/ds_ops.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -123,9 +124,85 @@ __global__ void __launch_bounds__(1024) hc_mixes_k(const float * __restrict__ re
     }
 }
 
+// Small windows: one block per token reads the 2 MB mixer matrix alone (85 us on one SM). Instead block (t, j) takes
+// mixer row j (j = MIX: the sum of squares) into a scratch of MIX + 1 floats per token, and a second kernel does the
+// sigmoids and the Sinkhorn iterations from it.
+template <int HC>
+__global__ void __launch_bounds__(256) hc_mix_dots_k(const float * __restrict__ res, const float * __restrict__ fn, float * scratch, int E) {
+    constexpr int MIX = (2 + HC) * HC;
+    __shared__ float part[8];
+    const int t = blockIdx.x, j = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int64_t D = (int64_t) HC * E;
+    const float4 * x = (const float4 *) (res + (int64_t) t * D);
+    float acc = 0.f;
+    if (j < MIX) {
+        const float4 * row = (const float4 *) (fn + (int64_t) j * D);
+        for (int64_t i = threadIdx.x; i < D / 4; i += 256) {
+            const float4 a = row[i], b = x[i];
+            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    } else {
+        for (int64_t i = threadIdx.x; i < D / 4; i += 256) {
+            const float4 b = x[i];
+            acc += b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) part[w] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        for (int i = 0; i < 8; ++i) s += part[i];
+        scratch[t * (MIX + 1) + j] = s;
+    }
+}
+template <int HC>
+__global__ void hc_mix_finish_k(const float * __restrict__ scratch, const float * __restrict__ scale, const float * __restrict__ base,
+                                float * pre, float * post, float * comb, int E, float eps, float hc_eps, int iters) {
+    constexpr int MIX = (2 + HC) * HC;
+    const int t = blockIdx.x;
+    const float * m = scratch + t * (MIX + 1);
+    const float r = rsqrtf(m[MIX] / (float) ((int64_t) HC * E) + eps);
+    float c[HC][HC];
+    for (int s = 0; s < HC; ++s) {
+        pre[t * HC + s] = sigmoidf_(m[s] * r * scale[0] + base[s]) + hc_eps;
+        post[t * HC + s] = 2.f * sigmoidf_(m[HC + s] * r * scale[1] + base[HC + s]);
+    }
+    for (int j = 0; j < HC; ++j) {
+        float mx = -FLT_MAX;
+        for (int k = 0; k < HC; ++k) {
+            c[j][k] = m[2 * HC + j * HC + k] * r * scale[2] + base[2 * HC + j * HC + k];
+            mx = fmaxf(mx, c[j][k]);
+        }
+        float sum = 0.f;
+        for (int k = 0; k < HC; ++k) { c[j][k] = __expf(c[j][k] - mx); sum += c[j][k]; }
+        for (int k = 0; k < HC; ++k) c[j][k] = c[j][k] / sum + hc_eps;
+    }
+    for (int it = 0; it < iters; ++it) {
+        if (it > 0)
+            for (int j = 0; j < HC; ++j) {
+                float s = 0.f;
+                for (int k = 0; k < HC; ++k) s += c[j][k];
+                for (int k = 0; k < HC; ++k) c[j][k] /= (s + hc_eps);
+            }
+        for (int k = 0; k < HC; ++k) {
+            float s = 0.f;
+            for (int j = 0; j < HC; ++j) s += c[j][k];
+            for (int j = 0; j < HC; ++j) c[j][k] /= (s + hc_eps);
+        }
+    }
+    for (int j = 0; j < HC; ++j)
+        for (int k = 0; k < HC; ++k) comb[(t * HC + j) * HC + k] = c[j][k];
+}
+
 void ds_hc_mixes(const float * res, const float * fn, const float * scale, const float * base, float * pre, float * post,
-                 float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s) {
+                 float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s, float * scratch) {
     if (hc != 4) throw std::runtime_error("ds_hc_mixes: hc must be 4");
+    if (scratch && T <= 16 && (hc * E) % 4 == 0) {
+        hc_mix_dots_k<4><<<dim3(T, 25), 256, 0, s>>>(res, fn, scratch, E);
+        hc_mix_finish_k<4><<<T, 1, 0, s>>>(scratch, scale, base, pre, post, comb, E, eps, hc_eps, iters);
+        return;
+    }
     hc_mixes_k<4><<<T, 1024, 0, s>>>(res, fn, scale, base, pre, post, comb, E, eps, hc_eps, iters);
 }
 
@@ -244,6 +321,112 @@ __global__ void __launch_bounds__(256) attention_k(const float * __restrict__ q,
     float m = -1e30f, l = 0.f;
     const int n_win = min(W, pos + 1);
     const int n_keys = n_win + (idx ? k_sel : 0);
+    // keys in batches of KB: their rows loaded together (memory parallelism), their dots reduced together (the warp
+    // shuffles of independent chains overlap), one online-softmax step per batch. One key at a time ran at 30 ms per
+    // 2,048-token layer: the per-key reduction and exponentials serialized.
+    constexpr int KB = 8;
+    for (int key0 = 0; key0 < n_keys; key0 += KB) {
+        uint4 r0[KB], r1[KB];
+        bool ok[KB];
+        float sd[KB];
+#pragma unroll
+        for (int j = 0; j < KB; ++j) {
+            const int key = key0 + j;
+            ok[j] = key < n_keys;
+            const half * row = nullptr;
+            if (ok[j]) {
+                if (key < n_win) {
+                    const int p = pos - n_win + 1 + key;
+                    row = ring + (int64_t) (origin >= 0 ? p - origin : p % kDsRing) * D;
+                } else {
+                    const int c = idx[(int64_t) t * k_sel + (key - n_win)];
+                    if (c < 0) ok[j] = false;
+                    else row = comp + (int64_t) c * D;
+                }
+            }
+            if (ok[j]) {
+                const uint4 * rp = (const uint4 *) (row + lane * 16);
+                r0[j] = rp[0];
+                r1[j] = rp[1];
+            } else {
+                r0[j] = make_uint4(0, 0, 0, 0);
+                r1[j] = r0[j];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < KB; ++j) {
+            const half2 * h0 = (const half2 *) &r0[j], * h1 = (const half2 *) &r1[j];
+            float d = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 a = __half22float2(h0[i]), b = __half22float2(h1[i]);
+                d += qv[2 * i] * a.x + qv[2 * i + 1] * a.y + qv[8 + 2 * i] * b.x + qv[8 + 2 * i + 1] * b.y;
+            }
+            sd[j] = d;
+        }
+#pragma unroll
+        for (int j = 0; j < KB; ++j) sd[j] = warp_sum(sd[j]);
+        float mn = m;
+#pragma unroll
+        for (int j = 0; j < KB; ++j) if (ok[j]) mn = fmaxf(mn, sd[j]);
+        const float corr = __expf(m - mn);
+        l *= corr;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) acc[d] *= corr;
+#pragma unroll
+        for (int j = 0; j < KB; ++j) {
+            if (!ok[j]) continue;
+            const float p = __expf(sd[j] - mn);
+            l += p;
+            const half2 * h0 = (const half2 *) &r0[j], * h1 = (const half2 *) &r1[j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 a = __half22float2(h0[i]), b = __half22float2(h1[i]);
+                acc[2 * i] += p * a.x; acc[2 * i + 1] += p * a.y; acc[8 + 2 * i] += p * b.x; acc[8 + 2 * i + 1] += p * b.y;
+            }
+        }
+        m = mn;
+    }
+    l += __expf(sinks[h] - m);
+    const float inv = 1.f / l;
+#pragma unroll
+    for (int d = 0; d < 16; ++d) acc[d] *= inv;
+    // the query's rotation removed from the last n_rot dims (pairs stay inside a lane: 16 is even)
+    const int r0 = D - n_rot;
+    if (lane * 16 + 15 >= r0) {
+#pragma unroll
+        for (int d = 0; d < 16; d += 2) {
+            const int dim = lane * 16 + d;
+            if (dim >= r0) {
+                float sn, cs;
+                rot_sc(pos, inv_freq, (dim - r0) >> 1, sn, cs);
+                const float a = acc[d], b = acc[d + 1];
+                acc[d] = a * cs + b * sn;
+                acc[d + 1] = -a * sn + b * cs;
+            }
+        }
+    }
+    float * op = out + ((int64_t) t * H + h) * D + lane * 16;
+#pragma unroll
+    for (int d = 0; d < 16; ++d) op[d] = acc[d];
+}
+// one key at a time (the default: see ds_attention)
+__global__ void __launch_bounds__(256) attention_k1(const float * __restrict__ q, const half * __restrict__ ring,
+                                                   const half * __restrict__ comp, const int32_t * __restrict__ idx,
+                                                   int k_sel, const float * __restrict__ sinks, float * out, int H, int W,
+                                                   int n_rot, const int * pos0p, const float * inv_freq, float scale,
+                                                   int origin) {
+    constexpr int D = 512;
+    const int t = blockIdx.x, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = blockIdx.y * 8 + w;
+    const int pos = *pos0p + t;
+    float qv[16], acc[16];
+    const float * qp = q + ((int64_t) t * H + h) * D + lane * 16;
+#pragma unroll
+    for (int d = 0; d < 16; ++d) { qv[d] = qp[d] * scale; acc[d] = 0.f; }
+    float m = -1e30f, l = 0.f;
+    const int n_win = min(W, pos + 1);
+    const int n_keys = n_win + (idx ? k_sel : 0);
     for (int key = 0; key < n_keys; ++key) {
         const half * row;
         if (key < n_win) {
@@ -297,11 +480,109 @@ __global__ void __launch_bounds__(256) attention_k(const float * __restrict__ q,
 #pragma unroll
     for (int d = 0; d < 16; ++d) op[d] = acc[d];
 }
+// Small windows: a block per (token, head), its 8 warps each taking every 8th key (one key at a time as above), the
+// eight partial softmax states merged through shared memory. One key at a time with 8 blocks for a token kept 8 SMs
+// busy for 0.5 ms per layer; this keeps 512.
+__global__ void __launch_bounds__(256) attention_split_k(const float * __restrict__ q, const half * __restrict__ ring,
+                                                         const half * __restrict__ comp, const int32_t * __restrict__ idx,
+                                                         int k_sel, const float * __restrict__ sinks, float * out, int H, int W,
+                                                         int n_rot, const int * pos0p, const float * inv_freq, float scale,
+                                                         int origin) {
+    constexpr int D = 512, NW = 8;
+    __shared__ float s_acc[NW][D];
+    __shared__ float s_m[NW], s_l[NW];
+    const int t = blockIdx.x, h = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = *pos0p + t;
+    float qv[16], acc[16];
+    const float * qp = q + ((int64_t) t * H + h) * D + lane * 16;
+#pragma unroll
+    for (int d = 0; d < 16; ++d) { qv[d] = qp[d] * scale; acc[d] = 0.f; }
+    float m = -1e30f, l = 0.f;
+    const int n_win = min(W, pos + 1);
+    const int n_keys = n_win + (idx ? k_sel : 0);
+    for (int key = w; key < n_keys; key += NW) {
+        const half * row;
+        if (key < n_win) {
+            const int p = pos - n_win + 1 + key;
+            row = ring + (int64_t) (origin >= 0 ? p - origin : p % kDsRing) * D;
+        } else {
+            const int c = idx[(int64_t) t * k_sel + (key - n_win)];
+            if (c < 0) continue;
+            row = comp + (int64_t) c * D;
+        }
+        const uint4 * rp = (const uint4 *) (row + lane * 16);
+        const uint4 r0 = rp[0], r1 = rp[1];
+        const half2 * h0 = (const half2 *) &r0, * h1 = (const half2 *) &r1;
+        float kf[16];
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            const float2 a = __half22float2(h0[d]), b = __half22float2(h1[d]);
+            kf[2 * d] = a.x; kf[2 * d + 1] = a.y; kf[8 + 2 * d] = b.x; kf[8 + 2 * d + 1] = b.y;
+        }
+        float sdot = 0.f;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) sdot += qv[d] * kf[d];
+        sdot = warp_sum(sdot);
+        const float mn = fmaxf(m, sdot);
+        const float corr = __expf(m - mn), p = __expf(sdot - mn);
+        l = l * corr + p;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) acc[d] = acc[d] * corr + p * kf[d];
+        m = mn;
+    }
+#pragma unroll
+    for (int d = 0; d < 16; ++d) s_acc[w][lane * 16 + d] = acc[d];
+    if (lane == 0) { s_m[w] = m; s_l[w] = l; }
+    __syncthreads();
+    if (w == 0) {
+        float M = -1e30f;
+        for (int i = 0; i < NW; ++i) M = fmaxf(M, s_m[i]);
+        float L = 0.f, f[NW];
+        for (int i = 0; i < NW; ++i) { f[i] = s_l[i] > 0.f ? __expf(s_m[i] - M) : 0.f; L += s_l[i] * f[i]; }
+#pragma unroll
+        for (int d = 0; d < 16; ++d) {
+            float a = 0.f;
+            for (int i = 0; i < NW; ++i) a += s_acc[i][lane * 16 + d] * f[i];
+            acc[d] = a;
+        }
+        L += __expf(sinks[h] - M);
+        const float inv = 1.f / L;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) acc[d] *= inv;
+        const int r0 = D - n_rot;
+        if (lane * 16 + 15 >= r0) {
+#pragma unroll
+            for (int d = 0; d < 16; d += 2) {
+                const int dim = lane * 16 + d;
+                if (dim >= r0) {
+                    float sn, cs;
+                    rot_sc(pos, inv_freq, (dim - r0) >> 1, sn, cs);
+                    const float a = acc[d], b = acc[d + 1];
+                    acc[d] = a * cs + b * sn;
+                    acc[d + 1] = -a * sn + b * cs;
+                }
+            }
+        }
+        float * op = out + ((int64_t) t * H + h) * D + lane * 16;
+#pragma unroll
+        for (int d = 0; d < 16; ++d) op[d] = acc[d];
+    }
+}
+
 void ds_attention(const float * q, const half * ring, const half * comp, const int32_t * idx, int k_sel,
                   const float * sinks, float * out, int T, int H, int D, int W, int n_rot, const int * pos0,
                   const float * inv_freq, float scale, cudaStream_t s, int origin) {
     if (D != 512 || H % 8) throw std::runtime_error("ds_attention: D must be 512 and H a multiple of 8");
-    attention_k<<<dim3(T, H / 8), 256, 0, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
+    static const bool split_off = getenv("BNK_DS_ATTN_SPLIT") && atoi(getenv("BNK_DS_ATTN_SPLIT")) == 0;
+    if (T <= 16 && !split_off) {
+        attention_split_k<<<dim3(T, H), 256, 0, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
+        return;
+    }
+    // BNK_DS_ATTN_BATCH=1: the batched-keys variant (slower on a V100: 52 vs 40 ms on a 2,048-token chunk with the
+    // selection, 12.5 vs 7.9 window-only; the extra registers cost more occupancy than the overlap gains)
+    static const bool batched = getenv("BNK_DS_ATTN_BATCH") && atoi(getenv("BNK_DS_ATTN_BATCH")) != 0;
+    if (batched) attention_k<<<dim3(T, H / 8), 256, 0, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
+    else attention_k1<<<dim3(T, H / 8), 256, 0, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
 }
 
 // ------------------------------------------------------------------------------------------ compressor
@@ -648,6 +929,39 @@ __global__ void copy_rows_k(const float * x, int64_t ldx, float * y, int64_t ldy
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
         y[(int64_t) t * ldy + i] = x[(int64_t) t * ldx + i];
 }
+__global__ void copy_bytes_k(const uint4 * src, uint4 * dst, size_t n16) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void ds_copy_from_host(const void * src, void * dst, size_t bytes, cudaStream_t s) {
+    if (bytes % 16) throw std::runtime_error("ds_copy_from_host: bytes must be a multiple of 16");
+    const size_t n16 = bytes / 16, b = (n16 + 255) / 256;
+    copy_bytes_k<<<(unsigned) (b < 4096 ? b : 4096), 256, 0, s>>>((const uint4 *) src, (uint4 *) dst, n16);
+}
+__global__ void rows_from_host_k(const float4 * src, const int32_t * map, float4 * dst, int E4) {
+    const int t = blockIdx.y;
+    const bool have = map[t] >= 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < E4; i += gridDim.x * blockDim.x)
+        dst[(size_t) t * E4 + i] = have ? src[(size_t) t * E4 + i] : make_float4(0.f, 0.f, 0.f, 0.f);
+}
+void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int N, int E, cudaStream_t s) {
+    if (E % 4) throw std::runtime_error("ds_rows_from_host: E % 4");
+    rows_from_host_k<<<dim3(4, N), 256, 0, s>>>((const float4 *) src, map, (float4 *) dst, E / 4);
+}
+__global__ void zero_half_k(half * p, size_t n) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) p[i] = __float2half(0.f);
+}
+void ds_zero_half(half * p, size_t n, cudaStream_t s) { zero_half_k<<<(unsigned) std::min<size_t>((n + 255) / 256, 4096), 256, 0, s>>>(p, n); }
+__global__ void ring_read_k(const half * ring, int origin, half * kwin, int p_from, int D) {
+    const int p = p_from + blockIdx.x;
+    const half * src = ring + (int64_t) (p % kDsRing) * D;
+    half * dst = kwin + (int64_t) (p - origin) * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) dst[d] = src[d];
+}
+void ds_ring_read(const half * ring, int origin, half * kwin, int p_from, int p_to, int D, cudaStream_t s) {
+    if (p_to <= p_from) return;
+    ring_read_k<<<p_to - p_from, 256, 0, s>>>(ring, origin, kwin, p_from, D);
+}
+
 void ds_copy_rows(const float * x, int64_t ldx, float * y, int64_t ldy, int T, int n, cudaStream_t s) {
     copy_rows_k<<<dim3(min(256, (n + 255) / 256), T), 256, 0, s>>>(x, ldx, y, ldy, n);
 }

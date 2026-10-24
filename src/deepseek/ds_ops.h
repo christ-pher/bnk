@@ -22,8 +22,9 @@ std::vector<float> ds_rope_inv_freq(int n_rot, float base, float factor, int yar
 // ---- hyper-connections
 // per token: m = fn . rmsnorm(res) (res [T][hc*E] as one vector), then pre = sigmoid(m[0:hc]*s0 + b) + eps,
 // post = 2 sigmoid(m[hc:2hc]*s1 + b), comb [hc][hc] = sinkhorn(softmax(m[2hc:]*s2 + b) + eps)
+// scratch (optional, [T][(2+hc)*hc + 1] floats): with it, small windows run the mixer dots on separate blocks
 void ds_hc_mixes(const float * res, const float * fn, const float * scale, const float * base, float * pre, float * post,
-                 float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s);
+                 float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s, float * scratch = nullptr);
 // out[t][e] = sum_s pre[t][s] * res[t][s*E + e]
 void ds_hc_pre(const float * res, const float * pre, float * out, int T, int hc, int E, cudaStream_t s);
 // res[t][k][e] = post[t][k] * x[t][e] + sum_j comb[t][j*hc + k] * res[t][j][e]   (in place)
@@ -92,5 +93,14 @@ void ds_route(const float * logits, const float * bias, int T, int n_exp, int k,
 // ---- misc
 // y[t][:] = x[t][:] (n floats per row) for rows [0, T): a strided copy helper for the pipeline transfers
 void ds_copy_rows(const float * x, int64_t ldx, float * y, int64_t ldy, int T, int n, cudaStream_t s);
+// Transfers done by kernels rather than the copy engine, for a stream that must not queue behind the expert
+// streaming (a copy engine serves its copies in order: a 2 GB prefetch ahead of a 1 KB table would stall the compute
+// stream until it is through). src is the device alias of mapped pinned host memory.
+void ds_copy_from_host(const void * src, void * dst, size_t bytes, cudaStream_t s);
+// dst[t][:] = map[t] >= 0 ? src[t][:] : 0 for t < N (src, map: mapped host; the CPU experts' rows for the tokens that had CPU tasks)
+void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int N, int E, cudaStream_t s);
+void ds_zero_half(half * p, size_t n, cudaStream_t s);
+// kwin[p - origin][:] = ring[p % kDsRing][:] for p in [p_from, p_to): a chunk's window rows before it, out of the ring
+void ds_ring_read(const half * ring, int origin, half * kwin, int p_from, int p_to, int D, cudaStream_t s);
 
 }  // namespace bnk

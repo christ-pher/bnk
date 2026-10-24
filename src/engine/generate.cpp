@@ -138,7 +138,7 @@ bool Generator::choose_drafts(int32_t mtp_first, float mtp_prob) {
         drafts_from_lookup_ = true;
         return false;
     }
-    if (opt_.max_draft <= 0) return false;
+    if (opt_.max_draft <= 0 || mtp_first < 0) return false;   // (-1: a drafter with nothing to propose)
     drafts_.push_back(mtp_first);
     return (int) drafts_.size() < opt_.max_draft && mtp_prob >= opt_.min_p;
 }
