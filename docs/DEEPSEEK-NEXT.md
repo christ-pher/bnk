@@ -74,7 +74,7 @@ below are from it.
 ## Commands
 
 ```bash
-cd /opt/engines/bnk-deepseek      # branch ds-perf
+cd /opt/engines/bnk               # master (v0.5.1; the ds-perf branch is merged, its worktree bnk-deepseek still exists)
 cmake --build build --target bnk test_ds_ops test_ds_gemv test_ds_cpu bench_ds_cpu bench_ds_attn -j 24
 CUDA_VISIBLE_DEVICES=1 ./build/test_ds_ops && CUDA_VISIBLE_DEVICES=1 ./build/test_ds_gemv
 ./run.sh ds-xs --port 8081        # production (master, 8080) must not be running: both GPUs are needed
