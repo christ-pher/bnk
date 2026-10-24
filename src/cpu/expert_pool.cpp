@@ -76,7 +76,7 @@ void ColdStore::build(const Model & m, int threads, bool verbose) {
     for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(worker);
     for (auto & t : th) t.join();
     const double t1 = now_ms();
-    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
+    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
     if (verbose)
         fprintf(stderr, "bnk: cold experts: %d in RAM, %.2f GiB (copied in %.1f s), %s\n", n, total_ / 1073741824.0,
@@ -155,7 +155,7 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
     for (int i = 0; i < threads; ++i) th.emplace_back(worker);
     for (auto & t : th) t.join();
     const double t1 = now_ms();
-    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable) == cudaSuccess;
+    pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
     if (verbose)
         fprintf(stderr, "bnk: experts: %d in RAM, %.2f GiB (copied in %.1f s, %.2f GiB/s), %s\n", n_kept_, total_ / 1073741824.0,
@@ -164,14 +164,48 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
 }
 
 // ------------------------------------------------------------------------------------------ pool
+// the CPUs this process may run on, one per physical core first (by core_id), then the SMT siblings: a container's
+// cpuset is often a scattered subset of the host's threads, and two workers on one core share its execution units
+static std::vector<int> cpu_order() {
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    if (sched_getaffinity(0, sizeof cs, &cs) != 0) return {};
+    std::vector<std::pair<int, int>> cpus;   // (core_id, cpu)
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &cs)) continue;
+        int core = c;
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+        if (FILE * f = fopen(path, "r")) {
+            if (fscanf(f, "%d", &core) != 1) core = c;
+            fclose(f);
+        }
+        cpus.push_back({core, c});
+    }
+    std::vector<int> order;
+    std::vector<char> used(cpus.size(), 0);
+    for (int round = 0; (int) order.size() < (int) cpus.size(); ++round) {
+        std::vector<int> seen_core;
+        for (size_t i = 0; i < cpus.size(); ++i) {
+            if (used[i]) continue;
+            if (std::find(seen_core.begin(), seen_core.end(), cpus[i].first) != seen_core.end()) continue;
+            seen_core.push_back(cpus[i].first);
+            used[i] = 1;
+            order.push_back(cpus[i].second);
+        }
+    }
+    return order;
+}
+
 SpinPool::SpinPool(int n_workers, int first_cpu) {
     done_.reset(new Flag[n_workers + 1]);
+    const std::vector<int> order = first_cpu >= 0 ? cpu_order() : std::vector<int>{};
     for (int i = 0; i < n_workers; ++i) {
         workers_.emplace_back([this, i]() { loop(i + 1); });
-        if (first_cpu >= 0) {
+        if (first_cpu >= 0 && (size_t) (first_cpu + i) < order.size()) {   // (the caller's thread takes order[0..first_cpu))
             cpu_set_t cs;
             CPU_ZERO(&cs);
-            CPU_SET(first_cpu + i, &cs);
+            CPU_SET(order[first_cpu + i], &cs);
             pthread_setaffinity_np(workers_.back().native_handle(), sizeof cs, &cs);
         }
     }
@@ -208,12 +242,12 @@ void SpinPool::run(const std::function<void(int, int)> & fn) {
 }
 
 // ------------------------------------------------------------------------------------------ experts
-void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads) {
+void CpuExpertPool::init(const Model & m, const ExpertStore & st, int n_threads, bool pin_default) {
     m_ = &m;
     st_ = &st;
     // BNK_CPU_PIN=1: worker i on core i + 1 (the calling thread stays free: threads it creates later would
     // inherit a single-core mask); BNK_CPU_CHUNKS=n: n work ranges per thread, claimed dynamically
-    const bool pin = env_int("BNK_CPU_PIN", 0) != 0;
+    const bool pin = env_int("BNK_CPU_PIN", pin_default ? 1 : 0) != 0;
     chunks_per_thread_ = std::max(1, env_int("BNK_CPU_CHUNKS", 1));
     chunks_env_ = getenv("BNK_CPU_CHUNKS") != nullptr;
     pool_ = std::make_unique<SpinPool>(n_threads - 1, pin ? 1 : -1);
@@ -249,11 +283,10 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
     if (tg->vec_dot_type != tu->vec_dot_type) throw std::runtime_error("gate/up vec_dot types differ");
     const ggml_type xt = tg->vec_dot_type;
     const bool down_q2 = L.down_type == GGML_TYPE_Q2_0;
-    // BNK_CPU_MDOT1=1: the multi-token kernels for single-token experts too (one decode of the row either way)
-    static const bool mdot1 = env_int("BNK_CPU_MDOT1", 0) != 0;
-    const int multi_min = mdot1 ? 1 : 2;
+    // the multi-token kernels from this many tokens on (mdot_min_tokens: 1 where they beat ggml's one-token dot)
     const bool gu_multi = mdot_supported(L.gate_type) && L.gate_type == L.up_type;
     const bool dn_multi = mdot_supported(L.down_type);
+    const int gu_min = gu_multi ? mdot_min_tokens(L.gate_type) : 2, dn_min = dn_multi ? mdot_min_tokens(L.down_type) : 2;
     const size_t xrow = ggml_row_size(xt, E);
     const size_t hrow = down_q2 ? (F / 64) * sizeof(A8P64) : ggml_row_size(td->vec_dot_type, F);
     const size_t grow = ggml_row_size((ggml_type) L.gate_type, E), urow = ggml_row_size((ggml_type) L.up_type, E);
@@ -326,7 +359,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             for (; g < r_end; ++g) {
                 const int r = g - gi * 2 * F;
                 const uint8_t * w = r < F ? blob + (size_t) r * grow : blob + L.gate_bytes + (size_t) (r - F) * urow;
-                if (gu_multi && n >= multi_min) {
+                if (gu_multi && n >= gu_min) {
                     mdot(L.gate_type, E, w, ys, n, vals);
                 } else {
                     for (int k = 0; k < n; ++k) (r < F ? tg : tu)->vec_dot(E, &vals[k], 0, w, 0, ys[k], 0, 1);
@@ -378,7 +411,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
                 const int n = (int) grp.size();
                 const uint8_t * w = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
                 for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
-                if (dn_multi && n >= multi_min) {
+                if (dn_multi && n >= dn_min) {
                     mdot(L.down_type, F, w, hs, n, vals);
                 } else if (down_q2) {
                     for (int k = 0; k < n; ++k) vals[k] = dot_q2_0(w, (const A8P64 *) hs[k], F);

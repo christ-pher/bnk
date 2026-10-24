@@ -250,6 +250,32 @@ private:
     ActQ8 act_, act2_;
     // per lane and kv-source layer: the window's raw compressor projections (kept for the commit)
     std::vector<DevBuf<float>> ckv_raw_[kLanes], sc_raw_[kLanes];
+    // The PCIe lane of decode (BNK_DS_PULL=P experts a layer; off by default, see pull_init): in layer il, layer il + 1's router is
+    // applied to il's FFN input (Strata's guess: the top expert right 97% of the time), its non-resident picks are
+    // pulled from their host copies (the store's memory, mapped) into il + 1's staging slots on a low-priority side
+    // stream while il's FFN and il + 1's attention run, and il + 1's slot table is patched so the plan kernel finds
+    // them resident: the CPU is spared them. The staging slots are P spare slots at the end of each layer's cache
+    // region (ExpertCache::reserve_spare), R-layout like the rest, so the hit kernels need no extra launch: the blob
+    // goes host -> pull_raw_ -> repacked into the slot. After il + 1's FFN the table is restored.
+    int pull_P_ = 0;
+    cudaStream_t st_pull_ = nullptr;
+    cudaEvent_t ev_pull_fork_ = nullptr, ev_pull_join_ = nullptr;
+    DevBuf<uint64_t> pull_blob_ptr_;         // [n_layer][n_expert] device aliases of the host blobs (0: none)
+    DevBuf<uint8_t> pull_raw_;               // P blobs in their file layout, on their way to the slots
+    DevBuf<uint8_t *> pull_dst_;             // [layers of this stage][P] the spare slots' addresses, for the repack
+    DevBuf<int32_t> pull_picks_, pull_staged_;   // [n_layer][P]
+    DevBuf<float> pull_logits_, pull_w_;
+    DevBuf<int32_t> pull_ids_;
+    DevBuf<uint32_t> pull_stats_;            // staged, used, late
+    uint32_t pull_stats_seen_[3] = {0, 0, 0};
+    DevBuf<int32_t> pull_state_;             // [n_layer]: 0 idle, 1 a pull in flight, 2 committed (slots patched)
+    bool pull_wait_ = false;                 // BNK_DS_PULL_WAIT=1: the plan waits for the pull (the first design)
+    void pull_init();
+    void pull_predict(int il, int T);        // in layer il, before its FFN: il + 1's routing guessed and its picks made
+    void pull_launch(int il);                // after il's plan kernel: the picks' pull forked onto st_pull_ (the plan
+                                             // kernel's mailbox writes and a pull's reads of host memory on the same
+                                             // link ran the plan 10x slower when they overlapped)
+    int pull_pending_ = -1;                  // the layer whose picks await their pull_launch (-1 none)
     // MoE
     MoeScratch moes_;
     DevBuf<uint8_t> hits_buf_;
@@ -326,11 +352,14 @@ private:
         uint8_t * eg_rows = nullptr;             // pinned host, per Engram layer in sequence
         size_t eg_rows_per_layer = 0;
         int32_t * h_ids = nullptr, * h_ids2 = nullptr, * h_perm = nullptr, * h_inv = nullptr, * h_cpu_map = nullptr;
+        int32_t * h_cpu_tok = nullptr;           // the tokens with CPU tasks, compact (their rows go out in that order)
+        int xc_rows = 0;                         // rows the compact copy holds (more: every row goes out, as before)
         float * h_w = nullptr, * h_x = nullptr, * h_cpu = nullptr;
         uint8_t * h_items = nullptr;
         // device aliases of the mapped host buffers (read by kernels instead of copy-engine transfers)
-        int32_t * d_h_perm = nullptr, * d_h_inv = nullptr, * d_h_cpu_map = nullptr;
+        int32_t * d_h_perm = nullptr, * d_h_inv = nullptr, * d_h_cpu_map = nullptr, * d_h_cpu_tok = nullptr;
         float * d_h_cpu = nullptr;
+        DevBuf<float> xc;                        // [xc_rows][E]: the CPU tokens' FFN input rows, compact
         uint8_t * d_h_items = nullptr;
         size_t items_bytes = 0;
         int max_blocks = 0;

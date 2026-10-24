@@ -692,5 +692,9 @@ int main(int argc, char ** argv) {
     printf("expert misses %.2f%% (%.2f per forward), %lld cache swaps\n",
            100.0 * tm.misses / std::max<int64_t>(1, tm.routed), (double) tm.misses / std::max(1, tm.calls),
            (long long) eng.cache_swaps());
+    if (tm.pulled)
+        printf("PCIe lane: %lld experts pulled a layer ahead (%.2f per forward), %lld of them routed (%.1f%%), %lld late\n",
+               (long long) tm.pulled, (double) tm.pulled / std::max(1, tm.calls), (long long) tm.pull_used, 100.0 * tm.pull_used / tm.pulled,
+               (long long) tm.pull_late);
     return 0;
 }

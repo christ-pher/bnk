@@ -6,7 +6,12 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include <mma.h>
+
 #include "core/util.h"
+#include "kernels/actq.cuh"
+#include "kernels/route.cuh"
+#include "kernels/ops.h"
 
 namespace bnk {
 
@@ -127,10 +132,53 @@ __global__ void __launch_bounds__(1024) hc_mixes_k(const float * __restrict__ re
 // Small windows: one block per token reads the 2 MB mixer matrix alone (85 us on one SM). Instead block (t, j) takes
 // mixer row j (j = MIX: the sum of squares) into a scratch of MIX + 1 floats per token, and a second kernel does the
 // sigmoids and the Sinkhorn iterations from it.
+// the finish from the scratch's MIX + 1 dots of token t (one thread)
 template <int HC>
-__global__ void __launch_bounds__(256) hc_mix_dots_k(const float * __restrict__ res, const float * __restrict__ fn, float * scratch, int E) {
+__device__ __forceinline__ void hc_mix_finish(const float * __restrict__ m, const float * __restrict__ scale,
+                                              const float * __restrict__ base, float * pre, float * post, float * comb, int t,
+                                              int E, float eps, float hc_eps, int iters) {
+    constexpr int MIX = (2 + HC) * HC;
+    const float r = rsqrtf(__ldcg(m + MIX) / (float) ((int64_t) HC * E) + eps);
+    float c[HC][HC];
+    for (int s = 0; s < HC; ++s) {
+        pre[t * HC + s] = sigmoidf_(__ldcg(m + s) * r * scale[0] + base[s]) + hc_eps;
+        post[t * HC + s] = 2.f * sigmoidf_(__ldcg(m + HC + s) * r * scale[1] + base[HC + s]);
+    }
+    for (int j = 0; j < HC; ++j) {
+        float mx = -FLT_MAX;
+        for (int k = 0; k < HC; ++k) {
+            c[j][k] = __ldcg(m + 2 * HC + j * HC + k) * r * scale[2] + base[2 * HC + j * HC + k];
+            mx = fmaxf(mx, c[j][k]);
+        }
+        float sum = 0.f;
+        for (int k = 0; k < HC; ++k) { c[j][k] = __expf(c[j][k] - mx); sum += c[j][k]; }
+        for (int k = 0; k < HC; ++k) c[j][k] = c[j][k] / sum + hc_eps;
+    }
+    for (int it = 0; it < iters; ++it) {
+        if (it > 0)
+            for (int j = 0; j < HC; ++j) {
+                float s = 0.f;
+                for (int k = 0; k < HC; ++k) s += c[j][k];
+                for (int k = 0; k < HC; ++k) c[j][k] /= (s + hc_eps);
+            }
+        for (int k = 0; k < HC; ++k) {
+            float s = 0.f;
+            for (int j = 0; j < HC; ++j) s += c[j][k];
+            for (int j = 0; j < HC; ++j) c[j][k] /= (s + hc_eps);
+        }
+    }
+    for (int j = 0; j < HC; ++j)
+        for (int k = 0; k < HC; ++k) comb[(t * HC + j) * HC + k] = c[j][k];
+}
+// cnt: a counter per token (zero between calls): the last of a token's MIX + 1 blocks runs the finish, so the two
+// launches became one (the counter's reset is its own)
+template <int HC>
+__global__ void __launch_bounds__(256) hc_mix_dots_k(const float * __restrict__ res, const float * __restrict__ fn, float * scratch,
+                                                     unsigned * cnt, const float * __restrict__ scale, const float * __restrict__ base,
+                                                     float * pre, float * post, float * comb, int E, float eps, float hc_eps, int iters) {
     constexpr int MIX = (2 + HC) * HC;
     __shared__ float part[8];
+    __shared__ int s_last;
     const int t = blockIdx.x, j = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int64_t D = (int64_t) HC * E;
     const float4 * x = (const float4 *) (res + (int64_t) t * D);
@@ -154,53 +202,23 @@ __global__ void __launch_bounds__(256) hc_mix_dots_k(const float * __restrict__ 
         float s = 0.f;
         for (int i = 0; i < 8; ++i) s += part[i];
         scratch[t * (MIX + 1) + j] = s;
+        __threadfence();
+        s_last = atomicAdd(&cnt[t], 1u) == (unsigned) MIX;
     }
-}
-template <int HC>
-__global__ void hc_mix_finish_k(const float * __restrict__ scratch, const float * __restrict__ scale, const float * __restrict__ base,
-                                float * pre, float * post, float * comb, int E, float eps, float hc_eps, int iters) {
-    constexpr int MIX = (2 + HC) * HC;
-    const int t = blockIdx.x;
-    const float * m = scratch + t * (MIX + 1);
-    const float r = rsqrtf(m[MIX] / (float) ((int64_t) HC * E) + eps);
-    float c[HC][HC];
-    for (int s = 0; s < HC; ++s) {
-        pre[t * HC + s] = sigmoidf_(m[s] * r * scale[0] + base[s]) + hc_eps;
-        post[t * HC + s] = 2.f * sigmoidf_(m[HC + s] * r * scale[1] + base[HC + s]);
+    __syncthreads();
+    if (s_last && threadIdx.x == 0) {
+        __threadfence();
+        hc_mix_finish<HC>(scratch + t * (MIX + 1), scale, base, pre, post, comb, t, E, eps, hc_eps, iters);
+        cnt[t] = 0;
     }
-    for (int j = 0; j < HC; ++j) {
-        float mx = -FLT_MAX;
-        for (int k = 0; k < HC; ++k) {
-            c[j][k] = m[2 * HC + j * HC + k] * r * scale[2] + base[2 * HC + j * HC + k];
-            mx = fmaxf(mx, c[j][k]);
-        }
-        float sum = 0.f;
-        for (int k = 0; k < HC; ++k) { c[j][k] = __expf(c[j][k] - mx); sum += c[j][k]; }
-        for (int k = 0; k < HC; ++k) c[j][k] = c[j][k] / sum + hc_eps;
-    }
-    for (int it = 0; it < iters; ++it) {
-        if (it > 0)
-            for (int j = 0; j < HC; ++j) {
-                float s = 0.f;
-                for (int k = 0; k < HC; ++k) s += c[j][k];
-                for (int k = 0; k < HC; ++k) c[j][k] /= (s + hc_eps);
-            }
-        for (int k = 0; k < HC; ++k) {
-            float s = 0.f;
-            for (int j = 0; j < HC; ++j) s += c[j][k];
-            for (int j = 0; j < HC; ++j) c[j][k] /= (s + hc_eps);
-        }
-    }
-    for (int j = 0; j < HC; ++j)
-        for (int k = 0; k < HC; ++k) comb[(t * HC + j) * HC + k] = c[j][k];
 }
 
 void ds_hc_mixes(const float * res, const float * fn, const float * scale, const float * base, float * pre, float * post,
                  float * comb, int T, int hc, int E, float eps, float hc_eps, int iters, cudaStream_t s, float * scratch) {
     if (hc != 4) throw std::runtime_error("ds_hc_mixes: hc must be 4");
-    if (scratch && T <= 16 && (hc * E) % 4 == 0) {
-        hc_mix_dots_k<4><<<dim3(T, 25), 256, 0, s>>>(res, fn, scratch, E);
-        hc_mix_finish_k<4><<<T, 1, 0, s>>>(scratch, scale, base, pre, post, comb, E, eps, hc_eps, iters);
+    if (scratch && T <= kDsMixSlots && (hc * E) % 4 == 0) {
+        unsigned * cnt = (unsigned *) (scratch + kDsMixSlots * 25);
+        hc_mix_dots_k<4><<<dim3(T, 25), 256, 0, s>>>(res, fn, scratch, cnt, scale, base, pre, post, comb, E, eps, hc_eps, iters);
         return;
     }
     hc_mixes_k<4><<<T, 1024, 0, s>>>(res, fn, scale, base, pre, post, comb, E, eps, hc_eps, iters);
@@ -215,6 +233,68 @@ __global__ void hc_pre_k(const float * res, const float * pre, float * out, int 
 }
 void ds_hc_pre(const float * res, const float * pre, float * out, int T, int hc, int E, cudaStream_t s) {
     hc_pre_k<<<dim3((E + 255) / 256, T), 256, 0, s>>>(res, pre, out, hc, E);
+}
+
+// block per token: mixed = sum_s pre[s] res[s] (P float4 a thread, in registers), xn = rmsnorm(mixed) * w, and xn
+// quantized (quant4_store: what quantize_act writes, bit for bit). Three launches were one each.
+template <int HC, int P>
+__global__ void hc_pre_norm_q_k(const float * __restrict__ res, const float * __restrict__ pre, const float * __restrict__ w,
+                                float * mixed, float * xn, int E, float eps, ActQ8 q) {
+    __shared__ float sh[32];
+    const int t = blockIdx.x, n4 = E / 4;
+    float pw[HC];
+#pragma unroll
+    for (int s = 0; s < HC; ++s) pw[s] = pre[t * HC + s];
+    float4 v[P];
+    float ss = 0.f;
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int i = threadIdx.x + p * blockDim.x;
+        v[p] = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (i < n4) {
+#pragma unroll
+            for (int s = 0; s < HC; ++s) {
+                const float4 r = ((const float4 *) (res + ((int64_t) t * HC + s) * E))[i];
+                v[p].x += pw[s] * r.x; v[p].y += pw[s] * r.y; v[p].z += pw[s] * r.z; v[p].w += pw[s] * r.w;
+            }
+            if (mixed) ((float4 *) (mixed + (int64_t) t * E))[i] = v[p];
+        }
+        ss += v[p].x * v[p].x + v[p].y * v[p].y + v[p].z * v[p].z + v[p].w * v[p].w;
+    }
+    ss = block_sum(ss, sh);
+    const float inv = rsqrtf(ss / E + eps);
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int i = threadIdx.x + p * blockDim.x;
+        if (i < n4) {
+            const float4 g = ((const float4 *) w)[i];
+            const float4 o = make_float4(v[p].x * inv * g.x, v[p].y * inv * g.y, v[p].z * inv * g.z, v[p].w * inv * g.w);
+            ((float4 *) (xn + (int64_t) t * E))[i] = o;
+            quant4_store(o, (int64_t) t * E + 4 * i, q);
+        }
+    }
+}
+void ds_hc_pre_norm_q(const float * res, const float * pre, const float * w, float * mixed, float * xn, int T, int hc, int E,
+                      float eps, ActQ8 & q, cudaStream_t s) {
+    const int n4 = E / 4;
+    int P = 1;
+    while (P < 8 && (n4 + P - 1) / P > 512) P *= 2;
+    const int threads = (n4 + P - 1) / P;
+    // whole warps over whole quant blocks (every 8-lane group in or out of the row together), else the three launches
+    if (hc != 4 || E % 128 || threads % 32 || threads * P != n4) {
+        ds_hc_pre(res, pre, mixed, T, hc, E, s);
+        rmsnorm_rows(mixed, w, xn, T, E, E, E, eps, s);
+        quantize_act(xn, E, T, E, q, s);
+        return;
+    }
+    q.T = T;
+    q.cols = q.cols_pad = E;
+    switch (P) {
+        case 1: hc_pre_norm_q_k<4, 1><<<T, threads, 0, s>>>(res, pre, w, mixed, xn, E, eps, q); break;
+        case 2: hc_pre_norm_q_k<4, 2><<<T, threads, 0, s>>>(res, pre, w, mixed, xn, E, eps, q); break;
+        case 4: hc_pre_norm_q_k<4, 4><<<T, threads, 0, s>>>(res, pre, w, mixed, xn, E, eps, q); break;
+        default: hc_pre_norm_q_k<4, 8><<<T, threads, 0, s>>>(res, pre, w, mixed, xn, E, eps, q);
+    }
 }
 
 template <int HC>
@@ -281,6 +361,43 @@ void ds_kv_prep(const float * kv, const float * w, half * ring, int T, int D, in
                 const float * inv_freq, float eps, cudaStream_t s, int origin) {
     if (D != 512) throw std::runtime_error("ds_kv_prep: D must be 512");
     kv_prep_k<<<T, D, 0, s>>>(kv, w, ring, D, n_rot, pos0, inv_freq, eps, origin);
+}
+
+// grid T, block 512: the token's query heads rotated (H * n_rot / 2 pairs over the block), then kv_prep_k's work
+__global__ void __launch_bounds__(512) rope_kv_prep_k(float * q, int H, int D, int n_rot, const float * kv, const float * w,
+                                                      half * ring, const int * pos0p, const float * inv_freq, float eps, int origin) {
+    __shared__ float sh[32];
+    __shared__ float buf[512];
+    const int t = blockIdx.x, d = threadIdx.x, pos = *pos0p + t;
+    const int np = n_rot / 2;
+    for (int i = d; i < H * np; i += 512) {
+        const int h = i / np, pr = i - h * np;
+        float * v = q + ((int64_t) t * H + h) * D + (D - n_rot) + 2 * pr;
+        float sn, cs;
+        rot_sc(pos, inv_freq, pr, sn, cs);
+        const float a = v[0], b = v[1];
+        v[0] = a * cs - b * sn;
+        v[1] = a * sn + b * cs;
+    }
+    const float x = kv[(int64_t) t * D + d];
+    const float ss = block_sum(x * x, sh);
+    buf[d] = x * rsqrtf(ss / D + eps) * w[d];
+    __syncthreads();
+    float out = buf[d];
+    const int r0 = D - n_rot;
+    if (d >= r0) {
+        const int j = d - r0, i = j >> 1;
+        float sn, cs;
+        rot_sc(pos, inv_freq, i, sn, cs);
+        const float a = buf[r0 + 2 * i], b = buf[r0 + 2 * i + 1];
+        out = (j & 1) ? a * sn + b * cs : a * cs - b * sn;
+    }
+    ring[(int64_t) (origin >= 0 ? pos - origin : pos % kDsRing) * D + d] = __float2half(out);
+}
+void ds_rope_kv_prep(float * q, int H, const float * kv, const float * w, half * ring, int T, int D, int n_rot, const int * pos0,
+                     const float * inv_freq, float eps, cudaStream_t s, int origin) {
+    if (D != 512) throw std::runtime_error("ds_rope_kv_prep: D must be 512");
+    rope_kv_prep_k<<<T, D, 0, s>>>(q, H, D, n_rot, kv, w, ring, pos0, inv_freq, eps, origin);
 }
 
 __global__ void ring_fill_k(const half * win, int origin, half * ring, int p_from, int D) {
@@ -569,6 +686,202 @@ __global__ void __launch_bounds__(256) attention_split_k(const float * __restric
     }
 }
 
+// ------------------------------------------------------------------------------------------ attention on the tensor cores
+// A prompt chunk: a block takes 32 heads of one token (the 64 query heads share the key rows: one KV head), 512 threads.
+// The rows (window + selected, at most kTcMax) go by in tiles of 32, staged once in shared memory and used for both
+// products: S = Q K^T (wmma 16x16x16; a warp a (head tile, row tile, k-quarter), the four partials summed in the
+// softmax), the online softmax per head in fp32 (the running max's correction applied to the O accumulators through
+// the fragment row map read at the start), O += P V (a warp a head tile x 64 columns, 4 accumulators). fp16's range: a
+// head's query is scaled by a power of two to a largest value of ~2^12 (exact), the probabilities by 2^14; the key rows
+// are fp16 already; fp32 accumulators. Logit error ~1e-4 absolute from the fp16 rounding of q (the three-phase
+// high + low design of Project Maya's sparse_attn_v7_kernel, which this follows, was shared-memory bound: 136 block
+// syncs per block; this has ~80 with twice the heads a block). One block per SM (85 KB of shared memory).
+constexpr int kTcThreads = 512, kTcMax = 640, kTcHeads = 32, kTcRows = 32, kTcLd = 520, kTcLdP = kTcRows + 8;
+constexpr float kTcPScale = 16384.f;
+constexpr size_t kTcQ = (size_t) kTcHeads * kTcLd * 2;            // Q (fp16)
+constexpr size_t kTcK = (size_t) kTcRows * kTcLd * 2;             // the tile's key rows (fp16)
+constexpr size_t kTcS = (size_t) 16 * 16 * 16 * 4;                 // 16 partial S tiles (fp32); the row map at the start
+constexpr size_t kTcP = (size_t) kTcHeads * kTcLdP * 2;           // P (fp16)
+constexpr size_t kTcSmem = kTcQ + kTcK + kTcS + kTcP;
+static_assert(kTcQ + kTcK >= (size_t) kTcHeads * 512 * 4, "O at the end fits the Q + K regions");
+static_assert(kTcSmem <= 90 * 1024, "a V100's shared memory (96 KB) with room for the static arrays");
+
+__global__ void __launch_bounds__(kTcThreads, 1) attention_tc_k(const float * __restrict__ q, const half * __restrict__ ring,
+                                                                const half * __restrict__ comp, const int32_t * __restrict__ idx,
+                                                                int k_sel, const float * __restrict__ sinks, float * out, int H,
+                                                                int W, int n_rot, const int * pos0p, const float * inv_freq,
+                                                                float scale, int origin) {
+    namespace wm = nvcuda::wmma;
+    constexpr int D = 512;
+    extern __shared__ __align__(32) unsigned char tc_smem[];
+    half * Qs = (half *) tc_smem;
+    half * Ks = (half *) (tc_smem + kTcQ);
+    float * Ss = (float *) (tc_smem + kTcQ + kTcK);
+    half * Ps = (half *) (tc_smem + kTcQ + kTcK + kTcS);
+    float * Os = (float *) tc_smem;   // the end
+    __shared__ float s_qf[kTcHeads], s_corr[kTcHeads], s_den[kTcHeads];
+    __shared__ int32_t s_sel[kTcMax];   // the token's selected rows (a fetch resolves its row without a global lookup)
+    const int t = blockIdx.y, hb = blockIdx.x * kTcHeads;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int pos = *pos0p + t;
+    const int n_win = min(W, pos + 1);
+    const int total = n_win + (idx ? k_sel : 0);
+    if (idx) for (int j = tid; j < k_sel; j += kTcThreads) s_sel[j] = idx[(int64_t) t * k_sel + j];
+    auto row_of = [&](int j) -> const half * {   // the row of key j (nullptr: none)
+        if (j >= total) return nullptr;
+        if (j < n_win) {
+            const int p = pos - n_win + 1 + j;
+            return ring + (int64_t) (origin >= 0 ? p - origin : p % kDsRing) * D;
+        }
+        const int c = s_sel[j - n_win];
+        return c < 0 ? nullptr : comp + (int64_t) c * D;
+    };
+    // the queries of heads `warp` and `warp + 16`: each to a largest value of ~2^12 (exact), as fp16
+    for (int hh = warp; hh < kTcHeads; hh += 16) {
+        const float * qr = q + ((int64_t) t * H + hb + hh) * D;
+        float a = 0.f;
+        for (int c = lane; c < D; c += 32) a = fmaxf(a, fabsf(qr[c]));
+        a = warp_max(a);
+        const int e = a > 0.f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 127 : 0;
+        const float up = ldexpf(1.f, 12 - e);
+        for (int c = lane; c < D; c += 32) Qs[hh * kTcLd + c] = __float2half_rn(qr[c] * up);
+        if (lane == 0) s_qf[hh] = scale / up;
+    }
+    // the accumulator fragment's row map: element i of every accumulator fragment lies in row rowmap[i]
+    for (int i = tid; i < 256; i += kTcThreads) Ss[i] = (float) (i >> 4);
+    __syncthreads();
+    int rowmap[8];
+    {
+        wm::fragment<wm::accumulator, 16, 16, 16, float> f;
+        wm::load_matrix_sync(f, Ss, 16, wm::mem_row_major);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) rowmap[i] = (int) f.x[i];
+    }
+    // this warp's parts: S partial (head tile sh, row tile sr, dims [sk, sk + 128)); O (head tile oh, columns oc..oc+64)
+    const int sh = warp & 1, sr = (warp >> 1) & 1, sk = (warp >> 2) * 128;
+    const int oh = warp & 1, oc = (warp >> 1) * 64;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> o[4];
+#pragma unroll
+    for (int f = 0; f < 4; ++f) wm::fill_fragment(o[f], 0.f);
+    // the softmax state of head `hh` (lanes 0-15: head 2 warp, lanes 16-31: head 2 warp + 1), rows lane & 15 and + 16
+    const int hh = 2 * warp + (lane >> 4), lr = lane & 15;
+    float m = -INFINITY, l = 0.f;
+    // the tile's rows: a thread row tid / 16, dims (tid & 15) * 32; the next tile's fetched during this tile's products
+    const int fr = tid >> 4, fv = (tid & 15) * 32;
+    uint4 nxt[4];
+    auto fetch = [&](int j) {
+        const half * p = row_of(j);
+        if (p) {
+            const uint4 * s4 = (const uint4 *) (p + fv);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) nxt[i] = s4[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) nxt[i] = make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    fetch(fr);
+    for (int r0 = 0; r0 < total; r0 += kTcRows) {
+        __syncthreads();   // the tile before's products done with Ks and Ps
+        {
+            uint4 * d = (uint4 *) (Ks + fr * kTcLd + fv);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) d[i] = nxt[i];
+        }
+        __syncthreads();
+        if (r0 + kTcRows < total) fetch(r0 + kTcRows + fr);
+        {   // S partial: 8 k-steps of 16 over this warp's quarter of the dims
+            wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+            wm::fill_fragment(acc, 0.f);
+#pragma unroll
+            for (int kk = 0; kk < 128; kk += 16) {
+                wm::fragment<wm::matrix_a, 16, 16, 16, half, wm::row_major> a;
+                wm::fragment<wm::matrix_b, 16, 16, 16, half, wm::col_major> b;
+                wm::load_matrix_sync(a, Qs + sh * 16 * kTcLd + sk + kk, kTcLd);
+                wm::load_matrix_sync(b, Ks + sr * 16 * kTcLd + sk + kk, kTcLd);
+                wm::mma_sync(acc, a, b, acc);
+            }
+            wm::store_matrix_sync(Ss + warp * 256, acc, 16, wm::mem_row_major);
+        }
+        __syncthreads();
+        {   // the softmax of head hh over the tile's 32 rows: two rows a lane, the 16 lanes of the head reduce
+            const float qf = s_qf[hh];
+            float sv[2];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int rr = lr + 16 * k, j = r0 + rr;   // row rr of the tile: row tile rr / 16
+                const bool ok = j < total && (j < n_win || s_sel[j - n_win] >= 0);
+                const float * ps = Ss + ((hh >> 4) | ((rr >> 4) << 1)) * 256 + (hh & 15) * 16 + (rr & 15);   // (warp (sh, sr, 0))
+                sv[k] = ok ? (ps[0] + ps[4 * 256] + ps[8 * 256] + ps[12 * 256]) * qf : -INFINITY;
+            }
+            float mt = fmaxf(sv[0], sv[1]);
+#pragma unroll
+            for (int off = 8; off; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+            const float mn = fmaxf(m, mt);   // finite from the first tile on (the window has a row)
+            const float corr = __expf(m - mn);
+            float ps = 0.f;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const float pv = __expf(sv[k] - mn);
+                ps += pv;
+                Ps[hh * kTcLdP + lr + 16 * k] = __float2half_rn(pv * kTcPScale);
+            }
+#pragma unroll
+            for (int off = 8; off; off >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, off);
+            l = l * corr + ps;
+            m = mn;
+            if (lr == 0) s_corr[hh] = corr;
+        }
+        __syncthreads();
+        {   // O = O corr + P V over the tile's two row tiles
+#pragma unroll
+            for (int f = 0; f < 4; ++f)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) o[f].x[i] *= s_corr[oh * 16 + rowmap[i]];
+#pragma unroll
+            for (int rt = 0; rt < kTcRows; rt += 16) {
+                wm::fragment<wm::matrix_a, 16, 16, 16, half, wm::row_major> a;
+                wm::load_matrix_sync(a, Ps + oh * 16 * kTcLdP + rt, kTcLdP);
+#pragma unroll
+                for (int f = 0; f < 4; ++f) {
+                    wm::fragment<wm::matrix_b, 16, 16, 16, half, wm::row_major> b;
+                    wm::load_matrix_sync(b, Ks + rt * kTcLd + oc + f * 16, kTcLd);
+                    wm::mma_sync(o[f], a, b, o[f]);
+                }
+            }
+        }
+    }
+    if (lr == 0) s_den[hh] = l + __expf(sinks[hb + hh] - m);
+    __syncthreads();   // the last products done with Qs / Ks: O takes the region
+#pragma unroll
+    for (int f = 0; f < 4; ++f) wm::store_matrix_sync(Os + oh * 16 * D + oc + f * 16, o[f], D, wm::mem_row_major);
+    __syncthreads();
+    // out = O / (2^14 den), the query's rotation removed from the last n_rot dims (adjacent pairs)
+    const int r0d = D - n_rot;
+    for (int i = tid; i < kTcHeads * (D / 2); i += kTcThreads) {
+        const int h = i / (D / 2), c = (i % (D / 2)) * 2;
+        const float inv = 1.f / (kTcPScale * s_den[h]);
+        float a = Os[h * D + c] * inv, b = Os[h * D + c + 1] * inv;
+        if (c >= r0d) {
+            float sn, cs;
+            rot_sc(pos, inv_freq, (c - r0d) >> 1, sn, cs);
+            const float a0 = a;
+            a = a0 * cs + b * sn;
+            b = -a0 * sn + b * cs;
+        }
+        *(float2 *) (out + ((int64_t) t * H + hb + h) * D + c) = make_float2(a, b);
+    }
+}
+// the kernel's dynamic shared memory above 48 KB: allowed once per device
+static void attention_tc_ready() {
+    static bool done[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16 || done[dev]) return;
+    CUDA_CHECK(cudaFuncSetAttribute(attention_tc_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem));
+    done[dev] = true;
+}
+
 void ds_attention(const float * q, const half * ring, const half * comp, const int32_t * idx, int k_sel,
                   const float * sinks, float * out, int T, int H, int D, int W, int n_rot, const int * pos0,
                   const float * inv_freq, float scale, cudaStream_t s, int origin) {
@@ -576,6 +889,13 @@ void ds_attention(const float * q, const half * ring, const half * comp, const i
     static const bool split_off = getenv("BNK_DS_ATTN_SPLIT") && atoi(getenv("BNK_DS_ATTN_SPLIT")) == 0;
     if (T <= 16 && !split_off) {
         attention_split_k<<<dim3(T, H), 256, 0, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
+        return;
+    }
+    // prompt chunks: the tensor-core kernel (BNK_DS_ATTN_TC=0: the fp32 one-key-at-a-time kernel below)
+    static const int tc = getenv("BNK_DS_ATTN_TC") ? atoi(getenv("BNK_DS_ATTN_TC")) : 1;
+    if (tc && H % kTcHeads == 0 && W + (idx ? k_sel : 0) <= kTcMax) {
+        attention_tc_ready();
+        attention_tc_k<<<dim3(H / kTcHeads, T), kTcThreads, kTcSmem, s>>>(q, ring, comp, idx, k_sel, sinks, out, H, W, n_rot, pos0, inv_freq, scale, origin);
         return;
     }
     // BNK_DS_ATTN_BATCH=1: the batched-keys variant (slower on a V100: 52 vs 40 ms on a 2,048-token chunk with the
@@ -877,51 +1197,113 @@ void ds_engram_gate(float * res, const float * key, int64_t ldk, const float * v
 }
 
 // ------------------------------------------------------------------------------------------ routing
-__device__ __forceinline__ float softplusf_(float x) { return x > 20.f ? x : x < -20.f ? __expf(x) : log1pf(__expf(x)); }
-
-// one warp per token; n_exp <= 32 * 16
 __global__ void route_k(const float * logits, const float * bias, int n_exp, int k, float scale, int norm, int32_t * ids,
                         float * w) {
-    const int t = blockIdx.x, lane = threadIdx.x;
-    constexpr int PER = 16;
-    float s[PER], sc[PER];
-    bool taken[PER];
-#pragma unroll
-    for (int j = 0; j < PER; ++j) {
-        const int e = lane + 32 * j;
-        s[j] = e < n_exp ? sqrtf(softplusf_(logits[(int64_t) t * n_exp + e])) : 0.f;
-        sc[j] = e < n_exp ? s[j] + bias[e] : -FLT_MAX;
-        taken[j] = e >= n_exp;
-    }
-    float sum = 0.f;
-    for (int r = 0; r < k; ++r) {
-        float best = -FLT_MAX;
-        int bj = -1;
-#pragma unroll
-        for (int j = 0; j < PER; ++j)
-            if (!taken[j] && sc[j] > best) { best = sc[j]; bj = j; }
-        // the warp's best: highest score, lowest expert id on ties
-        float wb = warp_max(best);
-        int cand = (best == wb && bj >= 0) ? lane + 32 * bj : 0x7fffffff;
-#pragma unroll
-        for (int o = 16; o; o >>= 1) cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, o));
-        const int e = cand;
-        const int owner = e & 31, j = e >> 5;
-        float sv = 0.f;
-        if (lane == owner) { taken[j] = true; sv = s[j]; }
-        sv = __shfl_sync(0xffffffffu, sv, owner);
-        sum += sv;
-        if (lane == 0) { ids[t * k + r] = e; w[t * k + r] = sv; }
-    }
-    if (lane == 0) {
-        const float f = (norm && k > 1) ? scale / (sum + 1e-20f) : scale;
-        for (int r = 0; r < k; ++r) w[t * k + r] *= f;
-    }
+    ds_route_warp(logits, bias, n_exp, k, scale, norm, ids, w, blockIdx.x, threadIdx.x);
 }
 void ds_route(const float * logits, const float * bias, int T, int n_exp, int k, float scale, bool norm, int32_t * ids,
               float * w, cudaStream_t s) {
     if (n_exp > 32 * 16 || k > 32) throw std::runtime_error("ds_route: too many experts");
     route_k<<<T, 32, 0, s>>>(logits, bias, n_exp, k, scale, norm ? 1 : 0, ids, w);
+}
+
+// ------------------------------------------------------------------------------------------ the PCIe lane
+// one block: the T * k predicted pairs (<= 128) walked by thread 0 (a few dozen comparisons)
+__global__ void pull_pick_k(const int32_t * ids, const float * w, int n, const int32_t * slot_of, int32_t * out, int P,
+                            int32_t * state) {
+    if (threadIdx.x) return;
+    for (int p = 0; p < P; ++p) {
+        int best = -1;
+        float bw = -1.f;
+        for (int i = 0; i < n; ++i) {
+            const int e = ids[i];
+            if (e < 0 || slot_of[e] >= 0 || w[i] <= bw) continue;
+            bool taken = false;
+            for (int q = 0; q < p; ++q) taken |= out[q] == e;
+            if (!taken) { best = e; bw = w[i]; }
+        }
+        out[p] = best;
+    }
+    if (state) *state = out[0] >= 0 ? 1 : 0;   // a pull in flight (the commit makes it 2, the restore 0)
+}
+void ds_pull_pick(const int32_t * ids, const float * w, int T, int k, const int32_t * slot_of, int32_t * out, int P, cudaStream_t s,
+                  int32_t * state) {
+    pull_pick_k<<<1, 32, 0, s>>>(ids, w, T * k, slot_of, out, P, state);
+}
+// grid (blocks, P): the blob of pick p, 16 bytes a thread per step, eight loads in flight. Few blocks on purpose: the
+// link (~12 GB/s) is full with ~1 MB of requests in flight, and the main stream's kernels must find free SMs beside
+// the pull (512 blocks of it stalled decode's own work for the pull's duration: 50 -> 75 ms a token).
+constexpr int kPullBlocks = 16, kPullUnroll = 8;
+__global__ void __launch_bounds__(256) pull_copy_k(const int32_t * picks, const uint64_t * blob_ptr, size_t n16, uint8_t * raw) {
+    const int p = blockIdx.y, e = picks[p];
+    if (e < 0) return;
+    const uint4 * src = (const uint4 *) blob_ptr[e];
+    uint4 * dst = (uint4 *) (raw + (size_t) p * n16 * 16);
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    for (; i + (kPullUnroll - 1) * stride < n16; i += kPullUnroll * stride) {
+        uint4 v[kPullUnroll];
+#pragma unroll
+        for (int u = 0; u < kPullUnroll; ++u) v[u] = src[i + u * stride];
+#pragma unroll
+        for (int u = 0; u < kPullUnroll; ++u) dst[i + u * stride] = v[u];
+    }
+    for (; i < n16; i += stride) dst[i] = src[i];
+}
+void ds_pull_copy(const int32_t * picks, int P, const uint64_t * blob_ptr, size_t bytes, uint8_t * raw, cudaStream_t s) {
+    if (bytes % 16) throw std::runtime_error("ds_pull_copy: blob bytes not a multiple of 16");
+    static const int blocks = getenv("BNK_DS_PULL_BLOCKS") ? atoi(getenv("BNK_DS_PULL_BLOCKS")) : kPullBlocks;
+    pull_copy_k<<<dim3(blocks, P), 256, 0, s>>>(picks, blob_ptr, bytes / 16, raw);
+}
+// after the copy: the slots patched in, then (fence) the state 2. A plan kernel that runs before this sees the experts
+// as misses (the CPU takes them); one that runs after finds them resident.
+__global__ void pull_commit_k(const int32_t * picks, int P, int32_t * slot_of, int slot0, int32_t * staged, int32_t * state) {
+    const int p = threadIdx.x;
+    if (p < P) {
+        const int e = picks[p];
+        if (e >= 0) slot_of[e] = slot0 + p;
+        staged[p] = e;
+    }
+    __threadfence();
+    __syncthreads();
+    if (p == 0 && state && *((volatile int32_t *) state) == 1) *((volatile int32_t *) state) = 2;
+}
+void ds_pull_commit(const int32_t * picks, int P, int32_t * slot_of, int slot0, int32_t * staged, cudaStream_t s, int32_t * state) {
+    pull_commit_k<<<1, 32, 0, s>>>(picks, P, slot_of, slot0, staged, state);
+}
+// after the layer's FFN: a pull still in flight (state 1) is waited for here (it had the FFN's time on top of its
+// window; stats[2] counts these), then the slots are unpatched and the state is 0 again
+__global__ void pull_restore_k(int32_t * staged, int P, int32_t * slot_of, int slot0, const HitList * hits, uint32_t * stats,
+                               int32_t * state) {
+    __shared__ int s_had;
+    if (threadIdx.x == 0) {
+        int st = state ? *((volatile int32_t *) state) : 2;
+        if (st == 1) {
+            atomicAdd(&stats[2], 1u);
+            while ((st = *((volatile int32_t *) state)) == 1) __nanosleep(500);
+        }
+        __threadfence();
+        s_had = st == 2;
+    }
+    __syncthreads();
+    const int p = threadIdx.x;
+    if (s_had && p < P) {
+        const int e = staged[p];
+        if (e >= 0) {
+            slot_of[e] = -1;
+            staged[p] = -1;
+            int used = 0;
+            for (int i = 0; i < hits->n; ++i) used |= hits->e[i].slot == slot0 + p;
+            atomicAdd(&stats[0], 1u);
+            if (used) atomicAdd(&stats[1], 1u);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && state) *((volatile int32_t *) state) = 0;
+}
+void ds_pull_restore(int32_t * staged, int P, int32_t * slot_of, int slot0, const HitList * hits, uint32_t * stats, cudaStream_t s,
+                     int32_t * state) {
+    pull_restore_k<<<1, 32, 0, s>>>(staged, P, slot_of, slot0, hits, stats, state);
 }
 
 __global__ void copy_rows_k(const float * x, int64_t ldx, float * y, int64_t ldy, int n) {
@@ -938,10 +1320,17 @@ void ds_copy_from_host(const void * src, void * dst, size_t bytes, cudaStream_t 
     copy_bytes_k<<<(unsigned) (b < 4096 ? b : 4096), 256, 0, s>>>((const uint4 *) src, (uint4 *) dst, n16);
 }
 __global__ void rows_from_host_k(const float4 * src, const int32_t * map, float4 * dst, int E4) {
-    const int t = blockIdx.y;
-    const bool have = map[t] >= 0;
+    const int t = blockIdx.y, m = map[t];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < E4; i += gridDim.x * blockDim.x)
-        dst[(size_t) t * E4 + i] = have ? src[(size_t) t * E4 + i] : make_float4(0.f, 0.f, 0.f, 0.f);
+        dst[(size_t) t * E4 + i] = m >= 0 ? src[(size_t) m * E4 + i] : make_float4(0.f, 0.f, 0.f, 0.f);
+}
+__global__ void rows_gather_k(const float4 * x, const int32_t * tok, float4 * xc, int E4) {
+    const int m = blockIdx.y, t = tok[m];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < E4; i += gridDim.x * blockDim.x) xc[(size_t) m * E4 + i] = x[(size_t) t * E4 + i];
+}
+void ds_rows_gather(const float * x, const int32_t * tok, float * xc, int M, int E, cudaStream_t s) {
+    if (E % 4) throw std::runtime_error("ds_rows_gather: E % 4");
+    if (M > 0) rows_gather_k<<<dim3(4, M), 256, 0, s>>>((const float4 *) x, tok, (float4 *) xc, E / 4);
 }
 void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int N, int E, cudaStream_t s) {
     if (E % 4) throw std::runtime_error("ds_rows_from_host: E % 4");

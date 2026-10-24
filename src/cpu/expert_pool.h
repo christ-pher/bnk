@@ -93,11 +93,16 @@ struct ExpertTask {
 
 class CpuExpertPool {
 public:
-    void init(const Model & m, const ExpertStore & st, int n_threads);
+    // pin_default: pin one worker per physical core of the allowed set (cpu_order) unless BNK_CPU_PIN says otherwise
+    void init(const Model & m, const ExpertStore & st, int n_threads, bool pin_default = false);
     // out[t][E] = sum over tasks of w * expert(x[t]); `out` is zeroed first. x: [T][E] host. One caller at a
     // time (pipeline stages reading a prompt run on two threads).
     void run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
     int threads() const { return pool_ ? pool_->size() : 0; }
+    // fn(part, nparts) once on every pool thread (the caller's included): host work that must not wait for a scheduler
+    // slice - a thread spawned per token lands beside a spinning worker and waits for one (the Engram gather measured
+    // 2 ms or 50 ms a token by placement luck); the workers are spinning and ready. One caller at a time, as run().
+    void parallel(const std::function<void(int, int)> & fn) { if (pool_) pool_->run(fn); else fn(0, 1); }
     // work ranges per thread, claimed dynamically (an engine's default; BNK_CPU_CHUNKS in the environment wins). The
     // DeepSeek experts (9.4 MiB, 2-bit) measured 0.91 -> 0.64 ms per 3-expert decode step going from 1 to 8: the
     // static split leaves cores idle while the slowest finishes.

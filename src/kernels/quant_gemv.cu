@@ -365,6 +365,8 @@ static void launch_float(const QMat & W, const float * x, int64_t ldx, int T, fl
 void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, float * y, int64_t ldy,
           bool accumulate, cudaStream_t s, GemvSplit sp) {
     if (T < 1 || T > kMaxGemvRows) throw std::runtime_error("gemv: window out of range");
+    if (sp.grp_rows > 0 && (W.layout != 1 || sp.grp_rows % 16 || !a || a->cols != W.cols))
+        throw std::runtime_error("gemv: a grouped product needs an R-layout matrix, groups of 16n rows and a->cols = W.cols");
     if (W.layout == 1) {
         if (!a || a->cols != W.cols) throw std::runtime_error("gemv: activation not quantized for this width");
         gemv_r(W, *a, T, y, ldy, accumulate, s, sp);

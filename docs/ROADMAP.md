@@ -21,6 +21,14 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-10-24, v0.5.2: DeepSeek second pass** (`docs/DEEPSEEK-NEXT.md`): the prompt attention on the tensor cores
+  (a fused single pass, 40 -> 9.5 ms per 2,048-token layer-chunk), the CPU tasks' rows copied out compact (a 168 MB
+  copy per layer had stalled the compute stream 52 ms), decode's launches fused (48 -> 28 a layer), a PCIe lane that
+  pulls the next layer's predicted non-resident experts into spare cache slots while the layer runs (measured 17.6 tok/s against 19-20 with it off, so it ships off by default (`BNK_DS_PULL=1` turns it on)).
+  Prompts 467 -> 652 tok/s at 8K, 828 at 16K; decode 19-20 -> 22.4 tok/s with the container on all 48 CPUs and the
+  pool pinned one worker a core (the Engram gather on the pool's threads: its 50 ms scheduler mode gone); quality
+  unchanged (copy test ppl 1.037, top-1 99.61%).
+
 * **2026-10-24, v0.5.1: DeepSeek prompt path and decode kernels** (`docs/DEEPSEEK-NEXT.md`): the prompt path
   runs layer-major over groups of chunks (each non-resident expert crosses PCIe once per layer per group, the next
   layer's experts prefetched during attention from its router applied a layer early), the compute stream no longer

@@ -13,7 +13,7 @@ in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s
 
 Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384 experts) through a third engine
 (`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
-tables read from the NVMe, experts split between VRAM and RAM without a copy; ~13 tok/s decode, ~100 tok/s prompts.
+tables read from the NVMe, experts split between VRAM and RAM without a copy; ~22 tok/s decode, 650-830 tok/s on long prompts (v0.5.2).
 
 Both read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
 `image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`).
@@ -85,6 +85,49 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
 each) since v0.4.2, 23 us each through host memory before.
+
+### What v0.5.2 changed: the DeepSeek prompt path on the tensor cores, decode's launches and a PCIe lane
+
+The second performance pass over the DeepSeek engine (`docs/DEEPSEEK-NEXT.md` has the state and the plan). Prompts went
+from 467 to 652 tok/s on 8,192 tokens (12.5 s, both cards in sequence) and read 16,000 tokens at 828 tok/s (two groups
+pipelined over the cards); 2,048-token prompts stay PCIe-bound at ~290. Quality unchanged: the copy test after a
+4,096-token prefix scores ppl 1.037, top-1 99.61%, on every build measured. Decode: 19-20 tok/s plain on the container's old 32-CPU set, 22.4 tok/s once the container had all 48 CPUs and the pool pinned one worker a core (44.7 ms a token: CPU experts 26.3, GPU kernels 21.4, the Engram rows 1.3) (the DeepSeek default now; `BNK_CPU_PIN=0` off); the PCIe lane is off by default (below).
+
+* **Prompt attention on the tensor cores** (`attention_tc_k`, `BNK_DS_ATTN_TC=0` the fp32 kernel). The model has one
+  shared KV head, so a token's 64 query heads attend to the same 640 rows (128 window + 512 selected): a block takes
+  32 heads of one token, the rows go by in tiles of 32 staged once in shared memory for both products (S = Q K^T and
+  O = P V through wmma), the online softmax rescales the O accumulators through a fragment row map read at the start,
+  q in fp16 after a power-of-two scaling (logit error ~1e-4). 40 -> 9.5 ms per 2,048-token layer-chunk. Project Maya's
+  three-phase Volta design with fp16 high + low parts came first and measured 17-21 ms: shared-memory traffic and 136
+  block syncs per block; the fused single pass has ~80 with twice the heads a block.
+* **A bubble the timeline found.** Each layer's MoE started ~51 ms after the routing: a 168 MB device-to-host copy of
+  every token's FFN input for the CPU tasks, on the compute stream at 3.2 GB/s beside the expert stream, everything
+  behind it waiting (~1 s per stage at 8K). The tokens with CPU tasks (a few hundred) are gathered compact on the
+  device and only they go out: 507 -> 652 tok/s. The per-phase profiler (`BNK_DS_PF_PROF=1`) had hidden this behind a
+  slow-looking stage 1 of its own making: it synchronizes after every phase.
+* **Decode's launches** 48 -> 28 a layer (GPU kernel time 23.5 -> 21.4 ms a token): the grouped output projection as
+  one block-diagonal GEMV (`GemvSplit::grp_rows`; 8 x (quantize + GEMV) before), the hyper-connection pre-mix +
+  rmsnorm + quantization in one kernel, the Sinkhorn mixes' two kernels as one (the last of a token's 25 blocks runs
+  the finish), rope + kv_prep as one, DeepSeek's routing + the plan as one. What is left on the GPU is near its floor:
+  the dense GEMVs read ~145 MB of weights a layer (6.4 ms a token at HBM speed).
+* **The PCIe lane for decode's missed experts** (`BNK_DS_PULL=P`, 0 off). In layer il, layer il + 1's router is applied
+  to il's FFN input (Strata's guess: 86% of the picks are routed), its non-resident picks are pulled from the store's
+  host memory (registered mapped; a 16-block kernel reads it at the link's 13 GB/s) into spare R-layout slots at the end
+  of il + 1's cache region while il's FFN and il + 1's attention run, and the slot table is patched so the plan kernel
+  finds them resident: the CPU is spared them (33 -> 26 ms a token at P = 1, 22 at P = 2). Non-blocking: the plan takes
+  what has landed, a late pull costs the CPU an expert, never the GPU a stall (none late in any run). It is **off by default**: measured 17.6 tok/s against 19-20 with it off, so it ships off by default (`BNK_DS_PULL=1` turns it on). The trace says why: the routing + plan kernel writes the mailbox into host memory and fences it, and those writes queue behind the pull's saturating reads on the same link (26 -> 223 us a layer, even with the pull launched after the plan), and the repack on the side stream costs 170 us of SM time a layer. The CPU saving is real (33 -> 26 ms at one expert a layer, 22 at two); the GPU-side loss has to go first.
+* **A bimodal host cost found late:** the Engram row gather took 2 ms a token in most runs and 50 ms in three (10 tok/s
+  decode), by run rather than warming up. Not the NVMe (a cold 4 KB read is 113 us): the gather spawned 8 threads per
+  token, and a thread placed beside a spinning pool worker waits out a scheduler slice. It runs on the pool's own
+  spinning workers now (`CpuExpertPool::parallel`).
+* **Measured and kept off:** Project Maya's signed-grid table variant of the IQ2_XXS CPU dot (`BNK_CPU_XXS_CT=1`; the
+  "IQ2_XS" GGUF's experts are ~85% IQ2_XXS by bytes) is bit-exact but slower on this EPYC 7402 (0.44 vs 0.34 ms an
+  expert: the 256 KB table shares Zen 2's 512 KB L2 with the weight stream); groups of 8 chunks for prompts
+  (`BNK_DS_PF_CHUNKS=8`: 606 vs 828 tok/s at 16K, one group leaves the cards no overlap). The CPU pool is instruction
+  bound (34 GB/s of weights against 8 channels of DDR4-2400), and the container sees 32 of the host's 48 logical CPUs
+  covering 22 of 24 cores when the pass began; with all 48 and the pool pinned one worker a core (`cpu_order()`: one per physical core of the allowed set first) decode went 19-20 -> 22.4 tok/s. A non-spinning SMT pool is the untested CPU lever.
+* Tools: `bench_ds_attn` times the attention kernel; `bnk run` prints the lane's pulled / routed / late counts;
+  `tests/test_ds_gemv` covers the grouped GEMV, `tests/test_ds_ops` the kernels at both window sizes.
 
 ### What v0.5.1 changed: the DeepSeek prompt path and decode kernels
 

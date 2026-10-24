@@ -66,6 +66,8 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
         const int grp = SPLITK ? g0 : g0 + warp;
         const int r = grp * RPW + rsel;
         const bool rok = grp < ngroups && r < rows;
+        // the row's activation columns start (block-diagonal products: GemvSplit::grp_rows)
+        const int64_t goff = sp.grp_rows > 0 && rok ? (int64_t) (r / sp.grp_rows) * sp.grp_cols : 0;
         float acc[NT];
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[t] = 0.f;
@@ -83,7 +85,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
                     if (t < T) {
-                        const int4 * ap = (const int4 *) (aq_s + t * cols_pad + sb * 32);
+                        const int4 * ap = (const int4 *) (aq_s + t * cols_pad + goff + sb * 32);
                         const int4 a0 = ap[0], a1 = ap[1];
                         int i0 = __dp4a(u.w[0], a0.x, 0);
                         i0 = __dp4a(u.w[1], a0.y, i0);
@@ -97,7 +99,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
                         if constexpr (RT<FMT>::HAS_MIN) {
                             int s0, s1;
                             if (as_s) {
-                                const int pk = ((const int *) as_s)[t * nb + sb];
+                                const int pk = ((const int *) as_s)[t * nb + goff / 32 + sb];
                                 s0 = (int) (int16_t) (pk & 0xffff);
                                 s1 = pk >> 16;
                             } else {
@@ -112,7 +114,7 @@ __global__ void __launch_bounds__(256, 4) gemv_r_k(const uint8_t * __restrict__ 
                             }
                             v -= u.m0 * (float) s0 + u.m1 * (float) s1;
                         }
-                        acc[t] += ad_s[t * nb + sb] * v;
+                        acc[t] += ad_s[t * nb + goff / 32 + sb] * v;
                     }
                 }
             }
@@ -224,6 +226,8 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 #pragma unroll
     for (int g = 0; g < RG; ++g) rowp[g] = W + (size_t) min(grp * 8 * RG + g * 8 + j, rows - 1) * row_bytes;
     const int per = (nsb + ks - 1) / ks, sb0 = kp * per, sb1 = min(nsb, sb0 + per);
+    // the warp's rows' activation columns start (block-diagonal products: GemvSplit::grp_rows, a multiple of 8 RG)
+    const int64_t goff = sp.grp_rows > 0 ? (int64_t) (min(grp * 8 * RG, rows - 1) / sp.grp_rows) * sp.grp_cols : 0;
     float c[RG][NTG][8];
 #pragma unroll
     for (int g = 0; g < RG; ++g)
@@ -242,7 +246,7 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
 #pragma unroll
                 for (int i = 0; i < 16; ++i) xw[tg][i] = 0;
             } else if constexpr (XF) {
-                const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) tj * ldx + (int64_t) sb * 32);
+                const float4 * xp = (const float4 *) ((const float *) xv_ + (int64_t) tj * ldx + goff + (int64_t) sb * 32);
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const float4 f = __ldg(xp + i);
@@ -250,7 +254,7 @@ __global__ void __launch_bounds__(256) gemv_mma_k(const uint8_t * __restrict__ W
                     xw[tg][2 * i + 1] = h2u(__floats2half2_rn(sat_h(f.z), sat_h(f.w)));
                 }
             } else {
-                const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) tj * ldx + (int64_t) sb * 32);
+                const uint4 * xp = (const uint4 *) ((const half *) xv_ + (int64_t) tj * ldx + goff + (int64_t) sb * 32);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) ((uint4 *) xw[tg])[i] = __ldg(xp + i);
             }
