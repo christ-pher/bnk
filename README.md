@@ -86,6 +86,41 @@ Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tens
 stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
 each) since v0.4.2, 23 us each through host memory before.
 
+### What v0.5.1 changed: the DeepSeek prompt path and decode kernels
+
+The first performance pass over the DeepSeek engine (`docs/DEEPSEEK-NEXT.md` has the state and the plan). Prompts went
+from 111 to 279 tok/s on 2,048 tokens and from ~110 to 467 tok/s on 8,192 (end to end, both cards in sequence; quality
+unchanged: the copy test after a 4,096-token prefix scores KL 0.02 against v0.5.0's logits, top-1 identical on 99.8% of
+rows). Decode: 12.95 -> 17.0 tok/s plain (77 -> 59 ms per token; the GPU's share of a layer fell from 1 ms to 0.4 ms, the CPU
+experts' 31-37 ms are now most of it), 32 tok/s when the output copies earlier text (prompt-lookup drafts, 4.7 tokens per verify window).
+
+* **Layer-major prompt path** (Strata's trick for this model). A group of up to four 2,048-token chunks
+  (`BNK_DS_PF_CHUNKS`) goes through each layer before the next, so a non-resident expert crosses PCIe once per layer
+  per group instead of once per chunk; the ~260 non-resident experts of a layer (2.4 GB) stream through two 1 GiB
+  staging buffers in waves, with the next layer's experts prefetched during this layer's attention from the next
+  layer's router applied one layer early (its guess is right for nearly every expert a long chunk uses); the CPU pool
+  takes what a cost model with measured PCIe and CPU constants says (little: the 2-bit CPU decode costs ~300 us per
+  expert-token). Groups are pipelined over the two cards when a prompt has several.
+* **Two things the profiler found.** `Gemm::run` converted strided inputs one row per launch: 16,000 launches per
+  layer for the grouped output projection, 65 ms of host-bound time (one kernel now). And the copy engine serves
+  copies in order: the compute stream's small transfers (routing tables, the CPU answer) queued behind the 2 GB expert
+  prefetch and stalled the stream until the prefetch was through (a layer took 320 ms wall for 114 ms of kernels);
+  those transfers are kernels over mapped pinned memory now.
+* **Decode.** The attention kernel launched 8 blocks for one token, each walking 640 keys serially (0.5 ms per layer,
+  20 ms per token): windows of up to 16 rows now use a block per (token, head) with the keys split over its 8 warps
+  (0.08 ms). The Sinkhorn mixes read their 2 MB mixer matrix on one SM (85 us each, twice per layer): small windows
+  spread the 24 dots over 25 blocks. The CPU pool claims work dynamically (`BNK_CPU_CHUNKS` 8 for this engine: a
+  3-expert step 0.91 -> 0.64 ms) and quantizes only the tokens it has tasks for; Engram rows are read on 8 threads (a
+  cold table costs ~100 us per row in NVMe page faults). Prompt-lookup drafting runs through a drafter that never
+  drafts itself (`LookupOnlyDrafter`, `BNK_DS_LOOKUP=0` off): copying text decodes at 32 tok/s against 12.3.
+* **Tried and dropped** (measured slower): IQ2 CPU kernels decoding 2 or 4 rows at once, SMT threads in the pool, a
+  batched-keys fp32 attention for prompts (kept behind `BNK_DS_ATTN_BATCH=1`), prefetching by rank into both buffers
+  (streams cold experts a chunk never uses). Not done: DSpark (Strata skips it where most experts live outside VRAM:
+  verify rounds read 3.3x a token's bytes), a tensor-core prompt attention (30 ms per layer-chunk today, the biggest
+  GPU item left), vision.
+* Tools: `bench_ds_cpu` (the pool on real experts), `bench_ds_attn` (the attention kernel on a chunk),
+  `BNK_DS_PF_PROF=1` (a per-phase line for every prompt group), `bnk run` prints the n-gram row and mailbox wait times.
+
 ### What v0.5.0 changed: DeepSeek-V4.1-Flash
 
 A third engine, `src/deepseek/` (`docs/DEEPSEEK.md`; the handoff and plan in `docs/DEEPSEEK-NEXT.md`), for the GGUF

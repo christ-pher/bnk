@@ -80,3 +80,12 @@ See the bottom of this file as the work progresses.
   671 tokens in 5.7 s (118 tok/s) against ~20 through decode windows; the path is
   PCIe-bound on expert streaming (every layer's experts are used by a long chunk), so prefetching the next layer's
   experts during the current layer and overlapping the two GPUs' chunks are the next steps.
+* 2026-10-24 (the first performance pass, branch `ds-perf`; the state and the plan are in `docs/DEEPSEEK-NEXT.md`): the
+  prompt path became layer-major (a group of chunks per layer, so each non-resident expert crosses PCIe once per layer per
+  group), streams experts in waves through the two staging buffers with the next layer's experts prefetched from its
+  router applied one layer early, keeps the compute stream's small transfers off the copy engine (they queued behind the
+  prefetch), and converts strided GEMM inputs in one launch (not one per row). Prompts: 2,048 tokens 111 -> 279 tok/s,
+  8,192 tokens ~110 -> 467 tok/s end to end (both stages in sequence for one group). Decode: the CPU pool claims work
+  dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
+  12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
+  windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.

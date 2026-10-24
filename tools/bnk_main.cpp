@@ -680,9 +680,11 @@ int main(int argc, char ** argv) {
            (long long) gs.mtp_accepted, (long long) gs.mtp_drafted, (long long) gs.mtp_rounds);
     if (gs.la_rounds) printf("lookahead: %lld of %lld rounds with a speculative next window confirmed (%.0f%%)\n",
                              (long long) gs.la_hits, (long long) gs.la_rounds, 100.0 * gs.la_hits / gs.la_rounds);
-    printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms\n",
+    printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms, n-gram rows %.2f ms, "
+           "mailbox wait %.2f ms\n",
            gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
-           gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls));
+           gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls), tm.ple_ms / std::max(1, tm.calls),
+           tm.wait_ms / std::max(1, tm.calls));
     printf("drafting: run %.2f ms per round, %.2f further steps per round at %.2f ms each\n",
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));

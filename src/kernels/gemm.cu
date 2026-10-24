@@ -20,6 +20,15 @@ void f32_to_f16(const float * x, half * y, int64_t n, cudaStream_t s) {
     const int64_t b = (n + 255) / 256;
     f32_to_f16_k<<<(int) (b < 65535 * 4 ? b : 65535 * 4), 256, 0, s>>>(x, y, n);
 }
+// rows x cols with a row stride: one launch (a per-row loop of launches cost a 2048-row chunk 16,000 launches a layer)
+__global__ void f32_to_f16_rows_k(const float * x, int64_t ldx, int64_t cols, half * y, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = __float2half(x[(i / cols) * ldx + i % cols]);
+}
+void f32_to_f16_rows(const float * x, int64_t ldx, int rows, int64_t cols, half * y, cudaStream_t s) {
+    const int64_t n = (int64_t) rows * cols, b = (n + 255) / 256;
+    f32_to_f16_rows_k<<<(int) (b < 65535 * 4 ? b : 65535 * 4), 256, 0, s>>>(x, ldx, cols, y, n);
+}
 
 // grid.x = rows (grid.y is capped at 65535; a chunk of 8192 tokens routes 81920 rows)
 __global__ void gather_rows_f16_k(const float * x, int64_t cols, const int32_t * rows, half * y) {
@@ -95,11 +104,8 @@ void Gemm::run_h(const QMat & W, const half * X, int64_t ldx, int N, float * Y, 
 
 void Gemm::run(const QMat & W, const float * X, int64_t ldx, int N, float * Y, int64_t ldy, bool accumulate) {
     if ((size_t) N * W.cols > xcap_) throw std::runtime_error("gemm: input larger than the workspace");
-    if (ldx == W.cols) {
-        f32_to_f16(X, x16_, (int64_t) N * W.cols, st_);
-    } else {
-        for (int i = 0; i < N; ++i) f32_to_f16(X + i * ldx, x16_ + (size_t) i * W.cols, W.cols, st_);
-    }
+    if (ldx == W.cols) f32_to_f16(X, x16_, (int64_t) N * W.cols, st_);
+    else f32_to_f16_rows(X, ldx, N, W.cols, x16_, st_);
     run_h(W, x16_, W.cols, N, Y, ldy, accumulate);
 }
 

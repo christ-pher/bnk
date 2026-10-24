@@ -6,6 +6,7 @@
 // disjointly: a resident expert has no host copy. Prompts go through decode windows for now.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <map>
@@ -31,6 +32,22 @@
 
 namespace bnk {
 
+// A drafter with no drafts of its own: the generator drafts only when it has a drafter, and with this one its
+// prompt-lookup proposals (what followed the sequence's last tokens earlier: copied text, code, tool scaffolding)
+// become the drafts. DSpark, the model's own draft head, is not ported (its experts would take ~7 GB of VRAM;
+// Strata measured it worthless where most experts live outside VRAM).
+class LookupOnlyDrafter : public Drafter {
+public:
+    int run(const float *, const int32_t *, int, int, bool, float * prob) override { if (prob) *prob = 0.f; return -1; }
+    int step(int32_t, int, float * prob) override { if (prob) *prob = 0.f; return -1; }
+    void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) override {
+        for (size_t i = 0; i < items.size(); ++i) { tok_out[i] = -1; prob_out[i] = 0.f; }
+    }
+    void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) override {
+        for (size_t i = 0; i < items.size(); ++i) { tok_out[i] = -1; prob_out[i] = 0.f; }
+    }
+};
+
 class DsEngine : public EngineApi {
 public:
     ~DsEngine();
@@ -45,7 +62,7 @@ public:
     std::string model_name() const override { return model_.gguf.get_str("general.name", "bnk"); }
     const Config & cfg() const override { return model_.cfg; }
     int res_dim() const override { return model_.ds.hc_dim(); }
-    Drafter * mtp() override { return nullptr; }
+    Drafter * mtp() override { return lookup_drafter_.get(); }
     int max_ctx() const override { return opt_.max_ctx; }
     int cpu_threads() const override { return cpu_->threads(); }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
@@ -137,6 +154,7 @@ private:
     double fwd_t0_ = 0;
     void save_counts_here();
 
+    std::unique_ptr<LookupOnlyDrafter> lookup_drafter_;   // BNK_DS_LOOKUP=0 turns the lookup drafts off
     DsModel model_;
     ExpertStore own_store_;
     ExpertStore * store_ = &own_store_;
@@ -212,7 +230,7 @@ private:
     const float * rope_of(int il) const { return model_.ds.ratio[il] ? rope_comp_.p : rope_win_.p; }
 
     // device activations (kMaxWindow rows)
-    DevBuf<float> x_, res_, mixed_, xn_, out_, pre_a_, pre_b_, attn_pre_, post_, comb_;
+    DevBuf<float> x_, res_, mixed_, xn_, out_, pre_a_, pre_b_, attn_pre_, post_, comb_, mix_scratch_;
     float * pre_ = nullptr, * pre_next_ = nullptr;   // the pre-mix the next sublayer collapses with / the one after
     DevBuf<float> qr_, qrn_, q_, kvr_, attn_o_, oa_;
     DevBuf<float> iq_, iw_, scores_, cand_scratch_;
@@ -244,43 +262,95 @@ private:
     MoeMsg * msg(int il) const { return (MoeMsg *) (mail_ + (size_t) il * mail_stride_); }
     std::vector<ExpertTask> tasks_;
 
-    // ---- batched prompt processing (ds_prefill.cpp): chunks of up to pf_max_ tokens through fp16 tensor-core GEMMs
-    // (weights dequantized on the fly), the same attention / compressor / indexer / Engram kernels over whole chunks,
-    // and the routed experts on the tensor cores: resident ones from the cache, the most-used others streamed from
-    // the host store into a staging arena, the rest on the CPU pool (the Qwen engine's cost model)
+    // ---- batched prompt processing (ds_prefill.cpp): a group of up to pf_group_ tokens (BNK_DS_PF_CHUNKS chunks of
+    // pf_max_) runs layer-major: every layer goes over all of the group's chunks (attention and the dense projections
+    // per chunk through fp16 tensor-core GEMMs, weights dequantized on the fly), then the layer's routed experts over the
+    // whole group at once on the tensor cores: resident ones from the cache, the others streamed from the host store
+    // into two staging buffers in waves (the copy engine busy throughout, the next layer's first wave prefetched by
+    // rank), the rest on the CPU pool (an adaptive cost model). So every non-resident expert crosses PCIe once per
+    // layer per group, not once per chunk. Groups are pipelined over the stages (a worker thread runs group k through
+    // the later stages while the first stage reads group k+1).
     Gemm gemm_;
-    int pf_max_ = 0;
-    void prefill_alloc(int N);
-    void prefill_chunk(const int32_t * tokens, int N);
-    void prefill_chunk_here(const int32_t * tokens, int N);
-    void pf_layer(int il, int N);
-    void pf_engram(int il, int N);
-    void pf_attn(int il, int N);
+    int pf_max_ = 0;     // tokens per chunk (the attention buffers)
+    int pf_group_ = 0;   // tokens per group (the MoE buffers): pf_max_ * chunks
+    void prefill_alloc(int N, int G);
+    void prefill_group(const int32_t * tokens, int N);
+    void prefill_group_here(const int32_t * tokens, int N, int buf);
+    void pf_engram(int il, int c, int N);
+    void pf_attn(int il, int c, int N, int pos0);
+    void pf_shared(int il, int c, int N);
     void pf_moe(int il, int N);
+    void pf_prefetch(int il, const std::vector<int> & order, int nbuf);
     void pf_head(int N);
-    void pf_engram_gather(int N);
-    float * pf_xfer_ = nullptr;   // pinned: a chunk's residual rows + pre-mix between stages
+    void pf_engram_gather(int N, int e_only = -1);
+    double pf_eg_ms_ = 0;   // (under head_->stats_mu_)
+    void pf_update_costs();
+    struct Worker {
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::function<void()> job;
+        bool busy = false, quit = false;
+        std::exception_ptr err;
+        Worker();
+        ~Worker();
+        void post(std::function<void()> f);
+        void wait();
+    };
+    std::unique_ptr<Worker> pf_worker_;
+    float * pf_xfer_[2] = {nullptr, nullptr};   // pinned: a group's residual rows + pre-mix between stages (two in flight)
+    std::vector<std::vector<int>> pf_rank_;      // per layer: this stage's non-resident experts, hottest first
+    double pf_ms_ = 0;
+    int64_t pf_tokens_ = 0;
+    // the cost model's constants, corrected from measurements as a read goes on (per stage: its own PCIe link; the
+    // CPU pool is shared, its scale lives on the first stage)
+    double pf_pcie_us_mb_ = 0;
+    double pf_cpu_scale_ = 1.0;
+    static constexpr int kPfWaves = 32;
     struct {
-        DevBuf<float> res, mixed, xn, out, pre_a, pre_b, attn_pre, post, comb;
-        DevBuf<float> qr, qrn, q, kvr, attn_o, oa, ckv, sc, iq, iw, scores, cand_scratch;
-        DevBuf<int32_t> idx, tok, ids, perm, inv;
+        // group-sized (pf_group_ rows)
+        DevBuf<float> res, xn, pre_a, pre_b, post, comb, shared, moe, cpu, rlog, w, w2;
+        DevBuf<int32_t> ids, perm, inv, ids2;    // ids2: the next layer's routing guessed from this layer's input
+        DevBuf<half> xg, hh, dd;
+        // chunk-sized (pf_max_ rows)
+        DevBuf<float> mixed, xnc, out, attn_pre, postc, combc;
+        DevBuf<float> qr, qrn, q, kvr, attn_o, oa, ckv, sc, iq, iw, scores, cand_scratch, sg, sh;
+        DevBuf<int32_t> idx, tok;
         DevBuf<uint8_t> cand, items;
-        DevBuf<float> eg_emb, eg_kv, rlog, w, sg, su, sh, shared, moe, cpu;
-        DevBuf<half> xg, hh, dd, kwin;           // kwin: the window keys of the chunk and the 128 positions before it
-        DevBuf<int32_t> pos;                     // the first position of every score sub-chunk (device)
+        DevBuf<float> eg_emb, eg_kv;
+        DevBuf<half> kwin;                       // kwin: the window keys of the chunk and the 128 positions before it
+        DevBuf<int32_t> pos;                     // the first position of every score sub-chunk (device), per chunk
+        WinParams * h_par = nullptr;             // pinned, per chunk
+        WinParams * d_par = nullptr;
+        int n_chunks_max = 0;
         uint8_t * eg_rows = nullptr;             // pinned host, per Engram layer in sequence
         size_t eg_rows_per_layer = 0;
-        int32_t * h_ids = nullptr, * h_perm = nullptr, * h_inv = nullptr;
+        int32_t * h_ids = nullptr, * h_ids2 = nullptr, * h_perm = nullptr, * h_inv = nullptr, * h_cpu_map = nullptr;
         float * h_w = nullptr, * h_x = nullptr, * h_cpu = nullptr;
         uint8_t * h_items = nullptr;
+        // device aliases of the mapped host buffers (read by kernels instead of copy-engine transfers)
+        int32_t * d_h_perm = nullptr, * d_h_inv = nullptr, * d_h_cpu_map = nullptr;
+        float * d_h_cpu = nullptr;
+        uint8_t * d_h_items = nullptr;
         size_t items_bytes = 0;
+        int max_blocks = 0;
         ElasticBuf stage_b[2];
         uint8_t * stage[2] = {nullptr, nullptr};
         size_t stage_bytes = 0;
-        std::vector<int> stage_idx;              // [n_expert] -> index in the stage (-1: not staged), this layer
+        std::vector<int> stage_idx;              // [n_expert] -> index in its stage buffer (-1: not staged), this layer
+        std::vector<char> stage_buf;             // [n_expert] -> which buffer
+        int toggle = 0;                          // the buffer the next wave takes
+        int pre_layer = -1;                      // the layer whose first waves are prefetched
+        std::vector<int> pre_list, pre_pos;      // its experts, each one's index in its buffer
+        std::vector<char> pre_bufs;              // ... and the buffer
         cudaStream_t copy = nullptr;
         cudaEvent_t copied[2] = {nullptr, nullptr}, used[2] = {nullptr, nullptr}, xready = nullptr;
+        cudaEvent_t wt0[kPfWaves] = {}, wt1[kPfWaves] = {};   // timing of each wave's copies
+        int n_timed = 0;
+        double timed_mb = 0;
+        double cpu_pred_ms = 0, cpu_meas_ms = 0;
         int score_rows = 0;                      // rows of the indexer's score buffer (the chunk in pieces)
+        int n_sub = 0;                           // score sub-chunks per chunk
     } pf_;
 };
 
