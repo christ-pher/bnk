@@ -1,5 +1,5 @@
 {
-  "notes": "DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XS (ISTA DASLab): 763B parameters, 384 experts top-6, through the DeepSeek engine (docs/DEEPSEEK.md). The Engram tables (DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf, 110.6 GB, shared by every build) stay on disk and are read by rows. Sampling is the model card's (temperature 1.0, top_p 1.0). No drafter yet (DSpark is a separate GGUF not converted). Experts are placed disjointly between the two GPUs' caches and host RAM: the first run places them unranked; the routing counts written while serving rank the next start.",
+  "notes": "DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XS (ISTA DASLab): 763B parameters, 384 experts top-6, through the DeepSeek engine (docs/DEEPSEEK.md). The Engram tables (DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf, 110.6 GB, shared by every build) stay on disk and are read by rows. Sampling is the model card's (temperature 1.0, top_p 1.0). No drafter yet (DSpark is a separate GGUF not converted). Experts are placed disjointly between the two GPUs' caches and host RAM: the first run places them unranked; the routing counts written while serving rank the next start. VRAM reserve 1 GiB (2026-10-25: a 120K-token session plus a Plex transcode on the same GPU crossed the 0.75 GiB default by 40 MiB, and this engine's expert cache cannot shrink to give it back).",
   "aliases": [
     "ds-xs",
     "deepseek-iq2_xs"
@@ -30,5 +30,9 @@
     "32768",
     "--slots",
     "1"
+  ],
+  "engine_args": [
+    "--vram-reserve-gib",
+    "1.0"
   ]
 }
