@@ -1,9 +1,15 @@
-"""Thinking-loop detection: notices when a model's reasoning keeps repeating itself.
+"""Loop detection: notices when a model's output keeps repeating itself.
 
 Some models (Orca in particular) can fall into a reasoning loop, regenerating the same passage until the output
-budget runs out. The guard watches only the thinking tokens. Once at least `min_tokens` have been generated, every
+budget runs out. One guard watches the thinking tokens. Once at least `min_tokens` have been generated, every
 `every` tokens it looks at the last `window` tokens and counts how many of their `span`-token stretches already
-appeared earlier in that window. When the share reaches `threshold`, the reasoning is looping.
+appeared earlier in that window. When the share reaches `threshold`, the reasoning is looping, and the server
+closes it (WRAP_UP) so the model answers with what it has.
+
+A second instance (content_guard) watches the answer: DeepSeek-V4.1 was seen repeating a tool call verbatim for
+27,000 tokens until max_tokens (2026-10-25). Answers are legitimately more repetitive than reasoning (code, tables),
+so its bar is higher and it starts later; when it fires the server ends the request as `length` and drops the
+tool call that was being repeated.
 
 Exact-token repetition only: a loop that paraphrases itself is not caught, and legitimately repetitive reasoning
 (long tables, enumerations) can trip it, which is why the bar is high and the window long. The cost of a check is
@@ -51,6 +57,11 @@ class ThinkingLoopGuard:
                 seen.add(key)
         self.last_ratio = repeated / n
         return self.last_ratio >= self.threshold
+
+
+def content_guard() -> ThinkingLoopGuard:
+    """The answer's guard: later and stricter than the thinking one (see the module docstring)."""
+    return ThinkingLoopGuard(min_tokens=2048, threshold=0.65)
 
 
 # What the model reads when the guard steps in: it is told to stop and answer, and the reasoning is closed.

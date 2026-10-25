@@ -741,7 +741,7 @@ expert cache starts warm after the first session.
 | `BNK_DRAFT_BATCH=0` | draft for each conversation on its own instead of in one batched pass |
 | `BNK_LOG_LEVEL=quiet\|info\|debug` | terminal output: `info` prints a line per request and a live status line |
 | `BNK_VRAM_LOG=1`, `BNK_VMEM_LOG=1` | log to the engine log when the VRAM budget corrects itself against the driver / when the expert cache shrinks or grows |
-| `BNK_THINK_GUARD=0` | turn the thinking-loop guard off |
+| `BNK_THINK_GUARD=0`, `BNK_CONTENT_GUARD=0` | turn the thinking-loop guard off / the answer's loop guard off (it ends an answer that repeats itself verbatim as `length`, dropping a tool call that was being repeated) |
 | `BNK_VISION=0`, `BNK_IMAGE_MAX_TOKENS=4096`, `BNK_IMAGE_URLS=0` | serve text only (no vision encoder) / the largest image in tokens (one per 32x32 pixels) / refuse image URLs (data URLs only) |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | a models folder (instead of the Hugging Face cache) and the MTP layer (`setup.sh` and `models.sh` save them to `bnk.env`) |
@@ -762,6 +762,7 @@ expert cache starts warm after the first session.
   "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0 },
   "speculation": { "draft": 4, "draft_min_p": 0.8 },
   "thinking_loop_guard": true,
+  "content_loop_guard": true,
   "server_args": ["--model-id", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", "--max-tokens", "32768", "--slots", "3"],
   "engine_args": ["--threads", "24"]
 }

@@ -18,11 +18,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import ChatTemplate, OutputParser
+from .chat import ChatTemplate, OutputParser, dsml_v41_template
 from .console import LEVELS, Console
 from .conversations import Conversations
 from .engine import Engine, EngineError
-from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary
+from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary, content_guard
 from .telemetry import Telemetry
 from .vision import ImageError, Images, anthropic_image, image_parts
 from .tokenizer import StreamDecoder, Tokenizer
@@ -36,7 +36,12 @@ class State:
     def __init__(self, args):
         self.args = args
         self.tok = Tokenizer.from_gguf(args.model, cache_dir=str(Path(args.cache_dir).expanduser()))
-        self.template = ChatTemplate(self.tok.chat_template)
+        source = dsml_v41_template(self.tok.chat_template, self.tok.model_name)
+        self.template_fixed = source != self.tok.chat_template
+        if self.template_fixed:
+            print("bnk: chat template: DeepSeek-V4.1's tool-call spelling (<｜DSML｜ calls>) applied to the GGUF's V4 "
+                  "template", flush=True)
+        self.template = ChatTemplate(source)
         self.model_id = args.model_id or Path(args.model).name.split("-0000")[0].replace(".gguf", "")
         self.recent = collections.deque(maxlen=200)   # finished requests, for the monitor
         self.started = time.time()
@@ -80,6 +85,10 @@ class State:
             args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
         if args.think_guard is None:
             args.think_guard = bool(self.config.get("thinking_loop_guard", True))
+        if args.content_guard is None and os.environ.get("BNK_CONTENT_GUARD"):
+            args.content_guard = os.environ["BNK_CONTENT_GUARD"] != "0"
+        if args.content_guard is None:
+            args.content_guard = bool(self.config.get("content_loop_guard", True))
         eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib),
                  "--slots", str(args.slots)]
         if args.gpus:
@@ -162,6 +171,8 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     dec = StreamDecoder(S.tok)
     parser = OutputParser(thinking, tools)
     guard = ThinkingLoopGuard() if (thinking and S.args.think_guard) else None
+    cguard = content_guard() if S.args.content_guard else None
+    content_loop = False
     force_at = int(os.environ.get("BNK_THINK_GUARD_TEST", "0"))   # testing: report a loop after N thinking tokens
     text_so_far = ""
     reasoning_tail = ""
@@ -182,7 +193,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     def stream(ids: list[int], allow_guard: bool) -> str:
         """One engine request; returns 'stop' (a stop string), 'loop' (the guard), 'yield' (its time slice is up
         and others wait), or the engine's reason."""
-        nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail, first_prefill, gen_ms
+        nonlocal rid, counted, done_msg, text_so_far, stopped, reasoning_tail, first_prefill, gen_ms, content_loop
         extra = {}
         # snapshot the engine state where the prompt's last turn begins: the next request in this conversation
         # shares everything before it (even when the client re-renders this turn's answer differently)
@@ -241,6 +252,9 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                 in_thinking = parser.mode == "reasoning"
                 for kind, txt in parser.feed(piece):
                     emit(kind, txt)
+                if cguard and not in_thinking and outcome is None and cguard.push(ev["ids"]):
+                    outcome, content_loop = "length", True
+                    S.engine.cancel(rid)
                 if allow_guard and guard and in_thinking and parser.mode == "reasoning" and outcome is None:
                     reasoning_tail = (reasoning_tail + piece)[-200:]
                     if not wrap_pending and (guard.push(ev["ids"]) or (force_at and guard.count >= force_at)):
@@ -315,8 +329,33 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     rest, content, calls = parser.finish()
     for kind, txt in rest:
         emit(kind, txt)
+    if content_loop and calls:
+        # a looping answer repeats its call: identical calls carry nothing, the client gets each distinct one once
+        seen, distinct = set(), []
+        for c in calls:
+            key = (c["function"]["name"], c["function"]["arguments"])
+            if key not in seen:
+                seen.add(key)
+                distinct.append(c)
+        calls = distinct
     if calls:
         finish = "tool_calls"
+    if content_loop:
+        S.console.line(S.console._c("33", "↻ ") + f"answer loop after {len(generated):,} tokens "
+                       f"({cguard.last_ratio:.0%} of the last {cguard.window:,} repeated): ended as {finish}"
+                       + (f", {len(calls)} distinct tool call(s) kept" if calls else ""))
+        S.telemetry.bus.publish("log", {"t": time.time(), "line": f"answer loop guard: ended the request after "
+                                                                   f"{len(generated)} tokens"})
+    truncated = parser.partial_call if (calls or finish == "length") else ""
+    if truncated:
+        # the generation was cut off inside a tool call: the client gets the content before it (and the complete
+        # calls before it, if any), not the call's markup as text (a coding agent would read that as a broken
+        # answer, or apply half an edit). Markup that never closed in an answer that stopped on its own stays in
+        # the content: that is the model's own malformed output, and hiding it would hide the problem.
+        if not calls:
+            content = parser.clean_content.rstrip()
+        S.console.line(S.console._c("33", "✂ ") + f"tool call cut off at {len(generated):,} tokens "
+                       f"({len(truncated):,} characters of markup dropped)")
     usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": len(generated),
              "total_tokens": len(prompt_ids) + len(generated)}
     timings = {k: done_msg.get(k) for k in ("prefill_ms", "prefill_tps", "gen_ms", "tps", "reused", "rounds",
@@ -336,6 +375,10 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         REQ.tokenize_ms = None
     if interventions:
         timings["thinking_loop_guard"] = interventions
+    if content_loop:
+        timings["content_loop_guard"] = 1
+    if truncated:
+        timings["truncated_tool_call"] = len(truncated)
     rec = {"id": rid, "time": time.time(), "api": getattr(REQ, "api", ""), "prompt_tokens": len(prompt_ids),
            "gen_tokens": usage["completion_tokens"], "finish": finish, "temperature": params.get("temperature"),
            "max_tokens": max_tokens, "thinking": thinking, "loop_guard": interventions, "conversation": cid,
@@ -817,6 +860,8 @@ def main():
                     help="model config JSON (configs/*.json): sampling, speculation, guard, engine_args, server_args")
     ap.add_argument("--no-think-guard", dest="think_guard", action="store_false", default=None,
                     help="disable the thinking-loop guard (it closes reasoning that keeps repeating itself)")
+    ap.add_argument("--no-content-guard", dest="content_guard", action="store_false", default=None,
+                    help="disable the answer's loop guard (it ends an answer that keeps repeating itself as `length`)")
     ap.add_argument("--model-id", default="")
     ap.add_argument("--cache-dir", default="~/.cache/bnk")
     ap.add_argument("--log", default="", help="engine log file")
@@ -854,7 +899,8 @@ def main():
     S.convs.slots = S.engine.slots()
     info = S.engine.info
     print(f"bnk: ready - {info.get('model')} | context {info.get('n_ctx')} | MTP {'on' if info.get('mtp') else 'off'}"
-          f" | thinking-loop guard {'on' if args.think_guard else 'off'} | tokenizer {S.tok.backend}", flush=True)
+          f" | loop guards: thinking {'on' if args.think_guard else 'off'}, answer {'on' if args.content_guard else 'off'}"
+          f" | tokenizer {S.tok.backend}", flush=True)
     d = S.defaults
     print(f"bnk: defaults - temperature {d['temperature']} · top_p {d['top_p']} · top_k {d['top_k']}"
           + (f" · draft {S.draft_defaults.get('draft')} (cutoff {S.draft_defaults.get('draft_min_p')})" if S.draft_defaults else "")

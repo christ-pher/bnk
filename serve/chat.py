@@ -67,12 +67,29 @@ class ChatTemplate:
                                     **kw)
 
 
+# DeepSeek-V4.1 writes its tool-call tags with a space after the one-token marker: "<｜DSML｜ calls>", "<｜DSML｜ invoke",
+# "<｜DSML｜ parameter" (encoding/encoding.py in the model repository; its README: "the V4 format used
+# <｜DSML｜tool_calls> without a space"). The chat template embedded in the GSQ-RCO GGUFs is V4's, so unpatched every
+# prompt teaches the model the other spelling and re-renders its own earlier calls in it.
+_DSML_V4 = (("dsml_token + 'tool_calls", "dsml_token + ' calls"), ("dsml_token + 'invoke", "dsml_token + ' invoke"),
+            ("dsml_token + 'parameter", "dsml_token + ' parameter"))
+
+
+def dsml_v41_template(source: str, model_name: str) -> str:
+    """A V4.1 model's template with V4.1's tool-call spelling; any other template comes back unchanged."""
+    if "V4.1" not in model_name or _DSML_V4[0][0] not in source:
+        return source
+    for old, new in _DSML_V4:
+        source = source.replace(old, new)
+    return source
+
+
 _TOOL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
-# DeepSeek-V4.1's DSML calls. The template describes them as <｜DSML｜tool_calls> ... but the model writes them as its
-# encoder does: "<｜DSML｜ calls>", "<｜DSML｜ invoke name=..>", "<｜DSML｜ parameter name=.. string=..>" (｜DSML｜ is one
-# token, id 128825, followed by a space-prefixed word; "tool_calls" / "function_calls" accepted too). string="true"
-# keeps the value as text, "false" parses it as JSON.
+# DeepSeek-V4.1's DSML calls, as its encoder writes them: "<｜DSML｜ calls>", "<｜DSML｜ invoke name=..>",
+# "<｜DSML｜ parameter name=.. string=..>" (｜DSML｜ is one token, id 128825, followed by a space-prefixed word). The
+# GGUF's template spelled them V4's way (dsml_v41_template above fixes that at load); "tool_calls" / "function_calls"
+# stay accepted for a history rendered before the fix. string="true" keeps the value as text, "false" parses it as JSON.
 DSML = "｜DSML｜"
 _DSML_BLOCK_RE = re.compile(r"<｜DSML｜\s*(?:tool_|function_)?calls\s*>(.*?)</｜DSML｜\s*(?:tool_|function_)?calls\s*>", re.S)
 _DSML_INVOKE_RE = re.compile(r"<｜DSML｜\s*invoke\s+name\s*=\s*\"([^\"\n]*)\"\s*>(.*?)</｜DSML｜\s*invoke\s*>", re.S)
@@ -151,6 +168,8 @@ class OutputParser:
         self.content_all = ""
         self.reasoning_all = ""
         self.in_tool = False
+        self.partial_call = ""     # after finish(): tool-call markup that never closed (the generation was cut off)
+        self.clean_content = ""    # after finish(): the content before that markup
 
     def feed(self, text: str):
         self.buf += text
@@ -212,6 +231,14 @@ class OutputParser:
                 self.content_all += self.buf
             self.buf = ""
         content, calls = parse_tool_calls(self.content_all, self.tools)
+        if self.in_tool:
+            # markup left after the complete calls are taken out is a call that never closed (the generation was
+            # cut off inside it, or it was malformed): kept apart for the server to report
+            i = min((j for j in (content.find(t) for t in TOOL_STARTS) if j >= 0), default=-1)
+            if i >= 0:
+                self.partial_call, self.clean_content = content[i:], content[:i]
+                if calls:
+                    content = self.clean_content.strip()
         return out, content.strip() if calls else self.content_all, calls
 
 

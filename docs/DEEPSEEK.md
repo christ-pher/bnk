@@ -71,7 +71,34 @@ See the bottom of this file as the work progresses.
   / `BNK_DS_TRACE_DUMP`. The model writes its tool calls as `<｜DSML｜ calls>` / `<｜DSML｜ invoke ...>` (a space
   and a short word after the one-token marker, not the template's `tool_calls`); the server's parser accepts both
   spellings (Strata 0.2.4, which added DeepSeek the same night, documents the same). Served: a reasoning question
-  answered correctly at 13.8 tok/s decode; tool calls parsed.
+  answered correctly at 13.8 tok/s decode; tool calls parsed. (2026-10-25: the spelling difference was the GGUF's
+  template being wrong, not the model: see below.)
+* 2026-10-25, agent session review (branch `ds-agent-fixes`): a coding agent at 85K tokens of context reported
+  "malformed tokens" in the model's output. Findings, with the engine's output text unavailable (the server does
+  not log it): the sampling was the model card's (temperature 1.0, top_p 1.0; DeepSeek's agentic evaluations used
+  top_p 0.95, DeepSeek Harness itself sets no sampling fields), the tokenizer and stream decoder round-trip
+  byte-exactly, string tool arguments pass verbatim, RoPE/YaRN match llama.cpp's DeepSeek-V4 graph (window layers
+  plain, compressed layers YaRN x16 from 64K, no attention factor). Three defects in this stack, all fixed here:
+  * **The prompt spoke V4's tool-call dialect.** DeepSeek's `encoding/encoding.py` (the prompt-format reference for
+    V4.1) writes `<｜DSML｜ calls>`, `<｜DSML｜ invoke`, `<｜DSML｜ parameter`; its README: "the V4 format used
+    `<｜DSML｜tool_calls>` without a space". The template embedded in the GSQ-RCO GGUFs (and llama.cpp's shipped
+    DeepSeek-V4 templates) is V4's, so the tools header taught the model the wrong spelling and every earlier call
+    of its own was re-rendered in it (`tool` `_c` `alls` vs ` calls` at the token level), 20+ turns deep. The
+    server now patches the template at load for a V4.1 model (`serve/chat.py` `dsml_v41_template`; the startup log
+    says so); `tests/test_tool_calls.py` renders a tool-call conversation through the real GGUF's template and
+    checks it against the encoder's output.
+  * **A tool call cut off at max_tokens came back as raw markup in `content`.** The parser only extracts complete
+    blocks; the client got `<｜DSML｜ invoke ...` as text (finish `length`). Now the content before the call is
+    returned, the markup dropped, `timings.truncated_tool_call` set, and the console says `✂ tool call cut off`.
+  * **Verbatim repetition in the answer was unguarded.** The loop guard watched reasoning only; the model repeated
+    a tool call for 27,700 of 32,000 tokens (100% lookup-draft acceptance) until the cap. A second guard watches
+    the answer (`content_guard()`: from 2,048 tokens, 65% of 12-token spans repeated within 4K; `BNK_CONTENT_GUARD=0`,
+    `--no-content-guard`, config `content_loop_guard`), ends the request (`timings.content_loop_guard`): complete
+    calls parsed so far are kept once each (identical repeats collapse), the call being repeated when it was cut off
+    is dropped as above, and without calls the finish is `length`. `tests/test_loop_guard.py`, and
+    `tests/test_serve_run.py` drives the server's request loop against a fake engine through all three cases.
+  Not verifiable without the GPUs: output quality past 64K tokens of context, and the lookup-draft rollback path
+  under rejections.
 * 2026-10-24 (later): the batched prompt path (`src/deepseek/ds_prefill.cpp`): chunks of up to 2,048 tokens through
   fp16 tensor-core GEMMs, the chunk kernels, and the routed experts on the tensor cores (resident from the cache, the
   most-used others streamed into a staging arena of 1 GiB per buffer, `BNK_DS_STAGE_MIB`, the rest on the CPU). The
