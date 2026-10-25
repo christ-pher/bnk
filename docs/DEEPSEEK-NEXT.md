@@ -52,7 +52,7 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
   `build/bench_ds_cpu MODEL [layer] [experts] [per call]` (pool speed, decode and verify shapes), `build/bench_ds_attn
   [T]` (the attention kernel on a chunk). `BNK_DS_PF_PROF=1` prints a per-phase breakdown of every prompt group.
 
-* **The PCIe lane for decode's missed experts** (`BNK_DS_PULL=P`, default 1; 0 off): in layer il, layer il + 1's router
+* **The PCIe lane for decode's missed experts** (`BNK_DS_PULL=P`, default 0 = off): in layer il, layer il + 1's router
   is applied to il's FFN input (Strata's guess; 86% of the picks are routed), its non-resident picks are pulled by a
   16-block kernel from the store's host memory (registered mapped; a kernel reads it at the link's 13 GB/s, like the
   copy engine) into spare R-layout slots at the end of il + 1's cache region (`ExpertCache::reserve_spare`, repacked on
@@ -104,13 +104,20 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
 
 ## Next steps, in order
 
-1. **Decode's CPU experts** (30-33 of a ~51 ms token). The pool is instruction-bound in ggml's IQ2_XXS / IQ2_XS dots at
-   a third of the memory bandwidth. Levers: whole cores for the container (`cores: 48`: all 24 cores with both threads,
-   the user gave the container all 48 on 2026-10-24; with the pool pinned one worker a core decode went 19-20 -> 22.4 tok/s, CPU experts 30-33 -> 26.5 ms), a pool
-   that uses the SMT siblings without spinning (48 spinning threads measured slower), and a faster one-token IQ2_XXS dot
-   on Zen 2 (the table variant lost: L2). Expected 1.2-1.5x on the CPU part.
-2. **The PCIe lane's plan-kernel contention** (above): keep the plan kernel off host memory while a pull is on the link.
-   With it, P = 1 is worth ~7 ms a token and P = 2 ~11 (CPU 33 -> 22 ms): decode 19-20 -> ~24 tok/s.
+1. **Decode's CPU experts** (~20 of a ~38 ms token on 2026-10-25: 26.1-26.4 tok/s plain with the container on all 48
+   CPUs and the counts ranking matured, misses 39%). The pool is instruction-bound in ggml's IQ2_XXS / IQ2_XS dots at
+   a third of the memory bandwidth. Measured and settled: 24 threads pinned one a core is the optimum (23: 25.2 tok/s,
+   22: 25.7, 20: 23.9, 16: 22.1, unpinned 24: 24.2; 48 spinning threads slower still), so Project Maya's "leave cores
+   free" finding (their #433) does not apply here: our pool already leaves the SMT siblings to everything else. The
+   lever left is a faster one-token IQ2_XXS / IQ2_S dot on Zen 2 (the signed-grid table variant lost: L2).
+2. **The PCIe lane** (above) is not rescued by taking the mailbox off the SMs. Tried 2026-10-25 (`BNK_DS_MAIL_DMA`,
+   not kept): the plan kernel wrote its request into a device mirror, the copy engines moved the request and the
+   CPU's answer, the reduce read device memory. Lane off: 25.3 tok/s (3 copy nodes a layer cost 3-4%). Lane at P = 1:
+   18.4 tok/s - the CPU experts fell 20.6 -> 16.3 ms a token as predicted, but each stage's GPU time rose 18.5 -> 26.3
+   ms a forward (+0.4 ms a layer, misses 39 -> 28%). So the loss is a GPU-wide slowdown of the forward's kernels while
+   a pull kernel streams host memory, not the mailbox's host traffic. The lane pays only if the pull runs while the
+   GPU is otherwise idle (it is, during the CPU phase, but the pull outlasts it), or through a path that leaves the SMs'
+   memory traffic alone. Shelved.
 3. **The Engram gather's 50 ms mode**: three runs paid 50 ms a token in the row gather against 2 ms in the others, by
    run, not warming up. Not the NVMe (a cold random 4 KB read is 113 us and a token touches few rows; `MADV_WILLNEED`
    changed nothing): the gather spawned 8 threads per token, and a thread that lands beside a spinning pool worker waits
@@ -119,8 +126,10 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
    exposed on stage 0 at 8K) could run ahead of the group.
 4. **The prompt path's floor**: both stages are ~5.3 of 6.3 s in kernels at 8K: the experts' tensor-core GEMMs ~3.1 s
    (22 TFLOPS), attention 0.8, dense GEMMs 0.8. 2K prompts stay PCIe-bound (~2 GB of experts a layer a stage).
-5. **Quality A/B for the user**: IQ2_XS vs IQ2_XXS on their own prompts (`./run.sh ds-xxs --port 8081`); the XXS build
-   leaves ~17 GB more RAM for the Engram page cache.
+5. **The IQ2_XXS build (ds-xxs) does not load** ("R layout: unsupported format"): 28 of its 40 down and 16 of its 40
+   gate/up expert tensors are IQ1_M, which `rfmt.cpp` and the MoE kernels lack. Dropped by decision on 2026-10-25: no
+   speed to gain (the pool is decode-bound and an IQ1_M expert decodes slower than an IQ2_XXS one even in Maya's
+   optimized kernel) and lower quality; the 17 GB it saves is RAM, not time.
 6. **Loose ends**: the indexer's `weights_proj` scale (1/64) is not applied (ranking-invariant); `--slots 2` untested;
    `forward_pipe` untested; vision not ported; the Qwen engine's prefill may queue its small copies behind the expert
    prefetch too (the copy-engine finding of v0.5.1).
