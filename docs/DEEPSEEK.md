@@ -15,7 +15,7 @@ the two 98 GB Engram tables stay on disk and the routed experts are split betwee
 | Context | a sliding window of 128 raw latents per layer, plus (38 of 40 layers) compressed latents shared from the nearest source layer (2, 8, 14, 20; ratio 2 pools pairs with a learned softmax gate, ratio 1 is a projection), each query keeping the 512 scored best by an indexer at 8 layers (candidate blocks of 8 at layer 20 prefilter later ones to 2,048 blocks); YaRN x16 on the compressed path | QSA: top-k blocks of 4 cells |
 | MoE | 384 experts, top-6 of sqrt(softplus(logits)) + bias, renormalized, x1.5; one shared expert; SwiGLU with up clamped to [-10, 10] and gate to <= 10 | 512, top-10 softmax, shared expert with its own gate |
 | Engram | n-gram hash tables at layers 1 and 14: 24 rows of 256 per token (2-, 3-, 4-grams x 8 heads over a case/space-folded token map), a 6,144 -> 25,600 projection into a key per stream and one value, a signed-sqrt sigmoid gate on the key/stream dot | PLE: one layer, 16 rows, conv |
-| Drafter | DSpark: 3 MoE layers of 128 experts (top-3), block of 5 drafts, Markov and confidence heads, in the official safetensors (no GGUF) - not ported yet: a verified row cost 0.43-0.48 of a plain round with the static placement, 0.13-0.19 with the adaptive exchange (DEEPSEEK-NEXT.md, 2026-10-26); prompt-lookup drafts only | MTP layer |
+| Drafter | DSpark, the model's own draft head: 3 MoE layers of 128 experts (top-3), blocks of 5 drafts, Markov and confidence heads (`docs/DSPARK.md`; `src/deepseek/ds_spark.cpp`): code 30.8 -> 45-52 tok/s, 89% of its drafts accepted; plus the prompt-lookup drafts | MTP layer |
 | Vocabulary | 129,280, GPT-2 BPE with the `joyai-llm` pre-tokenizer; chat template in the GGUF (`<think>`, DSML tool calls) | 248,320 |
 
 The GGUF (ISTA's variant of llama.cpp PR 30817's layout): routed experts as `blk.N.ffn_{gate,up,down}_exps.weight`
@@ -122,6 +122,10 @@ See the bottom of this file as the work progresses.
   dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
   12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
   windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.
+* 2026-10-26, later (`docs/DSPARK.md`): the DSpark draft head ported (its GGUF through upstream llama.cpp's `--dspark`
+  converter, experts MXFP4 in RAM on the CPU pool): code decode 30.8 -> 45 tok/s (52 with the cache warm), prose +5%.
+  Found on the way: the SwiGLU clamp symbols were set on the first GPU only, so the second stage's experts ran
+  unclamped; fixed per stage (teacher-forced NLL 2.2459 -> 2.2305).
 * 2026-10-26, v0.6.0 (`docs/DEEPSEEK-NEXT.md`): the expert cache adapts while serving by exchange (the leaving expert
   gets a host copy in a spare blob first), the routing-counts file is capped, and a teacher-forced verify-window bench
   measured what a drafter's rows cost: 0.43 of a plain round static, 0.13-0.19 with the exchange. Essay decode 19.3 ->

@@ -768,6 +768,7 @@ expert cache starts warm after the first session.
 | `BNK_API_KEY` | require this key from API clients |
 | `BNK_CPU_PIN=1`, `BNK_CPU_CHUNKS=3` | pin the CPU expert workers to cores / split their work dynamically (no measurable gain on this machine, so off by default) |
 | `BNK_DS_ADAPT=4`, `BNK_DS_ADAPT_SWAPS=8` | DeepSeek: the adaptive expert exchange, every N decode forwards up to M exchanges in flight a GPU (`0` keeps the placement from the start static); `BNK_COUNTS_CAP=268435456` caps the routing-counts file (halved past it, so the ranking follows the recent workload) |
+| `BNK_DS_SPARK_ROUND_MS=40`, `BNK_DS_SPARK_ROW_MS=10`, `BNK_DS_SPARK_PMIN=0` | DeepSeek's DSpark drafter (`docs/DSPARK.md`): the schedule's plain-round and verify-row costs, and a floor on a draft's survival probability; `BNK_DS_SPARK_TRACE=1` prints every drafted position |
 
 **Per-model configs** - `configs/<name>.json`:
 

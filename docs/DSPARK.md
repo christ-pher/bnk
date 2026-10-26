@@ -108,18 +108,41 @@ next to the 99 GB arena (pinned, their own store).
 
 ## Status
 
-* 2026-10-26: branch and worktree (`/opt/engines/bnk-dspark`). `tools/dspark_fetch.py` fetched the 2,401 `mtp.*`
-  tensors (7.93 GB) into `~/.cache/bnk/dspark`; `tools/dspark_gguf.py` wrote them as one safetensors shard and ran
-  upstream llama.cpp's `convert_hf_to_gguf.py --dspark` (checkout d854d98, the venv at `~/.cache/bnk/convert-venv`):
-  `~/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf`, 8.5 GB, 78 tensors (experts MXFP4 [5120 x 2304 x
-  128] a matrix, dense BF16, norms / router / bias / sinks / mixers F32, `conf_proj` F32 [5376]), metadata as in the
-  precedent section (`dflash.sliding_window` 128 as is: the +1 is llama.cpp's runtime). `src/deepseek/ds_spark.{h,cpp}`:
-  the `DsSpark` drafter's interface and its loader (the stages as `DsLayer`s, the experts into their own pinned
-  `ExpertStore`, run on the engine's pool through `CpuExpertPool::run(model, store, ...)`), wired into `DsEngine`:
-  `--mtp FILE` loads it on the last stage (the head's and the target layers'), `ds_hc_mean` captures the window rows
-  at layers 37-39 into its target buffer inside the forward graph, slot select / reset / rollback follow into its
-  rings, `mtp()` returns it. Builds. The forward (`feed`, `draft_block`: steps 2-4 of the plan) is not written: the
-  two stubs throw. Not yet run: the loader needs the backbone loaded, i.e. the GPUs free of the server.
-  Next: run `build/bnk run --mtp ~/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf ...` for the load check
-  (store build time and RAM: 7.2 GB pinned next to the 99 GB arena), then `feed` (fc + norm + per-stage wkv/kv_norm/rope
-  into the rings), the block forward, the heads.
+* 2026-10-26, evening: **the drafter works.** `--mtp ~/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf --draft 5`
+  (`configs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS.json` names it). The block matches a NumPy reference of
+  `inference/model.py`'s math from the raw checkpoint (`tools/dspark_ref.py --ours` on a `BNK_DS_SPARK_DUMP`): attention
+  0.05%, routed experts 1% (the Q8 activations), shared expert 0.03%, the collapsed state exact given its inputs.
+  Measured on the two V100s, IQ2_XS, the exchange adapting (`BNK_MISS_TRACE=300`, 1,500 tokens asked; both runs reach the
+  same miss rate at the same token, since the exchange now adapts per window row):
+
+  | | drafter off | drafter on |
+  |---|---|---|
+  | Python module: tok/s over the run | 30.8 | **45.1** (4.73 tokens a round; 954 of 1,070 drafts accepted, 89%) |
+  | Python module: tokens 913-1213 (cache at 24% misses) | 33.9 | **51.9** |
+  | Essay (ends at ~780 tokens, cache still at 38-43% misses) | 24.3 | 25.5 (1.77 tokens a round; 329 of 554 accepted, 59%; the schedule keeps 1.3 drafts) |
+  | A draft round's own cost | | 11-12.5 ms (45 expert reads on the CPU pool + the dense GEMVs + the head) |
+
+  The lookup drafts keep working beside it (209 of 445 on the module; `choose_drafts` prefers a lookup match).
+* **Three bugs found on the way**, two of them the engine's: (1) the mixer scratch was sized per token instead of the
+  engine's fixed `kDsMixScratch` with its atomic counters, so `ds_hc_mixes` never finished and every residual update
+  multiplied by zero (the block was all zeros; drafts came from the Markov bias alone). (2) The block attended to never-fed
+  ring slots (zeros) and the ring was not seeded by the prompt: now the target rows are captured by position into a ring
+  (`ds_hc_mean_ring`, both forward paths), the prompt's last 128 positions seed the drafter after a prefill, and the
+  attention span stops at the lowest fed position. (3) **The SwiGLU clamp (`quantize_set_swiglu_limit` and the MoE
+  kernels' limits) is a `__device__` symbol and was set on the head stage's GPU only**: the second card's shared experts
+  and resident experts ran unclamped since the engine's first day. Set per stage now. Teacher-forced NLL of the
+  4,000-token docs text, exchange off: 2.2459 -> **2.2305** a token (ppl 9.449 -> 9.305), KL 0.021 to the pre-fix pass
+  (run-to-run noise is 0.006), so the backbone's output moved, towards the model as trained.
+* **The schedule** (`DsSpark::draft_block`): draft i is kept while its survival probability (the confidences' product)
+  adds tokens per millisecond above the round's running average, with a plain round at `BNK_DS_SPARK_ROUND_MS` (40) and
+  a verify row at `BNK_DS_SPARK_ROW_MS` (10) and the drafter's own time measured; `BNK_DS_SPARK_PMIN` is an extra floor.
+  Prose keeps ~1.3 drafts a round under it; the row cost assumed (10 ms) is the warm cache's, so with a cold cache the
+  essay gains little. Next: feed the schedule the engine's measured per-row cost instead of the constants.
+* **Not done**: the drafter's experts in VRAM (an MXFP4 R-layout for the expert cache; they would join the exchange as
+  layers 40-42); sampled drafts are verified by rejection sampling against the Markov-biased distribution
+  (`draft_dist`) but `bnk run` is greedy, so the sampled path is untested at temperature 1.0; the drafter's own K/V rings
+  are not parked with a conversation (a swapped-in conversation starts with an empty ring until its next tokens fill it
+  -- the prompt seeding covers the common case); multi-slot batches run the drafter once per slot in sequence.
+* Earlier the same day: branch and worktree (`/opt/engines/bnk-dspark`); the tensors fetched (`tools/dspark_fetch.py`,
+  7.93 GB) and converted with upstream llama.cpp's `--dspark` (`tools/dspark_gguf.py`; the GGUF 8.5 GB, 78 tensors);
+  the loader and the engine wiring.
