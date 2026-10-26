@@ -164,31 +164,9 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
     if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
     if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
-    std::vector<char> skip((size_t) c.n_layer * c.n_expert, 0);
-    int resident = 0;
-    for (DsEngine * st = this; st; st = st->next_.get()) {
-        st->init_cache(rank);
-        for (int il = st->l0_; il < st->l1_; ++il)
-            for (int e : st->cache_.slot_experts(il)) { skip[(size_t) il * c.n_expert + e] = 1; ++resident; }
-    }
-    // the adaptive exchange: resident experts follow the routing while serving (docs/DEEPSEEK.md); the store keeps
-    // spare blobs for the experts on their way out of VRAM
-    const int adapt_every = env_int("BNK_DS_ADAPT", opt.adapt_every), adapt_swaps = env_int("BNK_DS_ADAPT_SWAPS", std::min(opt.adapt_swaps, 8));
-    const int spare = adapt_every > 0 && adapt_swaps > 0 ? 2 : 0;
-    for (DsEngine * st = this; st; st = st->next_.get()) {
-        st->adapt_every_ = spare ? adapt_every : 0;
-        st->adapt_swaps_ = spare ? adapt_swaps : 0;
-    }
-    store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip, spare);
-    if (opt.verbose && spare)
-        fprintf(stderr, "bnk: expert cache: adaptive exchange every %d forwards, up to %d in flight a stage (BNK_DS_ADAPT=0 off)\n",
-                adapt_every, adapt_swaps);
-    // pinned one worker a physical core (the container on all 48 CPUs: decode 19-20 -> 21.8 tok/s, the CPU experts
-    // 30-33 -> 26.5 ms a token); BNK_CPU_PIN=0 leaves the placement to the scheduler
-    cpu_->init(model_.ev, *store_, opt.cpu_threads, true);
-    for (DsEngine * st = this; st; st = st->next_.get()) st->pull_init();
-    cpu_->set_chunks(8);
-    if (env_int("BNK_DS_LOOKUP", 1) != 0) lookup_drafter_ = std::make_unique<LookupOnlyDrafter>();
+    // Before the caches take the free VRAM: the DSpark drafter's weights and buffers (on the last stage's GPU) and the
+    // exchange's settings (its staging is held back in init_cache), so the budgets account for them (a 67K-token
+    // prompt ran out of VRAM for its compressed KV when the drafter came after the budget)
     if (!opt.mtp.empty() && opt.mtp != "builtin") {   // the DSpark drafter, on the stage that holds the head and the target layers
         DsEngine * last = this;
         while (last->next_) last = last->next_.get();
@@ -205,6 +183,31 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
         }
         last->spark_->bind(last->tgt_.p, kDsRing, last->rope_win_.p, model_.tok_embd);
     }
+    // the adaptive exchange: resident experts follow the routing while serving (docs/DEEPSEEK.md); the store keeps
+    // spare blobs for the experts on their way out of VRAM
+    const int adapt_every = env_int("BNK_DS_ADAPT", opt.adapt_every), adapt_swaps = env_int("BNK_DS_ADAPT_SWAPS", std::min(opt.adapt_swaps, 8));
+    const int spare = adapt_every > 0 && adapt_swaps > 0 ? 2 : 0;
+    for (DsEngine * st = this; st; st = st->next_.get()) {
+        st->adapt_every_ = spare ? adapt_every : 0;
+        st->adapt_swaps_ = spare ? adapt_swaps : 0;
+    }
+    std::vector<char> skip((size_t) c.n_layer * c.n_expert, 0);
+    int resident = 0;
+    for (DsEngine * st = this; st; st = st->next_.get()) {
+        st->init_cache(rank);
+        for (int il = st->l0_; il < st->l1_; ++il)
+            for (int e : st->cache_.slot_experts(il)) { skip[(size_t) il * c.n_expert + e] = 1; ++resident; }
+    }
+    store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip, spare);
+    if (opt.verbose && spare)
+        fprintf(stderr, "bnk: expert cache: adaptive exchange every %d forwards, up to %d in flight a stage (BNK_DS_ADAPT=0 off)\n",
+                adapt_every, adapt_swaps);
+    // pinned one worker a physical core (the container on all 48 CPUs: decode 19-20 -> 21.8 tok/s, the CPU experts
+    // 30-33 -> 26.5 ms a token); BNK_CPU_PIN=0 leaves the placement to the scheduler
+    cpu_->init(model_.ev, *store_, opt.cpu_threads, true);
+    for (DsEngine * st = this; st; st = st->next_.get()) st->pull_init();
+    cpu_->set_chunks(8);
+    if (env_int("BNK_DS_LOOKUP", 1) != 0) lookup_drafter_ = std::make_unique<LookupOnlyDrafter>();
     if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
         for (int b = 0; b < 2; ++b) {
             CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_[b], (size_t) pf_group_ * (c.hc * model_.ds.n_embd + model_.ds.hc) * 4,
@@ -423,7 +426,10 @@ void DsEngine::init_cache(const Ranking & rank) {
         }
         lane += (size_t) P * mb;
     }
-    const size_t hold = (ctx_full > mapped ? ctx_full - mapped : 0) + graphs + lane;
+    // the exchange's swap staging (ExpertCache::adapt_init allocates it outside the budget at the first exchange)
+    const size_t xchg = adapt_every_ > 0 ? (size_t) std::max(1, adapt_swaps_) * store_->max_blob_bytes() + (64u << 20) : 0;
+    const size_t hold = (ctx_full > mapped ? ctx_full - mapped : 0) + graphs + lane + xchg;
+    budget_.sync();   // the limit from what the GPU really has free now (the drafter's weights were allocated outside the budget)
     const size_t avail = budget_.free();
     size_t budget = avail > hold ? avail - hold : 0;
     double cap = opt_.expert_cache_gib;
@@ -434,7 +440,7 @@ void DsEngine::init_cache(const Ranking & rank) {
     }
     if (cap >= 0) budget = std::min(budget, (size_t) (cap * 1073741824.0));
     if (opt_.verbose)
-        fprintf(stderr, "bnk: layers %d-%d: expert cache budget %.2f GiB (%.2f free, %.2f held for the context, graphs and the PCIe lane)\n",
+        fprintf(stderr, "bnk: layers %d-%d: expert cache budget %.2f GiB (%.2f free, %.2f held for the context, graphs, the exchange's staging and the PCIe lane)\n",
                 l0_, l1_ - 1, budget / 1073741824.0, avail / 1073741824.0, hold / 1073741824.0);
     cache_.init(model_.ev, *store_, budget, rank, st_, opt_.verbose, &budget_, l0_, l1_, nullptr);
 }

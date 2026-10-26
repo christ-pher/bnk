@@ -115,6 +115,11 @@ next to the 99 GB arena (pinned, their own store).
   way turned out to be the adaptive exchange's (v0.6.0: `docs/DEEPSEEK-NEXT.md`, "the exchange's copies and the
   forward"), fixed here: every forward and prompt group now waits on an event recorded after the exchange's copies.
   Also found: the batched draft loop (`Generator::draft_batch`, the server's path) pushed a spent block's -1 as a draft.
+* 2026-10-26, later: a 67K-token agent prompt failed with "compressed KV: not enough VRAM" on the drafter's GPU: the
+  drafter's 1.19 GiB of dense weights and its buffers were allocated after the expert cache had taken the free VRAM
+  (the cache budget is computed from the driver's free memory at load), so the context had no room to grow. The
+  drafter and the exchange's settings now load before the cache budgets, and `init_cache` holds back the exchange's
+  swap staging too (`adapt_swaps` blobs + 64 MiB). Tested with a 70,000-token prompt through the runner.
 
 * 2026-10-26, evening: **the drafter works.** `--mtp ~/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf --draft 5`
   (`configs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS.json` names it). The block matches a NumPy reference of
