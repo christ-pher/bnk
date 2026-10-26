@@ -139,3 +139,38 @@ s; the guessed prefetch off is 2-3% slower at 2K-8K than the selective one. Deco
 
 **Next on this branch**: B.2 (stage 2 streams its layers' hot experts while stage 1 computes; the 2K cases are still
 PCIe-bound at 4-5 s), the Engram gather overlap on long prompts (~8% at 8K), then A2's occupancy work (<= 15%).
+
+## Pass 2 (branch prefill2, 2026-10-26)
+
+Track B.1 (requantizing the dense weights) is off the list by the user's decision. The other three items, measured
+unprofiled on the same bench (`bnk pbench`: agent-shaped follow-ups after a 16K prefix, cold prompts):
+
+| Prompt | master (5463687) | prefill2 |
+|---|---|---|
+| 64 new tokens | 0.62 s | 0.63 s |
+| 250 new tokens | 1.50 s | **1.35 s** |
+| 800 new tokens | 2.88 s | **2.52 s** |
+| 2,048 new tokens | 4.97 s | **4.80 s** |
+| Cold 2,048 | 4.26 s | **3.97-4.06 s** |
+| Cold 8,192 | 11.96 s | **11.5-11.65 s** |
+
+* **The link's backlog in the split (kept, the main gain).** The profile of a 2K follow-up showed each stage moving
+  ~25 GB over PCIe (~2 s) while the CPU pool worked 0.4 s: the prefetched experts were left out of the CPU/link
+  balance, so the balance treated the link as idle while it still had a layer's worth of copies queued. pf_moe now
+  tracks when the copy stream's last queued copy should land (`link_free`, host clock, from the measured us/MB) and
+  starts the link's side of the balance there; the CPU takes the experts it finishes first. `BNK_DS_PF_BALANCE=0`
+  restores the old split. Budgeting the guessed prefetch the same way (from the layer period) was worse everywhere
+  (64 tokens 0.62 -> 1.18 s) and was dropped.
+* **The Engram gather (kept).** Both Engram layers (1 and 14) are on stage 0 and were gathered at once on two thread
+  sets, so layer 1's rows (needed after only layer 0) shared the I/O with layer 14's. One thread now gathers layer 1
+  first, a chunk at a time, and each chunk of layer 1 waits only for its own rows. The exposed wait on an 8K group is
+  ~0.28 s of a 1.1 s gather (was ~0.55 s). `BNK_DS_EG_THREADS=96`: within noise, the default stays 32.
+* **B.2, stage 2 streaming during stage 1 (dropped).** The later stage's first layer prefetched by rank into both
+  staging buffers when the prompt starts: no gain at any size (250 / 800 / 2K follow-ups and cold 2K / 8K all equal
+  or slower). The 2 GiB of staging covers about one of a stage's 20 layers, ~0.17 s of a ~2 s link-bound stage.
+* **A2, the fused kernel (not pursued).** The software pipelining is already in moe_tc_k. `tests/bench_moe_tc.cu`
+  times both kernels on a real layer with uniform top-6 routing over 256 experts: 27.3 TFLOPS at 2,048 tokens,
+  30.7 at 8,192 (layer 5, IQ2_XXS). Against the 34-44 TFLOPS cuBLAS ceiling at 150 W that is <= 1.1-1.4x on the
+  kernel, ~5% on cold 8K+ prompts and nothing on the follow-ups, which are link-bound.
+
+Quality: teacher-forced NLL after a 3,000-token prefill, KL to master 0.0035 mean (master against itself 0.0036).

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <condition_variable>
 #include <thread>
 
 #include <cublas_v2.h>
@@ -25,7 +26,7 @@ static const float * F(const QMat & m) { return (const float *) m.data; }
 // BNK_DS_PF_PROF=1: wall time per phase of the prompt path (synchronously measured, so a little slower)
 static const bool g_pf_prof = getenv("BNK_DS_PF_PROF") != nullptr;
 struct PfProf {
-    double engram_host = 0, setup = 0, attn = 0, route = 0, enqueue = 0, cpu = 0, gather = 0, head = 0, total = 0;
+    double engram_host = 0, eg_wait = 0, setup = 0, attn = 0, route = 0, enqueue = 0, cpu = 0, gather = 0, head = 0, total = 0;
     double copy_mb = 0;
     int64_t cpu_pairs = 0, gpu_pairs = 0, staged = 0, resident = 0;
 };
@@ -185,39 +186,37 @@ void DsEngine::prefill_alloc(int N, int G) {
     pf_pcie_us_mb_ = env_double("BNK_PCIE_US_PER_MB", opt_.pcie_us_per_mb);
 }
 
-// the group's Engram table rows for one Engram layer (host; the rows are read from the memory-mapped table on
-// several threads so that the page faults overlap). Runs on a thread of its own from the group's start, joined before
-// the layer: a cold table costs ~0.4 s per 2,048 tokens, which the earlier layers' GPU work hides.
-void DsEngine::pf_engram_gather(int N, int e_only) {
+// the group's Engram table rows of one Engram layer for tokens [t0, t1) of the group (host; the rows are read from
+// the memory-mapped table on several threads so that the page faults overlap). Runs on a thread of its own from the
+// group's start, a chunk at a time and the earlier layer first: a cold table costs ~0.2 s per 2,048 tokens a layer,
+// and layer 1's chunks are waited for one at a time behind only layer 0's work.
+void DsEngine::pf_engram_gather(int N, int e, int t0, int t1) {
     const DsConfig & c = model_.ds;
     auto & p = pf_;
     if (!p.eg_rows) return;
-    const double t0 = now_ms();
+    const double tg = now_ms();
     const int cols = c.eg_cols(), pos0 = pos() - N;
-    for (size_t e = 0; e < c.engram_layers.size(); ++e) {
-        if (!owns(c.engram_layers[e]) || (e_only >= 0 && (int) e != e_only)) continue;
-        const TensorRef & tab = *model_.engram_tab[e];
-        const size_t rb = tab.row_bytes();
-        uint8_t * dst = p.eg_rows + e * p.eg_rows_per_layer;
-        auto part = [&](int t0_, int t1_) {
-            uint64_t rows[64];
-            for (int t = t0_; t < t1_; ++t) {
-                engram_hash((int) e, cur_->history, pos0 + t, rows);
-                for (int col = 0; col < cols; ++col) memcpy(dst + ((size_t) t * cols + col) * rb, tab.data + rows[col] * rb, rb);
-            }
-        };
-        static const int max_th = env_int("BNK_DS_EG_THREADS", 32);
-        const int nth = std::max(1, std::min(max_th, N / 32));
-        if (nth == 1) part(0, N);
-        else {
-            std::vector<std::thread> th;
-            for (int i = 0; i < nth; ++i) th.emplace_back(part, (int) ((int64_t) N * i / nth), (int) ((int64_t) N * (i + 1) / nth));
-            for (auto & t : th) t.join();
+    const TensorRef & tab = *model_.engram_tab[e];
+    const size_t rb = tab.row_bytes();
+    uint8_t * dst = p.eg_rows + e * p.eg_rows_per_layer;
+    auto part = [&](int a, int b) {
+        uint64_t rows[64];
+        for (int t = a; t < b; ++t) {
+            engram_hash(e, cur_->history, pos0 + t, rows);
+            for (int col = 0; col < cols; ++col) memcpy(dst + ((size_t) t * cols + col) * rb, tab.data + rows[col] * rb, rb);
         }
+    };
+    static const int max_th = env_int("BNK_DS_EG_THREADS", 32);
+    const int n = t1 - t0, nth = std::max(1, std::min(max_th, n / 32));
+    if (nth == 1) part(t0, t1);
+    else {
+        std::vector<std::thread> th;
+        for (int i = 0; i < nth; ++i) th.emplace_back(part, t0 + (int) ((int64_t) n * i / nth), t0 + (int) ((int64_t) n * (i + 1) / nth));
+        for (auto & t : th) t.join();
     }
     std::lock_guard<std::mutex> lk(head_->stats_mu_);
-    head_->times.ple_ms += now_ms() - t0;
-    pf_eg_ms_ += now_ms() - t0;   // (overlapped with the GPU work of the layers before)
+    head_->times.ple_ms += now_ms() - tg;
+    pf_eg_ms_ += now_ms() - tg;   // (overlapped with the GPU work of the layers before)
 }
 
 // ------------------------------------------------------------------------------------------------ a chunk's layer
@@ -381,6 +380,7 @@ void DsEngine::pf_prefetch(int il, const std::vector<int> & r, int nbuf) {
         }
         at += n;
         g_prof.copy_mb += n * blob / 1048576.0;
+        p.link_free = std::max(now_ms(), p.link_free) + n * (pf_pcie_us_mb_ * blob / 1e6 / 1000.0);
     }
     if (p.pre_list.empty()) return;
     p.pre_layer = il;
@@ -456,7 +456,9 @@ void DsEngine::pf_moe(int il, int N) {
     double cpu_total = 0;
     for (int e : nr) cpu_total += t_cpu(e);
     size_t n_pcie = 0;
-    double pcie_total = 0;
+    // the link starts behind what it still has queued (the prefetched waves): the CPU and it finish together
+    static const bool balance = env_int("BNK_DS_PF_BALANCE", 1) != 0;
+    double pcie_total = balance ? std::max(0.0, p.link_free - tp) : 0;
     const size_t max_pcie = std::min(nr.size(), cap * (size_t) (kPfWaves - 1));
     while (n_pcie < max_pcie) {
         const double cpu_after = cpu_total - t_cpu(nr[n_pcie]);
@@ -581,6 +583,7 @@ void DsEngine::pf_moe(int il, int N) {
             ++p.n_timed;
         }
         g_prof.copy_mb += (waves[w].second - waves[w].first) * blob / 1048576.0;
+        p.link_free = std::max(now_ms(), p.link_free) + (waves[w].second - waves[w].first) * t_pcie;
         CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
         const Set & s = sets[n_fixed + w];
         CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[b], 0));
@@ -692,14 +695,36 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
         CUDA_CHECK(cudaMemcpyAsync(p.pos.p, ps.data(), ps.size() * 4, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));   // (pageable source)
     }
-    // the Engram rows of each of this stage's Engram layers, gathered on a thread each while the earlier layers run
-    std::vector<std::thread> eg_th(c.engram_layers.size());
-    for (size_t e = 0; e < c.engram_layers.size(); ++e)
-        if (owns(c.engram_layers[e]) && p.eg_rows) eg_th[e] = std::thread([this, N, e]() { pf_engram_gather(N, (int) e); });
-    auto eg_join = [&](int il) {
+    // the Engram rows of this stage's Engram layers, gathered on a thread while the earlier layers run: the earliest
+    // layer first, a chunk at a time (each chunk of a layer waits only for its own rows)
+    const int n_eg = (int) c.engram_layers.size();
+    std::vector<int> eg_ready((size_t) n_eg * nc, 0);
+    std::mutex eg_mu;
+    std::condition_variable eg_cv;
+    std::thread eg_th;
+    if (p.eg_rows) {
+        std::vector<int> order;
+        for (int e = 0; e < n_eg; ++e) if (owns(c.engram_layers[e])) order.push_back(e);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return c.engram_layers[a] < c.engram_layers[b]; });
+        if (!order.empty())
+            eg_th = std::thread([&, order, N, nc]() {
+                for (int e : order)
+                    for (int i = 0; i < nc; ++i) {
+                        pf_engram_gather(N, e, coff[i], coff[i] + csz[i]);
+                        { std::lock_guard<std::mutex> lk(eg_mu); eg_ready[(size_t) e * nc + i] = 1; }
+                        eg_cv.notify_all();
+                    }
+            });
+    }
+    auto eg_join = [&](int il, int i) {
         const int e = c.engram_index(il);
-        if (e >= 0 && eg_th[e].joinable()) eg_th[e].join();
+        if (e < 0 || !eg_th.joinable()) return;
+        const double tj = now_ms();
+        std::unique_lock<std::mutex> lk(eg_mu);
+        eg_cv.wait(lk, [&]() { return eg_ready[(size_t) e * nc + i] != 0; });
+        g_prof.eg_wait += now_ms() - tj;
     };
+    struct EgJoin { std::thread & t; ~EgJoin() { if (t.joinable()) t.join(); } } eg_guard{eg_th};
     pre_ = p.pre_a;
     pre_next_ = p.pre_b;
     if (first()) {
@@ -720,21 +745,23 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
     }
     double tl = now_ms();
     if (g_pf_prof) g_prof.setup += tl - t0 - g_prof.engram_host + prof_lap(st_, tl);
-    p.pre_layer = -1;
     // the first layer's first wave by rank, while its attention runs (BNK_DS_PF_PREFETCH buffers; the later layers'
     // prefetches follow their guessed routing)
-    static const int rank_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_PREFETCH", 1)));
     // (a short group routes few tokens to each expert: the CPU answers most of them faster than the link, so the
     // rank-ordered prefetch only pays for groups of BNK_DS_PF_RANK_MIN (1,024) tokens or more)
+    static const int rank_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_PREFETCH", 1)));
     static const int rank_min = env_int("BNK_DS_PF_RANK_MIN", 1024);
+    p.pre_layer = -1;
     if (!pf_rank_.empty() && N >= rank_min) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
     for (int il = l0_; il < l1_; ++il) {
         const DsLayer & L = model_.layers[il];
-        eg_join(il);
         for (int i = 0; i < nc; ++i) {
             const int n = csz[i];
             float * res_c = p.res.p + (size_t) coff[i] * HC, * pre_c = pre_ + (size_t) coff[i] * c.hc;
-            if (c.engram_index(il) >= 0) pf_engram(il, i, n);
+            if (c.engram_index(il) >= 0) {
+                eg_join(il, i);
+                pf_engram(il, i, n);
+            }
             if (!tgt_index_.empty() && tgt_index_[il] >= 0)   // the DSpark drafter's capture (the prompt's tail seeds its rings)
                 ds_hc_mean_ring(res_c, tgt_.p + (size_t) tgt_index_[il] * E, (int64_t) spark_->n_targets() * E, n, c.hc, E,
                                 &p.d_par[i].pos0, kDsRing, st_);
@@ -757,7 +784,7 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
         std::swap(pre_, pre_next_);
         g_prof.gather += prof_lap(st_, tl);
     }
-    for (auto & t : eg_th) if (t.joinable()) t.join();
+    if (eg_th.joinable()) eg_th.join();
     if (last_) pf_head(N);
     else {
         CUDA_CHECK(cudaMemcpyAsync(pf_xfer_[buf], p.res.p, (size_t) N * HC * 4, cudaMemcpyDeviceToHost, st_));
@@ -768,10 +795,10 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
     cur_->pending_T = 0;
     const double ms = now_ms() - t0;
     if (g_pf_prof)
-        fprintf(stderr, "bnk: prompt group %d tokens, %d chunks, layers %d-%d: %.0f ms (%.0f tok/s); engram host (overlapped) %.0f, setup %.0f, "
+        fprintf(stderr, "bnk: prompt group %d tokens, %d chunks, layers %d-%d: %.0f ms (%.0f tok/s); engram host (overlapped) %.0f wait %.0f, setup %.0f, "
                         "attention+dense %.0f, route %.0f, enqueue %.0f, cpu %.0f, gather/wait %.0f, head/out %.0f ms; %.0f MiB over PCIe "
                         "(%.1f us/MB), experts %lld resident %lld staged, pairs %lld gpu %lld cpu, cpu scale %.2f\n",
-                N, nc, l0_, l1_ - 1, ms, N / (ms / 1000), (double) pf_eg_ms_, g_prof.setup, g_prof.attn, g_prof.route, g_prof.enqueue,
+                N, nc, l0_, l1_ - 1, ms, N / (ms / 1000), (double) pf_eg_ms_, g_prof.eg_wait, g_prof.setup, g_prof.attn, g_prof.route, g_prof.enqueue,
                 g_prof.cpu, g_prof.gather, g_prof.head, g_prof.copy_mb, pf_pcie_us_mb_, (long long) g_prof.resident, (long long) g_prof.staged,
                 (long long) g_prof.gpu_pairs, (long long) g_prof.cpu_pairs, head_->pf_cpu_scale_);
     std::lock_guard<std::mutex> lk(head_->stats_mu_);

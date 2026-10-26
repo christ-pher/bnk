@@ -322,7 +322,7 @@ private:
     void pf_moe(int il, int N);
     void pf_prefetch(int il, const std::vector<int> & order, int nbuf);
     void pf_head(int N);
-    void pf_engram_gather(int N, int e_only = -1);
+    void pf_engram_gather(int N, int e, int t0, int t1);
     double pf_eg_ms_ = 0;   // (under head_->stats_mu_)
     void pf_update_costs();
     struct Worker {
@@ -392,6 +392,7 @@ private:
         int n_timed = 0;
         double timed_mb = 0;
         double cpu_pred_ms = 0, cpu_meas_ms = 0;
+        double link_free = 0;                    // host clock: when the copy stream's last queued copy should land
         int score_rows = 0;                      // rows of the indexer's score buffer (the chunk in pieces)
         int n_sub = 0;                           // score sub-chunks per chunk
     } pf_;
