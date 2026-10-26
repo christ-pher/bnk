@@ -41,8 +41,12 @@ public:
     size_t host_bytes() const { return store_.total_bytes(); }
 
     // the target's rows: `targets` [kMaxWindow][n_targets * E] on this device (the engine's capture of the window's
-    // rows at the target layers' attention input, mean over the hc copies), `rope` the plain rotary table
-    void bind(const float * targets, const float * rope) { targets_dev_ = targets; rope_ = rope; }
+    // rows at the target layers' attention input, mean over the hc copies; row i of the window), `res` / `res_dim` the
+    // engine's residual rows (run() finds its window rows by R_rows - res), `rope` the plain rotary table, `tok_embd`
+    // the target's token table (host-mapped, portable: readable from this device)
+    void bind(const float * targets, const float * res, int res_dim, const float * rope, const QMat & tok_embd) {
+        targets_dev_ = targets; res_ = res; res_dim_ = res_dim; rope_ = rope; tok_embd_ = tok_embd;
+    }
     void select(int slot) { cur_ = slot; }
     // the ring is valid up to position `pos` (a new or rolled-back conversation in the current slot)
     void restart(int pos);
@@ -74,8 +78,34 @@ private:
     float p_min_ = 0.5f;         // the confidence product under which the block's remaining drafts are dropped
     size_t vram_bytes_ = 0;
     const float * targets_dev_ = nullptr;
+    const float * res_ = nullptr;
+    int res_dim_ = 0;
     const float * rope_ = nullptr;
+    QMat tok_embd_;
     cudaStream_t st_ = nullptr;
+    int dev_ = 0;                 // the GPU holding the drafter (the stage with the head)
+    std::vector<float> conf_w_;   // the confidence projection on the host [E + rank]
+
+    // work buffers (T = block_ rows; the feed up to kMaxWindow rows)
+    DevBuf<float> x_, res_blk_, mixed_, xn_, out_, pre_a_, pre_b_, attn_pre_, post_, comb_, mix_scratch_;
+    DevBuf<float> qr_, qrn_, q_, kvr_, attn_o_, oa_;
+    DevBuf<float> rlogits_, rw_, sg_, su_, shared_out_, cpu_out_, moe_out_, logits_, bias_, w1_row_, main_x_, main_xn_;
+    DevBuf<int32_t> rids_, ids_, pos_;
+    DevBuf<int8_t> actq_, actq2_;
+    DevBuf<half> acth_, acth2_;
+    DevBuf<float> actd_, actd2_;
+    ActQ8 act_, act2_;
+    std::vector<ExpertTask> tasks_;
+    std::vector<float> h_x_, h_out_, h_logits_, h_bias_, h_mixed_, h_w1_;
+    std::vector<int32_t> h_ids_;
+    void stage_forward(int il, int T);      // one stage on the block rows (res_blk_, pre_)
+    // BNK_DS_SPARK_DUMP=prefix: the first dumps_left_ draft calls' inputs and intermediates to prefix.N.* (the NumPy
+    // reference tools/dspark_ref.py checks them against the checkpoint's math)
+    int dumps_left_ = 0, dump_n_ = 0;
+    std::string dump_prefix_;
+    void dump(const char * what, const void * dev, size_t bytes);
+    void dump_host(const char * what, const void * host, size_t bytes);
+    float * pre_ = nullptr, * pre_next_ = nullptr;
 
     // per conversation slot: each stage's ring of the target positions' latents, and how far it is valid
     struct Slot {

@@ -56,6 +56,10 @@ void ds_rope_kv_prep(float * q, int H, const float * kv, const float * w, half *
 void ds_attention(const float * q, const half * ring, const half * comp, const int32_t * idx, int k_sel,
                   const float * sinks, float * out, int T, int H, int D, int W, int n_rot, const int * pos0,
                   const float * inv_freq, float scale, cudaStream_t s, int origin = -1);
+// the DSpark drafter's block: T rows at positions pos0..pos0+T-1 whose keys are in the ring, every row attending to
+// the W positions before pos0 and to all T block rows (not causal), with the sinks; the output de-rotated per row
+void ds_attention_block(const float * q, const half * ring, const float * sinks, float * out, int T, int H, int D, int W, int n_rot,
+                        const int * pos0, const float * inv_freq, float scale, cudaStream_t s);
 // after a prompt chunk: positions [p_from, p_to) of the linear window buffer (row p - origin) into the ring
 void ds_ring_fill(const half * win, int origin, half * ring, int p_from, int p_to, int D, cudaStream_t s);
 // h[n][f] = silu(min(g, limit)) * clamp(u, -limit, limit) from gu [n][2F] (gate | up); limit <= 0: no clamp
@@ -130,6 +134,8 @@ void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int 
 // xc[m][:] = x[tok[m]][:] for m < M (tok: host-mapped): the rows the CPU needs, compact, before their copy out
 void ds_rows_gather(const float * x, const int32_t * tok, float * xc, int M, int E, cudaStream_t s);
 void ds_zero_half(half * p, size_t n, cudaStream_t s);
+// y[i] = a[i] + b[i]
+void ds_add(const float * a, const float * b, float * y, size_t n, cudaStream_t s);
 // out[t][e] = mean over s of res[t][s*E + e] (row stride ldo): the hyper-connection copies collapsed by averaging, what
 // the DSpark drafter reads at its target layers' attention input
 void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s);

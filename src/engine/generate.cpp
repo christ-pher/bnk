@@ -179,6 +179,7 @@ void Generator::draft_from(const float * R_row, int32_t tok, int cell) {
     if (choose_drafts(d, pr)) {
         while ((int) drafts_.size() < opt_.max_draft && pr >= opt_.min_p) {
             d = mtp_->step(d, ++cell, &pr);
+            if (d < 0) break;   // the drafter's block is spent (DSpark stops at its confidence threshold)
             drafts_.push_back(d);
         }
     }
@@ -448,6 +449,7 @@ std::vector<int32_t> Generator::finish(bool draft) {
             la_conf_ = pr;
             while ((int) drafts_.size() < opt_.max_draft && pr >= opt_.min_p) {
                 d = mtp_->step(d, cell++, &pr);
+                if (d < 0) break;
                 drafts_.push_back(d);
                 stats.draft_steps++;
                 la_conf_ *= pr;
@@ -506,6 +508,7 @@ std::vector<int32_t> Generator::next_lookahead() {
         int32_t d = la_last_;
         for (int i = 0; i < chain_T; ++i) {
             d = mtp_->step(d, cell++, &pr);
+            if (d < 0) break;
             out.push_back(d);
         }
         return (int) out.size();
@@ -607,6 +610,7 @@ std::vector<int32_t> Generator::next_lookahead() {
             la_conf_ = pr;
             while ((int) drafts_.size() < opt_.max_draft && pr >= opt_.min_p) {
                 d = mtp_->step(d, cell++, &pr);
+                if (d < 0) break;
                 drafts_.push_back(d);
                 stats.draft_steps++;
                 la_conf_ *= pr;

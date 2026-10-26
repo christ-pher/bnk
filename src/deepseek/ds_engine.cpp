@@ -194,7 +194,7 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
             if (!last->owns(il)) throw std::runtime_error("dspark: target layer " + std::to_string(il) + " is not on the stage with the head");
             last->tgt_index_[il] = k;
         }
-        last->spark_->bind(last->tgt_.p, last->rope_win_.p);
+        last->spark_->bind(last->tgt_.p, last->res_.p, c.hc * c.n_embd, last->rope_win_.p, model_.tok_embd);
     }
     if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
         for (int b = 0; b < 2; ++b) {
