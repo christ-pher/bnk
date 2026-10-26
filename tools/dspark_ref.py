@@ -142,6 +142,7 @@ def main():
     ap.add_argument("prefix", help="the dump's prefix with its number, e.g. /tmp/d.0")
     ap.add_argument("--tensors", default=os.path.expanduser("~/.cache/bnk/dspark"))
     ap.add_argument("--no-ffn", action="store_true", help="skip the routed experts (slow): compare up to the FFN input")
+    ap.add_argument("--ours", action="store_true", help="feed each step the engine's dumped input (per-op error, no drift)")
     a = ap.parse_args()
     W = Weights(a.tensors)
     pre = a.prefix
@@ -209,12 +210,16 @@ def main():
         d = load(pre, f"res_attn{s}")
         if d is not None:
             print(f"res after attention: rel err {rel(d, res):.4f}")
+            if a.ours:
+                res = d.reshape(T, HC, E).copy()
         ffn_pre, post, comb = hc_mixes(res, W.get(pfx + "hc_ffn_fn"), W.get(pfx + "hc_ffn_scale"), W.get(pfx + "hc_ffn_base"))
         cur = hc_pre(res, attn_pre)
         xn = rmsnorm(cur, W.get(pfx + "ffn_norm.weight"))
         d = load(pre, f"ffn_in{s}")
         if d is not None:
             print(f"ffn input: rel err {rel(d, xn):.4f}")
+            if a.ours:
+                xn = d.reshape(T, E).copy()
         if a.no_ffn:
             return
         # routing
@@ -248,11 +253,17 @@ def main():
         shared = np.stack([expert(xn[t], 0, f"{pfx}ffn.shared_experts") for t in range(T)])
         d = load(pre, f"shared{s}")
         if d is not None:
-            print(f"shared expert: rel err {rel(d, shared):.4f}")
+            print(f"shared expert: rel err {rel(d, shared):.4f}  (ref rms {np.sqrt((shared**2).mean()):.4f}, ours {np.sqrt((d**2).mean()):.4f}; max |gate| {np.abs(xn @ W.get(pfx + "ffn.shared_experts.w1.weight").T).max():.1f}, max |up| {np.abs(xn @ W.get(pfx + "ffn.shared_experts.w3.weight").T).max():.1f})")
+        if a.ours:
+            dr, dsh = load(pre, f"routed{s}"), load(pre, f"shared{s}")
+            if dr is not None and dsh is not None:
+                routed, shared = dr.reshape(T, E), dsh.reshape(T, E)
         res = hc_post(routed + shared, res, post, comb)
         d = load(pre, f"res{s}")
         if d is not None:
             print(f"res after stage: rel err {rel(d, res):.4f}")
+            if a.ours:
+                res = d.reshape(T, HC, E).copy()
         pre_mix = ffn_pre
     mixed = hc_pre(res, pre_mix)
     d = load(pre, "mixed")

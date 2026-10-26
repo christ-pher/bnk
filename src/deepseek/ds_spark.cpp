@@ -63,6 +63,8 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
     if (gguf_.get_u64(a + "embedding_length") != (uint64_t) m.ds.n_embd || gguf_.get_u64(a + "attention.head_count") != (uint64_t) m.ds.n_head)
         throw std::runtime_error("dspark: the draft's dimensions do not match the target's");
     if (const char * pm = getenv("BNK_DS_SPARK_PMIN")) p_min_ = (float) atof(pm);
+    if (const char * v = getenv("BNK_DS_SPARK_ROUND_MS")) round_ms_ = (float) atof(v);
+    if (const char * v = getenv("BNK_DS_SPARK_ROW_MS")) row_ms_ = (float) atof(v);
     if (const char * dp = getenv("BNK_DS_SPARK_DUMP")) { dump_prefix_ = dp; dumps_left_ = env_int("BNK_DS_SPARK_DUMP_N", 3); }
 
     main_proj_ = upload("fc.weight");
@@ -312,6 +314,7 @@ void DsSpark::stage_forward(int il, int T) {
 // confidence head on the host
 void DsSpark::draft_block(int32_t anchor, int pos) {
     const int T = block_, E = c_.n_embd, V = c_.n_vocab, RK = (int) markov_w1_.cols;
+    const double t_draft0 = now_ms();
     Block & b = blocks_[cur_];
     b = Block{};
     h_ids_[0] = anchor;
@@ -345,7 +348,7 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
     // the confidence of position i from its collapsed state and W1[token_{i-1}]
     static thread_local std::mt19937_64 rng{0x5eed};
     int32_t prev = anchor;
-    float survival = 1.f;
+    float survival = 1.f, expected = 1.f;   // tokens the round yields in expectation: the bonus token plus the kept drafts
     std::vector<float> row((size_t) V);
     std::vector<int> order;
     for (int i = 0; i < T; ++i) {
@@ -403,12 +406,16 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
                     pos, i, prev, tok, base_arg, base_mx, bias_mx, nan, conf, sqrt(hn / E));
         }
         survival *= conf;
-        if (i > 0 && survival < p_min_) break;   // the schedule: the rest of the block is not worth its verify rows
+        // the schedule: the draft's expected tokens per millisecond of its verify row against the round's average so far
+        const float avg = expected / (round_ms_ + draft_ms_ + row_ms_ * i);
+        if (i > 0 && (survival < p_min_ || survival < row_ms_ * avg)) break;
+        expected += survival;
         b.toks.push_back(tok);
         b.conf.push_back(conf);
         b.dist.push_back(std::move(dist));
         prev = tok;
     }
+    draft_ms_ = 0.9f * draft_ms_ + 0.1f * (float) (now_ms() - t_draft0);
 }
 
 int DsSpark::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {

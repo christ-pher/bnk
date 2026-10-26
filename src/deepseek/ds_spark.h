@@ -80,7 +80,13 @@ private:
     int block_ = 0;
     int32_t noise_id_ = 0;
     float temperature_ = 0.f;
-    float p_min_ = 0.5f;         // the confidence product under which the block's remaining drafts are dropped
+    // the schedule (docs/DSPARK.md): draft i is kept while its survival probability s_i (the confidences' product) adds
+    // tokens per millisecond above the round's running average: s_i >= row_ms * (1 + sum s_j) / (round_ms + draft_ms +
+    // row_ms * (i - 1)). round_ms / row_ms: a plain round and a verify row (BNK_DS_SPARK_ROUND_MS / _ROW_MS, defaults
+    // 40 / 10: the exchange's warm cache on this machine); draft_ms: this drafter's own time, measured. p_min_ (>= 0,
+    // BNK_DS_SPARK_PMIN) is a floor on the product on top of that.
+    float p_min_ = 0.f;
+    float round_ms_ = 40.f, row_ms_ = 10.f, draft_ms_ = 12.f;
     size_t vram_bytes_ = 0;
     const float * targets_dev_ = nullptr;
     int nslots_ = 0;

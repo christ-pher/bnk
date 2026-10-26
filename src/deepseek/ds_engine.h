@@ -293,7 +293,7 @@ private:
     DevBuf<int8_t> hq_buf_;
     DevBuf<uint32_t> counts_;
     std::vector<uint32_t> saved_counts_;
-    // the adaptive exchange (ExpertCache::adapt_exchange): every adapt_every_ decode forwards, up to adapt_swaps_
+    // the adaptive exchange (ExpertCache::adapt_exchange): every adapt_every_ decode window rows, up to adapt_swaps_
     // exchanges in flight per stage; BNK_DS_ADAPT=N sets the interval (0 off), BNK_DS_ADAPT_SWAPS the count
     int adapt_every_ = 0, adapt_swaps_ = 0;
     int64_t fwd_count_ = 0;

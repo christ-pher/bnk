@@ -240,12 +240,14 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     model_.load(path, opt.ple_gguf, opt.verbose, l0_, l1_, first(), last_);
     if (l1_ < 0) l1_ = model_.ds.n_layer;
     const DsConfig & c = model_.ds;
+    // the GPU kernels' SwiGLU clamp is a __device__ symbol: set on every stage's device (it was set on the head's only,
+    // so the second GPU's shared experts and resident experts ran unclamped: found by the DSpark drafter's reference)
+    moe_set_swiglu_limit(c.swiglu_limit);
+    moe_tc_set_swiglu_limit(c.swiglu_limit);
+    quantize_set_swiglu_limit(c.swiglu_limit);
     if (head) {
         layer_routed.assign(c.n_layer, 0);
         layer_misses.assign(c.n_layer, 0);
-        moe_set_swiglu_limit(c.swiglu_limit);
-        moe_tc_set_swiglu_limit(c.swiglu_limit);
-        quantize_set_swiglu_limit(c.swiglu_limit);
         cpu_experts_set_swiglu_limit(c.swiglu_limit);
         if (kMaxWindow > 8) throw std::runtime_error("kDsRing assumes decode windows of at most 8 rows");
     } else {
@@ -1133,7 +1135,12 @@ void DsEngine::fwd_end() {
     }
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
     // the adaptive exchange, between forwards (the CPU pool and the prompt path are idle here)
-    if (adapt_every_ > 0 && !pull_P_ && ++fwd_count_ % adapt_every_ == 0) cache_.adapt_exchange(counts_.p, st_, adapt_swaps_, *store_);
+    // the adaptive exchange, between forwards (the CPU pool and the prompt path are idle here); counted in window rows,
+    // so a drafted forward of several tokens adapts the cache as fast per token as plain decoding
+    if (adapt_every_ > 0 && !pull_P_ && (fwd_count_ += last_T) >= adapt_every_) {
+        fwd_count_ = 0;
+        cache_.adapt_exchange(counts_.p, st_, adapt_swaps_, *store_);
+    }
     if (pull_P_) {
         uint32_t v[3];
         CUDA_CHECK(cudaMemcpy(v, pull_stats_.p, sizeof(v), cudaMemcpyDeviceToHost));
