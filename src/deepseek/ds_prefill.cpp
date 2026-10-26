@@ -656,6 +656,7 @@ void DsEngine::prefill_group(const int32_t * tokens, int N) {
 }
 
 void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
+    cache_.wait_exchanges(st_);   // the exchange's copies settle before a prompt group reads the cache
     DeviceScope dsc(dev_);
     join_commit_here();
     const DsConfig & c = model_.ds;

@@ -139,6 +139,7 @@ ExpertCache::~ExpertCache() {
         copier_.join();
     }
     if (copy_) cudaStreamSynchronize(copy_);
+    if (xchg_done_) cudaEventDestroy(xchg_done_);
     for (auto & x : xs_) if (x->done) cudaEventDestroy(x->done);
     if (swap_stage_) cudaFree(swap_stage_);
     if (swap_ptrs_) cudaFree(swap_ptrs_);
@@ -290,6 +291,10 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
     return started;
 }
 
+void ExpertCache::wait_exchanges(cudaStream_t s) {
+    if (xchg_done_) CUDA_CHECK(cudaStreamWaitEvent(s, xchg_done_, 0));
+}
+
 // the helper thread: a leaving expert's three matrices from the mapped model file into its spare blob
 void ExpertCache::copier_main() {
     for (;;) {
@@ -364,6 +369,8 @@ int ExpertCache::adapt_exchange(const uint32_t * counts_dev, cudaStream_t s, int
         CUDA_CHECK(cudaEventRecord(x.done, copy_));
         slot_expert_[x.il][x.slot] = x.in;
         x.gpu_started = true;
+        if (!xchg_done_) CUDA_CHECK(cudaEventCreateWithFlags(&xchg_done_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(xchg_done_, copy_));
     }
     // 3. new exchanges from the routing counts, each with a spare host blob for its leaving expert
     update_scores(counts_dev, s);

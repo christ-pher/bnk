@@ -115,6 +115,7 @@ int main(int argc, char ** argv) {
     std::string mode = argv[1], model, tokfile, ref, mtp_path;
     bool solo = false, adapt_set = false, pipe = false;
     int max_new = 32;
+    SamplingParams run_sp;
     GenOptions gopt;
     EngineOptions opt;
     opt.kv8 = env_int("BNK_KV8", 0) != 0;   // fp16 K/V by default; --kv8 wins
@@ -140,6 +141,9 @@ int main(int argc, char ** argv) {
         else if (a == "--stage-small-mib") opt.stage_small_mib = std::stoi(next());
         else if (a == "--stage-full-min") opt.stage_full_min = std::stoi(next());
         else if (a == "--draft") gopt.max_draft = std::stoi(next());
+        else if (a == "--temp") run_sp.temperature = std::stof(next());   // run: sample at this temperature (default greedy)
+        else if (a == "--top-p") run_sp.top_p = std::stof(next());
+        else if (a == "--seed") run_sp.seed = (uint64_t) std::stoull(next());
         else if (a == "--min-p") gopt.min_p = std::stof(next());
         else if (a == "--counts") opt.counts_out = next();
         else if (a == "--cache-gib") {   // one size, or one per GPU (comma-separated)
@@ -665,7 +669,7 @@ int main(int argc, char ** argv) {
     if (oracle_w) printf("=== oracle window %d\n", oracle_w);
     Generator gen(eng, eng.mtp(), go);
     const double t0 = now_ms();
-    int tok = gen.prefill(prompt);
+    int tok = gen.prefill(prompt, run_sp);
     gen.set_lookahead(!getenv("BNK_LOOKAHEAD") || atoi(getenv("BNK_LOOKAHEAD")) != 0);
     const double t1 = now_ms();
     std::vector<int> out{tok};

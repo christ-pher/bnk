@@ -87,6 +87,9 @@ public:
     // and often both for a moment. Returns the exchanges started. Needs the store built with spare blobs.
     int adapt_exchange(const uint32_t * counts_dev, cudaStream_t s, int max_swaps, ExpertStore & store);
     int exchanges_pending() const { return (int) xs_.size(); }
+    // makes stream `s` wait for every exchange copy enqueued so far (the forward runs after the slots it may touch
+    // are settled; a GPU-side wait, the host does not block)
+    void wait_exchanges(cudaStream_t s);
     int64_t swaps_done = 0;
     const std::vector<int> & slot_experts(int il) const { return slot_expert_[il]; }
     int slot_of(int il, int e) const { return slot_of_host_[(size_t) il * n_expert_ + e]; }
@@ -149,6 +152,7 @@ private:
     std::deque<Exchange *> hq_;
     bool hq_stop_ = false;
     ExpertStore * xstore_ = nullptr;
+    cudaEvent_t xchg_done_ = nullptr;   // recorded on copy_ after the latest exchange copies
     void copier_main();
 };
 

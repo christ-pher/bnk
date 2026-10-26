@@ -106,10 +106,10 @@ public:
     // drafts, one at a time round-robin, while rows are left (a generator gets no more rows than it has drafts).
     static std::vector<int> share_rows(const std::vector<Generator *> & gens, int total = 0);   // 0: max_window()
     // Back-compat for the CLI: start with greedy sampling on a fresh state.
-    int32_t prefill(const std::vector<int32_t> & prompt) {
+    int32_t prefill(const std::vector<int32_t> & prompt, const SamplingParams & sp = SamplingParams{}) {
         use_slot();
         eng_.reset();
-        return start(prompt, SamplingParams{});
+        return start(prompt, sp);
     }
     void set_draft(int n) { opt_.max_draft = n; }
     void set_draft_min_p(float p) { opt_.min_p = p; }

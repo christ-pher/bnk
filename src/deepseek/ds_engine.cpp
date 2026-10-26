@@ -17,6 +17,15 @@ namespace bnk {
 
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
+static void sync_debug(const char * what, int dev, int which = 3) {
+    static const int on = env_int("BNK_DS_SYNC_DEBUG", 0);   // 1: after the forward, 2: around the exchange, 3: both
+    if (!(on & which)) return;
+    const cudaError_t e = cudaDeviceSynchronize(), l = cudaGetLastError();
+    if (e != cudaSuccess || l != cudaSuccess)
+        throw std::runtime_error(std::string("sync debug: ") + what + " on GPU " + std::to_string(dev) + ": " + cudaGetErrorString(e != cudaSuccess ? e : l));
+}
+
+
 // BNK_DS_TRACE="0,1": in eager mode, the rms of every row of a buffer after each stage of those layers
 static bool trace_layer(int il) {
     static const std::string v = getenv("BNK_DS_TRACE") ? getenv("BNK_DS_TRACE") : "";
@@ -1119,6 +1128,7 @@ void DsEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
 }
 
 void DsEngine::fwd_launch(cudaEvent_t after) {
+    cache_.wait_exchanges(st_);   // the exchange's copies settle before the forward (docs/DEEPSEEK.md)
     DeviceScope ds(dev_);
     if (after) CUDA_CHECK(cudaStreamWaitEvent(st_, after, 0));
     CUDA_CHECK(cudaEventRecord(ev_t0_, st_));
@@ -1137,6 +1147,7 @@ void DsEngine::fwd_service() {
 void DsEngine::fwd_end() {
     DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    sync_debug("after the forward", dev_, 1);   // (a device sync is only safe once every stage has been serviced)
     float ms = 0.f;
     if (cudaEventElapsedTime(&ms, ev_t0_, ev_t1_) == cudaSuccess) {
         gpu_ms_ += ms;
@@ -1150,7 +1161,9 @@ void DsEngine::fwd_end() {
     // so a drafted forward of several tokens adapts the cache as fast per token as plain decoding
     if (adapt_every_ > 0 && !pull_P_ && (fwd_count_ += last_T) >= adapt_every_) {
         fwd_count_ = 0;
+        sync_debug("before adapt_exchange", dev_, 2);
         cache_.adapt_exchange(counts_.p, st_, adapt_swaps_, *store_);
+        sync_debug("after adapt_exchange", dev_, 2);
     }
     if (pull_P_) {
         uint32_t v[3];

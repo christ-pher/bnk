@@ -296,7 +296,7 @@ const std::vector<int32_t> & Generator::window(int max_rows) {
     win_.clear();
     win_.push_back(pending_);
     for (int d : drafts_) {
-        if ((int) win_.size() >= max_rows) break;
+        if ((int) win_.size() >= max_rows || d < 0) break;
         win_.push_back(d);
     }
     if (eng_.pos() + (int) win_.size() > eng_.max_ctx()) win_.resize(1);
@@ -664,6 +664,10 @@ void Generator::draft_batch(const std::vector<Generator *> & gens) {
         mtp->step_multi(st, t2.data(), p2.data());
         for (size_t j = 0; j < who.size(); ++j) {
             Generator * x = g[who[j]];
+            if (t2[j] < 0) {   // the drafter's block is spent (DSpark's schedule): this generator is done drafting
+                idx[who[j]] = -1;
+                continue;
+            }
             x->drafts_.push_back(t2[j]);
             pr[who[j]] = p2[j];
             idx[who[j]] = (int) j;
