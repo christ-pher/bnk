@@ -594,9 +594,15 @@ void DsEngine::pf_moe(int il, int N) {
     if (guess) {
         std::vector<int> cnt2(NE, 0);
         for (int i = 0; i < P; ++i) cnt2[p.h_ids2[i]]++;
+        // only the experts the cost model would stream anyway: a prefetched expert counts as free on the GPU, so an
+        // expert the CPU would answer faster (few tokens: a short chunk, the agent's per-turn suffix) must not be
+        // prefetched, or its 9.4 MB copy lands on the critical path (64 new tokens: 2.3 s -> 0.7 s; BNK_DS_PF_GUESS_ALL=1
+        // prefetches every guessed expert as before)
+        static const bool guess_all = env_int("BNK_DS_PF_GUESS_ALL", 0) != 0;
+        const int min_cnt = guess_all ? 1 : std::max(1, (int) std::ceil(t_pcie / std::max(1e-9, t_tok)) - 1);
         std::vector<int> order;
         for (int e = 0; e < NE; ++e)
-            if (cnt2[e] && cache_.slot_of(il + 1, e) < 0) order.push_back(e);
+            if (cnt2[e] >= min_cnt && cache_.slot_of(il + 1, e) < 0) order.push_back(e);
         std::sort(order.begin(), order.end(), [&](int a, int b) { return cnt2[a] > cnt2[b]; });
         pf_prefetch(il + 1, order, guess_bufs);
     } else {
@@ -718,7 +724,10 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
     // the first layer's first wave by rank, while its attention runs (BNK_DS_PF_PREFETCH buffers; the later layers'
     // prefetches follow their guessed routing)
     static const int rank_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_PREFETCH", 1)));
-    if (!pf_rank_.empty()) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
+    // (a short group routes few tokens to each expert: the CPU answers most of them faster than the link, so the
+    // rank-ordered prefetch only pays for groups of BNK_DS_PF_RANK_MIN (1,024) tokens or more)
+    static const int rank_min = env_int("BNK_DS_PF_RANK_MIN", 1024);
+    if (!pf_rank_.empty() && N >= rank_min) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
     for (int il = l0_; il < l1_; ++il) {
         const DsLayer & L = model_.layers[il];
         eg_join(il);

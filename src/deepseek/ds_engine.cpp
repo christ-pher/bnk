@@ -236,6 +236,8 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
 
 void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     opt_ = opt;
+    // fewer new tokens than this go through decode windows instead of the prompt path (BNK_PREFILL_MIN)
+    opt_.prefill_min = env_int("BNK_PREFILL_MIN", opt_.prefill_min);
     const bool head = head_ == this;
     CUDA_CHECK(cudaSetDevice(dev_));
     if (cudaSetDeviceFlags(cudaDeviceMapHost) != cudaSuccess) cudaGetLastError();
