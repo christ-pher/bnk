@@ -163,7 +163,7 @@ private:
 
     std::unique_ptr<LookupOnlyDrafter> lookup_drafter_;   // BNK_DS_LOOKUP=0 turns the lookup drafts off
     std::unique_ptr<DsSpark> spark_;     // docs/DSPARK.md; on the last stage
-    DevBuf<float> tgt_;                  // its view of the window rows at the target layers: [kMaxWindow][n_targets * E]
+    DevBuf<float> tgt_;                  // its view of the rows at the target layers by position: [kDsRing][n_targets * E]
     std::vector<int> tgt_index_;         // per layer: which target it is, -1 none
     DsModel model_;
     ExpertStore own_store_;

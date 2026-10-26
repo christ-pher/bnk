@@ -44,9 +44,14 @@ public:
     // rows at the target layers' attention input, mean over the hc copies; row i of the window), `res` / `res_dim` the
     // engine's residual rows (run() finds its window rows by R_rows - res), `rope` the plain rotary table, `tok_embd`
     // the target's token table (host-mapped, portable: readable from this device)
-    void bind(const float * targets, const float * res, int res_dim, const float * rope, const QMat & tok_embd) {
-        targets_dev_ = targets; res_ = res; res_dim_ = res_dim; rope_ = rope; tok_embd_ = tok_embd;
+    // `targets`: the engine's position-indexed capture ring [nslots][n_targets * E] on this device (the window rows at
+    // the target layers' attention input, mean over the hc copies, at slot position % nslots); `rope` the plain rotary
+    // table; `tok_embd` the target's token table (host-mapped, portable: readable from this device)
+    void bind(const float * targets, int nslots, const float * rope, const QMat & tok_embd) {
+        targets_dev_ = targets; nslots_ = nslots; rope_ = rope; tok_embd_ = tok_embd;
     }
+    // the positions [p_from, p_to) are captured (a prompt's tail): their latents into the rings
+    void feed_range(int p_from, int p_to);
     void select(int slot) { cur_ = slot; }
     // the ring is valid up to position `pos` (a new or rolled-back conversation in the current slot)
     void restart(int pos);
@@ -78,8 +83,7 @@ private:
     float p_min_ = 0.5f;         // the confidence product under which the block's remaining drafts are dropped
     size_t vram_bytes_ = 0;
     const float * targets_dev_ = nullptr;
-    const float * res_ = nullptr;
-    int res_dim_ = 0;
+    int nslots_ = 0;
     const float * rope_ = nullptr;
     QMat tok_embd_;
     cudaStream_t st_ = nullptr;
@@ -110,7 +114,7 @@ private:
     // per conversation slot: each stage's ring of the target positions' latents, and how far it is valid
     struct Slot {
         std::vector<DevBuf<half>> ring;   // [stage][kDsRing][D]
-        int valid_lo = 0, fed = 0;
+        int fed_lo = 0, fed_hi = 0;       // the ring holds positions [fed_lo, fed_hi) (contiguous; a gap restarts it)
     };
     std::vector<Slot> slots_;
     int cur_ = 0;
@@ -125,7 +129,7 @@ private:
     std::vector<Block> blocks_;
 
     QMat upload(const std::string & name, bool required = true);
-    void feed(const float * targets_rows, int n, int pos0);   // n rows' latents into the rings at pos0..
+    void feed(int pos0, int n);   // the capture ring's rows at positions pos0..pos0+n-1 into the stages' rings
     void draft_block(int32_t anchor, int pos);                  // the block after the anchor at position pos
 };
 

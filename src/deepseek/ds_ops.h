@@ -57,9 +57,10 @@ void ds_attention(const float * q, const half * ring, const half * comp, const i
                   const float * sinks, float * out, int T, int H, int D, int W, int n_rot, const int * pos0,
                   const float * inv_freq, float scale, cudaStream_t s, int origin = -1);
 // the DSpark drafter's block: T rows at positions pos0..pos0+T-1 whose keys are in the ring, every row attending to
-// the W positions before pos0 and to all T block rows (not causal), with the sinks; the output de-rotated per row
+// the W positions before pos0 (none below p_lo: unfed ring slots) and to all T block rows (not causal), with the sinks;
+// the output de-rotated per row
 void ds_attention_block(const float * q, const half * ring, const float * sinks, float * out, int T, int H, int D, int W, int n_rot,
-                        const int * pos0, const float * inv_freq, float scale, cudaStream_t s);
+                        const int * pos0, const float * inv_freq, float scale, cudaStream_t s, int p_lo = 0);
 // after a prompt chunk: positions [p_from, p_to) of the linear window buffer (row p - origin) into the ring
 void ds_ring_fill(const half * win, int origin, half * ring, int p_from, int p_to, int D, cudaStream_t s);
 // h[n][f] = silu(min(g, limit)) * clamp(u, -limit, limit) from gu [n][2F] (gate | up); limit <= 0: no clamp
@@ -139,6 +140,8 @@ void ds_add(const float * a, const float * b, float * y, size_t n, cudaStream_t 
 // out[t][e] = mean over s of res[t][s*E + e] (row stride ldo): the hyper-connection copies collapsed by averaging, what
 // the DSpark drafter reads at its target layers' attention input
 void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s);
+// the same into slot (pos0 + t) % nslots of a position-indexed ring (rows of stride ldo; pos0 on the device)
+void ds_hc_mean_ring(const float * res, float * ring, int64_t ldo, int T, int hc, int E, const int * pos0, int nslots, cudaStream_t s);
 // kwin[p - origin][:] = ring[p % kDsRing][:] for p in [p_from, p_to): a chunk's window rows before it, out of the ring
 void ds_ring_read(const half * ring, int origin, half * kwin, int p_from, int p_to, int D, cudaStream_t s);
 

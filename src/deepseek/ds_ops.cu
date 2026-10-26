@@ -604,7 +604,7 @@ __global__ void __launch_bounds__(256) attention_split_k(const float * __restric
                                                          const half * __restrict__ comp, const int32_t * __restrict__ idx,
                                                          int k_sel, const float * __restrict__ sinks, float * out, int H, int W,
                                                          int n_rot, const int * pos0p, const float * inv_freq, float scale,
-                                                         int origin, int blk = 0) {
+                                                         int origin, int blk = 0, int p_lo = 0) {
     constexpr int D = 512, NW = 8;
     __shared__ float s_acc[NW][D];
     __shared__ float s_m[NW], s_l[NW];
@@ -616,7 +616,7 @@ __global__ void __launch_bounds__(256) attention_split_k(const float * __restric
     for (int d = 0; d < 16; ++d) { qv[d] = qp[d] * scale; acc[d] = 0.f; }
     float m = -1e30f, l = 0.f;
     // blk > 0 (the DSpark drafter's block): every row sees the W positions before the block and all blk block rows
-    const int p_first = blk ? max(0, *pos0p - W) : pos - min(W, pos + 1) + 1;
+    const int p_first = blk ? max(p_lo, *pos0p - W) : pos - min(W, pos + 1) + 1;
     const int n_win = blk ? *pos0p + blk - p_first : min(W, pos + 1);
     const int n_keys = n_win + (idx ? k_sel : 0);
     for (int key = w; key < n_keys; key += NW) {
@@ -885,9 +885,9 @@ static void attention_tc_ready() {
 }
 
 void ds_attention_block(const float * q, const half * ring, const float * sinks, float * out, int T, int H, int D, int W, int n_rot,
-                        const int * pos0, const float * inv_freq, float scale, cudaStream_t s) {
+                        const int * pos0, const float * inv_freq, float scale, cudaStream_t s, int p_lo) {
     if (D != 512 || T > 16) throw std::runtime_error("ds_attention_block: D must be 512 and T at most 16");
-    attention_split_k<<<dim3(T, H), 256, 0, s>>>(q, ring, nullptr, nullptr, 0, sinks, out, H, W, n_rot, pos0, inv_freq, scale, -1, T);
+    attention_split_k<<<dim3(T, H), 256, 0, s>>>(q, ring, nullptr, nullptr, 0, sinks, out, H, W, n_rot, pos0, inv_freq, scale, -1, T, p_lo);
 }
 
 void ds_attention(const float * q, const half * ring, const half * comp, const int32_t * idx, int k_sel,
@@ -1363,6 +1363,18 @@ __global__ void hc_mean_k(const float * res, float * out, int64_t ldo, int hc, i
 }
 void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s) {
     hc_mean_k<<<dim3((E + 255) / 256, T), 256, 0, s>>>(res, out, ldo, hc, E);
+}
+__global__ void hc_mean_ring_k(const float * res, float * ring, int64_t ldo, int hc, int E, const int * pos0, int nslots) {
+    const int t = blockIdx.y;
+    float * out = ring + (int64_t) ((*pos0 + t) % nslots) * ldo;
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += gridDim.x * blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < hc; ++s) a += res[((int64_t) t * hc + s) * E + e];
+        out[e] = a / hc;
+    }
+}
+void ds_hc_mean_ring(const float * res, float * ring, int64_t ldo, int T, int hc, int E, const int * pos0, int nslots, cudaStream_t s) {
+    hc_mean_ring_k<<<dim3((E + 255) / 256, T), 256, 0, s>>>(res, ring, ldo, hc, E, pos0, nslots);
 }
 
 void ds_zero_half(half * p, size_t n, cudaStream_t s) { zero_half_k<<<(unsigned) std::min<size_t>((n + 255) / 256, 4096), 256, 0, s>>>(p, n); }

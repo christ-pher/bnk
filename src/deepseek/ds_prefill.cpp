@@ -725,6 +725,9 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
             const int n = csz[i];
             float * res_c = p.res.p + (size_t) coff[i] * HC, * pre_c = pre_ + (size_t) coff[i] * c.hc;
             if (c.engram_index(il) >= 0) pf_engram(il, i, n);
+            if (!tgt_index_.empty() && tgt_index_[il] >= 0)   // the DSpark drafter's capture (the prompt's tail seeds its rings)
+                ds_hc_mean_ring(res_c, tgt_.p + (size_t) tgt_index_[il] * E, (int64_t) spark_->n_targets() * E, n, c.hc, E,
+                                &p.d_par[i].pos0, kDsRing, st_);
             ds_hc_mixes(res_c, F(L.hc_attn_fn), F(L.hc_attn_scale), F(L.hc_attn_base), p.attn_pre, p.postc, p.combc, n, c.hc, E, c.eps,
                         c.hc_eps, c.sinkhorn, st_);
             ds_hc_pre(res_c, pre_c, p.mixed, n, c.hc, E, st_);
@@ -832,6 +835,10 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
         forward(tokens.data() + i, (int) std::min<size_t>(kMaxWindow, n - i), true);
         if (on_prefill_progress) on_prefill_progress(std::min(n, i + kMaxWindow), n);
     }
+    // the DSpark drafter's rings take the prompt's last window of positions (its drafts attend to them)
+    DsEngine * last = this;
+    while (last->next_) last = last->next_.get();
+    if (last->spark_) last->spark_->feed_range(std::max(0, pos() - model_.ds.window), pos());
 }
 
 }  // namespace bnk

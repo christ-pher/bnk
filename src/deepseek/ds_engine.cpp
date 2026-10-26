@@ -187,14 +187,14 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
         last->spark_ = std::make_unique<DsSpark>();
         last->spark_->load(opt.mtp, last->model_, *cpu_, (int) seqs_.size(), opt.cpu_threads, last->st_, opt.verbose);
         const int nt = last->spark_->n_targets();
-        last->tgt_.alloc((size_t) kMaxWindow * nt * c.n_embd);
+        last->tgt_.alloc((size_t) kDsRing * nt * c.n_embd);
         last->tgt_index_.assign(c.n_layer, -1);
         for (int k = 0; k < nt; ++k) {
             const int il = last->spark_->target_layers()[k];
             if (!last->owns(il)) throw std::runtime_error("dspark: target layer " + std::to_string(il) + " is not on the stage with the head");
             last->tgt_index_[il] = k;
         }
-        last->spark_->bind(last->tgt_.p, last->res_.p, c.hc * c.n_embd, last->rope_win_.p, model_.tok_embd);
+        last->spark_->bind(last->tgt_.p, kDsRing, last->rope_win_.p, model_.tok_embd);
     }
     if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
         for (int b = 0; b < 2; ++b) {
@@ -880,8 +880,10 @@ void DsEngine::layer_forward(int il, int T) {
     const DsLayer & L = model_.layers[il];
     const int E = c.n_embd;
     if (c.engram_index(il) >= 0) engram(il, T);
-    if (!tgt_index_.empty() && tgt_index_[il] >= 0)   // the DSpark drafter reads this layer's attention input
-        ds_hc_mean(res_.p, tgt_.p + (size_t) tgt_index_[il] * E, (int64_t) spark_->n_targets() * E, T, c.hc, E, st_);
+    if (!tgt_index_.empty() && tgt_index_[il] >= 0)   // the DSpark drafter reads this layer's attention input, by position
+        for (size_t wi = 0; wi < wins_.size(); ++wi)
+            ds_hc_mean_ring(res_.p + (size_t) wins_[wi].r0 * c.hc_dim(), tgt_.p + (size_t) tgt_index_[il] * E,
+                            (int64_t) spark_->n_targets() * E, wins_[wi].T, c.hc, E, &d_par_[wi].pos0, kDsRing, st_);
     // the attention's mixes (its pre-mix is for the FFN; the attention collapses with the previous sublayer's)
     ds_hc_mixes(res_, F(L.hc_attn_fn), F(L.hc_attn_scale), F(L.hc_attn_base), attn_pre_, post_, comb_, T, c.hc, E, c.eps, c.hc_eps,
                 c.sinkhorn, st_, mix_scratch_.p);

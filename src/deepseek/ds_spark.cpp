@@ -176,9 +176,9 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
 void DsSpark::restart(int pos) {
     DeviceScope dsc(dev_);
     Slot & s = slots_[cur_];
-    if (s.fed - pos > kDsRing - c_.window) s.valid_lo = pos;
-    else s.valid_lo = std::min(s.valid_lo, pos);
-    s.fed = std::min(s.fed, pos);
+    // positions below pos stay valid when the ring still holds them; past a deep rewind the slots hold later positions
+    if (pos < s.fed_lo || s.fed_hi - pos > nslots_ - c_.window) s.fed_lo = pos;
+    s.fed_hi = std::min(s.fed_hi, pos);
     blocks_[cur_] = Block{};
 }
 
@@ -201,30 +201,44 @@ void DsSpark::dump(const char * what, const void * dev, size_t bytes) {
     dump_host(what, h.data(), bytes);
 }
 
-// n verified rows' target features (rows row0.. of the engine's capture) into every stage's ring at positions pos0..
-void DsSpark::feed(const float * targets_rows, int n, int pos0) {
+// the capture ring's rows at positions pos0..pos0+n-1 (the target layers' attention inputs) into every stage's ring
+void DsSpark::feed(int pos0, int n) {
     const int E = c_.n_embd, D = c_.head_dim, R = c_.n_rot;
     const int64_t NT = (int64_t) targets_.size() * E;
     if (n <= 0) return;
-    if (n > kMaxWindow) throw std::runtime_error("dspark: too many rows to feed");
     Slot & sl = slots_[cur_];
-    if (dumps_left_ > 0) {   // every feed before the dumped draft: the rows and their positions
-        static int feed_n = 0;
-        const int32_t hdr[2] = {pos0, n};
-        dump_host(("feed" + std::to_string(feed_n) + ".hdr").c_str(), hdr, sizeof hdr);
-        dump(("feed" + std::to_string(feed_n) + ".rows").c_str(), targets_rows, (size_t) n * NT * 4);
-        ++feed_n;
+    if (pos0 > sl.fed_hi || pos0 < sl.fed_lo) sl.fed_lo = pos0;   // a gap or a rewind: the span restarts here
+    for (int done = 0; done < n;) {
+        const int p = pos0 + done, slot = p % nslots_;
+        const int m = std::min(n - done, nslots_ - slot);   // up to the ring's wrap
+        if (m > kMaxWindow) throw std::runtime_error("dspark: feed chunk larger than a window");
+        const float * rows = targets_dev_ + (size_t) slot * NT;
+        if (dumps_left_ > 0) {
+            static int feed_n = 0;
+            const int32_t hdr[2] = {p, m};
+            dump_host(("feed" + std::to_string(feed_n) + ".hdr").c_str(), hdr, sizeof hdr);
+            dump(("feed" + std::to_string(feed_n) + ".rows").c_str(), rows, (size_t) m * NT * 4);
+            ++feed_n;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(pos_.p, &p, 4, cudaMemcpyHostToDevice, st_));
+        quantize_act(rows, NT, m, NT, act_, st_);
+        gemv(main_proj_, &act_, nullptr, 0, m, main_x_, E, false, st_);
+        rmsnorm_rows(main_x_, F(main_norm_), main_xn_, m, E, E, E, c_.eps, st_);
+        quantize_act(main_xn_, E, m, E, act_, st_);
+        for (int il = 0; il < c_.n_layer; ++il) {
+            gemv(stages_[il].kv, &act_, nullptr, 0, m, kvr_, D, false, st_);
+            ds_kv_prep(kvr_, F(stages_[il].kv_norm), sl.ring[il].p, m, D, R, pos_.p, rope_, c_.eps, st_);
+        }
+        done += m;
     }
-    CUDA_CHECK(cudaMemcpyAsync(pos_.p, &pos0, 4, cudaMemcpyHostToDevice, st_));
-    quantize_act(targets_rows, NT, n, NT, act_, st_);
-    gemv(main_proj_, &act_, nullptr, 0, n, main_x_, E, false, st_);
-    rmsnorm_rows(main_x_, F(main_norm_), main_xn_, n, E, E, E, c_.eps, st_);
-    quantize_act(main_xn_, E, n, E, act_, st_);
-    for (int il = 0; il < c_.n_layer; ++il) {
-        gemv(stages_[il].kv, &act_, nullptr, 0, n, kvr_, D, false, st_);
-        ds_kv_prep(kvr_, F(stages_[il].kv_norm), sl.ring[il].p, n, D, R, pos_.p, rope_, c_.eps, st_);
-    }
-    sl.fed = std::max(sl.fed, pos0 + n);
+    sl.fed_hi = pos0 + n;
+}
+
+void DsSpark::feed_range(int p_from, int p_to) {
+    DeviceScope dsc(dev_);
+    p_from = std::max(p_from, p_to - nslots_);
+    for (int p = p_from; p < p_to; p += kMaxWindow) feed(p, std::min(kMaxWindow, p_to - p));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 // one stage over the block rows: the hyper-connection mixes, the window attention over the ring and the block, the
@@ -243,7 +257,7 @@ void DsSpark::stage_forward(int il, int T) {
     gemv(L.q_b, &act2_, nullptr, 0, T, q_, (int64_t) H * D, false, st_);
     gemv(L.kv, &act_, nullptr, 0, T, kvr_, D, false, st_);
     ds_rope_kv_prep(q_, H, kvr_, F(L.kv_norm), sl.ring[il].p, T, D, R, pos_.p, rope_, c_.eps, st_);
-    ds_attention_block(q_, sl.ring[il].p, F(L.sinks), attn_o_, T, H, D, c_.window, R, pos_.p, rope_, 1.f / sqrtf((float) D), st_);
+    ds_attention_block(q_, sl.ring[il].p, F(L.sinks), attn_o_, T, H, D, c_.window, R, pos_.p, rope_, 1.f / sqrtf((float) D), st_, sl.fed_lo);
     const int G = c_.o_groups, GW = H * D / G, OL = c_.o_lora;
     for (int g = 0; g < G; ++g) {
         quantize_act(attn_o_.p + (size_t) g * GW, (int64_t) H * D, T, GW, act2_, st_);
@@ -401,8 +415,8 @@ int DsSpark::run(const float * R_rows, const int32_t * next_tokens, int n, int c
     if (prob) *prob = 0.f;
     if (!targets_dev_) throw std::runtime_error("dspark: the engine has not bound the target rows");
     DeviceScope dsc(dev_);
-    const int row0 = res_ && res_dim_ > 0 && R_rows ? (int) ((R_rows - res_) / res_dim_) : 0;
-    feed(targets_dev_ + (size_t) row0 * targets_.size() * c_.n_embd, n, cell0);
+    (void) R_rows;   // the rows come from the capture ring by position
+    feed(cell0, n);
     if (!draft) return -1;
     draft_block(next_tokens[n - 1], cell0 + n);
     Block & b = blocks_[cur_];
