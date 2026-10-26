@@ -107,6 +107,8 @@ public:
     // out[t][E] = sum over tasks of w * expert(x[t]); `out` is zeroed first. x: [T][E] host. One caller at a
     // time (pipeline stages reading a prompt run on two threads).
     void run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
+    // the same over another model's experts in another store (the DSpark drafter's stages), on these threads
+    void run(const Model & m, const ExpertStore & st, int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out);
     int threads() const { return pool_ ? pool_->size() : 0; }
     // fn(part, nparts) once on every pool thread (the caller's included): host work that must not wait for a scheduler
     // slice - a thread spawned per token lands beside a spinning worker and waits for one (the Engram gather measured

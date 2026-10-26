@@ -24,6 +24,7 @@
 #include "core/vmem.h"
 #include "cpu/expert_pool.h"
 #include "deepseek/ds_model.h"
+#include "deepseek/ds_spark.h"
 #include "deepseek/ds_ops.h"
 #include "engine/engine.h"
 #include "engine/engine_api.h"
@@ -63,7 +64,12 @@ public:
     std::string model_name() const override { return model_.gguf.get_str("general.name", "bnk"); }
     const Config & cfg() const override { return model_.cfg; }
     int res_dim() const override { return model_.ds.hc_dim(); }
-    Drafter * mtp() override { return lookup_drafter_.get(); }
+    // the DSpark drafter when loaded (--mtp FILE; it lives on the stage with the head and the target layers), else
+    // the lookup-only drafter
+    Drafter * mtp() override {
+        for (const DsEngine * s = this; s; s = s->next_.get()) if (s->spark_) return s->spark_.get();
+        return lookup_drafter_.get();
+    }
     int max_ctx() const override { return opt_.max_ctx; }
     int cpu_threads() const override { return cpu_->threads(); }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
@@ -156,6 +162,9 @@ private:
     void save_counts_here();
 
     std::unique_ptr<LookupOnlyDrafter> lookup_drafter_;   // BNK_DS_LOOKUP=0 turns the lookup drafts off
+    std::unique_ptr<DsSpark> spark_;     // docs/DSPARK.md; on the last stage
+    DevBuf<float> tgt_;                  // its view of the window rows at the target layers: [kMaxWindow][n_targets * E]
+    std::vector<int> tgt_index_;         // per layer: which target it is, -1 none
     DsModel model_;
     ExpertStore own_store_;
     ExpertStore * store_ = &own_store_;

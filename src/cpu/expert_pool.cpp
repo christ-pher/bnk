@@ -284,10 +284,15 @@ static inline void split(int n, int part, int nparts, int & b, int & e) {
 }
 
 void CpuExpertPool::run(int il, int T, const float * x, const std::vector<ExpertTask> & tasks, float * out) {
+    run(*m_, *st_, il, T, x, tasks, out);
+}
+
+void CpuExpertPool::run(const Model & m, const ExpertStore & st, int il, int T, const float * x, const std::vector<ExpertTask> & tasks,
+                        float * out) {
     std::lock_guard<std::mutex> lk(mu_);
     const double t0 = now_ms();
-    const Config & c = m_->cfg;
-    const LayerWeights & L = m_->layers[il];
+    const Config & c = m.cfg;
+    const LayerWeights & L = m.layers[il];
     const int E = c.n_embd, F = c.n_ff_exp;
     const int nt = (int) tasks.size();
     if (nt == 0) {
@@ -371,7 +376,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             const int r_end = std::min(e, (gi + 1) * 2 * F);
             const std::vector<int> & grp = groups_[gi];
             const int n = (int) grp.size();
-            const uint8_t * blob = st_->blob(il, tasks[grp[0]].expert);
+            const uint8_t * blob = st.blob(il, tasks[grp[0]].expert);
             for (int k = 0; k < n; ++k) ys[k] = xq_.data() + (size_t) tok_slot_[tasks[grp[k]].t] * xrow;
             for (; g < r_end; ++g) {
                 const int r = g - gi * 2 * F;
@@ -426,7 +431,7 @@ void CpuExpertPool::run(int il, int T, const float * x, const std::vector<Expert
             for (int gi = 0; gi < ng; ++gi) {
                 const std::vector<int> & grp = groups_[gi];
                 const int n = (int) grp.size();
-                const uint8_t * w = st_->blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
+                const uint8_t * w = st.blob(il, tasks[grp[0]].expert) + L.gate_bytes + L.up_bytes + (size_t) r * drow;
                 for (int k = 0; k < n; ++k) hs[k] = hq_.data() + grp[k] * hrow;
                 if (dn_multi && n >= dn_min) {
                     mdot(L.down_type, F, w, hs, n, vals);

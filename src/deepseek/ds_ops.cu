@@ -1339,6 +1339,18 @@ void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int 
 __global__ void zero_half_k(half * p, size_t n) {
     for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) p[i] = __float2half(0.f);
 }
+__global__ void hc_mean_k(const float * res, float * out, int64_t ldo, int hc, int E) {
+    const int t = blockIdx.y;
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += gridDim.x * blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < hc; ++s) a += res[((int64_t) t * hc + s) * E + e];
+        out[(int64_t) t * ldo + e] = a / hc;
+    }
+}
+void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s) {
+    hc_mean_k<<<dim3((E + 255) / 256, T), 256, 0, s>>>(res, out, ldo, hc, E);
+}
+
 void ds_zero_half(half * p, size_t n, cudaStream_t s) { zero_half_k<<<(unsigned) std::min<size_t>((n + 255) / 256, 4096), 256, 0, s>>>(p, n); }
 __global__ void ring_read_k(const half * ring, int origin, half * kwin, int p_from, int D) {
     const int p = p_from + blockIdx.x;

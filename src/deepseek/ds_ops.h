@@ -130,6 +130,9 @@ void ds_rows_from_host(const float * src, const int32_t * map, float * dst, int 
 // xc[m][:] = x[tok[m]][:] for m < M (tok: host-mapped): the rows the CPU needs, compact, before their copy out
 void ds_rows_gather(const float * x, const int32_t * tok, float * xc, int M, int E, cudaStream_t s);
 void ds_zero_half(half * p, size_t n, cudaStream_t s);
+// out[t][e] = mean over s of res[t][s*E + e] (row stride ldo): the hyper-connection copies collapsed by averaging, what
+// the DSpark drafter reads at its target layers' attention input
+void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s);
 // kwin[p - origin][:] = ring[p % kDsRing][:] for p in [p_from, p_to): a chunk's window rows before it, out of the ring
 void ds_ring_read(const half * ring, int origin, half * kwin, int p_from, int p_to, int D, cudaStream_t s);
 

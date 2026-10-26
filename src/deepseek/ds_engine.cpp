@@ -180,6 +180,22 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
     for (DsEngine * st = this; st; st = st->next_.get()) st->pull_init();
     cpu_->set_chunks(8);
     if (env_int("BNK_DS_LOOKUP", 1) != 0) lookup_drafter_ = std::make_unique<LookupOnlyDrafter>();
+    if (!opt.mtp.empty() && opt.mtp != "builtin") {   // the DSpark drafter, on the stage that holds the head and the target layers
+        DsEngine * last = this;
+        while (last->next_) last = last->next_.get();
+        DeviceScope dsl(last->dev_);
+        last->spark_ = std::make_unique<DsSpark>();
+        last->spark_->load(opt.mtp, last->model_, *cpu_, (int) seqs_.size(), opt.cpu_threads, last->st_, opt.verbose);
+        const int nt = last->spark_->n_targets();
+        last->tgt_.alloc((size_t) kMaxWindow * nt * c.n_embd);
+        last->tgt_index_.assign(c.n_layer, -1);
+        for (int k = 0; k < nt; ++k) {
+            const int il = last->spark_->target_layers()[k];
+            if (!last->owns(il)) throw std::runtime_error("dspark: target layer " + std::to_string(il) + " is not on the stage with the head");
+            last->tgt_index_[il] = k;
+        }
+        last->spark_->bind(last->tgt_.p, last->rope_win_.p);
+    }
     if (pf_max_ > 0 && next_) {   // two group transfer buffers for the whole pipeline (a group in flight on each side)
         for (int b = 0; b < 2; ++b) {
             CUDA_CHECK(cudaHostAlloc((void **) &pf_xfer_[b], (size_t) pf_group_ * (c.hc * model_.ds.n_embd + model_.ds.hc) * 4,
@@ -460,6 +476,7 @@ void DsEngine::select_here(int slot) {
     if (slot < 0 || slot >= (int) seqs_.size()) throw std::runtime_error("select: no such slot");
     join_commit_here();
     use(seqs_[slot].get());
+    if (spark_) spark_->select(slot);
     if (!cur_->used) { cur_->used = true; reset_here(); }
 }
 
@@ -508,6 +525,7 @@ void DsEngine::reset_here() {
     each_state([&](float * d, size_t n) { CUDA_CHECK(cudaMemsetAsync(d, 0, n * 4, st_)); });
     CUDA_CHECK(cudaStreamSynchronize(st_));
     if (cur_->ctx_mapped > kCtxBaseline) map_ctx(std::min(opt_.max_ctx, kCtxBaseline));
+    if (spark_) spark_->restart(0);
 }
 
 void DsEngine::checkpoint() {
@@ -561,6 +579,7 @@ int DsEngine::rollback_here(int max_pos) {
     best->age = ++ckpt_age_;
     for (auto & k : cur_->ckpts)
         if (k.pos > best->pos) k.pos = -1;
+    if (spark_) spark_->restart(best->pos);
     return best->pos;
 }
 
@@ -861,6 +880,8 @@ void DsEngine::layer_forward(int il, int T) {
     const DsLayer & L = model_.layers[il];
     const int E = c.n_embd;
     if (c.engram_index(il) >= 0) engram(il, T);
+    if (!tgt_index_.empty() && tgt_index_[il] >= 0)   // the DSpark drafter reads this layer's attention input
+        ds_hc_mean(res_.p, tgt_.p + (size_t) tgt_index_[il] * E, (int64_t) spark_->n_targets() * E, T, c.hc, E, st_);
     // the attention's mixes (its pre-mix is for the FFN; the attention collapses with the previous sublayer's)
     ds_hc_mixes(res_, F(L.hc_attn_fn), F(L.hc_attn_scale), F(L.hc_attn_base), attn_pre_, post_, comb_, T, c.hc, E, c.eps, c.hc_eps,
                 c.sinkhorn, st_, mix_scratch_.p);
