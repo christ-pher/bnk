@@ -21,6 +21,11 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-10-26, v0.6.0: the DeepSeek expert cache follows the routing** (`docs/DEEPSEEK-NEXT.md`): adaptive exchange
+  of resident experts (the leaving one gets a host copy in a spare blob first; every 4 forwards, 8 in flight a GPU),
+  a capped routing-counts file, a teacher-forced verify-window bench (`BNK_ORACLE`). Misses on an essay 79% -> 29%
+  within 500 tokens (19.3 -> 29.7 tok/s), on code 52% -> 20% (24.5 -> 32-36 tok/s); quality unchanged. A verified
+  window row now costs 0.13-0.19 of a plain round (0.43 static): the DSpark draft head is the next item.
 * **2026-10-24, v0.5.2: DeepSeek second pass** (`docs/DEEPSEEK-NEXT.md`): the prompt attention on the tensor cores
   (a fused single pass, 40 -> 9.5 ms per 2,048-token layer-chunk), the CPU tasks' rows copied out compact (a 168 MB
   copy per layer had stalled the compute stream 52 ms), decode's launches fused (48 -> 28 a layer), a PCIe lane that

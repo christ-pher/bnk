@@ -243,7 +243,7 @@ merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BN
 ## Commands
 
 ```bash
-cd /opt/engines/bnk               # master holds v0.5.2 (both passes merged); branch work goes in a worktree
+cd /opt/engines/bnk               # master holds v0.6.0 (the adaptive exchange merged); branch work goes in a worktree
 cmake --build build --target bnk test_ds_ops test_ds_gemv test_ds_cpu bench_ds_cpu bench_ds_attn -j 24
 CUDA_VISIBLE_DEVICES=1 ./build/test_ds_ops && CUDA_VISIBLE_DEVICES=1 ./build/test_ds_gemv
 ./run.sh ds-xs --port 8081        # production (master, 8080) must not be running: both GPUs are needed

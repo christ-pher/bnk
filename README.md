@@ -13,7 +13,7 @@ in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s
 
 Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384 experts) through a third engine
 (`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
-tables read from the NVMe, experts split between VRAM and RAM without a copy; ~22 tok/s decode, 650-830 tok/s on long prompts (v0.5.2).
+tables read from the NVMe, experts split between VRAM and RAM without a copy, the resident set following the routing while serving (v0.6.0); 22-36 tok/s decode, 650-830 tok/s on long prompts.
 
 Both read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
 `image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`).
@@ -85,6 +85,25 @@ llama.cpp's fp32 path within ~1% (the int8 activation quantization), same top to
 Decode is weight-bandwidth-bound (each card streams its 13 GB per forward); tensor parallelism lets both cards
 stream at once, with 128 exchanges of the partial sums per forward in between: direct GPU-to-GPU copies (9.4 us
 each) since v0.4.2, 23 us each through host memory before.
+
+### What v0.6.0 changed: the DeepSeek expert cache follows the routing, and what a drafter would buy
+
+The DeepSeek engine's expert placement was fixed at load from the routing counts of everything ever served, mostly the
+coding agent: fresh code missed 52% of its experts, an essay 80%, against 11-27% inside the agent's own long session,
+and every miss is a CPU expert read. The cache now adapts while serving by **exchange** (`ExpertCache::adapt_exchange`,
+`docs/DEEPSEEK.md`): every 4 decode forwards each GPU moves its hottest non-resident experts into the slots of its
+coldest resident ones; because a resident expert has no host copy here, the leaving expert first gets one in a spare
+blob of the host store (a helper thread, from the mapped model file), then the slot is unmapped, refilled and mapped.
+Measured on content the ranking never saw: an essay's misses 79% -> 29% within 500 tokens and 19.3 -> 29.7 tok/s; a
+Python module 52% -> 20% and 24.5 -> 32-36 tok/s; likelihood and KL against the static placement within the engine's
+run-to-run noise. `BNK_DS_ADAPT=0` keeps the old static placement. The routing-counts file is now capped
+(`BNK_COUNTS_CAP`, halved past 2^28 routings) so the next start ranks by the recent workload.
+
+Also: a bench that answers whether speculative decoding pays on a machine like this (`BNK_ORACLE`, `BNK_ORACLE_WS`:
+teacher-forced verify windows of a fixed width, `docs/DEEPSEEK-NEXT.md`). With the static placement a verified row
+cost 0.43 of a plain round, the extra token's CPU expert misses, which is why only prompt-lookup drafts ran; with the
+exchange it costs 0.13-0.19, which makes DeepSeek's own DSpark draft head (3 MoE layers of 128 experts, in the official
+safetensors) worth porting next: modelled x1.35-1.9 on code.
 
 ### What v0.5.2 changed: the DeepSeek prompt path on the tensor cores, decode's launches and a PCIe lane
 

@@ -122,6 +122,10 @@ See the bottom of this file as the work progresses.
   dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
   12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
   windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.
+* 2026-10-26, v0.6.0 (`docs/DEEPSEEK-NEXT.md`): the expert cache adapts while serving by exchange (the leaving expert
+  gets a host copy in a spare blob first), the routing-counts file is capped, and a teacher-forced verify-window bench
+  measured what a drafter's rows cost: 0.43 of a plain round static, 0.13-0.19 with the exchange. Essay decode 19.3 ->
+  29.7 tok/s, code 24.5 -> 32-36; quality unchanged.
 * 2026-10-24, v0.5.2 (`docs/DEEPSEEK-NEXT.md`): the prompt attention runs on the tensor cores (a fused single pass,
   40 -> 9.5 ms per 2,048-token layer-chunk), the CPU tasks' rows go out compact (a 168 MB device-to-host copy per layer
   had stalled the compute stream 52 ms), decode's launches are fused (48 -> 28 a layer), and a PCIe lane pulls the next
