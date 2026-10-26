@@ -104,3 +104,38 @@ The levers are residency and overlap, not kernels; none is a 2x.
 * The copy test (`docs/DEEPSEEK-NEXT.md` Commands: `BNK_NLL_T=8 BNK_NLL_SKIP=4096 bnk nll ...`): ppl 1.037, top-1
   99.61% must hold; `BNK_NLL_REF` KL against a dump from before the change under 0.01 mean.
 * End to end: `bnk run` prompts of 256 / 2,048 / 8,192 / 70,000 tokens, then the server with the agent for a session.
+
+## Results (2026-10-26)
+
+**Step 0, measured** (`pbench`: a 16K-token prefix cold, then a follow-up turn with the prefix cached; IQ2_XS, both GPUs,
+the drafter loaded, the served counts): 64 new tokens 2.31 s, 250 4.01 s, 800 5.2-7.6 s, 2,048 6.50 s; cold 2K 6.19 s,
+8K 11.8 s, 16K 18.1-18.6 s. The ceiling bench (`build/bench_expert_gemm`, cuBLAS fp16 batched over 64 experts at the
+150 W cap): 34 TFLOPS at 128-512 tokens an expert (44 at most), 18 at 64, 10 at 32. So `moe_tc_k`'s 22 TFLOPS is half
+of what the card gives these shapes: **track A is worth at most ~1.5x on that term (~15% on long prompts), A1's
+dequantize-then-cuBLAS would lose to its own round trip.** Shelved behind track B.
+
+**The finding: the prefetches, not the CPU constant.** A sweep on the follow-ups: `BNK_CPU_US_PER_EXPERT_TOKEN` 15
+changed nothing (the model already calibrates `pf_cpu_scale_`); the guessed prefetch off took 64 tokens 2.31 -> 0.93 s,
+both prefetches off 0.68 s. A prefetched expert counted as free on the GPU, so a short chunk streamed 9.4 MB experts
+the CPU would have answered faster, on the critical path. Now (`pf_moe`, `prefill_group_here`): the guessed prefetch
+takes only experts with at least `ceil(t_pcie / t_tok) - 1` guessed tokens (the ones the cost model streams anyway;
+`BNK_DS_PF_GUESS_ALL=1` restores all), and the rank-ordered first-layer prefetch runs only for groups of
+`BNK_DS_PF_RANK_MIN` (1,024) tokens or more.
+
+| Prompt | Before | After |
+|---|---|---|
+| 64 new tokens (cached 16K prefix) | 2.31 s | **0.64 s** |
+| 250 new tokens | 4.01 s | **1.52 s** |
+| 800 new tokens | 5.2-7.6 s | **2.94 s** |
+| 2,048 new tokens | 6.50 s | **4.98 s** |
+| Cold 2,048 | 6.19 s | **4.28 s** |
+| Cold 8,192 | 11.8 s | 12.0 s (noise) |
+| Cold 16,000 | 18.1-18.6 s | 18.5-19.0 s (noise) |
+
+Quality: teacher-forced NLL after a 3,000-token prefill, KL to master 0.0037 mean against 0.0036 for master against
+itself. Thresholds swept: `BNK_DS_PF_RANK_MIN` 4,096 = 1,024 within noise, never (100,000) costs the 2K follow-up 1.6
+s; the guessed prefetch off is 2-3% slower at 2K-8K than the selective one. Decode windows for a 64-token suffix
+(`BNK_PREFILL_MIN=128`): 1.52 s, slower; the crossover stays at 24.
+
+**Next on this branch**: B.2 (stage 2 streams its layers' hot experts while stage 1 computes; the 2K cases are still
+PCIe-bound at 4-5 s), the Engram gather overlap on long prompts (~8% at 8K), then A2's occupancy work (<= 15%).
