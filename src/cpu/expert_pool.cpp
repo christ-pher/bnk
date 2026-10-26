@@ -99,7 +99,21 @@ void ExpertStore::layout(const Model & m) {
     total_ = 0;
 }
 
-void ExpertStore::build(const Model & m, int threads, bool verbose, const std::vector<char> * skip) {
+int ExpertStore::take_blob(int il) {
+    if (free_.empty() || free_[il].empty()) return -1;
+    const int b = free_[il].back();
+    free_[il].pop_back();
+    return b;
+}
+
+void ExpertStore::release(int il, int e) {
+    const int b = index_[il][e];
+    if (b < 0) return;
+    index_[il][e] = -1;
+    free_[il].push_back(b);
+}
+
+void ExpertStore::build(const Model & m, int threads, bool verbose, const std::vector<char> * skip, int spare) {
     const Config & c = m.cfg;
     layer_off_.resize(c.n_layer);
     blob_.resize(c.n_layer);
@@ -107,6 +121,7 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
     // with a skip list the arena holds only the experts not skipped (those resident in VRAM without a host copy:
     // docs/DEEPSEEK.md); index_[il][e] is the expert's blob number in its layer, -1 when skipped
     index_.assign(c.n_layer, {});
+    free_.assign(c.n_layer, {});
     int kept = 0;
     for (int il = 0; il < c.n_layer; ++il) {
         const LayerWeights & L = m.layers[il];
@@ -117,7 +132,8 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
         for (int e = 0; e < c.n_expert; ++e)
             if (!skip || !(*skip)[(size_t) il * c.n_expert + e]) index_[il][e] = n++;
         kept += n;
-        total_ += blob_[il] * n;
+        for (int i = 0; i < spare; ++i) free_[il].push_back(n + i);   // the spare blobs, after the kept experts
+        total_ += blob_[il] * (n + spare);
         max_blob_ = std::max(max_blob_, blob_[il]);
     }
     n_kept_ = kept;
@@ -158,7 +174,8 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
     pinned_ = cudaHostRegister(base_, total_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
     if (!pinned_) cudaGetLastError();
     if (verbose)
-        fprintf(stderr, "bnk: experts: %d in RAM, %.2f GiB (copied in %.1f s, %.2f GiB/s), %s\n", n_kept_, total_ / 1073741824.0,
+        fprintf(stderr, "bnk: experts: %d in RAM, %.2f GiB%s (copied in %.1f s, %.2f GiB/s), %s\n", n_kept_, total_ / 1073741824.0,
+                spare ? (" with " + std::to_string(spare) + " spare blobs a layer").c_str() : "",
                 (t1 - t0) / 1000, total_ / 1073741824.0 / ((t1 - t0) / 1000),
                 pinned_ ? "page-locked for DMA" : "NOT page-locked (DMA falls back to staging)");
 }

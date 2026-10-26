@@ -162,7 +162,18 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
         for (int il = st->l0_; il < st->l1_; ++il)
             for (int e : st->cache_.slot_experts(il)) { skip[(size_t) il * c.n_expert + e] = 1; ++resident; }
     }
-    store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip);
+    // the adaptive exchange: resident experts follow the routing while serving (docs/DEEPSEEK.md); the store keeps
+    // spare blobs for the experts on their way out of VRAM
+    const int adapt_every = env_int("BNK_DS_ADAPT", opt.adapt_every), adapt_swaps = env_int("BNK_DS_ADAPT_SWAPS", std::min(opt.adapt_swaps, 8));
+    const int spare = adapt_every > 0 && adapt_swaps > 0 ? 2 : 0;
+    for (DsEngine * st = this; st; st = st->next_.get()) {
+        st->adapt_every_ = spare ? adapt_every : 0;
+        st->adapt_swaps_ = spare ? adapt_swaps : 0;
+    }
+    store_->build(model_.ev, std::min(opt.cpu_threads, 16), opt.verbose, &skip, spare);
+    if (opt.verbose && spare)
+        fprintf(stderr, "bnk: expert cache: adaptive exchange every %d forwards, up to %d in flight a stage (BNK_DS_ADAPT=0 off)\n",
+                adapt_every, adapt_swaps);
     // pinned one worker a physical core (the container on all 48 CPUs: decode 19-20 -> 21.8 tok/s, the CPU experts
     // 30-33 -> 26.5 ms a token); BNK_CPU_PIN=0 leaves the placement to the scheduler
     cpu_->init(model_.ev, *store_, opt.cpu_threads, true);
@@ -580,9 +591,7 @@ void DsEngine::save_counts_here() {
     std::vector<uint32_t> delta(now.size());
     for (size_t i = 0; i < now.size(); ++i) delta[i] = now[i] - saved_counts_[i];
     saved_counts_ = now;
-    auto old = load_counts(opt_.counts_out, c.n_layer, c.n_expert);
-    if (old.size() == delta.size())
-        for (size_t i = 0; i < delta.size(); ++i) delta[i] += old[i];
+    merge_counts(delta, load_counts(opt_.counts_out, c.n_layer, c.n_expert));
     bnk::save_counts(opt_.counts_out, delta, c.n_layer, c.n_expert);
 }
 
@@ -1100,6 +1109,8 @@ void DsEngine::fwd_end() {
         cudaGetLastError();
     }
     for (const Win & w : wins_) w.q->pending_T = w.commit ? 0 : w.T;
+    // the adaptive exchange, between forwards (the CPU pool and the prompt path are idle here)
+    if (adapt_every_ > 0 && !pull_P_ && ++fwd_count_ % adapt_every_ == 0) cache_.adapt_exchange(counts_.p, st_, adapt_swaps_, *store_);
     if (pull_P_) {
         uint32_t v[3];
         CUDA_CHECK(cudaMemcpy(v, pull_stats_.p, sizeof(v), cudaMemcpyDeviceToHost));
@@ -1121,6 +1132,10 @@ void DsEngine::pull_init() {
     pull_P_ = env_int("BNK_DS_PULL", 0);
     if (pull_P_ <= 0 || l1_ - l0_ < 2) { pull_P_ = 0; return; }
     if (pull_P_ > 8) pull_P_ = 8;
+    if (pull_P_ > 0 && adapt_every_ > 0) {   // the lane's host pointer table would go stale
+        if (opt_.verbose) fprintf(stderr, "bnk: the PCIe lane is on: the adaptive exchange is off\n");
+        for (DsEngine * st = head_; st; st = st->next_.get()) st->adapt_every_ = 0;
+    }
     if (!store_->pinned()) {
         if (opt_.verbose) fprintf(stderr, "bnk: GPU %d: PCIe lane off (the experts' host memory is not page-locked)\n", dev_);
         pull_P_ = 0;

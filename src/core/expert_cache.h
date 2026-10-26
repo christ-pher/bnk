@@ -1,7 +1,13 @@
 // The VRAM tier of the routed experts: per-layer slot regions holding the most-used experts' blobs.
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,6 +28,9 @@ bool save_counts(const std::string & path, const std::vector<uint32_t> & counts,
 // `rank` restricted to layers [l0, l1) and completed with every missing pair (the order plan()/init() fill in)
 Ranking complete_ranking_public(const Ranking & rank, int n_layer, int n_expert, int l0, int l1);
 std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_expert);
+// delta += old, then halved (all of it) while the total exceeds the cap (BNK_COUNTS_CAP routings, default 2^28): the
+// file ranks by a sliding window of the recent workload rather than everything ever served
+void merge_counts(std::vector<uint32_t> & delta, const std::vector<uint32_t> & old);
 
 class ExpertCache {
 public:
@@ -69,6 +78,15 @@ public:
     // plans new swaps from routing counts (device [n_layer][n_expert], cumulative) and starts their
     // copies on a side stream. Returns the number of swaps started.
     int adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps);
+    // The adaptive tier for a disjoint placement (a resident expert has no host copy, docs/DEEPSEEK.md): the hottest
+    // non-resident expert of a layer takes the slot of its coldest resident one, which first gets a host copy in one
+    // of the store's spare blobs (a helper thread writes it from the mapped model file). Between forwards on the
+    // compute stream: (1) maps the copies that finished and releases the host blobs of the experts now resident,
+    // (2) for exchanges whose host copy is written, unmaps the leaving expert and starts the incoming one's copy,
+    // (3) plans new exchanges from the routing counts. Every expert is resident or in the store at every moment,
+    // and often both for a moment. Returns the exchanges started. Needs the store built with spare blobs.
+    int adapt_exchange(const uint32_t * counts_dev, cudaStream_t s, int max_swaps, ExpertStore & store);
+    int exchanges_pending() const { return (int) xs_.size(); }
     int64_t swaps_done = 0;
     const std::vector<int> & slot_experts(int il) const { return slot_expert_[il]; }
     int slot_of(int il, int e) const { return slot_of_host_[(size_t) il * n_expert_ + e]; }
@@ -111,6 +129,27 @@ private:
     int stage_n_ = 0;
     void fill(int il, const std::vector<int> & slots, const std::vector<int> & experts, cudaStream_t s);
     std::vector<char> busy_;   // [n_layer * n_expert]: expert involved in an in-flight swap
+    // shared by adapt() and adapt_exchange(): the copy stream and staging, the decayed routing scores, the plan
+    void adapt_init(int max_swaps);
+    void update_scores(const uint32_t * counts_dev, cudaStream_t s);
+    struct Cand { float gain; int il, slot, in; };
+    std::vector<Cand> plan_swaps() const;   // per layer at most one: the hottest non-resident vs the coldest resident
+    // the exchange: a leaving expert's host copy (the helper thread), then the GPU copy of the incoming one
+    struct Exchange {
+        int il, slot, in, out, blob, stage;
+        std::atomic<int> host_done{0};
+        bool gpu_started = false;
+        cudaEvent_t done = nullptr;
+    };
+    std::vector<std::unique_ptr<Exchange>> xs_;
+    std::vector<int> stage_free_;          // swap_stage_ slots not in use
+    std::thread copier_;
+    std::mutex hq_mu_;
+    std::condition_variable hq_cv_;
+    std::deque<Exchange *> hq_;
+    bool hq_stop_ = false;
+    ExpertStore * xstore_ = nullptr;
+    void copier_main();
 };
 
 }  // namespace bnk

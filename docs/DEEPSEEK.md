@@ -15,7 +15,7 @@ the two 98 GB Engram tables stay on disk and the routed experts are split betwee
 | Context | a sliding window of 128 raw latents per layer, plus (38 of 40 layers) compressed latents shared from the nearest source layer (2, 8, 14, 20; ratio 2 pools pairs with a learned softmax gate, ratio 1 is a projection), each query keeping the 512 scored best by an indexer at 8 layers (candidate blocks of 8 at layer 20 prefilter later ones to 2,048 blocks); YaRN x16 on the compressed path | QSA: top-k blocks of 4 cells |
 | MoE | 384 experts, top-6 of sqrt(softplus(logits)) + bias, renormalized, x1.5; one shared expert; SwiGLU with up clamped to [-10, 10] and gate to <= 10 | 512, top-10 softmax, shared expert with its own gate |
 | Engram | n-gram hash tables at layers 1 and 14: 24 rows of 256 per token (2-, 3-, 4-grams x 8 heads over a case/space-folded token map), a 6,144 -> 25,600 projection into a key per stream and one value, a signed-sqrt sigmoid gate on the key/stream dot | PLE: one layer, 16 rows, conv |
-| Drafter | DSpark: 3 MoE layers of 128 experts (top-3), block of 5 drafts, Markov and confidence heads, in the official safetensors (no GGUF) - not ported: a verified row costs 0.43-0.48 of a plain round here (DEEPSEEK-NEXT.md, 2026-10-26); prompt-lookup drafts only | MTP layer |
+| Drafter | DSpark: 3 MoE layers of 128 experts (top-3), block of 5 drafts, Markov and confidence heads, in the official safetensors (no GGUF) - not ported yet: a verified row cost 0.43-0.48 of a plain round with the static placement, 0.13-0.19 with the adaptive exchange (DEEPSEEK-NEXT.md, 2026-10-26); prompt-lookup drafts only | MTP layer |
 | Vocabulary | 129,280, GPT-2 BPE with the `joyai-llm` pre-tokenizer; chat template in the GGUF (`<think>`, DSML tool calls) | 248,320 |
 
 The GGUF (ISTA's variant of llama.cpp PR 30817's layout): routed experts as `blk.N.ffn_{gate,up,down}_exps.weight`
@@ -34,8 +34,14 @@ architecture `deepseek41-engram`, `blk.{1,14}.engram_embd.weight` IQ4_NL [256 x 
 * **Routed experts** (the model file less ~6 GB): *disjoint placement*. The ranking (routing counts from earlier
   runs, else uniform) and each GPU's free VRAM decide which experts are resident in the VRAM cache; only the
   others are copied into the pinned host arena (`ExpertStore::build` with a skip list; `ExpertCache` fills
-  resident experts straight from the file). The cache is static (no adaptive swaps: a swapped-in expert would
-  have no host copy). Misses run on the CPU pool as in the Qwen engine. Budget: ~48 GB of VRAM + ~180 GB of RAM,
+  resident experts straight from the file). While serving, the cache follows the routing by *exchange*
+  (`ExpertCache::adapt_exchange`, every `BNK_DS_ADAPT` = 4 decode forwards, up to `BNK_DS_ADAPT_SWAPS` = 8 in flight a
+  GPU, `BNK_DS_ADAPT=0` static): a layer's hottest non-resident expert takes the slot of its coldest resident one,
+  which first gets a host copy in one of the store's two spare blobs a layer (a helper thread writes it from the
+  mapped model file), then the slot is unmapped, refilled from the incoming expert's host blob and mapped, and the
+  incoming expert's blob returns to the store as the spare. Every expert is resident or in the store at every moment.
+  The routing-counts file that ranks the next start is capped (`BNK_COUNTS_CAP`, 2^28 routings; halved past it),
+  so it reflects the recent workload rather than everything ever served. Misses run on the CPU pool as in the Qwen engine. Budget: ~48 GB of VRAM + ~180 GB of RAM,
   so a model file of up to ~210 GB fits (the "largest quant that fits" rule: IQ3_XXS if its total is at or
   under that, else IQ2_XS).
 * **KV**: a ring of 136 (window 128 + the window's rows) latents of 512 fp16 per layer; compressed latents (512)

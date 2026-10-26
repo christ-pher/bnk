@@ -19,7 +19,9 @@ public:
     ~ExpertStore();
     // skip (optional, [n_layer * n_expert]): experts that get no host copy (they are resident in VRAM instead);
     // blob() returns nullptr for them
-    void build(const Model & m, int threads, bool verbose = true, const std::vector<char> * skip = nullptr);
+    // spare: unassigned blobs per layer, numbered after the kept experts, for the adaptive exchange
+    // (ExpertCache::adapt_exchange moves an expert leaving VRAM into one, then points the expert at it)
+    void build(const Model & m, int threads, bool verbose = true, const std::vector<char> * skip = nullptr, int spare = 0);
     // the blob sizes alone (no arena, blob() returns nullptr): what the VRAM cache needs to plan and fill from the file
     void layout(const Model & m);
     const uint8_t * blob(int il, int e) const {
@@ -34,6 +36,12 @@ public:
     bool pinned() const { return pinned_; }
     uint8_t * base() const { return base_; }
     size_t layer_offset(int il) const { return layer_off_[il]; }
+    // the exchange's bookkeeping (one thread at a time, never while the pool or a prefill reads the layer)
+    int take_blob(int il);                 // a free blob number of layer il, -1 when none
+    uint8_t * blob_mut(int il, int b) { return base_ + layer_off_[il] + (size_t) b * blob_[il]; }
+    void assign(int il, int e, int b) { index_[il][e] = b; }   // expert e now has the host copy in blob b
+    void release(int il, int e);           // expert e's blob back to the free list: no host copy afterwards
+    int spare(int il) const { return free_.empty() ? 0 : (int) free_[il].size(); }
 
 private:
     uint8_t * base_ = nullptr;
@@ -42,6 +50,7 @@ private:
     bool pinned_ = false;
     std::vector<size_t> layer_off_, blob_;
     std::vector<std::vector<int>> index_;
+    std::vector<std::vector<int>> free_;   // per layer: blob numbers no expert owns
 };
 
 // the CPU experts' SwiGLU clamp (DeepSeek-V4: up to [-limit, limit], gate to <= limit), 0 = none

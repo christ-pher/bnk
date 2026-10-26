@@ -34,9 +34,9 @@ namespace bnk {
 
 // A drafter with no drafts of its own: the generator drafts only when it has a drafter, and with this one its
 // prompt-lookup proposals (what followed the sequence's last tokens earlier: copied text, code, tool scaffolding)
-// become the drafts. DSpark, the model's own draft head (3 MoE layers of 128 experts), is not ported: a verified
-// window row costs 0.43-0.48 of a plain round here, the CPU expert reads of the extra token (docs/DEEPSEEK-NEXT.md,
-// 2026-10-26; Strata measured the same where most experts live outside VRAM).
+// become the drafts. DSpark, the model's own draft head (3 MoE layers of 128 experts), is not ported yet: a verified
+// window row cost 0.43-0.48 of a plain round with the static placement (the CPU expert reads of the extra token),
+// 0.13-0.19 with the adaptive exchange, which makes the port worth it (docs/DEEPSEEK-NEXT.md, 2026-10-26).
 class LookupOnlyDrafter : public Drafter {
 public:
     int run(const float *, const int32_t *, int, int, bool, float * prob) override { if (prob) *prob = 0.f; return -1; }
@@ -104,7 +104,7 @@ public:
     void logits_rows_host(int T, float * out, int row0 = 0) override;
     void topk_rows_host(int row0, int T, int K, int32_t * ids, float * vals, double * z = nullptr, float temp = 1.f) override;
 
-    int64_t cache_swaps() const override { return 0; }
+    int64_t cache_swaps() const override { return cache_.swaps_done + (next_ ? next_->cache_swaps() : 0); }
     int cache_slots(int il) const override;
     int cache_resident() const override { return cache_.resident() + (next_ ? next_->cache_resident() : 0); }
     size_t cache_bytes() const override { return cache_.bytes() + (next_ ? next_->cache_bytes() : 0); }
@@ -284,6 +284,10 @@ private:
     DevBuf<int8_t> hq_buf_;
     DevBuf<uint32_t> counts_;
     std::vector<uint32_t> saved_counts_;
+    // the adaptive exchange (ExpertCache::adapt_exchange): every adapt_every_ decode forwards, up to adapt_swaps_
+    // exchanges in flight per stage; BNK_DS_ADAPT=N sets the interval (0 off), BNK_DS_ADAPT_SWAPS the count
+    int adapt_every_ = 0, adapt_swaps_ = 0;
+    int64_t fwd_count_ = 0;
     uint8_t * mail_ = nullptr;
     size_t mail_stride_ = 0;
     MoeMsg * msg(int il) const { return (MoeMsg *) (mail_ + (size_t) il * mail_stride_); }

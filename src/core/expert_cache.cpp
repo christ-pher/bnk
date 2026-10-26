@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 
@@ -41,6 +42,19 @@ Ranking ranking_from_counts(const std::vector<uint32_t> & counts, int n_layer, i
     Ranking r;
     for (int i : idx) r.emplace_back(i / n_expert, i % n_expert);
     return r;
+}
+
+void merge_counts(std::vector<uint32_t> & delta, const std::vector<uint32_t> & old) {
+    if (old.size() == delta.size())
+        for (size_t i = 0; i < delta.size(); ++i) delta[i] += old[i];
+    static const uint64_t cap = getenv("BNK_COUNTS_CAP") ? strtoull(getenv("BNK_COUNTS_CAP"), nullptr, 10) : (1ull << 28);
+    if (!cap) return;
+    for (;;) {
+        uint64_t total = 0;
+        for (uint32_t v : delta) total += v;
+        if (total <= cap) break;
+        for (auto & v : delta) v >>= 1;
+    }
 }
 
 bool save_counts(const std::string & path, const std::vector<uint32_t> & counts, int n_layer, int n_expert) {
@@ -116,6 +130,16 @@ void ExpertCache::fill_blobs(const std::vector<uint8_t *> & dst, const std::vect
 }
 
 ExpertCache::~ExpertCache() {
+    if (copier_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(hq_mu_);
+            hq_stop_ = true;
+        }
+        hq_cv_.notify_all();
+        copier_.join();
+    }
+    if (copy_) cudaStreamSynchronize(copy_);
+    for (auto & x : xs_) if (x->done) cudaEventDestroy(x->done);
     if (swap_stage_) cudaFree(swap_stage_);
     if (swap_ptrs_) cudaFree(swap_ptrs_);
     if (stage_) cudaFree(stage_);
@@ -158,26 +182,28 @@ void ExpertCache::finish_pending(cudaStream_t s, bool wait) {
     }
 }
 
-int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps) {
+void ExpertCache::adapt_init(int max_swaps) {
+    if (copy_) return;
     const size_t NN = (size_t) n_layer_ * n_expert_;
-    if (!copy_) {
-        CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
-        // the staging for swaps in flight is allocated outside the VRAM budget: with little free memory take
-        // fewer of them rather than fail (64 did not fit next to three conversations' context)
-        swap_n_ = std::max(max_swaps, 1);
-        while (cudaMalloc(&swap_stage_, stage_bytes_ * swap_n_) != cudaSuccess) {
-            cudaGetLastError();
-            if (swap_n_ == 1) throw std::runtime_error("expert cache: no VRAM for swap staging");
-            swap_n_ = std::max(1, swap_n_ / 2);
-        }
-        CUDA_CHECK(cudaMalloc(&swap_ptrs_, sizeof(uint8_t *) * swap_n_));
-        last_counts_.assign(NN, 0);
-        score_.assign(NN, 0.f);
-        busy_.assign(NN, 0);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
+    // the staging for swaps in flight is allocated outside the VRAM budget: with little free memory take
+    // fewer of them rather than fail (64 did not fit next to three conversations' context)
+    swap_n_ = std::max(max_swaps, 1);
+    while (cudaMalloc(&swap_stage_, stage_bytes_ * swap_n_) != cudaSuccess) {
+        cudaGetLastError();
+        if (swap_n_ == 1) throw std::runtime_error("expert cache: no VRAM for swap staging");
+        swap_n_ = std::max(1, swap_n_ / 2);
     }
-    // 1. map the experts whose copies finished
-    finish_pending(s, false);
-    // 2. decayed routing frequency
+    CUDA_CHECK(cudaMalloc(&swap_ptrs_, sizeof(uint8_t *) * swap_n_));
+    for (int i = swap_n_ - 1; i >= 0; --i) stage_free_.push_back(i);
+    last_counts_.assign(NN, 0);
+    score_.assign(NN, 0.f);
+    busy_.assign(NN, 0);
+}
+
+// decayed routing frequency: what the cache follows
+void ExpertCache::update_scores(const uint32_t * counts_dev, cudaStream_t s) {
+    const size_t NN = (size_t) n_layer_ * n_expert_;
     std::vector<uint32_t> now(NN);
     CUDA_CHECK(cudaMemcpyAsync(now.data(), counts_dev, NN * 4, cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
@@ -186,9 +212,10 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         score_[i] = score_[i] * 0.97f + (float) d;
     }
     last_counts_.swap(now);
-    if (max_swaps <= 0 || !pending_.empty()) return 0;
-    // 3. per layer: the hottest non-resident vs the coldest resident (an empty slot first)
-    struct Cand { float gain; int il, slot, in; };
+}
+
+// per layer: the hottest non-resident expert vs the coldest resident one (an empty slot first), best gains first
+std::vector<ExpertCache::Cand> ExpertCache::plan_swaps() const {
     std::vector<Cand> cands;
     for (int il = 0; il < n_layer_; ++il) {
         if (slot_expert_[il].empty()) continue;
@@ -214,6 +241,18 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         if (gain > 1.5f || (empty && sc[best] > 0.f)) cands.push_back({gain + (empty ? 1e6f : 0.f), il, worst_slot, best});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) { return a.gain > b.gain; });
+    return cands;
+}
+
+int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swaps) {
+    adapt_init(max_swaps);
+    // 1. map the experts whose copies finished
+    finish_pending(s, false);
+    // 2. decayed routing frequency
+    update_scores(counts_dev, s);
+    if (max_swaps <= 0 || !pending_.empty()) return 0;
+    // 3. per layer: the hottest non-resident vs the coldest resident (an empty slot first)
+    const std::vector<Cand> cands = plan_swaps();
     int started = 0;
     for (const Cand & c : cands) {
         if (started >= max_swaps || started >= swap_n_) break;
@@ -248,6 +287,107 @@ int ExpertCache::adapt(const uint32_t * counts_dev, cudaStream_t s, int max_swap
         busy_[(size_t) c.il * n_expert_ + c.in] = 1;
         ++started;
     }
+    return started;
+}
+
+// the helper thread: a leaving expert's three matrices from the mapped model file into its spare blob
+void ExpertCache::copier_main() {
+    for (;;) {
+        Exchange * x;
+        {
+            std::unique_lock<std::mutex> lk(hq_mu_);
+            hq_cv_.wait(lk, [&] { return hq_stop_ || !hq_.empty(); });
+            if (hq_stop_ && hq_.empty()) return;
+            x = hq_.front();
+            hq_.pop_front();
+        }
+        const LayerWeights & L = m_->layers[x->il];
+        uint8_t * dst = xstore_->blob_mut(x->il, x->blob);
+        memcpy(dst, L.gate_src + (size_t) x->out * L.gate_bytes, L.gate_bytes);
+        memcpy(dst + L.gate_bytes, L.up_src + (size_t) x->out * L.up_bytes, L.up_bytes);
+        memcpy(dst + L.gate_bytes + L.up_bytes, L.down_src + (size_t) x->out * L.down_bytes, L.down_bytes);
+        x->host_done.store(1, std::memory_order_release);
+    }
+}
+
+int ExpertCache::adapt_exchange(const uint32_t * counts_dev, cudaStream_t s, int max_swaps, ExpertStore & store) {
+    adapt_init(max_swaps);
+    xstore_ = &store;
+    if (!copier_.joinable()) copier_ = std::thread([this] { copier_main(); });
+    // 1. exchanges whose GPU copy finished: the incoming expert is mapped, its host blob goes back to the store
+    for (size_t i = 0; i < xs_.size();) {
+        Exchange & x = *xs_[i];
+        if (!x.gpu_started || cudaEventQuery(x.done) != cudaSuccess) { ++i; continue; }
+        int32_t sl = x.slot;
+        CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) x.il * n_expert_ + x.in, &sl, 4, cudaMemcpyHostToDevice, s));
+        slot_of_host_[(size_t) x.il * n_expert_ + x.in] = x.slot;
+        store.release(x.il, x.in);
+        busy_[(size_t) x.il * n_expert_ + x.in] = 0;
+        if (x.out >= 0) busy_[(size_t) x.il * n_expert_ + x.out] = 0;
+        else { ++resident_; ++resident_l_[x.il]; }
+        stage_free_.push_back(x.stage);
+        cudaEventDestroy(x.done);
+        xs_[i] = std::move(xs_.back());
+        xs_.pop_back();
+        ++swaps_done;
+    }
+    // 2. exchanges whose leaving expert has its host copy: unmap it, start the incoming expert's copy into the slot
+    for (auto & xp : xs_) {
+        Exchange & x = *xp;
+        if (x.gpu_started || !x.host_done.load(std::memory_order_acquire) || stage_free_.empty()) continue;
+        if (x.out >= 0) {
+            store.assign(x.il, x.out, x.blob);   // from here the CPU pool can serve it
+            int32_t minus1 = -1;
+            CUDA_CHECK(cudaMemcpyAsync(slot_of_dev_ + (size_t) x.il * n_expert_ + x.out, &minus1, 4, cudaMemcpyHostToDevice, s));
+            slot_of_host_[(size_t) x.il * n_expert_ + x.out] = -1;
+        }
+        cudaEvent_t unmapped;
+        CUDA_CHECK(cudaEventCreateWithFlags(&unmapped, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(unmapped, s));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_, unmapped, 0));
+        cudaEventDestroy(unmapped);
+        x.stage = stage_free_.back();
+        stage_free_.pop_back();
+        const Config & cf = m_->cfg;
+        const LayerWeights & L = m_->layers[x.il];
+        const size_t bb = store.blob_bytes(x.il);
+        uint8_t * stg = swap_stage_ + (size_t) x.stage * stage_bytes_;
+        const uint8_t * src = store.blob(x.il, x.in);
+        if (!src) throw std::runtime_error("expert cache: the incoming expert has no host copy");
+        CUDA_CHECK(cudaMemcpyAsync(stg, src, bb, cudaMemcpyHostToDevice, copy_));
+        uint8_t * dst = layer_base_[x.il] + (size_t) x.slot * sb_[x.il];
+        CUDA_CHECK(cudaMemcpyAsync(swap_ptrs_ + x.stage, &dst, sizeof(uint8_t *), cudaMemcpyHostToDevice, copy_));
+        moe_repack_blobs(stg, bb, swap_ptrs_ + x.stage, 1, cf.n_ff_exp, cf.n_embd, L.gate_type,
+                         ggml_row_size((ggml_type) L.gate_type, cf.n_embd), L.down_type,
+                         ggml_row_size((ggml_type) L.down_type, cf.n_ff_exp), copy_);
+        CUDA_CHECK(cudaEventCreateWithFlags(&x.done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(x.done, copy_));
+        slot_expert_[x.il][x.slot] = x.in;
+        x.gpu_started = true;
+    }
+    // 3. new exchanges from the routing counts, each with a spare host blob for its leaving expert
+    update_scores(counts_dev, s);
+    if (max_swaps <= 0) return 0;
+    int started = 0;
+    for (const Cand & c : plan_swaps()) {
+        if ((int) xs_.size() >= max_swaps || (int) xs_.size() >= swap_n_) break;
+        const int out = slot_expert_[c.il][c.slot];
+        int blob = -1;
+        if (out >= 0 && (blob = store.take_blob(c.il)) < 0) continue;   // no spare blob in this layer right now
+        auto x = std::make_unique<Exchange>();
+        x->il = c.il; x->slot = c.slot; x->in = c.in; x->out = out; x->blob = blob; x->stage = -1;
+        busy_[(size_t) c.il * n_expert_ + c.in] = 1;
+        if (out >= 0) {
+            busy_[(size_t) c.il * n_expert_ + out] = 1;
+            std::lock_guard<std::mutex> lk(hq_mu_);
+            hq_.push_back(x.get());
+        } else {
+            x->host_done.store(1);   // an empty slot: nothing leaves
+        }
+        xs_.push_back(std::move(x));
+        ++started;
+    }
+    if (started) hq_cv_.notify_all();
     return started;
 }
 

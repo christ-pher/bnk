@@ -257,6 +257,7 @@ int main(int argc, char ** argv) {
         printf("nll %.5f per token over %lld tokens (windows of %d), ppl %.4f, top-1 %.2f%%\n", nll / n, (long long) n, T,
                std::exp(nll / n), 100.0 * top1 / n);
         if (fwd_n) printf("forward of %d rows: %.2f ms (with the logits copy), over %lld windows\n", T, fwd_ms / fwd_n, (long long) fwd_n);
+        printf("expert misses %.2f%%, %lld cache swaps\n", 100.0 * eng.times.misses / std::max<int64_t>(1, eng.times.routed), (long long) eng.cache_swaps());
         if (dump) fclose(dump);
         if (reff) {
             fclose(reff);
@@ -673,10 +674,23 @@ int main(int argc, char ** argv) {
     static const bool prof = getenv("BNK_PROFILE_DECODE") != nullptr;
     if (prof) cudaProfilerStart();
     const double t2 = now_ms();
+    // BNK_MISS_TRACE=N: every N tokens, that stretch's expert miss rate, speed and cache swaps (the adaptive tier at work)
+    static const int trace_every = env_int("BNK_MISS_TRACE", 0);
+    int64_t tr_miss = eng.times.misses, tr_routed = eng.times.routed, tr_swaps = eng.cache_swaps();
+    double tr_t = now_ms();
+    size_t tr_n = out.size();
     while ((int) out.size() < max_new && out.back() != c.eos_token) {
         for (int t : gen.next_lookahead()) {
             out.push_back(t);
             if (t == c.eos_token) break;
+        }
+        if (trace_every > 0 && out.size() - tr_n >= (size_t) trace_every) {
+            const double now = now_ms();
+            printf("trace: tokens %5zu-%5zu: misses %.1f%%, %.1f tok/s, %lld swaps\n", tr_n, out.size(),
+                   100.0 * (eng.times.misses - tr_miss) / std::max<int64_t>(1, eng.times.routed - tr_routed),
+                   (out.size() - tr_n) / ((now - tr_t) / 1000), (long long) (eng.cache_swaps() - tr_swaps));
+            fflush(stdout);
+            tr_miss = eng.times.misses; tr_routed = eng.times.routed; tr_swaps = eng.cache_swaps(); tr_t = now; tr_n = out.size();
         }
     }
     const double t3 = now_ms();

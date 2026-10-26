@@ -140,10 +140,11 @@ per W plus how often the argmax agreed with the forced rows).
   experts in RAM through the CPU pool (54 expert reads a draft forward, ~12 ms) a = 0.8 gives x1.15 on code, a = 0.9
   x1.36, a = 0.7 x1.02; with them resident (3.9 GB = ~1,100 backbone experts evicted: by the counts file the production
   miss rate goes 20.7% -> 27.9%, CPU work x1.35) x1.06 / x1.22 / x0.95. Prose: the same within 2%.
-* **Verdict: not now.** A port of the head (its GGUF conversion, 3 MoE layers with mHC and a 128-token window, the noise
-  block, the Markov head, rejection sampling of 5 drafts) buys 10-20% on code at an optimistic acceptance and nothing
-  on prose. Everything on the next-steps list that cuts the CPU expert cost per row raises the drafter's value
-  proportionally, so re-run the sweep after those land; the bench stays (`BNK_ORACLE*`, inert otherwise).
+* **Verdict at the time: not now.** A port of the head (its GGUF conversion, 3 MoE layers with mHC and a 128-token
+  window, the noise block, the Markov head, rejection sampling of 5 drafts) would buy 10-20% on code at an optimistic
+  acceptance and nothing on prose, with the placement static. Everything that cuts the CPU expert cost per row raises
+  the drafter's value proportionally; the adaptive exchange (next section) did exactly that the same day and the
+  sweep re-run there puts the drafter at x1.35-1.9. The bench stays (`BNK_ORACLE*`, inert otherwise).
 * **Side findings.** (1) The expert ranking is content-bound: fresh code misses 52% of its experts and an essay 80%
   against 11-27% inside the long agent session that wrote the counts; the plain round is 41 ms on code, 52 ms on prose.
   Routing counts from a mix of workloads would serve prose better. (2) Greedy does not reproduce across window
@@ -151,6 +152,61 @@ per W plus how often the argmax agreed with the forced rows).
   disagreement per window: 99.5% / 98% / 97.5% / 92.6% of rows agreed at W = 2 / 3 / 5 / 8 on code, 96 / 97 / 94 /
   89% on prose), the kernels' accumulation order. Harmless at temperature 1.0; it is why the first, non-forced version
   of this bench diverged from its reference within a few tokens.
+
+## The adaptive expert exchange (2026-10-26, branch `adaptive-experts`)
+
+The verify-window sweep above exposed the real lever: the expert placement was static and ranked by the routing
+counts of everything ever served (mostly the coding agent), so fresh code missed 52% of its experts and an essay 80%,
+against 11-27% inside the agent's own session. The Qwen engine's adaptive cache could not be used as it was: its
+swap unmaps the leaving expert at once, and here a resident expert has no host copy. `ExpertCache::adapt_exchange`
+(expert_cache.cpp) does it as an exchange: the leaving expert first gets a host copy in one of the store's two spare
+blobs a layer (`ExpertStore::take_blob` / `assign` / `release`; a helper thread writes it from the mapped model
+file), then the slot is unmapped, refilled from the incoming expert's host blob on the copy stream and mapped, and the
+incoming expert's blob becomes the spare. Between forwards only (`DsEngine::fwd_end`, every `BNK_DS_ADAPT` = 4
+forwards, up to `BNK_DS_ADAPT_SWAPS` = 8 in flight a stage; off with the PCIe lane, whose host pointer table would go
+stale), so the CPU pool and the prompt path never see a half-moved expert; the prompt path's load-time prefetch list
+skips experts that became resident. The routing-counts file is capped (`merge_counts`, `BNK_COUNTS_CAP` = 2^28
+routings, halved past it) so the next start ranks by the recent workload. `tests/test_expert_counts.cpp` covers the
+merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BNK_MISS_TRACE=100`):
+
+| | exchange off | exchange on |
+|---|---|---|
+| Essay, misses by 100-token stretch | 79, 79, 79, 79, 79, 77% | 66, 48, 42, 34, 31, 29% |
+| Essay, tok/s by stretch | 19.1-19.4 throughout | 21.6, 25.2, 26.6, 28.3, 29.5, 29.7 |
+| Python module, misses by stretch | 52% flat (the sweep's W = 1 runs) | 48, 36, 33, 28, 26, 24, 22, 20, 20, 20, 22% |
+| Python module, tok/s by stretch | 24.5 | 24.7, 28.6, 29.3, 30.5, 30.8, 31.0, 32.9, 32.4, 35.9, 32.2, 32.4 |
+| Exchanges a 100 tokens | 0 | 105-154 (both stages), i.e. ~1.2 GB/s of blobs each way at the start |
+| Teacher-forced NLL of 4,000 tokens of docs (windows of 5) | 2.2459, ppl 9.449, top-1 50.66% | 2.2438, ppl 9.429, top-1 50.56%; misses 46.1% -> 27.4% over the pass, 1,176 exchanges |
+| KL from the exchange-off pass (top-64 log-probs a row) | a second exchange-off pass: mean 0.0059, max 7.8, same top-1 97.12%; 2 rows over 1 (the run-to-run noise: CPU and GPU accumulate differently) | mean 0.0091, max 8.6, same top-1 96.57%; 3 rows over 1 |
+
+* **Steady state is 20-30% misses on content the ranking never saw**, reached within 500 tokens, for +50% decode speed
+  on prose (19.3 -> 29.7 tok/s) and +30-45% on code (24.5 -> 32-36). The counts file was the agent's; a mixed file
+  will start closer. Long sessions pay nothing extra: an exchange is a 10 MB host memcpy on the helper thread and a
+  10 MB PCIe copy plus a repack on the side stream.
+* **Quality is unchanged**: the NLL matches within noise and the KL to the static placement is the kernels' CPU/GPU
+  placement noise (the control row: 0.0059 between two identical static passes against 0.0091 with the experts moving between the devices). A wrong blob would have shown as a jump in NLL.
+* **Spare blobs**: 2 a layer, 80 blobs, ~0.8 GB of pinned RAM. With one exchange a layer in flight at a time (the
+  planner proposes at most one per layer per step) one spare would do; the second lets the next one start while the
+  first's blob is still being read.
+
+* **The verify-window sweep again, exchange on** (the same code prompt, the five W runs in one process, so the cache
+  keeps adapting through them: misses 37% -> 23 -> 18 -> 16 -> 14%):
+
+  | rows per window | ms/round | tok/s | CPU experts ms | misses/forward |
+  |---|---|---|---|---|
+  | 1 | 36.2 | 27.6 | 18.4 | 89 |
+  | 2 | 40.8 | 48.9 | 20.9 | 110 |
+  | 3 | 49.4 | 60.4 | 24.2 | 132 |
+  | 5 | 87.5 (an outlier run) | 56.4 | 33.0 | 188 |
+  | 8 | 84.2 | 93.1 | 44.9 | 269 |
+
+  **A verified row now costs 5-7 ms, 0.13-0.19 of a plain round** (17-18 ms and 0.43 before): the misses per forward
+  no longer scale with W because the window's tokens hit the same resident experts. That reopens the drafter question
+  the section above closed. Re-modelled (`tools/ds_spec_scenarios.py 36.2 6.5 0.5`, DSpark's experts in RAM, 12 ms
+  a draft forward): acceptance 0.7 gives x1.35, 0.8 x1.65, 0.85 x1.86 at windows of 4-6; break-even at W = 3 is
+  a >= 0.45 with that drafter cost. The sweep's replay of one text four times over is a best case for the cache, but
+  the traced fresh-code run sat at 20% misses from token 600 on, close to this. **DSpark is worth porting once the
+  exchange is in production**, after a week of real sessions says where the steady-state miss rate lands.
 
 ## Next steps, in order
 

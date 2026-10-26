@@ -748,6 +748,7 @@ expert cache starts warm after the first session.
 | `BNK_MODELS`, `BNK_MTP` | a models folder (instead of the Hugging Face cache) and the MTP layer (`setup.sh` and `models.sh` save them to `bnk.env`) |
 | `BNK_API_KEY` | require this key from API clients |
 | `BNK_CPU_PIN=1`, `BNK_CPU_CHUNKS=3` | pin the CPU expert workers to cores / split their work dynamically (no measurable gain on this machine, so off by default) |
+| `BNK_DS_ADAPT=4`, `BNK_DS_ADAPT_SWAPS=8` | DeepSeek: the adaptive expert exchange, every N decode forwards up to M exchanges in flight a GPU (`0` keeps the placement from the start static); `BNK_COUNTS_CAP=268435456` caps the routing-counts file (halved past it, so the ranking follows the recent workload) |
 
 **Per-model configs** - `configs/<name>.json`:
 

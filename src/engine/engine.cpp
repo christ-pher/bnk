@@ -822,9 +822,7 @@ void Engine::save_counts_here() {
     std::vector<uint32_t> delta(now.size());
     for (size_t i = 0; i < now.size(); ++i) delta[i] = now[i] - saved_counts_[i];
     saved_counts_ = now;
-    auto old = load_counts(opt_.counts_out, c.n_layer, c.n_expert);
-    if (old.size() == delta.size())
-        for (size_t i = 0; i < delta.size(); ++i) delta[i] += old[i];
+    merge_counts(delta, load_counts(opt_.counts_out, c.n_layer, c.n_expert));
     bnk::save_counts(opt_.counts_out, delta, c.n_layer, c.n_expert);
 }
 

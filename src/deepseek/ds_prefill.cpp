@@ -360,18 +360,22 @@ void DsEngine::pf_prefetch(int il, const std::vector<int> & r, int nbuf) {
     if (il < l0_ || il >= l1_ || r.empty() || nbuf <= 0) return;
     const size_t blob = store_->blob_bytes(il);
     const size_t cap = blob ? p.stage_bytes / blob : 0;
+    // the ranked list was made at load: an expert the adaptive exchange has since made resident has no host copy
+    std::vector<int> rr;
+    for (int e : r) if (store_->blob(il, e)) rr.push_back(e);
+    const std::vector<int> & r2 = rr.size() == r.size() ? r : rr;
     size_t at = 0;
-    for (int w = 0; w < nbuf && at < r.size(); ++w) {
-        const size_t n = std::min(cap, r.size() - at);
+    for (int w = 0; w < nbuf && at < r2.size(); ++w) {
+        const size_t n = std::min(cap, r2.size() - at);
         if (!n) break;
         const int b = p.toggle;
         p.toggle ^= 1;
         CUDA_CHECK(cudaStreamWaitEvent(p.copy, p.used[b], 0));
         for (size_t i = 0; i < n; ++i)
-            CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + i * blob, store_->blob(il, r[at + i]), blob, cudaMemcpyHostToDevice, p.copy));
+            CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + i * blob, store_->blob(il, r2[at + i]), blob, cudaMemcpyHostToDevice, p.copy));
         CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
         for (size_t i = 0; i < n; ++i) {
-            p.pre_list.push_back(r[at + i]);
+            p.pre_list.push_back(r2[at + i]);
             p.pre_bufs.push_back((char) b);
             p.pre_pos.push_back((int) i);
         }
