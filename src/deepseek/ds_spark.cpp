@@ -67,6 +67,8 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
     if (const char * v = getenv("BNK_DS_SPARK_ROW_MS")) row_ms_ = (float) atof(v);
     if (const char * dp = getenv("BNK_DS_SPARK_DUMP")) { dump_prefix_ = dp; dumps_left_ = env_int("BNK_DS_SPARK_DUMP_N", 3); }
 
+    const double t_load0 = now_ms();
+    if (verbose) fprintf(stderr, "bnk: DSpark drafter: loading %s (%d stages, blocks of %d)\n", path.c_str(), c_.n_layer, block_);
     main_proj_ = upload("fc.weight");
     main_norm_ = upload("enc.output_norm.weight");
     out_norm_ = upload("output_norm.weight");
@@ -127,6 +129,7 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
         W.gate_bytes = g.nbytes / n; W.up_bytes = u.nbytes / n; W.down_bytes = d.nbytes / n;
         W.gate_src = g.data; W.up_src = u.data; W.down_src = d.data;
     }
+    if (verbose) fprintf(stderr, "bnk: DSpark drafter: dense weights uploaded (%.2f GiB) in %.1f s; copying the experts into RAM\n", vram_bytes_ / 1073741824.0, (now_ms() - t_load0) / 1000);
     store_.build(ev_, std::min(threads, 16), verbose);
     // the per-slot rings and the blocks
     slots_.resize(std::max(1, slots));

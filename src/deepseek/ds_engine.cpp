@@ -952,7 +952,18 @@ void DsEngine::service_cpu(uint32_t seq, int T) {
     for (int il = l0_; il < l1_; ++il) {
         MoeMsg * m = msg(il);
         const double t0 = now_ms();
-        while (__atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE) != seq) __builtin_ia32_pause();
+        // the mailbox wait with a watchdog: a GPU that never posts (a fault, a stream waiting on an event never recorded)
+        // used to spin here forever; after 20 s the state is reported, after 60 s the forward fails
+        for (uint64_t spins = 0; __atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE) != seq; ++spins) {
+            __builtin_ia32_pause();
+            if ((spins & 0xfffff) == 0 && now_ms() - t0 > 20000) {
+                const cudaError_t q = cudaStreamQuery(st_), last = cudaGetLastError();
+                fprintf(stderr, "bnk: layers %d-%d: layer %d's CPU mailbox has not been posted for %.0f s (seq %u, mailbox %u; stream %s, last error %s)\n",
+                        l0_, l1_ - 1, il, (now_ms() - t0) / 1000, seq, (unsigned) __atomic_load_n(&m->seq_req, __ATOMIC_ACQUIRE),
+                        cudaGetErrorString(q), cudaGetErrorString(last));
+                if (now_ms() - t0 > 60000) throw std::runtime_error("the GPU forward stalled: layer " + std::to_string(il) + "'s mailbox never arrived");
+            }
+        }
         const double t1 = now_ms();
         const int n = m->n_miss;
         {
