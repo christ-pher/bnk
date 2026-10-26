@@ -3,6 +3,8 @@
 #include "core/util.h"
 
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <cstring>
 
@@ -106,6 +108,16 @@ void Generator::lookup_drafts(int32_t bonus) {
     lookup_.clear();
     lookup_ctx_ = 0;
     probing_ = getenv("BNK_LA_PROBE") != nullptr;
+    if (!oracle_.empty()) {   // the bench: the reference sequence's next tokens, while the sequence follows it
+        const auto & h = eng_.history();
+        const size_t n = h.size() + 1;   // the sequence with the bonus token
+        if (n <= oracle_.size() && oracle_[n - 1] == bonus && (n < 2 || oracle_[n - 2] == h.back())) {
+            const size_t L = std::min<size_t>(std::min(eng_.max_window(), oracle_w_) - 1, oracle_.size() - n);
+            lookup_.assign(oracle_.begin() + n, oracle_.begin() + n + L);
+            lookup_ctx_ = 1 << 20;   // over any drafter's opinion
+        }
+        return;
+    }
     if (opt_.lookup_n <= 0 || opt_.lookup_max <= 0) return;
     const auto & h = eng_.history();
     seq_.assign(h.begin(), h.end());
@@ -177,6 +189,15 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     static const char * en = getenv("BNK_LOOKUP_N"), * em = getenv("BNK_LOOKUP_MAX"), * ea = getenv("BNK_LOOKUP_AGREE");
     if (en || em || ea)   // experiments: the lookup's parameters for every request
         set_lookup(en ? atoi(en) : opt_.lookup_n, em ? atoi(em) : opt_.lookup_max, ea ? atoi(ea) : opt_.lookup_agree);
+    if (const char * of = getenv("BNK_ORACLE"); of && !getenv("BNK_ORACLE_OFF") && oracle_.empty()) {
+        std::ifstream in(of);
+        std::string txt((std::istreambuf_iterator<char>(in)), {});
+        for (char & ch : txt) if (ch == ',') ch = ' ';
+        std::istringstream is(txt);
+        for (long x; is >> x;) oracle_.push_back((int32_t) x);
+        oracle_w_ = std::max(2, getenv("BNK_ORACLE_W") ? atoi(getenv("BNK_ORACLE_W")) : 2);
+        fprintf(stderr, "bnk: oracle drafts from %s (%zu tokens), windows of %d rows\n", of, oracle_.size(), oracle_w_);
+    }
     use_slot();
     sp_ = sp;
     if (mtp_) mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
@@ -308,6 +329,14 @@ int Generator::verify_window(int T, int r0, int32_t * bonus_out) {
         eng_.argmax_all(T, argmax_buf_.data(), r0);
         while (a < T - 1 && argmax_buf_[a] == win[a + 1]) ++a;
         bonus = argmax_buf_[a];
+        if (!oracle_.empty() && (size_t) eng_.pos() < oracle_.size()) {
+            // the bench keeps the reference's tokens whatever the model's argmax says (teacher forcing): every
+            // round verifies a full window of the reference text; how often the argmax agreed is counted
+            stats.oracle_rows += T;
+            stats.oracle_agreed += a + (argmax_buf_[a] == oracle_[eng_.pos()] ? 1 : 0);
+            a = T - 1;
+            bonus = oracle_[eng_.pos()];
+        }
         stats.verify_ms += now_ms() - t0;
     } else {
         stats.verify_ms += now_ms() - t0;

@@ -34,6 +34,7 @@ struct GenStats {
     int64_t host_rows = 0;     // rows sampled from the whole vocabulary on the host after the GPU candidates fell short
     // per draft source: rounds whose drafts came from the lookup / the MTP drafter, their drafts and accepted ones
     int64_t lookup_rounds = 0, lookup_drafted = 0, lookup_accepted = 0;
+    int64_t oracle_rows = 0, oracle_agreed = 0;   // the oracle bench: window rows forced, and those the argmax agreed with
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
     // lookahead probe (BNK_LA_PROBE=1): rounds with drafts, and those where every draft was accepted and the
     // bonus token equalled the drafter's next chained token (a speculative next window would have been right)
@@ -141,6 +142,11 @@ private:
     // the last round's drafts were a lookup's, all accepted: copying; only then may a lookup fill a window wider
     // than kMaxWindow (a 16-row window costs ~1.5x an 8-row one, so a partly wrong long match loses)
     bool lookup_streak_ = false;
+    // BNK_ORACLE=FILE (with BNK_ORACLE_W=W): a verify-cost bench. The file holds a token sequence (the prompt and
+    // the tokens plain greedy decoding produced after it); the drafts are its next W-1 tokens, so every round
+    // verifies a window of exactly W rows of the model's own continuation and (greedy) accepts them all.
+    std::vector<int32_t> oracle_;
+    int oracle_w_ = 0;
     int32_t probe_ = -1;                // the drafter's token after the window's last draft (the probe)
     bool probing_ = false;
     // lookahead

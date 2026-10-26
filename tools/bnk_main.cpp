@@ -648,7 +648,21 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    Generator gen(eng, eng.mtp(), gopt);
+    // BNK_ORACLE_WS="1,3,5,8" (with BNK_ORACLE=FILE): the verify-cost bench. The decode runs once per window size in
+    // one process: W = 1 is plain greedy decoding and writes the prompt plus its output to FILE; each later W verifies
+    // windows of W rows whose drafts are that output (Generator's oracle drafts). Prints one decode report per W.
+    std::vector<int> oracle_ws{0};
+    if (const char * ws = getenv("BNK_ORACLE_WS"); ws && getenv("BNK_ORACLE")) {
+        oracle_ws = int_list(ws);
+        setenv("BNK_ORACLE_OFF", "1", 1);
+    }
+    for (size_t wi = 0; wi < oracle_ws.size(); ++wi) {
+    GenOptions go = gopt;
+    const int oracle_w = oracle_ws[wi];
+    if (oracle_w == 1) { go.max_draft = 0; setenv("BNK_ORACLE_OFF", "1", 1); }
+    else if (oracle_w > 1) { unsetenv("BNK_ORACLE_OFF"); setenv("BNK_ORACLE_W", std::to_string(oracle_w).c_str(), 1); }
+    if (oracle_w) printf("=== oracle window %d\n", oracle_w);
+    Generator gen(eng, eng.mtp(), go);
     const double t0 = now_ms();
     int tok = gen.prefill(prompt);
     gen.set_lookahead(!getenv("BNK_LOOKAHEAD") || atoi(getenv("BNK_LOOKAHEAD")) != 0);
@@ -667,6 +681,13 @@ int main(int argc, char ** argv) {
     }
     const double t3 = now_ms();
     if (prof) cudaProfilerStop();
+    if (oracle_w == 1) {   // the reference for the oracle runs that follow
+        FILE * f = fopen(getenv("BNK_ORACLE"), "w");
+        if (!f) throw std::runtime_error("cannot write the oracle file");
+        for (int32_t t : prompt) fprintf(f, "%d ", t);
+        for (int t : out) fprintf(f, "%d ", t);
+        fclose(f);
+    }
     printf("output:");
     for (int t : out) printf(" %d", t);
     printf("\nprefill %zu tokens in %.1f ms (%.1f tok/s)\n", prompt.size(), t1 - t0, prompt.size() / ((t1 - t0) / 1000));
@@ -678,6 +699,8 @@ int main(int argc, char ** argv) {
            (double) gs.emitted / std::max<int64_t>(1, gs.rounds), (long long) gs.accepted, (long long) gs.drafted,
            (long long) gs.lookup_accepted, (long long) gs.lookup_drafted, (long long) gs.lookup_rounds,
            (long long) gs.mtp_accepted, (long long) gs.mtp_drafted, (long long) gs.mtp_rounds);
+    if (gs.oracle_rows) printf("oracle: %lld window rows forced, the argmax agreed with %lld (%.1f%%)\n", (long long) gs.oracle_rows,
+                               (long long) gs.oracle_agreed, 100.0 * gs.oracle_agreed / gs.oracle_rows);
     if (gs.la_rounds) printf("lookahead: %lld of %lld rounds with a speculative next window confirmed (%.0f%%)\n",
                              (long long) gs.la_hits, (long long) gs.la_rounds, 100.0 * gs.la_hits / gs.la_rounds);
     printf("per round: verify %.2f ms, commit %.2f ms, draft %.2f ms; per forward: CPU experts %.2f ms, n-gram rows %.2f ms, "
@@ -696,5 +719,7 @@ int main(int argc, char ** argv) {
         printf("PCIe lane: %lld experts pulled a layer ahead (%.2f per forward), %lld of them routed (%.1f%%), %lld late\n",
                (long long) tm.pulled, (double) tm.pulled / std::max(1, tm.calls), (long long) tm.pull_used, 100.0 * tm.pull_used / tm.pulled,
                (long long) tm.pull_late);
+    fflush(stdout);
+    }
     return 0;
 }

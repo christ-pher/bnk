@@ -34,8 +34,9 @@ namespace bnk {
 
 // A drafter with no drafts of its own: the generator drafts only when it has a drafter, and with this one its
 // prompt-lookup proposals (what followed the sequence's last tokens earlier: copied text, code, tool scaffolding)
-// become the drafts. DSpark, the model's own draft head, is not ported (its experts would take ~7 GB of VRAM;
-// Strata measured it worthless where most experts live outside VRAM).
+// become the drafts. DSpark, the model's own draft head (3 MoE layers of 128 experts), is not ported: a verified
+// window row costs 0.43-0.48 of a plain round here, the CPU expert reads of the extra token (docs/DEEPSEEK-NEXT.md,
+// 2026-10-26; Strata measured the same where most experts live outside VRAM).
 class LookupOnlyDrafter : public Drafter {
 public:
     int run(const float *, const int32_t *, int, int, bool, float * prob) override { if (prob) *prob = 0.f; return -1; }

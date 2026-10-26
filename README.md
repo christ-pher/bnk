@@ -159,7 +159,8 @@ experts' 31-37 ms are now most of it), 32 tok/s when the output copies earlier t
 * **Tried and dropped** (measured slower): IQ2 CPU kernels decoding 2 or 4 rows at once, SMT threads in the pool, a
   batched-keys fp32 attention for prompts (kept behind `BNK_DS_ATTN_BATCH=1`), prefetching by rank into both buffers
   (streams cold experts a chunk never uses). Not done: DSpark (Strata skips it where most experts live outside VRAM:
-  verify rounds read 3.3x a token's bytes), a tensor-core prompt attention (30 ms per layer-chunk today, the biggest
+  verify rounds read 3.3x a token's bytes; measured here 2026-10-26: a verified row costs 0.43-0.48 of a plain round,
+  `docs/DEEPSEEK-NEXT.md`), a tensor-core prompt attention (30 ms per layer-chunk today, the biggest
   GPU item left), vision.
 * Tools: `bench_ds_cpu` (the pool on real experts), `bench_ds_attn` (the attention kernel on a chunk),
   `BNK_DS_PF_PROF=1` (a per-phase line for every prompt group), `bnk run` prints the n-gram row and mailbox wait times.

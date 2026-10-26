@@ -15,7 +15,7 @@ the two 98 GB Engram tables stay on disk and the routed experts are split betwee
 | Context | a sliding window of 128 raw latents per layer, plus (38 of 40 layers) compressed latents shared from the nearest source layer (2, 8, 14, 20; ratio 2 pools pairs with a learned softmax gate, ratio 1 is a projection), each query keeping the 512 scored best by an indexer at 8 layers (candidate blocks of 8 at layer 20 prefilter later ones to 2,048 blocks); YaRN x16 on the compressed path | QSA: top-k blocks of 4 cells |
 | MoE | 384 experts, top-6 of sqrt(softplus(logits)) + bias, renormalized, x1.5; one shared expert; SwiGLU with up clamped to [-10, 10] and gate to <= 10 | 512, top-10 softmax, shared expert with its own gate |
 | Engram | n-gram hash tables at layers 1 and 14: 24 rows of 256 per token (2-, 3-, 4-grams x 8 heads over a case/space-folded token map), a 6,144 -> 25,600 projection into a key per stream and one value, a signed-sqrt sigmoid gate on the key/stream dot | PLE: one layer, 16 rows, conv |
-| Drafter | DSpark (3 MoE layers, separate GGUF) - not used yet | MTP layer |
+| Drafter | DSpark: 3 MoE layers of 128 experts (top-3), block of 5 drafts, Markov and confidence heads, in the official safetensors (no GGUF) - not ported: a verified row costs 0.43-0.48 of a plain round here (DEEPSEEK-NEXT.md, 2026-10-26); prompt-lookup drafts only | MTP layer |
 | Vocabulary | 129,280, GPT-2 BPE with the `joyai-llm` pre-tokenizer; chat template in the GGUF (`<think>`, DSML tool calls) | 248,320 |
 
 The GGUF (ISTA's variant of llama.cpp PR 30817's layout): routed experts as `blk.N.ffn_{gate,up,down}_exps.weight`

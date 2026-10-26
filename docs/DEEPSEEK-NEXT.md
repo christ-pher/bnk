@@ -47,7 +47,8 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
   3-expert step), Engram rows are read on 8 threads (`BNK_DS_EG_THREADS_DECODE`; a cold table costs ~100 us per row in page
   faults), and prompt-lookup drafting runs through a drafter that never drafts itself (`LookupOnlyDrafter`,
   `BNK_DS_LOOKUP=0` off; copying text: 32 tok/s). DSpark is not ported: Strata skips it where most experts live outside VRAM ("verify rounds read
-  3.3x a token's bytes and gain nothing"), which is our case.
+  3.3x a token's bytes and gain nothing"), which is our case; measured 2026-10-26 below (a verified row costs 0.43-0.48
+  of a plain round here).
 * Tests: `build/test_ds_ops`, `build/test_ds_gemv`, `build/test_ds_cpu MODEL [layer]` (the CPU pool vs a reference),
   `build/bench_ds_cpu MODEL [layer] [experts] [per call]` (pool speed, decode and verify shapes), `build/bench_ds_attn
   [T]` (the attention kernel on a chunk). `BNK_DS_PF_PROF=1` prints a per-phase breakdown of every prompt group.
@@ -101,6 +102,55 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
   by the dependency. The GPU part was attention_k 0.5 ms (8 blocks for one token), hc_mixes 2 x 85 us (one SM reading
   the 2 MB mixer), dense GEMVs 0.2 ms (near HBM bandwidth), ~50 small kernels; the first two are fixed. Profile with
   `nsys ... --cuda-graph-trace=node` (without it the graphs' kernels are invisible).
+
+## Speculative decoding: what a verify window costs here (measured 2026-10-26, branch `oracle-drafts`)
+
+Would a real drafter (DSpark) pay on this machine? The verify window's cost decides it, so it was measured directly
+rather than inferred: `BNK_ORACLE=FILE BNK_ORACLE_WS=1,2,3,5,8 build/bnk run ...` decodes a prompt once plain
+(W = 1, greedy; writes the prompt and its 400 output tokens to FILE), then once per window size with the reference's
+next tokens as the drafts, **teacher-forced**: the window's tokens are kept whatever the argmax says
+(`Generator::oracle_`, `BNK_ORACLE_OFF` guards the reference run), so every round is a full W-row window of the
+model's own text and the per-row cost is read straight off the round time. IQ2_XS, both GPUs, the server's flags, the
+served ranking file (a copy), one Python module and one essay (`tools/bnk_main.cpp` prints the usual decode report
+per W plus how often the argmax agreed with the forced rows).
+
+| rows per window | code: ms/round, tok/s, CPU experts ms, misses/forward | prose: ms/round, tok/s, CPU experts ms, misses/forward |
+|---|---|---|
+| 1 (plain) | 40.9, 24.5, 24.0, 124 | 51.9, 19.3, 35.2, 191 |
+| 2 | 59.1, 33.8, 41.0, 248 | 76.8, 26.0, 59.0, 381 |
+| 3 | 76.7, 38.9, 54.5, 370 | 100.4, 29.7, 78.6, 570 |
+| 5 | 108.8, 45.4, 82.7, 614 | 147.1, 33.6, 121.3, 943 |
+| 8 | 157.4, 49.8, 124.4, 972 | 211.2, 37.1, 178.8, 1,498 |
+
+* **A verified row costs 17-18 ms on code and 23-25 ms on prose: 0.43-0.48 of a plain round, flat from W = 2 to 8.**
+  The misses per forward scale exactly with W (adjacent tokens share no missed experts), and the CPU expert time
+  accounts for all but ~1 ms of each row: the GPU side of a window amortizes, the host side does not. Strata's "verify
+  rounds read 3.3x a token's bytes and gain nothing" is this. The live fit over the day's 145 agent requests (150K
+  context, 20-27% misses) gave the same slope, 21.8 + 17.9 ms x tokens per round.
+* **Break-even acceptance per draft token** (expected tokens 1 + a + a^2 ... against the plain round), code: W = 2
+  needs a >= 0.45, W = 3 0.56, W = 5 0.68, W = 8 0.77 with a drafter that costs nothing; prose within 0.02 of these.
+* **DSpark as shipped** (DeepSeek-V4.1-Flash-1017's own safetensors, shards 44-46 of 48; there is no GGUF of it, ISTA's
+  repository has none): 3 MoE layers (`mtp.0-2`) of **128 routed experts, top-3**, moe inter 2304 (an expert is the
+  backbone's size, 35.4M parameters), a shared expert, `main_proj` [5120, 15360] from three target layers' hidden
+  states, block size 5 (one forward over anchor + noise tokens drafts 5 positions), a Markov head (rank 256) and a
+  confidence head. 13.6B expert parameters: 3.9 GB at IQ2_XS, 7.6 GB as shipped (fp4); 0.57B dense. The DSpark
+  paper (arXiv 2607.05147) reports accepted lengths of 4.9-5.4 on code with block 7 at temperature 1.0 on Qwen3-4B,
+  and in DeepSeek's production (experts in HBM) budgets of 4-6 drafts and +51% throughput over MTP-1 for V4-Flash.
+* **Modelled here** (`tools/ds_spec_scenarios.py`: drafter cost D per round, cache loss when its experts take VRAM): with the
+  experts in RAM through the CPU pool (54 expert reads a draft forward, ~12 ms) a = 0.8 gives x1.15 on code, a = 0.9
+  x1.36, a = 0.7 x1.02; with them resident (3.9 GB = ~1,100 backbone experts evicted: by the counts file the production
+  miss rate goes 20.7% -> 27.9%, CPU work x1.35) x1.06 / x1.22 / x0.95. Prose: the same within 2%.
+* **Verdict: not now.** A port of the head (its GGUF conversion, 3 MoE layers with mHC and a 128-token window, the noise
+  block, the Markov head, rejection sampling of 5 drafts) buys 10-20% on code at an optimistic acceptance and nothing
+  on prose. Everything on the next-steps list that cuts the CPU expert cost per row raises the drafter's value
+  proportionally, so re-run the sweep after those land; the bench stays (`BNK_ORACLE*`, inert otherwise).
+* **Side findings.** (1) The expert ranking is content-bound: fresh code misses 52% of its experts and an essay 80%
+  against 11-27% inside the long agent session that wrote the counts; the plain round is 41 ms on code, 52 ms on prose.
+  Routing counts from a mix of workloads would serve prose better. (2) Greedy does not reproduce across window
+  shapes: the W-row verify path's argmax differed from the single-row reference's in 0.5-4% of rows (first
+  disagreement per window: 99.5% / 98% / 97.5% / 92.6% of rows agreed at W = 2 / 3 / 5 / 8 on code, 96 / 97 / 94 /
+  89% on prose), the kernels' accumulation order. Harmless at temperature 1.0; it is why the first, non-forced version
+  of this bench diverged from its reference within a few tokens.
 
 ## Next steps, in order
 
