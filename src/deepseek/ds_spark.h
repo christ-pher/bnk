@@ -1,0 +1,102 @@
+// DSpark: DeepSeek-V4.1-Flash's own draft head as the DeepSeek engine's drafter (engine_api.h Drafter). docs/DSPARK.md.
+//
+// Three extra V4.1 blocks (mtp.0-2 of the checkpoint; llama.cpp's DFLASH GGUF layout from tools/dspark_gguf.py:
+// stages blk.0-2, fc = main_proj, enc.output_norm = main_norm, output_norm, markov_w1/w2, conf_proj) draft a block of
+// 5 tokens in one forward: the anchor (the target's last token) and 4 noise tokens, embedded with the target's token
+// table, attend over a ring of the last 128 target positions' latents (kv_norm(wkv(main_norm(main_proj(h)))) where h
+// is the mean over the hyper-connection copies of the target's residual at the attention input of layers 37-39) and
+// over each other, run the stage's MoE (128 routed experts, top-3, the backbone's expert shape, plus the shared one),
+// and go through the target's head; a rank-256 Markov head biases each position's logits by the token chosen before
+// it, and a confidence head scores each position's acceptance. Routed experts live in RAM and run on the CPU expert
+// pool (MXFP4 bit-exact); the dense weights on this GPU.
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <cuda_fp16.h>
+
+#include "core/util.h"
+#include "cpu/expert_pool.h"
+#include "deepseek/ds_model.h"
+#include "engine/engine_api.h"
+#include "kernels/gemv.h"
+
+namespace bnk {
+
+class DsSpark : public Drafter {
+public:
+    static constexpr int kMaxBlock = 8;
+    ~DsSpark();
+    // Loads the drafter GGUF for the target `m` (its config, token table and head; the stage holding the head and the
+    // target layers). Dense weights to the current device; the routed experts into their own pinned host store, run
+    // by `pool` (the engine's CPU expert pool). `slots`: conversation slots, each with its own rings.
+    void load(const std::string & path, DsModel & m, CpuExpertPool & pool, int slots, int threads, cudaStream_t st, bool verbose);
+    bool loaded() const { return loaded_; }
+    int block() const { return block_; }                                  // drafts a forward (5)
+    const std::vector<int> & target_layers() const { return targets_; }   // the backbone layers whose attention input it reads
+    int n_targets() const { return (int) targets_.size(); }
+    size_t vram_bytes() const { return vram_bytes_; }
+    size_t host_bytes() const { return store_.total_bytes(); }
+
+    // the target's rows: `targets` [kMaxWindow][n_targets * E] on this device (the engine's capture of the window's
+    // rows at the target layers' attention input, mean over the hc copies), `rope` the plain rotary table
+    void bind(const float * targets, const float * rope) { targets_dev_ = targets; rope_ = rope; }
+    void select(int slot) { cur_ = slot; }
+    // the ring is valid up to position `pos` (a new or rolled-back conversation in the current slot)
+    void restart(int pos);
+
+    // Drafter: run() feeds the n verified rows' latents into the rings at cells cell0.. and, with `draft`, drafts a
+    // block after the last of them (returns draft 0); step() hands out drafts 1.. of the block (-1 when the block
+    // is spent or the confidence says stop).
+    int run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) override;
+    int step(int32_t tok, int cell, float * prob) override;
+    void run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) override;
+    void step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) override;
+    void set_temperature(float t) override { temperature_ = t; }
+    const std::vector<std::pair<int32_t, float>> * draft_dist(int slot, int i) const override;
+
+private:
+    bool loaded_ = false;
+    DsModel * main_ = nullptr;
+    CpuExpertPool * pool_ = nullptr;
+    GgufModel gguf_;
+    DsConfig c_;                 // the drafter's hyper-parameters (the target's, with its own expert counts)
+    std::vector<DsLayer> stages_;
+    Model ev_;                   // the stages' routed experts as the expert store / CPU pool see them
+    ExpertStore store_;
+    QMat main_proj_, main_norm_, out_norm_, markov_w1_, markov_w2_, conf_proj_;
+    std::vector<int> targets_;
+    int block_ = 0;
+    int32_t noise_id_ = 0;
+    float temperature_ = 0.f;
+    float p_min_ = 0.5f;         // the confidence product under which the block's remaining drafts are dropped
+    size_t vram_bytes_ = 0;
+    const float * targets_dev_ = nullptr;
+    const float * rope_ = nullptr;
+    cudaStream_t st_ = nullptr;
+
+    // per conversation slot: each stage's ring of the target positions' latents, and how far it is valid
+    struct Slot {
+        std::vector<DevBuf<half>> ring;   // [stage][kDsRing][D]
+        int valid_lo = 0, fed = 0;
+    };
+    std::vector<Slot> slots_;
+    int cur_ = 0;
+
+    // the block drafted last (per slot): tokens, their distributions, confidences
+    struct Block {
+        std::vector<int32_t> toks;
+        std::vector<float> conf;
+        std::vector<std::vector<std::pair<int32_t, float>>> dist;
+        int next = 0;
+    };
+    std::vector<Block> blocks_;
+
+    QMat upload(const std::string & name, bool required = true);
+    void feed(const float * targets_rows, int n, int pos0);   // n rows' latents into the rings at pos0..
+    void draft_block(int32_t anchor, int pos);                  // the block after the anchor at position pos
+};
+
+}  // namespace bnk

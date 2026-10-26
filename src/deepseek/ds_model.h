@@ -79,11 +79,13 @@ struct DsModel {
               bool embd = true, bool head = true);
     ~DsModel();
 
+    // a tensor of another GGUF (the DSpark drafter's) to this device by the same rules (BF16 -> F16 / F32, quantized as is)
+    QMat upload_tensor(const TensorRef & t, const std::string & name);
+
 private:
     std::vector<void *> device_allocs_;
     std::vector<void *> host_allocs_;
     QMat upload(const std::string & name, bool required = true);
-    QMat upload_tensor(const TensorRef & t, const std::string & name);
     QMat upload_f32(const std::vector<float> & v, int64_t rows, int64_t cols);
     bool stack(const std::string & na, const std::string & nb, QMat & a, QMat & b, QMat & ab);
     void expert_src(int il);

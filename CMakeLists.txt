@@ -76,6 +76,7 @@ add_library(bnk_core STATIC
   src/deepseek/ds_ops.cu
   src/deepseek/ds_engine.cpp
   src/deepseek/ds_prefill.cpp
+  src/deepseek/ds_spark.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
