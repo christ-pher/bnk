@@ -108,6 +108,14 @@ next to the 99 GB arena (pinned, their own store).
 
 ## Status
 
+* 2026-10-26, night: **serving.** `./run.sh ds-xs` from this branch (the config names the drafter). Through the server
+  at the production sampling (temperature 1.0, top_p 1.0, thinking off), 22 short requests: median 32.9 tok/s, 3.3
+  tokens a round, 74% of the sampled drafts accepted by rejection sampling, 15 ms a draft round (the host-side top-k
+  of each position's full-vocabulary distribution is the extra 3 ms over the greedy runner). A server-only crash on the
+  way turned out to be the adaptive exchange's (v0.6.0: `docs/DEEPSEEK-NEXT.md`, "the exchange's copies and the
+  forward"), fixed here: every forward and prompt group now waits on an event recorded after the exchange's copies.
+  Also found: the batched draft loop (`Generator::draft_batch`, the server's path) pushed a spent block's -1 as a draft.
+
 * 2026-10-26, evening: **the drafter works.** `--mtp ~/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf --draft 5`
   (`configs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS.json` names it). The block matches a NumPy reference of
   `inference/model.py`'s math from the raw checkpoint (`tools/dspark_ref.py --ours` on a `BNK_DS_SPARK_DUMP`): attention

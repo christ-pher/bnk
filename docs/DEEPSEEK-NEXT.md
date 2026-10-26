@@ -185,6 +185,18 @@ merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BN
   10 MB PCIe copy plus a repack on the side stream.
 * **Quality is unchanged**: the NLL matches within noise and the KL to the static placement is the kernels' CPU/GPU
   placement noise (the control row: 0.0059 between two identical static passes against 0.0091 with the experts moving between the devices). A wrong blob would have shown as a jump in NLL.
+* **The exchange's copies and the forward (found 2026-10-26 evening, branch `dspark`, fix to merge).** Through the
+  server the engine died, intermittently, with an illegal memory access on GPU 0 in a forward following an exchange;
+  `bnk run` never showed it, compute-sanitizer never saw it (its serialization hides it), a device synchronize after
+  each forward made it vanish (10 of 10), and so did making the forward's stream wait on an event recorded after the
+  exchange's copies (`ExpertCache::wait_exchanges`, called in `fwd_launch` and `prefill_group_here`; 22 of 22 with the
+  drafter on). The conflicting access is still not identified on paper: the slot under refill is unmapped before the
+  copy and mapped after it, so nothing in the forward should address it; the wait bounds whatever does. v0.6.0 on
+  master has the race (its per-forward cadence triggers it four times less often); merge the fix before serving the
+  exchange for long. Two aids stay: `BNK_DS_SYNC_DEBUG=1|2|3` (a device synchronize after each forward / around the
+  exchange, which names the phase of a fault; never synchronize between a stage's launch and its CPU service, the GPU
+  spins there waiting for the CPU) and a watchdog on the CPU mailbox wait that reports after 20 s and fails the forward
+  after 60 (it used to spin forever).
 * **Spare blobs**: 2 a layer, 80 blobs, ~0.8 GB of pinned RAM. With one exchange a layer in flight at a time (the
   planner proposes at most one per layer per step) one spare would do; the second lets the next one start while the
   first's blob is still being read.

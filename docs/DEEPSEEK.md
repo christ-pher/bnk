@@ -39,7 +39,8 @@ architecture `deepseek41-engram`, `blk.{1,14}.engram_embd.weight` IQ4_NL [256 x 
   GPU, `BNK_DS_ADAPT=0` static): a layer's hottest non-resident expert takes the slot of its coldest resident one,
   which first gets a host copy in one of the store's two spare blobs a layer (a helper thread writes it from the
   mapped model file), then the slot is unmapped, refilled from the incoming expert's host blob and mapped, and the
-  incoming expert's blob returns to the store as the spare. Every expert is resident or in the store at every moment.
+  incoming expert's blob returns to the store as the spare. Every expert is resident or in the store at every moment;
+  every forward waits (on the GPU) for the exchange's copies in flight before it starts.
   The routing-counts file that ranks the next start is capped (`BNK_COUNTS_CAP`, 2^28 routings; halved past it),
   so it reflects the recent workload rather than everything ever served. Misses run on the CPU pool as in the Qwen engine. Budget: ~48 GB of VRAM + ~180 GB of RAM,
   so a model file of up to ~210 GB fits (the "largest quant that fits" rule: IQ3_XXS if its total is at or
