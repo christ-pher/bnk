@@ -301,6 +301,22 @@ void DsEngine::pf_attn(int il, int c_, int N, int pos0) {
     gemm_.run(L.o_b, p.oa, (int64_t) OG * OL, N, p.out, E);
 }
 
+// a skipped row's work at the skip layer (chunk c_ from p.xnc): its compressed KV and index keys, which the layers
+// after it read for every earlier position; nothing of its attention or FFN
+void DsEngine::pf_kv_only(int il, int c_, int N) {
+    const DsConfig & c = model_.ds;
+    const DsLayer & L = model_.layers[il];
+    const int E = c.n_embd, D = c.head_dim, ID = c.idx_dim, R = c.n_rot, ratio = c.ratio[il];
+    auto & p = pf_;
+    const int * d_pos0 = &p.d_par[c_].pos0;
+    f32_to_f16(p.xnc, gemm_.xbuf(), (int64_t) N * E, st_);
+    gemm_.run_h(L.comp_kv, gemm_.xbuf(), E, N, p.ckv, D);
+    if (ratio > 1) gemm_.run_h(L.comp_gate, gemm_.xbuf(), E, N, p.sc, D);
+    ds_compress(p.ckv, ratio > 1 ? p.sc.p : nullptr, cur_->st_kv[il], cur_->st_sc[il], F(L.comp_norm), (const half *) L.idx_k.data,
+                F(L.idx_k_norm), cur_->ckc[il], cur_->ikc[il], N, ratio, D, ID, R, d_pos0, rope_comp_, c.eps, st_);
+    ds_compress_commit(p.ckv, ratio > 1 ? p.sc.p : nullptr, cur_->st_kv[il], cur_->st_sc[il], N, ratio, D, d_pos0, st_);
+}
+
 // the shared expert of chunk c_ from its rows of p.xn into its rows of p.shared
 void DsEngine::pf_shared(int il, int c_, int N) {
     const DsConfig & c = model_.ds;
@@ -402,7 +418,7 @@ void DsEngine::pf_moe(int il, int N) {
     ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids, p.w, st_);
     CUDA_CHECK(cudaMemcpyAsync(p.h_ids, p.ids.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
     static const int guess_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_GUESS", 2)));
-    const bool guess = guess_bufs > 0 && il + 1 < l1_;
+    const bool guess = guess_bufs > 0 && il + 1 < pf_lend_;
     if (guess) {   // the next layer's router on this layer's FFN input: its experts, to prefetch during its attention
         const DsLayer & L2 = model_.layers[il + 1];
         const float one = 1.f, zero = 0.f;
@@ -655,16 +671,50 @@ void DsEngine::pf_head(int N) {
     gemv(model_.output, &act_, nullptr, 0, 1, logits_, c.n_vocab, false, st_);
 }
 
+// ------------------------------------------------------------------------------------------------ the skip
+// A long prompt's skip (docs/PREFILL-SKIP-PLAN.md, Project Maya #318): on V4.1 the layers from the first ratio-1 layer
+// (20) on read the earlier positions only through that layer's compressed KV and index keys, and each looks back one
+// window more than the layer before. So only the prompt's last (n_layer - yl) (window - 1) + window rows (2,668) need
+// those layers for the last row's logits and the rings decode reads to be what the full work gives; the rows before
+// need the layers before yl and yl's compressed KV. -1: no skip (BNK_DS_SKIP=0, another geometry, or a stage after
+// the skip layer's that would need its rows).
+int DsEngine::skip_layer() const {
+    static const bool on = env_int("BNK_DS_SKIP", 1) != 0;
+    const DsConfig & c = model_.ds;
+    if (!on || pf_max_ <= 0) return -1;
+    int yl = -1;
+    for (int il = 0; il < c.n_layer && yl < 0; ++il)
+        if (c.ratio[il] == 1) yl = il;
+    if (yl <= 0 || !c.is_kv_src(yl) || c.cand_src > yl) return -1;
+    for (int il = yl + 1; il < c.n_layer; ++il)
+        if (c.ratio[il] != 1 || c.kv_src[il] != yl) return -1;
+    for (int il : c.engram_layers)
+        if (il >= yl) return -1;
+    const DsEngine * s = head_;
+    while (s && !s->owns(yl)) s = s->next_.get();
+    return s && s->last_ ? yl : -1;
+}
+
+// the rows that go through every layer (BNK_DS_SKIP_KEEP: fewer, at least a window - DeepSeek's own serving replays
+// the last 128, which is not exact)
+int DsEngine::skip_keep() const {
+    const DsConfig & c = model_.ds;
+    const int yl = skip_layer();
+    if (yl < 0) return 0;
+    static const int keep_env = env_int("BNK_DS_SKIP_KEEP", 0);
+    return keep_env > 0 ? std::max(keep_env, c.window) : (c.n_layer - yl) * (c.window - 1) + c.window;
+}
+
 // ------------------------------------------------------------------------------------------------ a group
-void DsEngine::prefill_group(const int32_t * tokens, int N) {
+void DsEngine::prefill_group(const int32_t * tokens, int N, bool skip) {
     const double t0 = now_ms();
-    for (DsEngine * s = this; s; s = s->next_.get()) s->prefill_group_here(tokens, N, 0);
+    for (DsEngine * s = this; s; s = s->next_.get()) s->prefill_group_here(tokens, N, 0, skip);
     last_T = 1;
     std::lock_guard<std::mutex> lk(stats_mu_);
     times.total_ms += now_ms() - t0;
 }
 
-void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
+void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool skip) {
     cache_.wait_exchanges(st_);   // the exchange's copies settle before a prompt group reads the cache
     DeviceScope dsc(dev_);
     join_commit_here();
@@ -681,6 +731,15 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
     ensure_ctx_here(pos0 + N + kMaxWindow);
     ctx_grid_ = cur_->ctx_mapped;
     cur_->history.insert(cur_->history.end(), tokens, tokens + N);
+    // a skipped group: the layers before the skip layer, then its compressed KV only (yl < 0: as usual)
+    const int yl = skip ? skip_layer() : -1;
+    if (skip && yl < 0) throw std::runtime_error("prefill_group: a skipped group without a skip layer");
+    if (yl >= 0 && l0_ > yl) {   // (no stage after the skip layer's: skip_layer() checks)
+        cur_->pending_T = 0;
+        return;
+    }
+    const int lend = yl >= 0 ? std::min(l1_, yl + 1) : l1_;
+    pf_lend_ = yl >= 0 ? yl : l1_;   // (pf_moe's guessed prefetch: no experts of the skip layer)
     // the chunks: pf_max_ rows each, the remainder last
     const int nc = (N + pf_max_ - 1) / pf_max_;
     std::vector<int> csz(nc), coff(nc);
@@ -752,9 +811,24 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
     static const int rank_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_PREFETCH", 1)));
     static const int rank_min = env_int("BNK_DS_PF_RANK_MIN", 1024);
     p.pre_layer = -1;
-    if (!pf_rank_.empty() && N >= rank_min) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
-    for (int il = l0_; il < l1_; ++il) {
+    if (!pf_rank_.empty() && N >= rank_min && l0_ != yl) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
+    for (int il = l0_; il < lend; ++il) {
         const DsLayer & L = model_.layers[il];
+        if (il == yl) {   // the skipped rows' compressed KV and index keys; the window rings of the layers from here
+                          // on hold no positions of them (zeroed: only rows within the cone read those slots)
+            for (int l2 = yl; l2 < l1_; ++l2) CUDA_CHECK(cudaMemsetAsync(cur_->ring[l2].p, 0, cur_->ring[l2].n * sizeof(half), st_));
+            for (int i = 0; i < nc; ++i) {
+                const int n = csz[i];
+                float * res_c = p.res.p + (size_t) coff[i] * HC, * pre_c = pre_ + (size_t) coff[i] * c.hc;
+                ds_hc_mixes(res_c, F(L.hc_attn_fn), F(L.hc_attn_scale), F(L.hc_attn_base), p.attn_pre, p.postc, p.combc, n, c.hc, E,
+                            c.eps, c.hc_eps, c.sinkhorn, st_);
+                ds_hc_pre(res_c, pre_c, p.mixed, n, c.hc, E, st_);
+                rmsnorm_rows(p.mixed, F(L.attn_norm), p.xnc, n, E, E, E, c.eps, st_);
+                pf_kv_only(il, i, n);
+            }
+            g_prof.attn += prof_lap(st_, tl);
+            break;
+        }
         for (int i = 0; i < nc; ++i) {
             const int n = csz[i];
             float * res_c = p.res.p + (size_t) coff[i] * HC, * pre_c = pre_ + (size_t) coff[i] * c.hc;
@@ -785,7 +859,8 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf) {
         g_prof.gather += prof_lap(st_, tl);
     }
     if (eg_th.joinable()) eg_th.join();
-    if (last_) pf_head(N);
+    if (yl >= 0 && owns(yl)) {   // a skipped group ends at the skip layer (its stage is the last): no logits
+    } else if (last_) pf_head(N);
     else {
         CUDA_CHECK(cudaMemcpyAsync(pf_xfer_[buf], p.res.p, (size_t) N * HC * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaMemcpyAsync(pf_xfer_[buf] + (size_t) pf_group_ * HC, pre_, (size_t) N * c.hc * 4, cudaMemcpyDeviceToHost, st_));
@@ -817,14 +892,23 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
         static const bool pipe = !getenv("BNK_PIPE_PROMPT") || atoi(getenv("BNK_PIPE_PROMPT")) != 0;
         const bool pipeline = next_ && pipe;
         if (pipeline && !pf_worker_) pf_worker_ = std::make_unique<Worker>();
+        // a long prompt's skip: the rows before its last skip_keep() go through the layers before the skip layer only
+        // (their own groups: the cut is a group boundary), BNK_DS_SKIP_MIN (2,048) of them at least: the cut costs
+        // stage 0 a group boundary (each streamed expert read once more), so 1,428 skipped rows of a 4K prompt lost 5%
+        // (690 -> 659 tok/s) while 5,524 of an 8K one gained 35%
+        static const int skip_min = std::max(1, env_int("BNK_DS_SKIP_MIN", 2048));
+        const size_t keep = (size_t) skip_keep();
+        const size_t cut = keep > 0 && n >= keep + (size_t) skip_min ? n - keep : 0;
         // groups of even size (a read of a group and a bit would leave a tiny last group to overlap with)
-        const size_t long_part = n >= (size_t) std::max(1, opt_.prefill_min) ? n : 0;
-        size_t group = pf_group_;
-        if (pipeline && long_part > (size_t) pf_group_) {
-            const size_t parts = (long_part + pf_group_ - 1) / pf_group_;
-            group = (long_part + parts - 1) / parts;
-            group = std::min<size_t>(pf_group_, (group + 63) / 64 * 64);
-        }
+        auto group_of = [&](size_t len) {
+            size_t group = pf_group_;
+            if (pipeline && len > (size_t) pf_group_) {
+                const size_t parts = (len + pf_group_ - 1) / pf_group_;
+                group = (len + parts - 1) / parts;
+                group = std::min<size_t>(pf_group_, (group + 63) / 64 * 64);
+            }
+            return group;
+        };
         bool posted = false;
         size_t handed = 0;
         int buf = 0;
@@ -834,28 +918,34 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
             posted = false;
         };
         try {
-            while (n - i >= (size_t) std::max(1, opt_.prefill_min)) {
-                const int N = (int) std::min(group, n - i);
-                const int32_t * tk = tokens.data() + i;
-                if (pipeline) {
-                    const double c0 = now_ms();
-                    prefill_group_here(tk, N, buf);
-                    pf_worker_->wait();   // the previous group is through every stage
-                    if (posted && on_prefill_progress) on_prefill_progress(handed, n);
-                    const int b = buf;
-                    pf_worker_->post([this, tk, N, b, c0]() {
-                        for (DsEngine * s = next_.get(); s; s = s->next_.get()) s->prefill_group_here(tk, N, b);
-                        std::lock_guard<std::mutex> lk(stats_mu_);
-                        times.total_ms += now_ms() - c0;
-                    });
-                    posted = true;
-                    buf ^= 1;
-                } else {
-                    prefill_group(tk, N);
+            // the skipped rows [0, cut) first, then the rest while at least prefill_min of it is left
+            for (const bool skip : {true, false}) {
+                if (skip && !cut) continue;
+                const size_t end = skip ? cut : n, min_left = skip ? 1 : (size_t) std::max(1, opt_.prefill_min);
+                const size_t group = group_of(end - i);
+                while (end - i >= min_left) {
+                    const int N = (int) std::min(group, end - i);
+                    const int32_t * tk = tokens.data() + i;
+                    if (pipeline) {
+                        const double c0 = now_ms();
+                        prefill_group_here(tk, N, buf, skip);
+                        pf_worker_->wait();   // the previous group is through every stage
+                        if (posted && on_prefill_progress) on_prefill_progress(handed, n);
+                        const int b = buf;
+                        pf_worker_->post([this, tk, N, b, c0, skip]() {
+                            for (DsEngine * s = next_.get(); s; s = s->next_.get()) s->prefill_group_here(tk, N, b, skip);
+                            std::lock_guard<std::mutex> lk(stats_mu_);
+                            times.total_ms += now_ms() - c0;
+                        });
+                        posted = true;
+                        buf ^= 1;
+                    } else {
+                        prefill_group(tk, N, skip);
+                    }
+                    i += N;
+                    handed = i;
+                    if (!pipeline && on_prefill_progress) on_prefill_progress(i, n);
                 }
-                i += N;
-                handed = i;
-                if (!pipeline && on_prefill_progress) on_prefill_progress(i, n);
             }
             if (posted) {
                 pf_worker_->wait();

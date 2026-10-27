@@ -313,9 +313,15 @@ private:
     Gemm gemm_;
     int pf_max_ = 0;     // tokens per chunk (the attention buffers)
     int pf_group_ = 0;   // tokens per group (the MoE buffers): pf_max_ * chunks
+    int pf_lend_ = 0;    // the group's layers end here for the experts (the skip layer on a skipped group)
     void prefill_alloc(int N, int G);
-    void prefill_group(const int32_t * tokens, int N);
-    void prefill_group_here(const int32_t * tokens, int N, int buf);
+    void prefill_group(const int32_t * tokens, int N, bool skip = false);
+    // skip: a long prompt's group before its last skip_keep() rows (docs/PREFILL-SKIP-PLAN.md): the layers before
+    // skip_layer() as usual, that layer's compressed KV and index keys only, none after it
+    void prefill_group_here(const int32_t * tokens, int N, int buf, bool skip = false);
+    int skip_layer() const;
+    int skip_keep() const;
+    void pf_kv_only(int il, int c, int N);
     void pf_engram(int il, int c, int N);
     void pf_attn(int il, int c, int N, int pos0);
     void pf_shared(int il, int c, int N);
