@@ -214,6 +214,61 @@ The 2% gap in the mean comes from turns whose text differs (one keep = 128 turn 
 this between two passes over the same prompts: it diverged on 2 of 6, against 4 of 6 for keep = 128 on this small
 sample. **No decode loss found.**
 
+## Later: the split's long-prompt gain without its decode cost (item 2b, not started)
+
+**Goal.** Split 8 read 16K at 1,686 and 70K at 1,563 tok/s (split 20: 1,345 / 1,015). But it made every agent
+follow-up 8-17% slower and every decode round 8-27% more expensive, so split 20 stays. Item 2b keeps split 20 for
+decode and short reads, and lets GPU 1 run layers 8-19 **only for a long prompt's skipped groups**. Those are the
+groups where GPU 1 now idles: ~60 ms each against GPU 0's 5-8 s.
+
+**Why decode stays as it is:** decode, its expert caches, the exchange and the drafter keep split 20's layout and
+code. The new path runs only inside `prefill()` for groups marked skip. Reads too short to skip (the agent's
+250-800-token turns) never touch it.
+
+**Design** (s = 8 first, then 14 for comparison; both are KV-source boundaries):
+1. **Prompt-only weights on GPU 1:** a second copy of layers s..19's dense weights (attention, shared expert,
+   hyper-connection mixers, compressor/indexer, layer 14's Engram projection, routers). That is **~1.6 GiB at s = 8**
+   (layers 0-19 are 2.68 GiB, 0-7 1.09 GiB), taken from GPU 1's expert-cache budget at load: ~170 fewer resident
+   experts of 2,108 (~8%). Measure what that costs decode before anything else; if it's too much, s = 14 needs ~0.8 GiB.
+2. **Per-layer state that decode reads on GPU 0:** for layers s..19 the skipped groups produce compressed KV, index
+   keys, the compressor's open-group state (layers 8 and 14, ratio 2), window rings and the Engram path's nothing
+   (stateless). GPU 1 computes them into its own buffers and copies them to GPU 0 by peer copy (P2P works since
+   iommu=pt, memory p2p-iommu-pt; push, not pull). At 70K that's ~35K compressed rows x (512 + index dim) halves a
+   source layer, ~40 MB: negligible. Rings and the open group must be the state at the group's end, so copy after
+   the last skipped group, before the tail group runs on GPU 0.
+3. **Experts of layers s..19 on GPU 1:** the non-resident ones stream from host RAM over **GPU 1's own link**, so both
+   links work at once. That is the main source of the gain: GPU 0's expert phase was ~2.6 s a group, link-bound. The
+   experts resident on GPU 0 have **no host copy**. Options, measure in this order:
+   a. peer-copy them GPU 0 -> GPU 1 per layer (~116 resident a layer x 9.4 MB ≈ 1.1 GB, ~0.1 s at P2P rates,
+      overlapped with the attention phase like the existing prefetch);
+   b. send the group's rows for those experts to GPU 0 and back (a row exchange each layer: latency, and GPU 0 busy);
+   c. keep host copies of GPU 0's residents for layers s..19 (RAM cost ~13 GB at s = 8; RAM is 192 GB, ~100 used by
+      the expert store).
+4. **Pipeline:** a skipped group runs 0..s-1 on GPU 0, hands the residual stream over at layer s (the existing xfer
+   path, at a different layer), then s..19 plus layer 20's kv-only on GPU 1. GPU 0 takes the next group meanwhile.
+   The tail group (keep = 128 rows) runs on split 20 as now, after the state copy in step 2.
+5. **Engram layer 14** lands on GPU 1 for skipped groups: its row gather runs on GPU 1's stage (the existing per-stage
+   path, verified working in the split sweep).
+
+**Expected:** close to split 8's long-prompt numbers (16K ~1,650, 70K ~1,500), minus the state copies and the
+resident-expert handling; follow-ups and decode unchanged from split 20. Stop if 70K gains less than ~25% over
+1,015.
+
+**Verification:**
+- **Exactness:** copy test and tools/retrieval_test.py, against split 20 with the same keep. GPU 1's copy of layers
+  s..19 must give the same results as GPU 0's; differences can come only from summation order.
+- **Decode and follow-ups:** decode_ab.sh with tools/decode_cmp.py (verify ms per round must match split 20), plus
+  the 250 / 800 follow-ups.
+- **Speed:** cold 8K / 16K / 70K.
+- **Risks:**
+  - the VRAM taken from GPU 1's cache (step 1);
+  - the staging buffers GPU 1 needs for layers s..19's experts;
+  - prefix forks and checkpoints: the state copy must finish before any checkpoint, and checkpoints are only taken
+    between prefill calls, so this is safe as long as step 2 completes inside prefill().
+
+**Effort:** a few days. Steps 1-2 and 4 are plumbing on existing pieces (stage loading, xfer, P2P push); step 3 is
+the open design question.
+
 ## Order
 
 1. Item 1: code (no GPUs) -> GPUs: correctness A/B, then speed.
