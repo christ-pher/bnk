@@ -178,6 +178,25 @@ Decode after them: 29.0 / 32.6 / 31.7 / 38.4 tok/s with keep = 128, 32.7 / 33.7 
 is after the 800-token follow-up, which reads the same way in both runs, so it is the drafter's acceptance varying
 from run to run.
 
+**Item 2, the split sweep (2026-10-27, keep = 128, DSpark; `--split` must sit on a KV source: 8, 14 or 20).**
+
+| | split 20 (default) | split 14 | split 8 |
+|---|---:|---:|---:|
+| cold 8K | 1,293 | 1,271 | 1,308 tok/s |
+| cold 16K | 1,345 | 1,600 | **1,686** |
+| cold 70K | 1,015 | 1,427 | **1,563** |
+| follow-up +250 (cached 16K) | **0.99 s** | 1.10 s | 1.15 s |
+| follow-up +800 | **2.14 s** | 2.30 s | 2.51 s |
+| verify ms per drafting round (same turn) | **108** | 117 | 137 |
+
+Moving the split earlier buys up to +54% at 70K, but every agent follow-up is 8-17% slower and a decode round 8-27%
+dearer. **Split 20 stays.** The long-prompt gain without the decode cost needs the plan's fallback: a prompt-only copy
+of layers s..19's dense weights on GPU 1, used while reading prompts and not for decode. That is a bigger change,
+not started.
+
+On the way, `--split 14 / 8` crashed on long prompts ("router GEMM failed at layer 14"). It was this branch's bug: a
+skipped group's guessed prefetch was bounded by the skip layer, not by the stage. Fixed; master's `--split` was fine.
+
 ## Order
 
 1. Item 1: code (no GPUs) -> GPUs: correctness A/B, then speed.
