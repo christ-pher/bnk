@@ -702,14 +702,16 @@ int DsEngine::skip_layer() const {
     return s && s->last_ ? yl : -1;
 }
 
-// the rows that go through every layer (BNK_DS_SKIP_KEEP: fewer, at least a window - DeepSeek's own serving replays
-// the last 128, which is not exact)
+// the rows that go through every layer: one window by default, as DeepSeek's own serving replays the last 128 (not
+// exact: the windows of layers 21-39 over the rows before the cut are empty; the copy test and the retrieval check of
+// docs/PREFILL-SKIP-PLAN.md found no loss, the retrieval check's answers identical to the full work's 25/25).
+// BNK_DS_SKIP_KEEP=N: N rows (at least a window); 0: the exact cone, (n_layer - yl) (window - 1) + window = 2,668
 int DsEngine::skip_keep() const {
     const DsConfig & c = model_.ds;
     const int yl = skip_layer();
     if (yl < 0) return 0;
-    static const int keep_env = env_int("BNK_DS_SKIP_KEEP", 0);
-    return keep_env > 0 ? std::max(keep_env, c.window) : (c.n_layer - yl) * (c.window - 1) + c.window;
+    static const int keep_env = env_int("BNK_DS_SKIP_KEEP", -1);
+    return keep_env == 0 ? (c.n_layer - yl) * (c.window - 1) + c.window : std::max(keep_env, c.window);
 }
 
 // ------------------------------------------------------------------------------------------------ a group
@@ -746,7 +748,7 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
         return;
     }
     const int lend = yl >= 0 ? std::min(l1_, yl + 1) : l1_;
-    pf_lend_ = yl >= 0 ? yl : l1_;   // (pf_moe's guessed prefetch: no experts of the skip layer)
+    pf_lend_ = yl >= 0 ? std::min(l1_, yl) : l1_;   // (pf_moe's guessed prefetch: none past this stage or into the skip layer)
     // the chunks: pf_max_ rows each, the remainder last
     const int nc = (N + pf_max_ - 1) / pf_max_;
     std::vector<int> csz(nc), coff(nc);
