@@ -143,6 +143,22 @@ skip off 1e-5 / 2e-5 (the copy test doesn't see the difference: its rows attend 
 exact cache). Speed: **4K 1,112, 8K 1,332, 16K 1,350 tok/s**. That is a large gain at 4-16K, but it isn't exact; keep
 it opt-in until a long-range quality check (e.g. retrieval from deep in a long prompt) shows no loss.
 
+**The retrieval check (2026-10-27).** This is the check keep = 128 needs, in the zone it affects. There were 25
+prompts of ~10K tokens of this repo's docs and sources, a different stretch each (nothing cached), served by
+`run.sh ds-xs`. Each holds six access codes ("the access code of orion-45 is 414108") at ~150, 500, 1,000, 1,600 and
+2,300 tokens from the end, plus a control at ~6,000. The question asks for all six; answers are greedy, thinking off.
+Script: tools/retrieval_test.py (gen / run / cmp).
+
+| | right | by distance (each of the six) | answers identical to skip off | s per prompt |
+|---|---|---|---|---:|
+| skip off | 144/150 | 24/25 | (reference) | 13.0 |
+| exact skip | 144/150 | 24/25 | 24/25 | 11.6 |
+| keep = 128 | 144/150 | 24/25 | **25/25** | **9.7** |
+
+The six misses are one prompt in all three configurations: the model answered as if asked to explore the
+repository ("I'll start by reading the files...") instead of listing the codes. keep = 128 lost nothing here: every
+code right at every distance, and every answer identical to the full computation's.
+
 ## Order
 
 1. Item 1: code (no GPUs) -> GPUs: correctness A/B, then speed.

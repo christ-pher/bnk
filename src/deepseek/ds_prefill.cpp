@@ -402,6 +402,13 @@ void DsEngine::pf_prefetch(int il, const std::vector<int> & r, int nbuf) {
     p.pre_layer = il;
 }
 
+// a failed router GEMM: cuBLAS's status and the CUDA error behind it (an earlier kernel's fault surfaces here)
+[[noreturn]] static void router_failed(cublasStatus_t st, int il, int N) {
+    const cudaError_t e = cudaGetLastError();
+    throw std::runtime_error("prefill: router GEMM failed at layer " + std::to_string(il) + ", " + std::to_string(N) + " rows: cuBLAS " +
+                             cublasGetStatusString(st) + ", CUDA " + cudaGetErrorString(e));
+}
+
 void DsEngine::pf_moe(int il, int N) {
     const DsConfig & c = model_.ds;
     const DsLayer & L = model_.layers[il];
@@ -411,9 +418,9 @@ void DsEngine::pf_moe(int il, int N) {
     // routing in fp32 (near ties pick the experts)
     {
         const float one = 1.f, zero = 0.f;
-        if (cublasSgemm(gemm_.handle(), CUBLAS_OP_T, CUBLAS_OP_N, NE, N, E, &one, F(L.router), E, p.xn, E, &zero, p.rlog, NE) !=
-            CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("prefill: router GEMM failed");
+        const cublasStatus_t st = cublasSgemm(gemm_.handle(), CUBLAS_OP_T, CUBLAS_OP_N, NE, N, E, &one, F(L.router), E, p.xn, E, &zero,
+                                              p.rlog, NE);
+        if (st != CUBLAS_STATUS_SUCCESS) router_failed(st, il, N);
     }
     ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids, p.w, st_);
     CUDA_CHECK(cudaMemcpyAsync(p.h_ids, p.ids.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
@@ -422,9 +429,9 @@ void DsEngine::pf_moe(int il, int N) {
     if (guess) {   // the next layer's router on this layer's FFN input: its experts, to prefetch during its attention
         const DsLayer & L2 = model_.layers[il + 1];
         const float one = 1.f, zero = 0.f;
-        if (cublasSgemm(gemm_.handle(), CUBLAS_OP_T, CUBLAS_OP_N, NE, N, E, &one, F(L2.router), E, p.xn, E, &zero, p.rlog, NE) !=
-            CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("prefill: router GEMM failed");
+        const cublasStatus_t st = cublasSgemm(gemm_.handle(), CUBLAS_OP_T, CUBLAS_OP_N, NE, N, E, &one, F(L2.router), E, p.xn, E,
+                                              &zero, p.rlog, NE);
+        if (st != CUBLAS_STATUS_SUCCESS) router_failed(st, il + 1, N);
         ds_route(p.rlog, F(L2.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids2, p.w2, st_);
         CUDA_CHECK(cudaMemcpyAsync(p.h_ids2, p.ids2.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
     }
