@@ -159,6 +159,25 @@ The six misses are one prompt in all three configurations: the model answered as
 repository ("I'll start by reading the files...") instead of listing the codes. keep = 128 lost nothing here: every
 code right at every distance, and every answer identical to the full computation's.
 
+**keep = 128 is the default** (the user's decision after the retrieval check; BNK_DS_SKIP_KEEP=0 restores the exact
+2,668). Mid-size reads, keep = 128 against skip off, with the DSpark drafter (`bnk pbench`, follow-ups after a
+cached 16K prefix, the agent's big tool outputs):
+
+| read | skip off | keep = 128 |
+|---|---:|---:|
+| cold 2.5K | 4.05 s | **2.83 s** |
+| cold 3K | 7.94 s (an outlier) | **2.94 s** |
+| cold 8K | 11.5 s | **6.2 s** |
+| cold 16K (4 runs) | 18.3-18.5 s | **11.8-13.0 s** |
+| follow-up +2.5K | 5.11 s | **3.06 s** |
+| follow-up +3K | 5.88 s | **3.25 s** |
+| follow-up +4K | 7.56 s | **3.97 s** |
+| follow-up +800 (no skip) | 2.10 s | 2.10 s |
+
+Decode after them: 29.0 / 32.6 / 31.7 / 38.4 tok/s with keep = 128, 32.7 / 33.7 / 31.6 / 43.1 off. The largest gap
+is after the 800-token follow-up, which reads the same way in both runs, so it is the drafter's acceptance varying
+from run to run.
+
 ## Order
 
 1. Item 1: code (no GPUs) -> GPUs: correctness A/B, then speed.
