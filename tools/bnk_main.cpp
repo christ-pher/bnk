@@ -621,6 +621,11 @@ int main(int argc, char ** argv) {
                        gs.draft_ms / std::max<int64_t>(1, gs.rounds));
             printf("       expert misses %lld, cache swaps %lld\n", (long long) (eng.times.misses - m0),
                    (long long) (eng.cache_swaps() - sw0));
+            if (getenv("BNK_PB_TOKENS")) {   // the decoded ids, to compare two variants' outputs
+                printf("tokens");
+                for (int t : out) printf(" %d", t);
+                printf("\n");
+            }
             eng.save_counts();   // the routing counts rank the next load's expert placement (--counts)
             fflush(stdout);
             // BNK_PB_DRAFTS="4:0.8,6:0.5": the same turn decoded again with other speculation settings (from the
