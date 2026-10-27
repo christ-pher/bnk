@@ -193,7 +193,7 @@ window plus compressed KV (2:1 or 1:1) shared from four source layers and select
 experts (top 6, sqrt-softplus routing, a clamped SwiGLU) plus a shared one, and Engram: two hashed n-gram tables of
 98 GB each, read 48 rows per token. The files are
 [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-(IQ2_XS 155 GB, `./run.sh ds-xs`; IQ2_XXS 138 GB, `./run.sh ds-xxs`, the build ISTA recommends) with the shared
+(IQ2_XS 155 GB, `./run.sh ds-xs`; ISTA's recommended IQ2_XXS does not load here, docs/DEEPSEEK-NEXT.md) with the shared
 Engram file (110.6 GB, IQ4_NL) beside them.
 
 * **Memory plan.** The Engram tables stay memory-mapped on the NVMe (a token reads 48 rows of 144 bytes). The

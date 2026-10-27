@@ -7,8 +7,8 @@ the PCIe lane for decode's missed experts. The numbers below are from it.
 
 ## Where things stand
 
-* Serves correctly: `./run.sh ds-xs --port 8081` (IQ2_XS, 155 GB) or `./run.sh ds-xxs` (IQ2_XXS, 138 GB). Both
-  backbones and the shared Engram file are in the Hugging Face cache (`tools/models.py resolve ds-xs`).
+* Serves correctly: `./run.sh ds-xs --port 8081` (IQ2_XS, 155 GB). The backbone and the shared Engram file are in
+  the Hugging Face cache (`tools/models.py resolve ds-xs`).
 * Measured on the two V100s (IQ2_XS, 1 slot, ranked placement from the counts file, ~4,650 experts resident):
 
   | | before the pass | after (end to end, both stages) |
@@ -247,7 +247,8 @@ merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BN
 5. **The IQ2_XXS build (ds-xxs) does not load** ("R layout: unsupported format"): 28 of its 40 down and 16 of its 40
    gate/up expert tensors are IQ1_M, which `rfmt.cpp` and the MoE kernels lack. Dropped by decision on 2026-10-25: no
    speed to gain (the pool is decode-bound and an IQ1_M expert decodes slower than an IQ2_XXS one even in Maya's
-   optimized kernel) and lower quality; the 17 GB it saves is RAM, not time.
+   optimized kernel) and lower quality; the 17 GB it saves is RAM, not time. Its config and files were deleted on
+   2026-10-27.
 6. **Loose ends**: the indexer's `weights_proj` scale (1/64) is not applied (ranking-invariant); `--slots 2` untested;
    `forward_pipe` untested; vision not ported; the Qwen engine's prefill may queue its small copies behind the expert
    prefetch too (the copy-engine finding of v0.5.1).
