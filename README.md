@@ -619,6 +619,8 @@ the model's own MTP block as the drafter.
 And GGUFs of the `deepseek41` architecture (DeepSeek-V4.1-Flash) through `src/deepseek/` (`docs/DEEPSEEK.md`):
 ISTA-DASLab's GSQ-RCO builds with their separate Engram file (routed experts in IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS
 mixes, dense weights Q5_K / Q8_0); the llama.cpp PR 30817 layout with the Engram tables as their own GGUF.
+Huihui's abliterated DeepSeek (`ds-xs-abl`, `docs/ABLITERATED.md`) is ds-xs with 18 attention-output tensors
+replaced by `tools/tensor_patch.py`, which builds the model directory from ds-xs and Huihui's patch file.
 
 Each model is one file in `configs/`: its settings and the Hugging Face files it comes from. `./run.sh` lists
 exactly these models, and `./models.sh` manages them:
