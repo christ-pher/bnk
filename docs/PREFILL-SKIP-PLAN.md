@@ -197,6 +197,23 @@ not started.
 On the way, `--split 14 / 8` crashed on long prompts ("router GEMM failed at layer 14"). It was this branch's bug: a
 skipped group's guessed prefetch was bounded by the skip layer, not by the stage. Fixed; master's `--split` was fine.
 
+**Decode after a skipped read (2026-10-27).** keep = 128 against skip off, DSpark, split 20. Six 8K prompts are read
+cold, then get a 200-token turn and 512 greedy tokens, all twice (`decode_ab.sh`, BNK_PB_TOKENS=1):
+
+| | keep = 128 | skip off |
+|---|---:|---:|
+| mean decode | 53.4 tok/s | 54.5 tok/s |
+| mean tokens per round | 5.30 | 5.40 |
+| mean verify ms per round | **87.0** | **86.7** |
+| outputs identical across the two variants | 6 of 12 turns | |
+| outputs identical between the two passes of the same variant | 2 of 6 prompts | 4 of 6 prompts |
+
+The cost of a decode round is the same (87.0 vs 86.7 ms). Where the outputs match, the speeds match within 1-3%.
+The 2% gap in the mean comes from turns whose text differs (one keep = 128 turn wrote a different answer from its
+3rd token, at 29.5 tok/s), so it reflects the drafter's acceptance on different text. Skip off itself varies like
+this between two passes over the same prompts: it diverged on 2 of 6, against 4 of 6 for keep = 128 on this small
+sample. **No decode loss found.**
+
 ## Order
 
 1. Item 1: code (no GPUs) -> GPUs: correctness A/B, then speed.
