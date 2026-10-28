@@ -36,6 +36,12 @@ class State:
     def __init__(self, args):
         self.args = args
         self.tok = Tokenizer.from_gguf(args.model, cache_dir=str(Path(args.cache_dir).expanduser()))
+        self.config = json.loads(Path(args.config).read_text()) if args.config else {}
+        # a config's own chat template (repository path) in place of the GGUF's: templates/README.md
+        if self.config.get("chat_template_file"):
+            tf = ROOT.parent / self.config["chat_template_file"]
+            self.tok.chat_template = tf.read_text()
+            print(f"bnk: chat template: {tf.relative_to(ROOT.parent)}", flush=True)
         source = dsml_v41_template(self.tok.chat_template, self.tok.model_name)
         self.template_fixed = source != self.tok.chat_template
         if self.template_fixed:
@@ -61,7 +67,6 @@ class State:
         # sampling defaults: the model file's recommendation, then the model config (configs/<model>.json);
         # a request's own fields always win
         samp = self.tok.sampling
-        self.config = json.loads(Path(args.config).read_text()) if args.config else {}
         self.defaults = {"temperature": float(samp.get("temp", 1.0)), "top_k": int(samp.get("top_k", 20)),
                          "top_p": float(samp.get("top_p", 0.95)), "min_p": 0.0, "presence_penalty": 0.0,
                          "repetition_penalty": 1.0}

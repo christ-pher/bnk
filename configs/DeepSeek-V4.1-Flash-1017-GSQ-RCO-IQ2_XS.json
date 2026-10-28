@@ -22,6 +22,7 @@
     "top_k": 0,
     "min_p": 0.0
   },
+  "chat_template_file": "templates/deepseek-v4.1.jinja",
   "thinking_loop_guard": true,
   "server_args": [
     "--model-id",

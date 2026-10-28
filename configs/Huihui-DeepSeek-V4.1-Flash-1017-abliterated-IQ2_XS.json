@@ -6,6 +6,7 @@
   },
   "mtp": "/root/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf",
   "sampling": { "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0 },
+  "chat_template_file": "templates/deepseek-v4.1.jinja",
   "thinking_loop_guard": true,
   "server_args": ["--model-id", "DeepSeek-V4.1-Flash-abliterated", "--max-tokens", "32768", "--slots", "1", "--draft", "5"],
   "engine_args": ["--vram-reserve-gib", "1.0"]

@@ -29,12 +29,15 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         env.filters["tojson"] = tojson
         self.template = env.from_string(source)
+        # DeepSeek-V4.1's template renders system messages anywhere in the conversation (<｜System｜>)
+        self.native_system = "<｜System｜>" in source
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kwargs) -> str:
         # Qwen templates take one system message, first ("System message must be at the beginning"), and some know
         # no "developer" role; agent harnesses send developer messages, several at the start and more mid-conversation
         # (reminders, steering). Leading ones merge into one system message (trimmed, joined by newlines, as the
-        # templates that accept several do), later ones become user turns. A lone leading system message is untouched.
+        # templates that accept several do), later ones become user turns (system turns where the template has them).
+        # A lone leading system message is untouched.
         lead = 0
         while lead < len(messages) and messages[lead].get("role") in ("system", "developer"):
             lead += 1
@@ -47,7 +50,7 @@ class ChatTemplate:
         for m in messages[lead:]:
             m = dict(m)
             if m.get("role") in ("system", "developer"):
-                m["role"] = "user"
+                m["role"] = "system" if self.native_system else "user"
             # OpenAI tool calls carry JSON-string arguments; the template wants a mapping
             if m.get("tool_calls"):
                 calls = []
