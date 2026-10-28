@@ -650,7 +650,8 @@ void DsEngine::load_vision(const EngineOptions & opt) {
     if (enc.cfg().out_dim != c.n_embd)
         throw std::runtime_error("vision: the encoder's output (" + std::to_string(enc.cfg().out_dim) + ") does not match the model (" +
                                  std::to_string(c.n_embd) + ")");
-    const int max_cells = env_int("BNK_IMAGE_MAX_TOKENS", 1024);
+    // the model's own cap (vision_max_n_token: the server never sends more), or less through BNK_IMAGE_MAX_TOKENS
+    const int max_cells = std::min(env_int("BNK_IMAGE_MAX_TOKENS", 1024), 1024);
     const size_t ws = vmem_round(enc.workspace_bytes(max_cells));
     vis_ws_.reserve(ws, &budget_, "vision workspace", false);
     vis_ws_.ensure(ws);

@@ -425,6 +425,25 @@ void DsEngine::pf_moe(int il, int N) {
     }
     ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids, p.w, st_, p.vl_on ? bias_vl(il) : nullptr, p.vl.p);
     CUDA_CHECK(cudaMemcpyAsync(p.h_ids, p.ids.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
+    static const bool vl_trace = env_int("BNK_DS_VL_TRACE", 0) != 0;
+    if (vl_trace && p.vl_on && bias_vl(il)) {   // checks: how many image rows the vision bias sends to other experts
+        ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids2, p.w2, st_);
+        std::vector<int32_t> a(P), b(P);
+        std::vector<uint8_t> vl(N);
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), p.ids2.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaMemcpyAsync(vl.data(), p.vl.p, (size_t) N, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        memcpy(a.data(), p.h_ids, (size_t) P * 4);
+        int img = 0, moved = 0, txt_moved = 0;
+        for (int t = 0; t < N; ++t) {
+            std::vector<int32_t> x(a.begin() + t * k, a.begin() + (t + 1) * k), y(b.begin() + t * k, b.begin() + (t + 1) * k);
+            std::sort(x.begin(), x.end());
+            std::sort(y.begin(), y.end());
+            if (vl[t]) { ++img; moved += x != y; } else txt_moved += x != y;
+        }
+        fprintf(stderr, "bnk: vl trace layer %d: %d of %d image rows route elsewhere with the vision bias, %d of %d text rows\n", il, moved,
+                img, txt_moved, N - img);
+    }
     static const int guess_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_GUESS", 2)));
     const bool guess = guess_bufs > 0 && il + 1 < pf_lend_;
     if (guess) {   // the next layer's router on this layer's FFN input: its experts, to prefetch during its attention

@@ -250,7 +250,7 @@ merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BN
    optimized kernel) and lower quality; the 17 GB it saves is RAM, not time. Its config and files were deleted on
    2026-10-27.
 6. **Loose ends**: the indexer's `weights_proj` scale (1/64) is not applied (ranking-invariant); `--slots 2` untested;
-   `forward_pipe` untested; vision not ported; the Qwen engine's prefill may queue its small copies behind the expert
+   `forward_pipe` untested; vision ported 2026-10-28 (docs/VISION.md); the Qwen engine's prefill may queue its small copies behind the expert
    prefetch too (the copy-engine finding of v0.5.1).
 
 ## Commands
