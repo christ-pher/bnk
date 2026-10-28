@@ -46,16 +46,27 @@ class Engine:
             env.update(self.env)
         # each process has its own readiness: the readers of one that died cannot mark a new one ready
         ready = self.ready = threading.Event()
+        served = threading.Event()   # its ready message came (`ready` is also set when its output ends)
         proc = self.proc = subprocess.Popen([self.exe, "serve", *self.args], stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=env)
         self.started_at = time.time()
-        threading.Thread(target=self._read_out, args=(proc, ready), daemon=True).start()
-        threading.Thread(target=self._read_err, args=(proc, ready, log), daemon=True).start()
+        threading.Thread(target=self._read_out, args=(proc, ready, served), daemon=True).start()
+        err = threading.Thread(target=self._read_err, args=(proc, ready, log), daemon=True)
+        err.start()
         if not ready.wait(timeout):
             proc.kill()   # else it outlives the server holding both GPUs and the next start fails in cudaMalloc
             raise EngineError("the engine did not become ready:\n" + "\n".join(list(self.log_tail)[-20:]))
-        if proc.poll() is not None:
-            raise EngineError("the engine exited during startup:\n" + "\n".join(list(self.log_tail)[-20:]))
+        if not served.is_set():
+            # its output ended without a ready message: it died during startup (e.g. cudaMalloc failed while the
+            # previous engine's VRAM was still being freed). Its pipes close before it is reaped, so poll() can
+            # still say running here: wait for the exit and the last log lines instead of reporting it ready
+            try:
+                code = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                code = proc.wait()
+            err.join(timeout=5)
+            raise EngineError(f"the engine exited during startup (code {code}):\n" + "\n".join(list(self.log_tail)[-20:]))
 
     def _restart(self, proc):
         """The engine died while serving (e.g. it exits when the GPU context is lost): start a new one. Parked
@@ -85,7 +96,7 @@ class Engine:
                 log.flush()
         ready.set()
 
-    def _read_out(self, proc, ready):
+    def _read_out(self, proc, ready, became_ready):
         served = False   # this process became ready
         for line in iter(proc.stdout.readline, b""):
             try:
@@ -96,6 +107,7 @@ class Engine:
             if t == "ready":
                 self.info = msg
                 served = True
+                became_ready.set()
                 ready.set()
                 continue
             if t == "telemetry":
