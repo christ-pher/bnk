@@ -19,6 +19,8 @@ A config's "source" says what to download:
 A model downloaded some other way can be given by path instead: "source": {"path": "/models/x-00001-of-00002.gguf"}.
 `mmproj` names the repo's vision encoder file (images in chat requests; downloaded with the model);
 "mmproj_path" gives one on disk, "mmproj_from" another config's (a converted copy of the same model).
+"mmproj_revision" pins the encoder's commit when it differs from the model's (added to the repo later), and
+"mmproj_extra" lists files the encoder needs beside it (same commit, same folder): {"file": ..., "sha256": ...}.
 
 Gated repos need a Hugging Face account that accepted the model's terms and a token: `.venv/bin/hf auth login`.
 run.sh also uses `resolve CHOICE` (prints the config name and the first shard's path) and `menu` (one line per model
@@ -110,11 +112,13 @@ def locate_mmproj(name: str, cfg: dict) -> Path | None:
     f = src.get("mmproj")
     if not f or "repo" not in src:
         return None
-    if env_models() and (Path(env_models()).expanduser() / name / f).exists():
+    need = [f] + [x["file"] for x in src.get("mmproj_extra", [])]
+    if env_models() and all((Path(env_models()).expanduser() / name / x).exists() for x in need):
         return Path(env_models()).expanduser() / name / f
     from huggingface_hub import try_to_load_from_cache
-    p = try_to_load_from_cache(src["repo"], f, revision=src.get("revision"))
-    return Path(p) if isinstance(p, str) else None
+    rev = src.get("mmproj_revision", src.get("revision"))
+    ps = [try_to_load_from_cache(src["repo"], x, revision=rev) for x in need]
+    return Path(ps[0]) if all(isinstance(p, str) for p in ps) else None
 
 
 def remote_files(repo: str, revision: str | None) -> tuple[str, dict[str, dict]]:
@@ -235,7 +239,17 @@ def cmd_download(a) -> int:
     except RepositoryNotFoundError:
         print(f"  {src['repo']} is not reachable (renamed, private, or a token is needed: .venv/bin/hf auth login)")
         return 1
-    files = src["files"] + ([src["mmproj"]] if src.get("mmproj") else [])
+    files = list(src["files"])
+    rev_of = {f: commit for f in files}
+    if src.get("mmproj"):
+        vision = [src["mmproj"]] + [x["file"] for x in src.get("mmproj_extra", [])]
+        vcommit, vinfo = (commit, info) if "mmproj_revision" not in src else remote_files(src["repo"], src["mmproj_revision"])
+        for x in src.get("mmproj_extra", []):   # small files outside LFS: the config carries their checksum
+            if x["file"] in vinfo and x.get("sha256"):
+                vinfo[x["file"]]["sha256"] = x["sha256"]
+        info = {**info, **{f: vinfo[f] for f in vision if f in vinfo}}
+        files += vision
+        rev_of.update({f: vcommit for f in vision})
     missing = [f for f in files if f not in info]
     if missing:
         print(f"  not in the repo at {commit[:12]}: {', '.join(missing)}")
@@ -252,7 +266,7 @@ def cmd_download(a) -> int:
         want = info[f]
         print(f"  {f} ({gb(want['size'] or 0)})")
         try:
-            out = Path(hf_hub_download(src["repo"], f, revision=commit, local_dir=str(root) if root else None))
+            out = Path(hf_hub_download(src["repo"], f, revision=rev_of[f], local_dir=str(root) if root else None))
         except GatedRepoError:
             print(f"  gated: accept the terms at https://huggingface.co/{src['repo']}, then .venv/bin/hf auth login")
             return 1

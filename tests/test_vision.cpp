@@ -1,5 +1,7 @@
-// Runs the vision encoder on a raw RGB image (H x W x 3 bytes, sides multiples of 32) and writes its embeddings
-// (fp32 [tokens][out_dim]): compared against llama.cpp's encoder by tests/compare_vision.py.
+// Runs the vision encoder on a raw RGB image (H x W x 3 bytes, sides multiples of the encoder's unit: 32 for Qwen,
+// 14 for DeepSeek) and writes its embeddings (fp32 [cells][out_dim]): compared against llama.cpp's encoder by
+// tests/compare_vision.py (Qwen) or tools/ds_vision_ref.py (DeepSeek). DeepSeek's encoder runs in the fixed workspace
+// the engine gives it, sized for BNK_IMAGE_MAX_TOKENS (1,024) cells.
 //   test_vision MMPROJ IMAGE.rgb W H OUT.emb [repeats]
 #include <cstdio>
 #include <cstdlib>
@@ -18,7 +20,14 @@ int main(int argc, char ** argv) {
     bnk::VisionEncoder enc;
     enc.load(argv[1], 0, nullptr);
     const auto & c = enc.cfg();
-    const int n = (H / c.unit()) * (W / c.unit());
+    const int n = c.cells(H, W);
+    void * ws = nullptr;
+    if (c.kind == bnk::Projector::DeepSeek41V) {
+        const size_t bytes = enc.workspace_bytes(getenv("BNK_IMAGE_MAX_TOKENS") ? atoi(getenv("BNK_IMAGE_MAX_TOKENS")) : 1024);
+        CUDA_CHECK(cudaMalloc(&ws, bytes));
+        enc.set_workspace(ws, bytes);
+        printf("workspace %.0f MiB\n", bytes / 1048576.0);
+    }
     std::vector<float> out((size_t) n * c.out_dim);
     for (int r = 0; r < reps; ++r) {
         const double t0 = bnk::now_ms();

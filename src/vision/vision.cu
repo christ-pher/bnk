@@ -90,15 +90,15 @@ __global__ void layernorm_k(const float * x, const float * w, const float * b, h
         y[(int64_t) blockIdx.x * E + i] = __float2half((xr[i] - mean) * rstd * w[i] + b[i]);
 }
 
-// qkv rows [N][3E] (fp32, bias not yet added) -> q, k, v [N][E] fp16; q and k rotated by the patch's row (first
-// half of each head's rotary pairs) and column (second half), pairs (i, i + D/2)
+// qkv rows [n][3E] of patches p0.. (fp32, bias not yet added) -> q, k, v [N][E] fp16; q and k rotated by the patch's
+// row (first half of each head's rotary pairs) and column (second half), pairs (i, i + D/2)
 __global__ void qkv_rope_k(const float * qkv, const float * bias, half * q, half * k, half * v, int E, int H,
-                           int gw, int merge, float base) {
-    const int p = blockIdx.x;
+                           int gw, int merge, float base, int p0) {
+    const int p = p0 + blockIdx.x;
     int r, c;
     patch_rc(p, gw, merge, &r, &c);
     const int D = E / H, half_d = D / 2, quarter = D / 4;
-    const float * row = qkv + (int64_t) p * 3 * E;
+    const float * row = qkv + (int64_t) blockIdx.x * 3 * E;
     for (int j = threadIdx.x; j < H * half_d; j += blockDim.x) {
         const int h = j / half_d, i = j % half_d;
         const int sec = i < quarter ? i : i - quarter;
@@ -116,10 +116,52 @@ __global__ void qkv_rope_k(const float * qkv, const float * bias, half * q, half
     for (int i = threadIdx.x; i < E; i += blockDim.x) v[(int64_t) p * E + i] = __float2half(row[2 * E + i] + bias[2 * E + i]);
 }
 
-// x += y + b
+// x += y + b (b may be null)
 __global__ void residual_k(float * x, const float * y, const float * b, int E, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] += y[i] + b[i % E];
+    if (i < n) x[i] += y[i] + (b ? b[i % E] : 0.f);
+}
+
+// RMSNorm of fp32 rows (E wide) -> fp16 (DeepSeek's ViT: weight * (x * rsqrt(mean(x^2) + eps)) in fp32)
+__global__ void rmsnorm_k(const float * x, const float * w, half * y, int E, float eps) {
+    __shared__ float sh[32];
+    const float * xr = x + (int64_t) blockIdx.x * E;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) s += xr[i] * xr[i];
+    const float r = rsqrtf(block_red<false>(s, sh) / E + eps);
+    for (int i = threadIdx.x; i < E; i += blockDim.x) y[(int64_t) blockIdx.x * E + i] = __float2half(w[i] * (xr[i] * r));
+}
+
+// SwiGLU: rows of [gate | up] (fp32, 2F wide) -> silu(gate) * up (fp16, F wide)
+__global__ void silu_mul_k(const float * gu, half * h, int F, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t r = i / F, j = i % F;
+    const float g = gu[r * 2 * F + j], u = gu[r * 2 * F + F + j];
+    h[i] = __float2half(g / (1.f + __expf(-g)) * u);
+}
+
+// the aligner's input: each cell (ly, lx) of the merged grid gets its 3x3 block of normalized patches, ordered as
+// torch's unfold (channel, ky, kx); patches past the grid's edge are zeros (the reference pads after the norm)
+__global__ void unfold_k(const half * xn, half * u, int E, int nvh, int nvw, int gw, int m) {
+    const int cell = blockIdx.x, ly = cell / gw, lx = cell % gw, mm = m * m;
+    half * dst = u + (int64_t) cell * E * mm;
+    for (int j = threadIdx.x; j < E * mm; j += blockDim.x) {
+        const int ch = j / mm, ky = (j % mm) / m, kx = j % m, r = ly * m + ky, c = lx * m + kx;
+        dst[j] = r < nvh && c < nvw ? xn[((int64_t) r * nvw + c) * E + ch] : __float2half(0.f);
+    }
+}
+
+// columns [c0, c0 + nc) of rows y (ld wide): exact GELU of y + b (b: the part's nc values) -> o (fp16, ld wide), or
+// just y + b in place
+template <bool GELU>
+__global__ void cols_bias_k(float * y, const float * b, half * o, int ld, int c0, int nc, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t r = i / nc, j = i % nc, at = r * ld + c0 + j;
+    const float x = y[at] + b[j];
+    if (GELU) o[at] = __float2half(0.5f * x * (1.f + erff(x * 0.70710678f)));
+    else y[at] = x;
 }
 
 // y16 = gelu(y + b): tanh approximation (the ViT's MLP) or exact (the merger)
@@ -187,25 +229,34 @@ VisionEncoder::~VisionEncoder() {
     if (copy_) cudaStreamDestroy(copy_);
 }
 
-// parts: (tensor, as fp16); a null tensor is a placeholder filled by the caller (the combined patch weight)
+// parts: (tensor, as fp16)
 void VisionEncoder::add_stage(const std::vector<std::pair<const TensorRef *, bool>> & parts) {
+    std::vector<std::pair<std::vector<float>, bool>> vals;
+    std::string names;
+    for (const auto & [t, f16] : parts) {
+        vals.emplace_back(to_f32(*t), f16);
+        names += (names.empty() ? "" : ", ") + t->name;
+    }
+    add_stage_vals(std::move(vals), names);
+}
+
+// parts: (values, as fp16); `what` names them in errors
+void VisionEncoder::add_stage_vals(std::vector<std::pair<std::vector<float>, bool>> parts, const std::string & what) {
     Stage s;
     size_t off = 0;
-    std::vector<std::vector<float>> vals;
-    for (const auto & [t, f16] : parts) {
-        vals.push_back(to_f32(*t));
+    for (const auto & [v, f16] : parts) {
         off = (off + 255) / 256 * 256;
         s.off.push_back(off);
-        off += vals.back().size() * (f16 ? 2 : 4);
+        off += v.size() * (f16 ? 2 : 4);
     }
     s.bytes = (off + 255) / 256 * 256;
     CUDA_CHECK(cudaHostAlloc((void **) &s.host, s.bytes, cudaHostAllocPortable));
     for (size_t i = 0; i < parts.size(); ++i) {
-        const auto & v = vals[i];
+        const auto & v = parts[i].first;
         if (parts[i].second) {
             half * d = (half *) (s.host + s.off[i]);
             for (size_t j = 0; j < v.size(); ++j) {
-                if (!(fabsf(v[j]) < 65504.f)) throw std::runtime_error("vision: " + parts[i].first->name + " does not fit fp16");
+                if (!(fabsf(v[j]) < 65504.f)) throw std::runtime_error("vision: " + what + " does not fit fp16");
                 d[j] = __float2half(v[j]);
             }
         } else {
@@ -222,8 +273,12 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
     budget_ = budget;
     const double t0 = now_ms();
     gguf_.open(path);
-    if (gguf_.get_str("clip.projector_type") != "qwen3vl_merger")
-        throw std::runtime_error("vision: projector '" + gguf_.get_str("clip.projector_type") + "' is not supported (qwen3vl_merger)");
+    const std::string proj = gguf_.get_str("clip.projector_type");
+    if (proj == "deepseek41v") {
+        load_ds();
+    } else {
+    if (proj != "qwen3vl_merger")
+        throw std::runtime_error("vision: projector '" + proj + "' is not supported (qwen3vl_merger, deepseek41v)");
     auto & c = cfg_;
     c.n_embd = (int) gguf_.get_u64("clip.vision.embedding_length");
     c.n_ff = (int) gguf_.get_u64("clip.vision.feed_forward_length");
@@ -272,6 +327,8 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
     std::vector<float> table = to_f32(pos);
     CUDA_CHECK(cudaMalloc(&pos_table_, table.size() * 4));
     CUDA_CHECK(cudaMemcpy(pos_table_, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
+    }
+    const auto & c = cfg_;
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
     for (int i = 0; i < 2; ++i) {
@@ -281,7 +338,7 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
     BLAS_CHECK(cublasCreate(&blas_));
     BLAS_CHECK(cublasSetStream(blas_, st_));
     BLAS_CHECK(cublasSetMathMode(blas_, CUBLAS_TENSOR_OP_MATH));
-    if (budget_) arena_.reserve((size_t) 8 << 30, budget_, "vision scratch");
+    if (budget_ && c.kind == Projector::Qwen3VL) arena_.reserve((size_t) 8 << 30, budget_, "vision scratch");
     loaded_ = true;
     size_t host = 0;
     for (auto & s : stages_) host += s.bytes;
@@ -292,7 +349,13 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
 }
 
 void * VisionEncoder::scratch(size_t bytes) {
-    if (budget_) {
+    if (fixed_) {
+        if (bytes > fixed_bytes_)
+            throw std::runtime_error("vision: the image needs " + std::to_string(bytes >> 20) + " MiB of scratch, the workspace has " +
+                                     std::to_string(fixed_bytes_ >> 20));
+        return fixed_;
+    }
+    if (budget_ && cfg_.kind == Projector::Qwen3VL) {
         arena_.ensure(bytes);
         return arena_.ptr();
     }
@@ -306,7 +369,7 @@ void * VisionEncoder::scratch(size_t bytes) {
 }
 
 void VisionEncoder::release_scratch() {
-    if (budget_) arena_.shrink_to(0);
+    if (budget_ && !fixed_ && cfg_.kind == Projector::Qwen3VL) arena_.shrink_to(0);
 }
 
 void VisionEncoder::fetch(int s, int buf) {
@@ -317,6 +380,7 @@ void VisionEncoder::fetch(int s, int buf) {
 
 void VisionEncoder::encode(const uint8_t * rgb, int H, int W, float * out) {
     if (!loaded_) throw std::runtime_error("vision: no encoder loaded");
+    if (cfg_.kind == Projector::DeepSeek41V) return encode_ds(rgb, H, W, out);
     const auto & c = cfg_;
     if (H % c.unit() || W % c.unit() || H <= 0 || W <= 0) throw std::runtime_error("vision: image sides must be multiples of " + std::to_string(c.unit()));
     DeviceScope ds(dev_);
@@ -379,7 +443,7 @@ void VisionEncoder::encode(const uint8_t * rgb, int H, int W, float * out) {
             // 0 qkv, 1 out, 2 up, 3 down, 4-7 their biases, 8/9 ln1, 10/11 ln2
             layernorm_k<<<N, 256, 0, st_>>>(x, F32(8), F32(9), h, E, c.eps);
             gemm(H16(0), 3 * E, E, h, N, y);
-            qkv_rope_k<<<N, 256, 0, st_>>>(y, F32(4), q, k, v, E, Hn, gw, c.merge, 10000.f);
+            qkv_rope_k<<<N, 256, 0, st_>>>(y, F32(4), q, k, v, E, Hn, gw, c.merge, 10000.f, 0);
             const float scale = 1.f / sqrtf((float) D), one = 1.f, zero = 0.f;
             for (int r0 = 0; r0 < N; r0 += R) {
                 const int rn = std::min(R, N - r0);
@@ -429,6 +493,221 @@ void VisionEncoder::encode(const uint8_t * rgb, int H, int W, float * out) {
     ms += now_ms() - t0;
     ++images;
     tokens += M;
+}
+
+// ------------------------------------------------------------------------------------------------ DeepSeek-V4.1
+namespace {
+// the aligner's matrices stream in column parts, so that no stage outweighs a ViT block (~26 MB): the largest
+// stage sets both weight buffers of the fixed workspace
+constexpr int kAlignParts1 = 4, kAlignParts2 = 2;
+constexpr int kDsRowBlock = 2048;              // rows per GEMM pass of the QKV and MLP (their fp32 outputs)
+constexpr size_t kDsScores = (size_t) 32 << 20;   // attention scores per pass
+}  // namespace
+
+void VisionEncoder::load_ds() {
+    auto & c = cfg_;
+    c.kind = Projector::DeepSeek41V;
+    c.n_embd = (int) gguf_.get_u64("clip.vision.embedding_length");
+    c.n_ff = (int) gguf_.get_u64("clip.vision.feed_forward_length");
+    c.n_layer = (int) gguf_.get_u64("clip.vision.block_count");
+    c.n_head = (int) gguf_.get_u64("clip.vision.attention.head_count");
+    c.patch = (int) gguf_.get_u64("clip.vision.patch_size", 14);
+    c.merge = (int) gguf_.get_u64("clip.vision.projector.scale_factor", 3);
+    c.out_dim = (int) gguf_.get_u64("clip.vision.projection_dim");
+    c.eps = (float) gguf_.get_f64("clip.vision.attention.layer_norm_epsilon", 1e-6);
+    auto mean = gguf_.get_f32_arr("clip.vision.image_mean"), sd = gguf_.get_f32_arr("clip.vision.image_std");
+    for (int i = 0; i < 3 && i < (int) mean.size() && i < (int) sd.size(); ++i) { c.mean[i] = mean[i]; c.std[i] = sd[i]; }
+    if (c.head_dim() % 4) throw std::runtime_error("vision: head dim not divisible by 4");
+    const int E = c.n_embd, F = c.n_ff, EM = E * c.merge * c.merge, O = c.out_dim;
+    if (O % (kAlignParts1 * 64) || O % (kAlignParts2 * 64)) throw std::runtime_error("vision: the aligner's width does not split");
+    add_stage({{&gguf_.get("v.patch_embd.weight"), true}, {&gguf_.get("v.patch_embd.bias"), false}});
+    for (int il = 0; il < c.n_layer; ++il) {
+        const std::string b = "v.blk." + std::to_string(il) + ".";
+        auto T = [&](const char * n) { return &gguf_.get(b + n); };
+        // gate and up back to back: one GEMM gives [gate | up] per row
+        add_stage({{T("attn_qkv.weight"), true}, {T("attn_out.weight"), true}, {T("ffn_gate.weight"), true}, {T("ffn_up.weight"), true},
+                   {T("ffn_down.weight"), true}, {T("attn_qkv.bias"), false}, {T("attn_out.bias"), false}, {T("ln1.weight"), false},
+                   {T("ln2.weight"), false}});
+        const auto & so = stages_.back().off;
+        if (so[3] != so[2] + (size_t) F * E * 2) throw std::runtime_error("vision: gate and up are not adjacent");
+    }
+    const TensorRef & w1 = gguf_.get("mm.1.weight"), & w2 = gguf_.get("mm.2.weight");
+    if (w1.ne[0] != EM || w1.ne[1] != O || w2.ne[0] != O || w2.ne[1] != O) throw std::runtime_error("vision: aligner shapes do not match");
+    const std::vector<float> W1 = to_f32(w1), B1 = to_f32(gguf_.get("mm.1.bias")), W2 = to_f32(w2), B2 = to_f32(gguf_.get("mm.2.bias"));
+    auto part = [&](const std::vector<float> & w, const std::vector<float> & bias, int k, int p0, int n) {
+        std::vector<std::pair<std::vector<float>, bool>> v;
+        v.emplace_back(std::vector<float>(w.begin() + (size_t) p0 * k, w.begin() + (size_t) (p0 + n) * k), true);
+        v.emplace_back(std::vector<float>(bias.begin() + p0, bias.begin() + p0 + n), false);
+        return v;
+    };
+    for (int j = 0; j < kAlignParts1; ++j) {
+        auto v = part(W1, B1, EM, j * (O / kAlignParts1), O / kAlignParts1);
+        if (j == 0) v.emplace_back(to_f32(gguf_.get("v.post_ln.weight")), false);
+        add_stage_vals(std::move(v), "mm.1.weight");
+    }
+    for (int j = 0; j < kAlignParts2; ++j) add_stage_vals(part(W2, B2, O, j * (O / kAlignParts2), O / kAlignParts2), "mm.2.weight");
+    markers_.clear();
+    for (const char * n : {"v.token_embd.img_start", "v.token_embd.img_end", "v.image_newline"}) {
+        const std::vector<float> m = to_f32(gguf_.get(n));
+        if ((int) m.size() != O) throw std::runtime_error(std::string("vision: ") + n + " has the wrong width");
+        markers_.insert(markers_.end(), m.begin(), m.end());
+    }
+}
+
+// the scratch of an image of N patches and M merged cells; offs (12): w0 w1 x h y q k v o s u g
+size_t VisionEncoder::ds_carve(int N, int M, size_t * offs) const {
+    const auto & c = cfg_;
+    const int E = c.n_embd, F = c.n_ff, K0 = 3 * c.patch * c.patch, mm = c.merge * c.merge, O = c.out_dim;
+    const int RB = std::min(N, kDsRowBlock);
+    const int R = std::max(16, std::min(N, (int) (kDsScores / ((size_t) c.n_head * N * 2))));
+    size_t off = 0;
+    auto carve = [&](size_t bytes) { off = (off + 255) / 256 * 256; const size_t o = off; off += bytes; return o; };
+    offs[0] = carve(stage_max_);
+    offs[1] = carve(stage_max_);
+    offs[2] = carve((size_t) N * E * 4);                                                   // x: the residual
+    offs[3] = carve((size_t) N * std::max(K0, E) * 2);                                     // h: patches, normed rows
+    offs[4] = carve((size_t) std::max({(size_t) RB * std::max(3 * E, 2 * F), (size_t) N * E, (size_t) M * O}) * 4);   // y
+    offs[5] = carve((size_t) std::max((size_t) N * E, (size_t) M * E * mm) * 2);           // q, then u (the unfolded cells)
+    offs[6] = carve((size_t) N * E * 2);                                                   // k
+    offs[7] = carve((size_t) N * E * 2);                                                   // v
+    offs[8] = carve((size_t) std::max({(size_t) N * E, (size_t) RB * F, (size_t) M * O}) * 2);   // o, the MLP's middle, g
+    offs[9] = carve((size_t) c.n_head * R * N * 2);                                        // s: scores
+    offs[10] = offs[5];
+    offs[11] = offs[8];
+    return (off + 255) / 256 * 256;
+}
+
+size_t VisionEncoder::workspace_bytes(int max_cells) const {
+    size_t offs[12];
+    const int mm = cfg_.merge * cfg_.merge;
+    return ds_carve(max_cells * mm, max_cells, offs);
+}
+
+void VisionEncoder::encode_ds(const uint8_t * rgb, int H, int W, float * out) {
+    const auto & c = cfg_;
+    if (H % c.patch || W % c.patch || H <= 0 || W <= 0) throw std::runtime_error("vision: image sides must be multiples of " + std::to_string(c.patch));
+    DeviceScope ds(dev_);
+    const double t0 = now_ms();
+    const int P = c.patch, nvh = H / P, nvw = W / P, N = nvh * nvw, m = c.merge, mm = m * m;
+    int gh, gw;
+    c.grid(H, W, &gh, &gw);
+    const int M = gh * gw, E = c.n_embd, F = c.n_ff, D = c.head_dim(), Hn = c.n_head, K0 = 3 * P * P, O = c.out_dim;
+    const int RB = std::min(N, kDsRowBlock);
+    const int R = std::max(16, std::min(N, (int) (kDsScores / ((size_t) Hn * N * 2))));
+    size_t o_[12];
+    uint8_t * base = (uint8_t *) scratch(ds_carve(N, M, o_));
+    wbuf_[0] = base + o_[0];
+    wbuf_[1] = base + o_[1];
+    float * x = (float *) (base + o_[2]), * y = (float *) (base + o_[4]);
+    half * h = (half *) (base + o_[3]), * q = (half *) (base + o_[5]), * k = (half *) (base + o_[6]), * v = (half *) (base + o_[7]);
+    half * o = (half *) (base + o_[8]), * S = (half *) (base + o_[9]), * u = (half *) (base + o_[10]), * g = (half *) (base + o_[11]);
+
+    // patches row-major over the grid, each (channel, ky, kx), normalized, fp16
+    std::vector<half> px((size_t) N * K0);
+    for (int p = 0; p < N; ++p) {
+        const int r = p / nvw, cc = p % nvw;
+        half * d = px.data() + (size_t) p * K0;
+        for (int ch = 0; ch < 3; ++ch)
+            for (int ky = 0; ky < P; ++ky)
+                for (int kx = 0; kx < P; ++kx) {
+                    const uint8_t b = rgb[((size_t) (r * P + ky) * W + cc * P + kx) * 3 + ch];
+                    d[(ch * P + ky) * P + kx] = __float2half((b / 255.f - c.mean[ch]) / c.std[ch]);
+                }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(h, px.data(), px.size() * 2, cudaMemcpyHostToDevice, st_));
+
+    // Y[n][ldc] = X[n][k] . W[m][k]^T (fp16 in, fp32 out)
+    auto gemm = [&](const half * Wm, int mo, int kk, const half * X, int n, float * Y, int ldc) {
+        const float one = 1.f, zero = 0.f;
+        BLAS_CHECK(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, mo, n, kk, &one, Wm, CUDA_R_16F, kk, X, CUDA_R_16F, kk,
+                                &zero, Y, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    };
+    const int ns = (int) stages_.size(), a1 = c.n_layer + 1, a2 = a1 + kAlignParts1;
+    fetch(0, 0);
+    for (int s = 0; s < ns; ++s) {
+        const int b = s & 1;
+        if (s + 1 < ns) fetch(s + 1, b ^ 1);
+        CUDA_CHECK(cudaStreamWaitEvent(st_, copied_[b], 0));
+        const uint8_t * w = wbuf_[b];
+        const auto & so = stages_[s].off;
+        auto H16 = [&](int i) { return (const half *) (w + so[i]); };
+        auto F32 = [&](int i) { return (const float *) (w + so[i]); };
+        if (s == 0) {
+            gemm(H16(0), E, K0, h, N, x, E);
+            add_bias_k<<<nblk((int64_t) N * E, 256), 256, 0, st_>>>(x, F32(1), E, (int64_t) N * E);
+        } else if (s < a1) {
+            // 0 qkv, 1 out, 2 gate (3 up right after), 4 down, 5 qkv bias, 6 out bias, 7 norm1, 8 norm2
+            rmsnorm_k<<<N, 256, 0, st_>>>(x, F32(7), h, E, c.eps);
+            for (int r0 = 0; r0 < N; r0 += RB) {
+                const int rn = std::min(RB, N - r0);
+                gemm(H16(0), 3 * E, E, h + (size_t) r0 * E, rn, y, 3 * E);
+                qkv_rope_k<<<rn, 256, 0, st_>>>(y, F32(5), q, k, v, E, Hn, nvw, 1, 10000.f, r0);
+            }
+            const float scale = 1.f / sqrtf((float) D), one = 1.f, zero = 0.f;
+            for (int r0 = 0; r0 < N; r0 += R) {
+                const int rn = std::min(R, N - r0);
+                BLAS_CHECK(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, N, rn, D, &scale, k, CUDA_R_16F,
+                                                      E, D, q + (size_t) r0 * E, CUDA_R_16F, E, D, &zero, S, CUDA_R_16F,
+                                                      N, (long long) N * rn, Hn, CUBLAS_COMPUTE_32F,
+                                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                softmax_k<<<Hn * rn, 256, 0, st_>>>(S, N);
+                BLAS_CHECK(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_N, CUBLAS_OP_N, D, rn, N, &one, v, CUDA_R_16F, E,
+                                                      D, S, CUDA_R_16F, N, (long long) N * rn, &zero,
+                                                      o + (size_t) r0 * E, CUDA_R_16F, E, D, Hn, CUBLAS_COMPUTE_32F,
+                                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+            gemm(H16(1), E, E, o, N, y, E);
+            residual_k<<<nblk((int64_t) N * E, 256), 256, 0, st_>>>(x, y, F32(6), E, (int64_t) N * E);
+            rmsnorm_k<<<N, 256, 0, st_>>>(x, F32(8), h, E, c.eps);
+            for (int r0 = 0; r0 < N; r0 += RB) {
+                const int rn = std::min(RB, N - r0);
+                gemm(H16(2), 2 * F, E, h + (size_t) r0 * E, rn, y, 2 * F);
+                silu_mul_k<<<nblk((int64_t) rn * F, 256), 256, 0, st_>>>(y, o, F, (int64_t) rn * F);
+                gemm(H16(4), E, F, o, rn, y, E);
+                residual_k<<<nblk((int64_t) rn * E, 256), 256, 0, st_>>>(x + (size_t) r0 * E, y, nullptr, E, (int64_t) rn * E);
+            }
+        } else if (s < a2) {
+            // the aligner's first matrix, a column part at a time: 0 weight, 1 bias (2: the ViT's final norm, part 0)
+            const int j = s - a1, nc = O / kAlignParts1;
+            if (j == 0) {
+                rmsnorm_k<<<N, 256, 0, st_>>>(x, F32(2), h, E, c.eps);
+                unfold_k<<<M, 256, 0, st_>>>(h, u, E, nvh, nvw, gw, m);
+            }
+            gemm(H16(0), nc, E * mm, u, M, y + (size_t) j * nc, O);
+            cols_bias_k<true><<<nblk((int64_t) M * nc, 256), 256, 0, st_>>>(y, F32(1), g, O, j * nc, nc, (int64_t) M * nc);
+        } else {
+            const int j = s - a2, nc = O / kAlignParts2;
+            gemm(H16(0), nc, O, g, M, y + (size_t) j * nc, O);
+            cols_bias_k<false><<<nblk((int64_t) M * nc, 256), 256, 0, st_>>>(y, F32(1), nullptr, O, j * nc, nc, (int64_t) M * nc);
+        }
+        CUDA_CHECK(cudaEventRecord(used_[b], st_));
+        static const char * dump = getenv("BNK_VISION_DUMP");   // debugging: the residual after every ViT stage
+        if (dump && s < a1) {
+            std::vector<float> hx((size_t) N * E);
+            CUDA_CHECK(cudaMemcpyAsync(hx.data(), x, hx.size() * 4, cudaMemcpyDeviceToHost, st_));
+            CUDA_CHECK(cudaStreamSynchronize(st_));
+            FILE * f = fopen((std::string(dump) + "/x" + std::to_string(s) + ".bin").c_str(), "wb");
+            if (f) { fwrite(hx.data(), 4, hx.size(), f); fclose(f); }
+        }
+    }
+    // the span: start, each row's cells and a newline, end
+    std::vector<float> cells((size_t) M * O);
+    CUDA_CHECK(cudaMemcpyAsync(cells.data(), y, cells.size() * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    CUDA_CHECK(cudaStreamSynchronize(copy_));
+    const float * start = markers_.data(), * end = start + O, * nl = start + 2 * O;
+    float * dst = out;
+    auto put = [&](const float * src, size_t rows) { memcpy(dst, src, rows * O * 4); dst += rows * O; };
+    put(start, 1);
+    for (int r = 0; r < gh; ++r) {
+        put(cells.data() + (size_t) r * gw * O, gw);
+        put(nl, 1);
+    }
+    put(end, 1);
+    release_scratch();
+    ms += now_ms() - t0;
+    ++images;
+    tokens += c.cells(H, W);
 }
 
 }  // namespace bnk

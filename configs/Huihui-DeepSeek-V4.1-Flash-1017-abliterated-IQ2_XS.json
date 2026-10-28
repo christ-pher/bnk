@@ -2,6 +2,7 @@
   "notes": "Huihui's abliteration of DeepSeek-V4.1-Flash-1017 (huihui-ai/Huihui-DeepSeek-V4.1-Flash-1017-abliterated-GGUF, its Strata patch) on ISTA's GSQ-RCO IQ2_XS (ds-xs): layers 11-28's attn_output_b (Q5_K) replaced, everything else ds-xs's bytes, experts untouched. Safety refusals are largely removed; review outputs. The model directory is built, not downloaded: tools/tensor_patch.py writes a copy of shard 4 (36.8 GB) beside symlinks to ds-xs's other shards and the Engram tables (docs/ABLITERATED.md has the commands). Engine settings, sampling and the DSpark drafter are ds-xs's.",
   "aliases": ["ds-xs-abl", "deepseek-abliterated"],
   "source": {
+    "mmproj_from": "ds-xs",
     "path": "~/.cache/bnk/huihui/IQ2_XS-abliterated/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf"
   },
   "mtp": "/root/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf",

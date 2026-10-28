@@ -13,6 +13,14 @@
       "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf",
       "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf",
       "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+    ],
+    "mmproj": "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf",
+    "mmproj_revision": "a419d74cd28d5b9f8c5e2b9077d11a609c17bc32",
+    "mmproj_extra": [
+      {
+        "file": "exp_probs_b_vl.f32",
+        "sha256": "710b11267b4db392d1fdb558f36ba8e0e91a91f4e8180c953c912e18eacf843d"
+      }
     ]
   },
   "mtp": "/root/.cache/bnk/dspark/DeepSeek-V4.1-Flash-1017-DSpark.gguf",

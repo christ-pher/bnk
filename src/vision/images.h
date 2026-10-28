@@ -29,7 +29,9 @@ public:
     void add(int32_t id, const std::string & path, int H, int W);
     // its merged grid (rows, columns); false: not registered
     bool grid(int32_t id, int * gh, int * gw) const;
-    // its embeddings, [gh * gw][out_dim] (encoded now if not cached); valid until the next call
+    // its cells in a prompt (cfg().cells: the grid, or DeepSeek's span); 0: not registered
+    int cells(int32_t id) const;
+    // its embeddings, [cells][out_dim] (encoded now if not cached); valid until the next call
     const float * rows(int32_t id);
     // encodes the images among tokens[0, n) not cached yet (before buffers are sized around the VRAM it borrows)
     void encode_all(const int32_t * tokens, int n);
@@ -46,7 +48,7 @@ public:
     void positions(const std::vector<int32_t> & seq, int cells, std::vector<int32_t> & out) const;
 
 private:
-    struct Image { std::string path; int H = 0, W = 0, gh = 0, gw = 0; };
+    struct Image { std::string path; int H = 0, W = 0, gh = 0, gw = 0, cells = 0; };
     struct Cached { std::vector<float> rows; std::list<int32_t>::iterator lru; };
     VisionEncoder enc_;
     std::unordered_map<int32_t, Image> images_;
