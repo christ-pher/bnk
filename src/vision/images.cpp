@@ -16,8 +16,16 @@ void ImageStore::add(int32_t id, const std::string & path, int H, int W) {
     if (!is_image_id(id)) throw std::runtime_error("image ids are negative");
     const int u = enc_.cfg().unit();
     if (H <= 0 || W <= 0 || H % u || W % u) throw std::runtime_error("image sides must be multiples of " + std::to_string(u));
+    int gh, gw;
+    enc_.cfg().grid(H, W, &gh, &gw);
     std::lock_guard<std::mutex> lk(mu_);
-    images_[id] = Image{path, H, W, H / u, W / u};
+    images_[id] = Image{path, H, W, gh, gw, enc_.cfg().cells(H, W)};
+}
+
+int ImageStore::cells(int32_t id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = images_.find(id);
+    return it == images_.end() ? 0 : it->second.cells;
 }
 
 bool ImageStore::grid(int32_t id, int * gh, int * gw) const {
@@ -43,7 +51,7 @@ const float * ImageStore::rows(int32_t id) {
     const bool ok = f && fread(rgb.data(), 1, rgb.size(), f) == rgb.size();
     if (f) fclose(f);
     if (!ok) throw std::runtime_error("cannot read the image file " + g.path);
-    std::vector<float> out((size_t) g.gh * g.gw * enc_.cfg().out_dim);
+    std::vector<float> out((size_t) g.cells * enc_.cfg().out_dim);
     enc_.encode(rgb.data(), g.H, g.W, out.data());
     const size_t bytes = out.size() * 4;
     while (!lru_.empty() && cached_bytes_ + bytes > cache_limit) {
@@ -70,15 +78,15 @@ void ImageStore::put_rows(const std::vector<int32_t> & h, int pos0, int N, float
     for (int t = 0; t < N;) {
         const int32_t id = h[pos0 + t];
         if (!is_image_id(id)) { ++t; continue; }
-        int gh = 0, gw = 0;
-        if (!grid(id, &gh, &gw)) throw std::runtime_error("image " + std::to_string(id) + " is not registered");
+        const int nc = cells(id);
+        if (!nc) throw std::runtime_error("image " + std::to_string(id) + " is not registered");
         int start = pos0 + t;
         while (start > 0 && h[start - 1] == id) --start;
         const float * src = rows(id);
         // cells of the same image in a row: one copy (a run longer than the image is the image again)
-        const int j = (pos0 + t - start) % (gh * gw);
+        const int j = (pos0 + t - start) % nc;
         int n = 0;
-        while (t + n < N && h[pos0 + t + n] == id && j + n < gh * gw) ++n;
+        while (t + n < N && h[pos0 + t + n] == id && j + n < nc) ++n;
         CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) t * E, src + (size_t) j * E, (size_t) n * E * 4, cudaMemcpyHostToDevice, s));
         t += n;
     }

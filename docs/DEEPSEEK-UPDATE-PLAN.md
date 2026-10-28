@@ -140,3 +140,12 @@ The fused attention kernel goes in with 2c and lands for Qwen's encoder too.
 * The encoder workspace: from GPU 0's cache (planned), or GPU 1's? GPU 1 runs the verify rounds; GPU 0 also serves Plex.
 * `exp_probs_b_vl` for the abliterated model: shared with ds-xs (the ablation did not touch the router). Assumed, not
   measured.
+
+## Status (2026-10-28, branch ds-vision)
+
+* Item 0 kept: the 4-shard pin; only the mmproj and `exp_probs_b_vl.f32` come from `a419d74c`.
+* Item 1 done: `templates/deepseek-v4.1.jinja` through `"chat_template_file"`; 20/21 prompts identical to
+  `encoding.py` against 0/21 for the GGUF's (which also lacked the BOS token).
+* Item 2 done: encoder, server, engine, docs (`docs/VISION.md`, measurements there). Encoder workspace on GPU 0
+  (252 MiB, fixed). ds-xs-abl shares the files (`"mmproj_from"`), not run on the GPUs.
+* The fused attention kernel of 2c was built and measured 2.4x slower than the cuBLAS path: not kept.

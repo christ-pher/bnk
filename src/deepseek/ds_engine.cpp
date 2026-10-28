@@ -157,6 +157,7 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
             s = s->next_.get();
         }
     }
+    if (!opt.mmproj.empty()) load_vision(opt);
     // Expert placement (docs/DEEPSEEK.md): every stage's cache is filled from the file first (the ranking and its
     // free VRAM decide the residents), then the host arena takes only the experts no cache holds.
     const Config & c = model_.cfg;
@@ -633,6 +634,50 @@ void DsEngine::save_counts_here() {
     bnk::save_counts(opt_.counts_out, delta, c.n_layer, c.n_expert);
 }
 
+// ------------------------------------------------------------------------------------------------ vision
+// The encoder (src/vision, projector deepseek41v) on the first stage's GPU, in a fixed workspace taken from the budget
+// before the expert caches size themselves (an image of up to 1,024 cells: ~0.3 GiB); the image tokens' routing bias
+// (the checkpoint's gate.bias_vl: exp_probs_b_vl.f32, next to the mmproj) on every stage.
+void DsEngine::load_vision(const EngineOptions & opt) {
+    DeviceScope ds(dev_);
+    const Config & c = model_.cfg;
+    images_ = std::make_unique<ImageStore>();
+    images_->cache_limit = (size_t) (opt.vision_cache_gib * 1073741824.0);
+    images_->open(opt.mmproj, dev_, nullptr, opt.verbose);
+    VisionEncoder & enc = images_->encoder();
+    if (enc.cfg().kind != Projector::DeepSeek41V)
+        throw std::runtime_error("vision: " + opt.mmproj + " is not a DeepSeek-V4.1 encoder (projector deepseek41v)");
+    if (enc.cfg().out_dim != c.n_embd)
+        throw std::runtime_error("vision: the encoder's output (" + std::to_string(enc.cfg().out_dim) + ") does not match the model (" +
+                                 std::to_string(c.n_embd) + ")");
+    // the model's own cap (vision_max_n_token: the server never sends more), or less through BNK_IMAGE_MAX_TOKENS
+    const int max_cells = std::min(env_int("BNK_IMAGE_MAX_TOKENS", 1024), 1024);
+    const size_t ws = vmem_round(enc.workspace_bytes(max_cells));
+    vis_ws_.reserve(ws, &budget_, "vision workspace", false);
+    vis_ws_.ensure(ws);
+    enc.set_workspace(vis_ws_.ptr(), ws);
+    // the vocabulary's image token (its row is overwritten; any id would do, this one is the reference's)
+    const auto vocab = model_.gguf.get_str_arr("tokenizer.ggml.tokens");
+    for (size_t i = 0; i < vocab.size(); ++i)
+        if (vocab[i] == "<\uff5cdeepseek_image\uff5c>") image_token_ = (int32_t) i;
+    // the routing bias of image tokens
+    const std::string dir = opt.mmproj.substr(0, opt.mmproj.find_last_of('/') + 1), bias = dir + "exp_probs_b_vl.f32";
+    std::vector<float> b((size_t) c.n_layer * c.n_expert);
+    FILE * f = fopen(bias.c_str(), "rb");
+    const bool ok = f && fread(b.data(), 4, b.size(), f) == b.size() && fgetc(f) == EOF;
+    if (f) fclose(f);
+    if (!ok) throw std::runtime_error("vision: " + bias + " (the image tokens' routing bias, " + std::to_string(b.size() * 4) +
+                                      " bytes) is missing or the wrong size: ./models.sh download fetches it with the mmproj");
+    for (DsEngine * s = this; s; s = s->next_.get()) {
+        DeviceScope d2(s->dev_);
+        s->probs_b_vl_.alloc(b.size());
+        CUDA_CHECK(cudaMemcpy(s->probs_b_vl_.p, b.data(), b.size() * 4, cudaMemcpyHostToDevice));
+    }
+    if (opt.verbose)
+        fprintf(stderr, "bnk: vision: workspace %.0f MiB on GPU %d (images up to %d cells), image token %d, routing bias %s\n",
+                ws / 1048576.0, dev_, max_cells, image_token_, bias.c_str());
+}
+
 // ------------------------------------------------------------------------------------------------ Engram
 // the hash ids of the n-grams ending at position p of `hist` (engram.py NgramHashState): rows[col]
 void DsEngine::engram_hash(int e, const std::vector<int32_t> & hist, int p, uint64_t * rows) const {
@@ -1094,7 +1139,12 @@ void DsEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
         q->last_r0 = r0;
         q->last_lane = lane;
-        for (int j = 0; j < b.T; ++j) h_tok_[r0 + j] = b.tokens[j];
+        for (int j = 0; j < b.T; ++j) {
+            // (image cells go through the prompt path only: as a token here, a placeholder id would index the embeddings
+            // out of bounds)
+            if (is_image_id(b.tokens[j])) throw std::runtime_error("forward: an image cell in a decode window");
+            h_tok_[r0 + j] = b.tokens[j];
+        }
         h_par_[wins_.size() - 1] = WinParams{wins_.back().pos0, b.T, seq_, 0};
         key.insert(key.end(), {b.slot, b.T, b.commit_all ? 1 : 0});
     }

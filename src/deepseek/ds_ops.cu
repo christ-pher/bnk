@@ -1179,9 +1179,10 @@ void ds_cand_blocks(const float * scores, int64_t lds, int T, int ratio, int bs,
 // ------------------------------------------------------------------------------------------ Engram
 // grid (T, hc), 1024 threads
 __global__ void __launch_bounds__(1024) engram_gate_k(float * res, const float * key, int64_t ldk, const float * value,
-                                                      int64_t ldv, const float * w, int hc, int E, float eps) {
+                                                      int64_t ldv, const float * w, int hc, int E, float eps, const uint8_t * skip) {
     __shared__ float sh[32];
     const int t = blockIdx.x, s = blockIdx.y;
+    if (skip && skip[t]) return;   // an image cell: no Engram contribution (engram.py token_mask)
     float * h = res + ((int64_t) t * hc + s) * E;
     const float * kk = key + (int64_t) t * ldk + (int64_t) s * E, * ww = w + (int64_t) s * E, * vv = value + (int64_t) t * ldv;
     float sh2 = 0.f, sk2 = 0.f, dt = 0.f;
@@ -1200,8 +1201,8 @@ __global__ void __launch_bounds__(1024) engram_gate_k(float * res, const float *
     for (int e = threadIdx.x; e < E; e += blockDim.x) h[e] += gate * vv[e];
 }
 void ds_engram_gate(float * res, const float * key, int64_t ldk, const float * value, int64_t ldv, const float * w, int T,
-                    int hc, int E, float eps, cudaStream_t s) {
-    engram_gate_k<<<dim3(T, hc), 1024, 0, s>>>(res, key, ldk, value, ldv, w, hc, E, eps);
+                    int hc, int E, float eps, cudaStream_t s, const uint8_t * skip) {
+    engram_gate_k<<<dim3(T, hc), 1024, 0, s>>>(res, key, ldk, value, ldv, w, hc, E, eps, skip);
 }
 
 // ------------------------------------------------------------------------------------------ routing
@@ -1209,10 +1210,16 @@ __global__ void route_k(const float * logits, const float * bias, int n_exp, int
                         float * w) {
     ds_route_warp(logits, bias, n_exp, k, scale, norm, ids, w, blockIdx.x, threadIdx.x);
 }
+// image tokens (vl[t] != 0) pick their experts with the vision bias (the training's noaux_tc_for_vl)
+__global__ void route_vl_k(const float * logits, const float * bias, const float * bias_vl, const uint8_t * vl, int n_exp, int k,
+                           float scale, int norm, int32_t * ids, float * w) {
+    ds_route_warp(logits, vl[blockIdx.x] ? bias_vl : bias, n_exp, k, scale, norm, ids, w, blockIdx.x, threadIdx.x);
+}
 void ds_route(const float * logits, const float * bias, int T, int n_exp, int k, float scale, bool norm, int32_t * ids,
-              float * w, cudaStream_t s) {
+              float * w, cudaStream_t s, const float * bias_vl, const uint8_t * vl) {
     if (n_exp > 32 * 16 || k > 32) throw std::runtime_error("ds_route: too many experts");
-    route_k<<<T, 32, 0, s>>>(logits, bias, n_exp, k, scale, norm ? 1 : 0, ids, w);
+    if (bias_vl && vl) route_vl_k<<<T, 32, 0, s>>>(logits, bias, bias_vl, vl, n_exp, k, scale, norm ? 1 : 0, ids, w);
+    else route_k<<<T, 32, 0, s>>>(logits, bias, n_exp, k, scale, norm ? 1 : 0, ids, w);
 }
 
 // ------------------------------------------------------------------------------------------ the PCIe lane

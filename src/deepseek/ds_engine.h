@@ -71,6 +71,8 @@ public:
         return lookup_drafter_.get();
     }
     int max_ctx() const override { return opt_.max_ctx; }
+    // the prompt images' store (--mmproj; on the first stage, GPU 0): docs/VISION.md
+    ImageStore * images() override { return images_ && images_->enabled() ? images_.get() : nullptr; }
     int cpu_threads() const override { return cpu_->threads(); }
     int64_t graph_captures() const override { return graph_captures_ + (next_ ? next_->graph_captures() : 0); }
     size_t graph_bytes() const override { return graph_bytes_ + (next_ ? next_->graph_bytes() : 0); }
@@ -162,6 +164,19 @@ private:
     void save_counts_here();
 
     std::unique_ptr<LookupOnlyDrafter> lookup_drafter_;   // BNK_DS_LOOKUP=0 turns the lookup drafts off
+    // vision (--mmproj): the encoder on the first stage in a fixed workspace from its budget (this engine's expert cache
+    // cannot give VRAM back for an encode), and every stage's copy of the image tokens' routing bias
+    // (exp_probs_b_vl.f32 beside the mmproj: [n_layer][n_expert])
+    void load_vision(const EngineOptions & opt);
+    std::unique_ptr<ImageStore> images_;
+    ElasticBuf vis_ws_;
+    DevBuf<float> probs_b_vl_;
+    int32_t image_token_ = 0;            // the vocabulary's image token: the embedding row image cells start from
+    // (BNK_DS_VL_BIAS=0, for checks: image cells route with the text bias)
+    const float * bias_vl(int il) const {
+        static const bool on = env_int("BNK_DS_VL_BIAS", 1) != 0;
+        return on && probs_b_vl_.p ? probs_b_vl_.p + (size_t) il * model_.cfg.n_expert : nullptr;
+    }
     std::unique_ptr<DsSpark> spark_;     // docs/DSPARK.md; on the last stage
     DevBuf<float> tgt_;                  // its view of the rows at the target layers by position: [kDsRing][n_targets * E]
     std::vector<int> tgt_index_;         // per layer: which target it is, -1 none
@@ -357,6 +372,8 @@ private:
         // group-sized (pf_group_ rows)
         DevBuf<float> res, xn, pre_a, pre_b, post, comb, shared, moe, cpu, rlog, w, w2;
         DevBuf<int32_t> ids, perm, inv, ids2;    // ids2: the next layer's routing guessed from this layer's input
+        DevBuf<uint8_t> vl;                      // 1 for image cells (their routing bias, no Engram)
+        bool vl_on = false;                      // the group has image cells
         DevBuf<half> xg, hh, dd;
         // chunk-sized (pf_max_ rows)
         DevBuf<float> mixed, xnc, out, attn_pre, postc, combc;

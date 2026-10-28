@@ -1,7 +1,7 @@
 # Vision: images in chat requests
 
-The Qwen3.8 models (Flash-Next and the 27B) were trained with a vision encoder; their GGUF repos ship it as a
-separate `mmproj` file (projector `qwen3vl_merger`). With it loaded, the server takes images in OpenAI
+The Qwen3.8 models (Flash-Next and the 27B) and DeepSeek-V4.1-Flash were trained with a vision encoder; their GGUF
+repos ship it as a separate `mmproj` file (projectors `qwen3vl_merger` and `deepseek41v`). With it loaded, the server takes images in OpenAI
 `image_url` parts and Anthropic `image` blocks, also inside `tool_result`s (a screenshot tool), and the model
 reads them: screenshots, mockups, diagrams, photos, documents.
 
@@ -17,6 +17,8 @@ downloaded (`./models.sh download iq3_s` fetches it with the model). `BNK_VISION
 | Qwen3.8-27B-GSQ-RCO-IQ3_S | `mmproj-Qwen3.8-27B-BF16.gguf` (ISTA-DASLab repo) |
 | Qwen3.8-27B-Q4, -Q8_0, -NVFP4 | `mmproj-BF16.gguf` (unsloth repo; NVFP4 through `"mmproj_from"`) |
 | CYBER-FROST-3.8 | none published |
+| DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS (ds-xs) | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` and `exp_probs_b_vl.f32` (ISTA-DASLab repo at `a419d74c`: `"mmproj_revision"`, `"mmproj_extra"`) |
+| Huihui-...-abliterated-IQ2_XS (ds-xs-abl) | the same files (`"mmproj_from"`: ds-xs; the abliteration leaves the router alone) |
 
 ```json
 "messages": [{"role": "user", "content": [
@@ -69,9 +71,63 @@ Image cells always go through prompt chunks (never the decode-window path for sh
 * Turns (IQ3_S, served): a 1,047-token prompt with a 1280x800 image read in 1.25 s cold; the follow-up turn reused
   1,040 tokens and read in 0.21 s. Decoding after an image: 107-127 tok/s with the MTP drafter (3.4 tokens/round).
 
+## DeepSeek-V4.1-Flash
+
+The base model (deepseek-ai/DeepSeek-V4.1-Flash-1017, `image-text-to-text`) has its own encoder and its own way of
+placing an image in the prompt; its reference is the repository's `inference/vision.py` and `image_processor.py`.
+ISTA's mmproj holds the checkpoint's tensors bit for bit (all 263 compared); `exp_probs_b_vl.f32` is the checkpoint's
+`gate.bias_vl` of the 40 layers (the file of their later layout embeds it; ours is the earlier one, docs/DEEPSEEK-UPDATE-PLAN.md).
+
+**Images** (`serve/vision.py` `deepseek_grid`, identical to `plan_image_grid` on 20,011 sizes): 14-pixel patches, one
+cell per 3x3 of them; an image under 544x544 pixels of area is scaled up, a larger one down until its span fits 1,024
+cells; it is letterboxed in grey to whole patches, not stretched. The span the model reads: a start cell, each row of
+the grid's cells followed by a newline cell, an end cell (`rows * (columns + 1) + 2`). A 1920x1080 screenshot is
+23 x 41 cells, 968 tokens; 1280x800, 20 x 31, 642. The template (`templates/deepseek-v4.1.jinja`) renders an image as
+`<｜deepseek_image｜>`, also inside tool results; the server lists the images in the order the template renders
+them (parallel tool results in call order, as DeepSeek's encoder sorts them).
+
+**Encoder** (`src/vision`, projector `deepseek41v`): a 32-layer ViT (1024 wide, 16 heads, RMSNorm, SwiGLU 2816,
+2D rotary positions over patch rows and columns, no position table), the aligner (every 3x3 block of patches, the
+grid zero-padded to whole blocks, unfolded as torch's `unfold` -> Linear 9216 -> 5120 -> GELU -> Linear), then the
+start / newline / end embeddings around the rows. Weights fp16 in page-locked host RAM (926 MiB), streamed in parts
+of at most ~26 MB. Its scratch is fixed: 252 MiB on GPU 0, charged to the budget before the expert cache sizes itself
+(the DeepSeek engine's cache cannot lend VRAM for an encode the way the Qwen engine's does); the QKV and MLP run in
+row blocks and the attention scores take 32 MiB a pass, so the largest image fits.
+
+**Language model** (`src/deepseek`): image cells take the encoder's rows in the prompt chunk (from the image token's
+row, overwritten); they pick their experts with `exp_probs_b_vl` instead of `exp_probs_b`, on both stages (the bias
+only chooses; the weights come from the unbiased scores); they get no Engram contribution, and no n-gram reaches across
+them (negative ids hash as dead, as `engram.py` masks them). Positions stay one per cell (no M-RoPE). Image cells
+always go through prompt groups; a decode window refuses them. DSpark drafts from the target layers' rows, which
+include the image's real rows; lookup drafts stop before image cells (`generate.cpp`). `BNK_DS_VL_BIAS=0` routes
+image cells with the text bias (for checks).
+
+### Measurements (two V100s, 2026-10-28)
+
+* Encoder against an fp32 numpy port of `vision.py` (`tools/ds_vision_ref.py`, the reference rows cached with
+  `--cache`): cosine per cell, mean / worst: 630x476 0.99993 / 0.9935, 1036x714 0.99997 / 0.9909, 658x462
+  0.99999 / 0.9997, 308x4004 1.00000 / 0.99995, 1708x966 0.99996 / 0.9862.
+* Encode time: 194 cells 82 ms, 444 cells 300 ms, 866 cells 758 ms, 968 cells (1080p) 1.45 s.
+* A fused tensor-core attention (WMMA, online softmax, 64 rows a block) was tried for both encoders: 2.4x slower
+  than the cuBLAS path at every size (one block an SM for its 66-80 KB of shared memory, a sync per key tile) and
+  less accurate (worst cell 0.79 at 1080p). Not kept.
+* Served (ds-xs, greedy): DeepSeek's own example (carrots and corn, the question in Chinese) answered correctly; a
+  1080p screenshot's 12 code lines transcribed exactly (12/12), its rectangle's color right; a screenshot in a tool
+  result read; a small (120x90) and a tall (300x4000) image read; a follow-up turn resending the image reused 474 of
+  485 tokens (0.23 s read). Prompts with an image read at 215-450 tok/s including the encode (996 tokens with a 1080p
+  screenshot: 2.2 s).
+* The routing bias reaches both stages (`BNK_DS_VL_TRACE=1`: each image group routed with both biases in one pass):
+  with `exp_probs_b_vl` 590-627 of 633 image rows pick other experts in layers 0-6, 186-270 in layers 30-38, 446 in
+  layer 39; text rows never.
+* Text without images: the same kernels as before (no mask, the text bias); the workspace took nothing from the expert
+  cache here (GPU 0's cache is capped at 20 GiB with 21.6 GiB free). Decode 27-31 tok/s with and without the encoder
+  loaded (DeepSeek's greedy output differs between runs anyway: which experts the CPU computes changes the rounding).
+
 ## Limits
 
 * Video is not supported (`<|video_pad|>`); images only.
+* DeepSeek: at most 1,024 cells an image (the model's training cap); larger screenshots are scaled down, so small
+  text reads better cropped.
 * The drafter (MTP / DFlash2) sees image cells as the image token at their cell positions, not the encoder's rows:
   only its acceptance can suffer, never the output.
 * Image ids are 30-bit hashes: two different images colliding in one server's lifetime would share a cache entry.

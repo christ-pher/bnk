@@ -103,6 +103,7 @@ void DsEngine::prefill_alloc(int N, int G) {
     p.pre_a.alloc((size_t) NG * c.hc); p.pre_b.alloc((size_t) NG * c.hc); p.post.alloc((size_t) NG * c.hc);
     p.comb.alloc((size_t) NG * c.hc * c.hc);
     p.shared.alloc((size_t) NG * E); p.moe.alloc((size_t) NG * E); p.cpu.alloc((size_t) NG * E);
+    p.vl.alloc((size_t) NG);
     p.rlog.alloc((size_t) NG * NE); p.w.alloc(P); p.w2.alloc(P); p.ids.alloc(P); p.ids2.alloc(P); p.perm.alloc(P + 4); p.inv.alloc(P + 4);
     p.xg.alloc((size_t) NG * E); p.hh.alloc((size_t) P * Fx); p.dd.alloc((size_t) (P + 1) * E);
     // chunk-sized
@@ -232,7 +233,7 @@ void DsEngine::pf_engram(int il, int c_, int N) {
     dequant_rows(rm, 0, rows, p.eg_emb, st_);
     gemm_.run(L.eg_wkv, p.eg_emb, D, N, p.eg_kv, (int64_t) (c.hc + 1) * E);
     ds_engram_gate(p.res.p + o * c.hc_dim(), p.eg_kv, (int64_t) (c.hc + 1) * E, p.eg_kv.p + (size_t) c.hc * E, (int64_t) (c.hc + 1) * E,
-                   F(L.eg_gate), N, c.hc, E, c.eps, st_);
+                   F(L.eg_gate), N, c.hc, E, c.eps, st_, p.vl_on ? p.vl.p + o : nullptr);
 }
 
 // attention of chunk c_ (N rows at position pos0) from p.xnc into p.out
@@ -422,8 +423,27 @@ void DsEngine::pf_moe(int il, int N) {
                                               p.rlog, NE);
         if (st != CUBLAS_STATUS_SUCCESS) router_failed(st, il, N);
     }
-    ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids, p.w, st_);
+    ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids, p.w, st_, p.vl_on ? bias_vl(il) : nullptr, p.vl.p);
     CUDA_CHECK(cudaMemcpyAsync(p.h_ids, p.ids.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
+    static const bool vl_trace = env_int("BNK_DS_VL_TRACE", 0) != 0;
+    if (vl_trace && p.vl_on && bias_vl(il)) {   // checks: how many image rows the vision bias sends to other experts
+        ds_route(p.rlog, F(L.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids2, p.w2, st_);
+        std::vector<int32_t> a(P), b(P);
+        std::vector<uint8_t> vl(N);
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), p.ids2.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaMemcpyAsync(vl.data(), p.vl.p, (size_t) N, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        memcpy(a.data(), p.h_ids, (size_t) P * 4);
+        int img = 0, moved = 0, txt_moved = 0;
+        for (int t = 0; t < N; ++t) {
+            std::vector<int32_t> x(a.begin() + t * k, a.begin() + (t + 1) * k), y(b.begin() + t * k, b.begin() + (t + 1) * k);
+            std::sort(x.begin(), x.end());
+            std::sort(y.begin(), y.end());
+            if (vl[t]) { ++img; moved += x != y; } else txt_moved += x != y;
+        }
+        fprintf(stderr, "bnk: vl trace layer %d: %d of %d image rows route elsewhere with the vision bias, %d of %d text rows\n", il, moved,
+                img, txt_moved, N - img);
+    }
     static const int guess_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_GUESS", 2)));
     const bool guess = guess_bufs > 0 && il + 1 < pf_lend_;
     if (guess) {   // the next layer's router on this layer's FFN input: its experts, to prefetch during its attention
@@ -432,7 +452,8 @@ void DsEngine::pf_moe(int il, int N) {
         const cublasStatus_t st = cublasSgemm(gemm_.handle(), CUBLAS_OP_T, CUBLAS_OP_N, NE, N, E, &one, F(L2.router), E, p.xn, E,
                                               &zero, p.rlog, NE);
         if (st != CUBLAS_STATUS_SUCCESS) router_failed(st, il + 1, N);
-        ds_route(p.rlog, F(L2.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids2, p.w2, st_);
+        ds_route(p.rlog, F(L2.probs_b), N, NE, k, c.route_scale, c.route_norm, p.ids2, p.w2, st_, p.vl_on ? bias_vl(il + 1) : nullptr,
+                 p.vl.p);
         CUDA_CHECK(cudaMemcpyAsync(p.h_ids2, p.ids2.p, (size_t) P * 4, cudaMemcpyDeviceToHost, st_));
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -740,6 +761,16 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
     ensure_ctx_here(pos0 + N + kMaxWindow);
     ctx_grid_ = cur_->ctx_mapped;
     cur_->history.insert(cur_->history.end(), tokens, tokens + N);
+    // image cells (negative placeholder ids, src/vision/images.h): the encoder's rows replace their embeddings, they route
+    // with the vision bias and take no Engram contribution (the reference's image_mask)
+    p.vl_on = std::any_of(tokens, tokens + N, is_image_id);
+    if (p.vl_on) {
+        if (!probs_b_vl_.p || !head_->images()) throw std::runtime_error("the prompt has images but no vision encoder is loaded (--mmproj)");
+        std::vector<uint8_t> vl(N);
+        for (int i = 0; i < N; ++i) vl[i] = is_image_id(tokens[i]) ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyAsync(p.vl.p, vl.data(), (size_t) N, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));   // (pageable source)
+    }
     // a skipped group: the layers before the skip layer, then its compressed KV only (yl < 0: as usual)
     const int yl = skip ? skip_layer() : -1;
     if (skip && yl < 0) throw std::runtime_error("prefill_group: a skipped group without a skip layer");
@@ -796,14 +827,23 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
     pre_ = p.pre_a;
     pre_next_ = p.pre_b;
     if (first()) {
-        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens, (size_t) std::min(N, pf_max_) * 4, cudaMemcpyHostToDevice, st_));
+        const int32_t * tk = tokens;
+        std::vector<int32_t> mapped;
+        if (p.vl_on) {   // image cells start from the image token's row (then the encoder's rows replace it)
+            images_->encode_all(tokens, N);
+            mapped.assign(tokens, tokens + N);
+            for (auto & t : mapped) if (is_image_id(t)) t = image_token_;
+            tk = mapped.data();
+        }
+        CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tk, (size_t) std::min(N, pf_max_) * 4, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
         for (int i = 0; i < nc; ++i) {   // the token table rows, a chunk at a time through the chunk buffers
             if (i) {
-                CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tokens + coff[i], (size_t) csz[i] * 4, cudaMemcpyHostToDevice, st_));
+                CUDA_CHECK(cudaMemcpyAsync(p.tok.p, tk + coff[i], (size_t) csz[i] * 4, cudaMemcpyHostToDevice, st_));
                 CUDA_CHECK(cudaStreamSynchronize(st_));
             }
             dequant_gather(model_.tok_embd, p.tok, csz[i], p.mixed, st_);
+            if (p.vl_on) images_->put_rows(cur_->history, pos0 + coff[i], csz[i], p.mixed.p, st_);
             hc_init(p.mixed, p.res.p + (size_t) coff[i] * HC, csz[i], c.hc, E, st_);
         }
         ds_onehot(pre_, N, c.hc, st_);
@@ -895,6 +935,8 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
     const size_t n = tokens.size();
     if (n == 0) return;
     if (on_prefill_progress) on_prefill_progress(0, n);
+    if (pf_max_ <= 0 && std::any_of(tokens.begin(), tokens.end(), is_image_id))
+        throw std::runtime_error("images need the prompt path (--prefill-chunk)");
     size_t i = 0;
     if (pf_max_ > 0) {
         // several stages: group k+1 on the first stage while the worker runs group k through the others
@@ -906,6 +948,10 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
         // stage 0 a group boundary (each streamed expert read once more), so 1,428 skipped rows of a 4K prompt lost 5%
         // (690 -> 659 tok/s) while 5,524 of an 8K one gained 35%
         static const int skip_min = std::max(1, env_int("BNK_DS_SKIP_MIN", 2048));
+        // image cells go through prompt groups however few the rows after them (their embeddings are put in there)
+        size_t img_end = 0;
+        for (size_t k = n; k > 0 && !img_end; --k)
+            if (is_image_id(tokens[k - 1])) img_end = k;
         const size_t keep = (size_t) skip_keep();
         const size_t cut = keep > 0 && n >= keep + (size_t) skip_min ? n - keep : 0;
         // groups of even size (a read of a group and a bit would leave a tiny last group to overlap with)
@@ -932,7 +978,7 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
                 if (skip && !cut) continue;
                 const size_t end = skip ? cut : n, min_left = skip ? 1 : (size_t) std::max(1, opt_.prefill_min);
                 const size_t group = group_of(end - i);
-                while (end - i >= min_left) {
+                while (end - i >= min_left || (!skip && i < img_end)) {
                     const int N = (int) std::min(group, end - i);
                     const int32_t * tk = tokens.data() + i;
                     if (pipeline) {

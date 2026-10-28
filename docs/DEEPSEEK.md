@@ -138,3 +138,7 @@ See the bottom of this file as the work progresses.
   tokens 467 -> 652 tok/s, 16,000 tokens 828 tok/s (groups of 8 chunks measured worse); decode 22.4 tok/s with the
   container on all 48 CPUs and the pool pinned one worker a core (default now); the copy test unchanged
   (ppl 1.037, top-1 99.61%). Project Maya's table IQ2_XXS CPU dot was bit-exact but slower on this Zen 2 (off).
+* 2026-10-28: vision (`docs/VISION.md`): ISTA's mmproj and the image tokens' routing bias from their later commit
+  (`a419d74c`), the encoder in src/vision, image cells in the prompt path (encoder rows, `exp_probs_b_vl`, no Engram);
+  and the chat template of their repository (`templates/deepseek-v4.1.jinja`): the GGUF's left out the BOS token and
+  put parallel tool results in arrival order (docs/DEEPSEEK-UPDATE-PLAN.md).

@@ -15,8 +15,8 @@ Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384
 (`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
 tables read from the NVMe, experts split between VRAM and RAM without a copy, the resident set following the routing while serving (v0.6.0); 22-36 tok/s decode, 650-830 tok/s on long prompts.
 
-Both read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
-`image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`).
+All three read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
+`image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`; DeepSeek since 2026-10-28).
 
 On top of that: speculative decoding with the model's own MTP layer, a 256K context whose memory is lent to the
 expert cache until it is needed, **several agents served at once** (their conversations decoded together in one
@@ -180,7 +180,7 @@ experts' 31-37 ms are now most of it), 32 tok/s when the output copies earlier t
   (streams cold experts a chunk never uses). Not done: DSpark (Strata skips it where most experts live outside VRAM:
   verify rounds read 3.3x a token's bytes; measured here 2026-10-26: a verified row costs 0.43-0.48 of a plain round,
   `docs/DEEPSEEK-NEXT.md`), a tensor-core prompt attention (30 ms per layer-chunk today, the biggest
-  GPU item left), vision.
+  GPU item left). Vision came later (2026-10-28, `docs/VISION.md`).
 * Tools: `bench_ds_cpu` (the pool on real experts), `bench_ds_attn` (the attention kernel on a chunk),
   `BNK_DS_PF_PROF=1` (a per-phase line for every prompt group), `bnk run` prints the n-gram row and mailbox wait times.
 
@@ -217,7 +217,8 @@ Engram file (110.6 GB, IQ4_NL) beside them.
 * The bug of the night: a new engine must call `ggml_cpu_init()`, or ggml's single-token `vec_dot` kernels (the
   CPU pool's path for an expert with one token) return zeros; decode scored ppl 17 against 3 for 8-token windows
   until found. `bnk hdump` now takes `BNK_HDUMP_T` / `BNK_HDUMP_T2` (two window sizes in one load) and the engine
-  `BNK_DS_TRACE` for the next hunt. Not done yet: the DSpark drafter, prompt-path overlap of the two GPUs, vision.
+  `BNK_DS_TRACE` for the next hunt. Not done yet: the DSpark drafter, prompt-path overlap of the two GPUs, vision (all
+  three done since).
 
 ### What v0.4.3 changed: the DFlash2 drafter and NVFP4 for the 27B
 
@@ -764,7 +765,7 @@ expert cache starts warm after the first session.
 | `BNK_LOG_LEVEL=quiet\|info\|debug` | terminal output: `info` prints a line per request and a live status line |
 | `BNK_VRAM_LOG=1`, `BNK_VMEM_LOG=1` | log to the engine log when the VRAM budget corrects itself against the driver / when the expert cache shrinks or grows |
 | `BNK_THINK_GUARD=0`, `BNK_CONTENT_GUARD=0` | turn the thinking-loop guard off / the answer's loop guard off (it ends an answer that repeats itself verbatim as `length`, dropping a tool call that was being repeated) |
-| `BNK_VISION=0`, `BNK_IMAGE_MAX_TOKENS=4096`, `BNK_IMAGE_URLS=0` | serve text only (no vision encoder) / the largest image in tokens (one per 32x32 pixels) / refuse image URLs (data URLs only) |
+| `BNK_VISION=0`, `BNK_IMAGE_MAX_TOKENS=4096`, `BNK_IMAGE_URLS=0` | serve text only (no vision encoder) / the largest image in tokens (Qwen: one per 32x32 pixels; DeepSeek: at most 1,024 cells, its own cap) / refuse image URLs (data URLs only) |
 | `BNK_DRAFT_VOCAB=` | draft over the whole vocabulary (e.g. for chats in non-Latin scripts) |
 | `BNK_MODELS`, `BNK_MTP` | a models folder (instead of the Hugging Face cache) and the MTP layer (`setup.sh` and `models.sh` save them to `bnk.env`) |
 | `BNK_API_KEY` | require this key from API clients |

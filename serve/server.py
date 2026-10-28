@@ -24,7 +24,8 @@ from .conversations import Conversations
 from .engine import Engine, EngineError
 from .loop_guard import WRAP_UP, ThinkingLoopGuard, at_clean_boundary, content_guard
 from .telemetry import Telemetry
-from .vision import ImageError, Images, anthropic_image, image_parts
+from .gguf_meta import read_metadata
+from .vision import ImageError, Images, anthropic_image, call_order, image_parts
 from .tokenizer import StreamDecoder, Tokenizer
 
 ROOT = Path(__file__).resolve().parent
@@ -36,6 +37,12 @@ class State:
     def __init__(self, args):
         self.args = args
         self.tok = Tokenizer.from_gguf(args.model, cache_dir=str(Path(args.cache_dir).expanduser()))
+        self.config = json.loads(Path(args.config).read_text()) if args.config else {}
+        # a config's own chat template (repository path) in place of the GGUF's: templates/README.md
+        if self.config.get("chat_template_file"):
+            tf = ROOT.parent / self.config["chat_template_file"]
+            self.tok.chat_template = tf.read_text()
+            print(f"bnk: chat template: {tf.relative_to(ROOT.parent)}", flush=True)
         source = dsml_v41_template(self.tok.chat_template, self.tok.model_name)
         self.template_fixed = source != self.tok.chat_template
         if self.template_fixed:
@@ -52,16 +59,24 @@ class State:
         # images (--mmproj): prepared here, encoded by the engine; their raw pixels go to a folder it reads
         self.images = None
         self.image_pad = self.tok.id_of("<|image_pad|>")
+        ds = None
+        if args.mmproj:
+            md = read_metadata(args.mmproj, {"clip.projector_type", "clip.vision.patch_size", "clip.vision.projector.scale_factor",
+                                             "clip.vision.image_min_pixels"})
+            if md.get("clip.projector_type") == "deepseek41v":   # DeepSeek-V4.1: its own grid, at most 1,024 cells
+                self.image_pad = self.tok.id_of("<｜deepseek_image｜>")
+                ds = {"patch": int(md.get("clip.vision.patch_size", 14)), "merge": int(md.get("clip.vision.projector.scale_factor", 3)),
+                      "min_pixels": int(md.get("clip.vision.image_min_pixels", 544 * 544))}
         if args.mmproj and self.image_pad is not None:
-            self.images = Images(str(Path(args.cache_dir).expanduser() / "images"), max_tokens=args.image_max_tokens,
-                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0")
+            self.images = Images(str(Path(args.cache_dir).expanduser() / "images"),
+                                 max_tokens=min(args.image_max_tokens, 1024) if ds else args.image_max_tokens,
+                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0", deepseek=ds)
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})
         # sampling defaults: the model file's recommendation, then the model config (configs/<model>.json);
         # a request's own fields always win
         samp = self.tok.sampling
-        self.config = json.loads(Path(args.config).read_text()) if args.config else {}
         self.defaults = {"temperature": float(samp.get("temp", 1.0)), "top_k": int(samp.get("top_k", 20)),
                          "top_p": float(samp.get("top_p", 0.95)), "min_p": 0.0, "presence_penalty": 0.0,
                          "repetition_penalty": 1.0}
@@ -422,7 +437,10 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
         else:
             kwargs["reasoning_effort"] = {"high": "xhigh", "minimal": "low"}.get(eff, eff)
     kwargs["enable_thinking"] = bool(thinking)
-    text = S.template.render(body.get("messages", []), tools=body.get("tools"), add_generation_prompt=True, **kwargs)
+    messages = body.get("messages", [])
+    if S.template.native_system:   # DeepSeek's order of parallel tool results (and of the images in them)
+        messages = call_order(messages)
+    text = S.template.render(messages, tools=body.get("tools"), add_generation_prompt=True, **kwargs)
     # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
     tail = text[max(text.rfind("<|im_start|>assistant"), text.rfind("<｜Assistant｜>")):]
     thinking = "<think>" in tail and "</think>" not in tail
@@ -433,8 +451,8 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     # each image's pad token becomes its run of placeholder ids (one per merged 32x32 block)
     REQ.images = []
     if S.images:
-        ids, REQ.images = S.images.expand(ids, S.image_pad, body.get("messages", []))
-    elif image_parts(body.get("messages", [])):
+        ids, REQ.images = S.images.expand(ids, S.image_pad, messages)
+    elif image_parts(messages):
         raise ImageError("this model has no vision encoder (no mmproj in its config)")
     REQ.tokenize_ms = (time.perf_counter() - t0) * 1e3   # reported in the response's timings
     return ids, thinking
