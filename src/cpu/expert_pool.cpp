@@ -165,6 +165,9 @@ void ExpertStore::build(const Model & m, int threads, bool verbose, const std::v
                 const int b = index_[il][e];
                 if (b >= 0) memcpy(base_ + layer_off_[il] + (size_t) b * blob_[il] + dst_off, src + (size_t) e * sz, sz);
             }
+            // hand the copied file pages back: at ~192 GiB the page lock below has to migrate pages first and
+            // stalls in reclaim with the shards still mapped (pve-container 6.1.15 / kernel 7.0.14-26)
+            madvise((void *) pa, len + ((uintptr_t) s0 - pa), MADV_PAGEOUT);
         }
     };
     std::vector<std::thread> th;

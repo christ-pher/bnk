@@ -52,7 +52,8 @@ class Engine:
         threading.Thread(target=self._read_out, args=(proc, ready), daemon=True).start()
         threading.Thread(target=self._read_err, args=(proc, ready, log), daemon=True).start()
         if not ready.wait(timeout):
-            raise EngineError("the engine did not become ready")
+            proc.kill()   # else it outlives the server holding both GPUs and the next start fails in cudaMalloc
+            raise EngineError("the engine did not become ready:\n" + "\n".join(list(self.log_tail)[-20:]))
         if proc.poll() is not None:
             raise EngineError("the engine exited during startup:\n" + "\n".join(list(self.log_tail)[-20:]))
 
