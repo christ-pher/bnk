@@ -4,7 +4,9 @@ aligner, the image span with its start / newline / end embeddings), from the mmp
 checkpoint's, bit for bit), against build/test_vision (src/vision, fp16 weights on the GPU). The image is prepared as
 the server prepares it (serve/vision.py deepseek_grid, grey letterboxing).
 
-    tools/ds_vision_ref.py MMPROJ IMAGE [IMAGE...] [--test-vision build/test_vision]
+    tools/ds_vision_ref.py MMPROJ IMAGE [IMAGE...] [--test-vision build/test_vision] [--cache DIR]
+
+--cache keeps each image's reference rows (a large image takes minutes in numpy).
 
 Prints per image: the grid, the encode time, the cosine between our rows and the reference's (mean, worst) and the
 worst row's index.
@@ -119,11 +121,20 @@ def main():
     ap.add_argument("mmproj")
     ap.add_argument("images", nargs="+")
     ap.add_argument("--test-vision", default=str(ROOT / "build" / "test_vision"))
+    ap.add_argument("--cache", help="a folder for the reference rows")
     a = ap.parse_args()
     t, kv = load(a.mmproj)
     for img in a.images:
         rgb, H, W = prepare(img, kv)
-        ref, (gh, gw) = encode(t, kv, rgb, H, W)
+        cached = os.path.join(a.cache, f"{Path(img).name}-{W}x{H}.npy") if a.cache else None
+        if cached and os.path.exists(cached):
+            ref = np.load(cached)
+            gh, gw = -(-(H // int(kv["clip.vision.patch_size"])) // 3), -(-(W // int(kv["clip.vision.patch_size"])) // 3)
+        else:
+            ref, (gh, gw) = encode(t, kv, rgb, H, W)
+            if cached:
+                os.makedirs(a.cache, exist_ok=True)
+                np.save(cached, ref)
         with tempfile.TemporaryDirectory() as d:
             raw, emb = os.path.join(d, "im.rgb"), os.path.join(d, "im.emb")
             rgb.tofile(raw)

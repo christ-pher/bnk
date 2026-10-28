@@ -98,12 +98,14 @@ void ds_cand_blocks(const float * scores, int64_t lds, int T, int ratio, int bs,
 // key [T][hc][E], value [T][E] (the wkv projection's rows), w [hc][E] (q_weight * k_weight):
 // gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)), dot = rmsnorm-weighted key/stream product / sqrt(E);
 // res[t][s] += gate * value[t]
+// skip (optional, per row): rows left alone (image cells)
 void ds_engram_gate(float * res, const float * key, int64_t ldk, const float * value, int64_t ldv, const float * w, int T,
-                    int hc, int E, float eps, cudaStream_t s);
+                    int hc, int E, float eps, cudaStream_t s, const uint8_t * skip = nullptr);
 
-// ---- routing: s = sqrt(softplus(logits)); top-k of s + bias; w = s / (sum + 1e-20) * scale (norm: renormalize)
+// ---- routing: s = sqrt(softplus(logits)); top-k of s + bias; w = s / (sum + 1e-20) * scale (norm: renormalize).
+// bias_vl and vl (optional): rows with vl[t] != 0 (image cells) take bias_vl instead of bias
 void ds_route(const float * logits, const float * bias, int T, int n_exp, int k, float scale, bool norm, int32_t * ids,
-              float * w, cudaStream_t s);
+              float * w, cudaStream_t s, const float * bias_vl = nullptr, const uint8_t * vl = nullptr);
 
 // ---- the PCIe lane of decode: the next layer's non-resident experts, predicted from this layer's FFN input, pulled
 // from their host copies into staging slots while this layer's FFN and the next layer's attention run
