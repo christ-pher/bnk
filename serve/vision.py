@@ -266,8 +266,13 @@ class Images:
         the image's run of placeholder ids, and the images the engine needs."""
         srcs = image_parts(messages)
         n_pad = sum(1 for t in ids if t == pad_id)
-        if not srcs and not n_pad:
-            return ids, []
+        if not srcs:
+            if not n_pad:
+                return ids, []
+            # pads with no images behind them: a vision placeholder a model once emitted as text, replayed by the
+            # client in its history ever since. Strip them and carry on as a plain text prompt — one stray token the
+            # model emitted should not fail every later request in the conversation.
+            return [t for t in ids if t != pad_id], []
         if n_pad != len(srcs):
             raise ImageError(f"the prompt has {n_pad} image placeholders for {len(srcs)} images")
         imgs = [self.prepare(s) for s in srcs]

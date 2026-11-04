@@ -288,13 +288,21 @@ class Tokenizer:
 
 
 class StreamDecoder:
-    """Incremental UTF-8: a multi-byte character split across tokens is held until complete."""
+    """Incremental UTF-8: a multi-byte character split across tokens is held until complete. The vision specials are
+    dropped: a vision model can emit one as text (it sees them in every image turn's prompt), and a client that
+    replays the answer in its history renders that literal string back as an image placeholder with no image behind
+    it — serve/vision.py expand then rejects the prompt, and every later request in the conversation with it."""
+
+    VISION = ("<|image_pad|>", "<|vision_start|>", "<|vision_end|>", "<｜deepseek_image｜>")
 
     def __init__(self, tok: Tokenizer):
         self.tok = tok
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.skip = {tok.special[t] for t in self.VISION if t in tok.special}
 
     def feed(self, ids: list[int]) -> str:
+        if self.skip:
+            ids = [i for i in ids if i not in self.skip]
         return self.dec.decode(b"".join(self.tok.token_bytes[i] for i in ids))
 
     def flush(self) -> str:
