@@ -93,6 +93,7 @@ static std::unique_ptr<EngineApi> make_engine(const std::string & model, const E
         e->load(model, opt);
         return e;
     }
+    if (!opt.lora.empty()) throw std::runtime_error("--lora: only the dense engine (qwen35) applies adapters; this model is " + arch);
     if (arch == "deepseek41") {   // docs/DEEPSEEK.md; --ple-gguf names the Engram file (default: beside the model)
         auto e = std::make_unique<DsEngine>();
         e->load(model, opt);
@@ -131,6 +132,8 @@ int main(int argc, char ** argv) {
         else if (a == "--profile") opt.profile = next();
         else if (a == "--mtp") opt.mtp = next();
         else if (a == "--dflash") opt.dflash = next();
+        else if (a == "--lora") opt.lora = next();
+        else if (a == "--lora-scale") opt.lora_scale = std::stof(next());
         else if (a == "--ple-gguf") opt.ple_gguf = next();
         else if (a == "--cold-experts") opt.cold_experts = next();
         else if (a == "--mmproj") opt.mmproj = next();
@@ -371,8 +374,9 @@ int main(int argc, char ** argv) {
         double logit_err = 0, kl_sum = 0, kl_max = 0;
         int agree = 0;
         eng.dump_all = true;
-        for (size_t p = 0; p < prompt.size(); p += kMaxWindow) {
-            const int T = (int) std::min<size_t>(kMaxWindow, prompt.size() - p);
+        const size_t CW = (size_t) std::max(1, std::min(env_int("BNK_CHECK_T", kMaxWindow), kMaxWindow));   // window rows
+        for (size_t p = 0; p < prompt.size(); p += CW) {
+            const int T = (int) std::min<size_t>(CW, prompt.size() - p);
             eng.forward(prompt.data() + p, T);
             for (int il = 0; il < c.n_layer; ++il) {
                 if (ref_layers[il].size() < (p + T) * HC) continue;

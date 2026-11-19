@@ -235,6 +235,14 @@ private:
     void gdn(int il, int T);
     void attn(int il, int T);
     void ffn(int il, int T);
+    // a LoRA site (--lora): y_i += B_i (A x), x the activations act_ holds (decode) or X (the prompt path)
+    // decode: lora_a starts A x on side stream 1 (beside the base GEMV, which reads the same act_), lora_b waits
+    // for it and adds the B products in one launch
+    void lora_a(const DenseLora & L, int T);
+    void lora_b(const DenseLora & L, int T, float * y0, int64_t ld0, float * y1 = nullptr, int64_t ld1 = 0,
+                float * y2 = nullptr, int64_t ld2 = 0);
+    void pf_lora(const DenseLora & L, const half * xh, const float * x, int64_t ldx, int N, float * y0, int64_t ld0,
+                 float * y1 = nullptr, int64_t ld1 = 0, float * y2 = nullptr, int64_t ld2 = 0);
     void head(int T);
     void enqueue_commit(int c);
     const float * pend_ = nullptr;   // a residual add left to the next norm's pass
@@ -291,6 +299,7 @@ private:
     DevBuf<float> conv_out_, z_, gdn_o_, gdn_n_;
     DevBuf<float> qfull_, k_, v_, q_, attn_o_, attn_scratch_;
     DevBuf<float> sg_, su_, logits_;
+    DevBuf<float> lora_t_;   // [W][widest LoRA site]: A x
     DevBuf<int32_t> argmax_dev_, topk_ids_;
     DevBuf<float> topk_vals_;
     DevBuf<double> topk_z_;
@@ -313,7 +322,7 @@ private:
     void pf_ffn(int il, int N);
     void mtp_feed(const float * R_rows, const int32_t * tokens, int n, int pos0);
     struct {
-        DevBuf<float> res, xn, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, sg, su, x;
+        DevBuf<float> res, xn, out, conv, co, z, g, b, o, n, qfull, k, v, q, ao, sg, su, x, lt;
         DevBuf<int32_t> tok;
     } pf_;
 };

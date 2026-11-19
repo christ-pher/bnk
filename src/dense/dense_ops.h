@@ -19,4 +19,9 @@ void add_rows(float * y, const float * x, int64_t n, cudaStream_t s);
 // rounded values, so their residuals stay identical)
 void add_rows_f16x2(float * y, const half * a, const half * b, int64_t n, cudaStream_t s);
 
+// A LoRA site's up projections in one launch: y_i[t][r] += B_i[r][:] . t[t][off_i : off_i + r_i] for the n <= 3
+// F16 matrices B_i (rows of `rank` values), t the A product [T][width] (fp32)
+void lora_up(const QMat * b, float * const * y, const int64_t * ld, const int * off, int n, const float * t, int T,
+             int width, cudaStream_t s);
+
 }  // namespace bnk

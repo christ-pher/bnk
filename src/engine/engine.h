@@ -52,6 +52,8 @@ struct EngineOptions {
     std::string counts_out;          // where routing counts are saved (BNKC), empty = off
     std::string mtp;                 // MTP draft layer GGUF (empty = no speculation)
     std::string dflash;              // dense engine: a DFlash2 drafter GGUF (tools/dflash_gguf.py) in place of the MTP
+    std::string lora;                // dense engine: a LoRA adapter GGUF (llama.cpp convert_lora_to_gguf.py), applied at run time
+    float lora_scale = 1.f;          // multiplies the adapter's alpha / r
     std::string ple_gguf;            // GGUF holding the PLE table when the model file has none
     std::string cold_experts;        // the least-routed experts in a smaller format (tools/requant_experts), all kept resident
     std::string mmproj;              // the vision encoder GGUF (empty: text only); docs/VISION.md

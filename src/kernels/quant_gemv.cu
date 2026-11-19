@@ -393,9 +393,11 @@ void gemv(const QMat & W, const ActQ8 * a, const float * x, int64_t ldx, int T, 
         }
         return;
     }
-    if (sp.y2 && sp.r1 < W.rows) {   // the other paths: the two halves as two launches
+    if (sp.y2 && sp.r1 < W.rows) {   // the other paths: the two (three) parts as two (three) launches
+        const int64_t e2 = sp.y3 && sp.r2 < W.rows ? sp.r2 : W.rows;
         gemv(qmat_rows(W, 0, sp.r1), a, x, ldx, T, y, ldy, accumulate, s);
-        gemv(qmat_rows(W, sp.r1, W.rows - sp.r1), a, x, ldx, T, sp.y2, sp.ldy2, accumulate, s);
+        gemv(qmat_rows(W, sp.r1, e2 - sp.r1), a, x, ldx, T, sp.y2, sp.ldy2, accumulate, s);
+        if (e2 < W.rows) gemv(qmat_rows(W, e2, W.rows - e2), a, x, ldx, T, sp.y3, sp.ldy3, accumulate, s);
         return;
     }
     if (is_float_format(W.type)) {

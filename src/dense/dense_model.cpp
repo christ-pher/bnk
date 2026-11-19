@@ -364,6 +364,179 @@ void DenseModel::load_layer(DenseLayer & L, const std::string & b, bool attn) {
     stack(b + "ffn_gate.weight", b + "ffn_up.weight", L.gate, L.up, L.gu);
 }
 
+// ------------------------------------------------------------------------------------------------ LoRA adapters
+static std::vector<float> tensor_floats(const TensorRef & t) {
+    std::vector<float> f((size_t) t.nrows() * t.ne[0]);
+    if (t.type == GGML_TYPE_F32) {
+        memcpy(f.data(), t.data, f.size() * 4);
+        return f;
+    }
+    const auto * tt = ggml_get_type_traits(t.type);
+    if (!tt || !tt->to_float) throw std::runtime_error("lora: unsupported format " + std::string(ggml_type_name(t.type)) + " in " + t.name);
+    tt->to_float(t.data, f.data(), (int64_t) f.size());
+    return f;
+}
+
+void DenseModel::release(const QMat & m) {
+    for (size_t i = 0; i < device_allocs_.size(); ++i)
+        if (device_allocs_[i] == m.data) {
+            vram_bytes -= std::min(vram_bytes, m.row_bytes * (size_t) m.rows);
+            cudaFree(device_allocs_[i]);
+            device_allocs_.erase(device_allocs_.begin() + (long) i);
+            return;
+        }
+}
+
+// rows [r0, r1) x columns [c0, c1) of t in its own format (columns in whole blocks)
+static std::vector<uint8_t> slice_bytes(const TensorRef & t, int64_t r0, int64_t r1, int64_t c0, int64_t c1) {
+    const int64_t blck = ggml_blck_size(t.type);
+    const size_t tsz = ggml_type_size(t.type), rb = t.row_bytes(), nrb = (size_t) ((c1 - c0) / blck) * tsz;
+    std::vector<uint8_t> buf((size_t) (r1 - r0) * nrb);
+    for (int64_t r = r0; r < r1; ++r) memcpy(buf.data() + (size_t) (r - r0) * nrb, t.data + (size_t) r * rb + (size_t) (c0 / blck) * tsz, nrb);
+    return buf;
+}
+
+int DenseModel::load_lora(const std::string & path, float user_scale, bool verbose) {
+    GgufModel g;
+    g.open(path);
+    if (g.get_str("general.type") != "adapter" || g.get_str("adapter.type") != "lora")
+        throw std::runtime_error(path + ": not a LoRA adapter GGUF (general.type adapter, adapter.type lora)");
+    const std::string arch = g.get_str("general.architecture"), march = gguf.get_str("general.architecture");
+    if (arch != march) throw std::runtime_error("lora: adapter for '" + arch + "', model is '" + march + "'");
+    const double alpha = g.get_f64("adapter.lora.alpha", 0);
+    const Config & c = cfg;
+    const int r = tp_rank, D = c.head_dim, Hl = c.n_head / tp_n, Hkvl = c.n_head_kv / tp_n, FFl = c.n_ff / tp_n;
+    const size_t vram0 = vram_bytes;
+    int used = 0, rank_seen = 0;
+
+    // a site's projections (all reading the same input): B rows [r0, r1) and A columns [c0, c1) of this rank (the
+    // base matrix's own slice: its rows when row-split, its columns when column-split); `views` the base QMats of
+    // the first parts that A's rows are stacked under (q; gate, up; o; down), `joint` gate | up's view
+    static const bool stack_ok = !getenv("BNK_LORA_STACK") || atoi(getenv("BNK_LORA_STACK")) != 0;
+    int stacked = 0;
+    struct Part { std::string w; int64_t r0, r1, c0, c1; };
+    auto build = [&](DenseLora & L, const std::vector<Part> & parts, std::vector<QMat *> views, QMat * joint) {
+        std::vector<float> A;
+        int64_t acols = -1;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const Part & p = parts[i];
+            const TensorRef * ta = g.find(p.w + ".lora_a"), * tb = g.find(p.w + ".lora_b");
+            if (!ta && !tb) continue;
+            if (!ta || !tb) throw std::runtime_error("lora: " + p.w + " has only one of lora_a / lora_b");
+            const TensorRef & w = gguf.get(p.w);
+            const int64_t rr = ta->ne[1];
+            if (ta->ne[0] != w.ne[0] || tb->ne[1] != w.ne[1] || tb->ne[0] != rr)
+                throw std::runtime_error("lora: " + p.w + ": A/B shapes do not match the weight");
+            if (rr % 8) throw std::runtime_error("lora: rank " + std::to_string(rr) + " is not a multiple of 8");
+            rank_seen = (int) rr;
+            const int64_t nc = p.c1 - p.c0;
+            if (nc % 32) throw std::runtime_error("lora: " + p.w + ": column slice not a multiple of 32");
+            if (acols >= 0 && acols != nc) throw std::runtime_error("lora: stacked A matrices of different widths");
+            acols = nc;
+            const std::vector<float> fa = tensor_floats(*ta);   // [rr][in]
+            for (int64_t k = 0; k < rr; ++k)
+                A.insert(A.end(), fa.begin() + (size_t) (k * ta->ne[0] + p.c0), fa.begin() + (size_t) (k * ta->ne[0] + p.c1));
+            const std::vector<float> fb = tensor_floats(*tb);   // [out][rr]
+            const float scale = (float) (alpha > 0 ? alpha / (double) rr : 1.0) * user_scale;
+            const int64_t nr = p.r1 - p.r0;
+            std::vector<float> bs((size_t) (nr * rr));
+            for (int64_t k = 0; k < nr * rr; ++k) bs[(size_t) k] = fb[(size_t) (p.r0 * rr + k)] * scale;
+            std::vector<ggml_fp16_t> bh(bs.size());
+            ggml_fp32_to_fp16_row(bs.data(), bh.data(), (int64_t) bs.size());
+            void * d = nullptr;
+            L.b[i] = upload_matrix(bh.data(), GGML_TYPE_F16, nr, rr, (size_t) rr * 2, false, &d);
+            device_allocs_.push_back(d);
+            vram_bytes += (size_t) nr * rr * 2;
+            L.off[i] = L.width;
+            L.width += (int) rr;
+            used += 2;
+        }
+        if (!L.width) return;
+        const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, acols);
+        std::vector<uint8_t> q(rb * (size_t) L.width);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, A.data(), q.data(), 0, L.width, acols, nullptr);
+        lora_width = std::max(lora_width, L.width);
+        bool can = stack_ok;
+        for (size_t i = 0; i < views.size(); ++i) {
+            const TensorRef & w = gguf.get(parts[i].w);
+            can = can && w.type == GGML_TYPE_Q8_0 && global_scale(parts[i].w) == 1.f && views[i]->valid() &&
+                  views[i]->layout == 1 && parts[i].c1 - parts[i].c0 == acols;
+        }
+        if (can) {
+            std::vector<uint8_t> buf;
+            std::vector<int64_t> nrows;
+            for (size_t i = 0; i < views.size(); ++i) {
+                const Part & p = parts[i];
+                std::vector<uint8_t> s = slice_bytes(gguf.get(p.w), p.r0, p.r1, p.c0, p.c1);
+                buf.insert(buf.end(), s.begin(), s.end());
+                nrows.push_back(p.r1 - p.r0);
+            }
+            int64_t base = 0;
+            for (int64_t n : nrows) base += n;
+            buf.insert(buf.end(), q.begin(), q.end());
+            void * d = nullptr;
+            QMat big = upload_matrix(buf.data(), GGML_TYPE_Q8_0, base + L.width, acols, rb, true, &d);
+            if (big.layout == 1) {
+                if (joint && joint->valid()) release(*joint);
+                for (QMat * v : views) release(*v);
+                device_allocs_.push_back(d);
+                vram_bytes += big.row_bytes * (size_t) big.rows;
+                int64_t o = 0;
+                for (size_t i = 0; i < views.size(); ++i) {
+                    *views[i] = qmat_rows(big, o, nrows[i]);
+                    o += nrows[i];
+                }
+                if (joint) *joint = qmat_rows(big, 0, base);
+                L.host = big;
+                L.host_rows = (int) base;
+                L.a = qmat_rows(big, base, L.width);
+                ++stacked;
+                return;
+            }
+            cudaFree(d);
+        }
+        void * d = nullptr;
+        L.a = upload_matrix(q.data(), GGML_TYPE_Q8_0, L.width, acols, rb, true, &d);
+        device_allocs_.push_back(d);
+        vram_bytes += rb * (size_t) L.width;
+    };
+
+    int sites = 0;
+    for (int il = l0; il < l1; ++il) {
+        DenseLayer & L = layers[il];
+        const std::string b = "blk." + std::to_string(il) + ".";
+        const int64_t E = c.n_embd;
+        if (L.attn) {
+            const int64_t q = (int64_t) Hl * 2 * D, kv = (int64_t) Hkvl * D, o = (int64_t) Hl * D;
+            build(L.lora_qkv, {{b + "attn_q.weight", r * q, (r + 1) * q, 0, E},
+                               {b + "attn_k.weight", r * kv, (r + 1) * kv, 0, E},
+                               {b + "attn_v.weight", r * kv, (r + 1) * kv, 0, E}}, {&L.wq}, nullptr);
+            build(L.lora_o, {{b + "attn_output.weight", 0, E, r * o, (r + 1) * o}}, {&L.wo}, nullptr);
+        }
+        build(L.lora_gu, {{b + "ffn_gate.weight", (int64_t) r * FFl, (int64_t) (r + 1) * FFl, 0, E},
+                          {b + "ffn_up.weight", (int64_t) r * FFl, (int64_t) (r + 1) * FFl, 0, E}}, {&L.gate, &L.up}, &L.gu);
+        build(L.lora_down, {{b + "ffn_down.weight", 0, E, (int64_t) r * FFl, (int64_t) (r + 1) * FFl}}, {&L.down}, nullptr);
+        sites += L.lora_qkv.valid() + L.lora_o.valid() + L.lora_gu.valid() + L.lora_down.valid();
+    }
+    // everything the adapter holds for these layers must have been applied (a DeltaNet projection, say, is not)
+    int expected = 0, mtp_skipped = 0;
+    for (const TensorRef & t : g.tensors()) {
+        int il = -1;
+        if (sscanf(t.name.c_str(), "blk.%d.", &il) != 1) throw std::runtime_error("lora: tensor " + t.name + " is not applied by this engine");
+        if (il >= c.n_layer) { ++mtp_skipped; continue; }
+        if (il >= l0 && il < l1) ++expected;
+    }
+    if (expected != used) throw std::runtime_error("lora: " + std::to_string(expected - used) + " tensor(s) of " + path +
+                                                   " target projections this engine does not adapt");
+    if (verbose)
+        fprintf(stderr, "bnk: lora %s: rank %d, alpha %g, scale %g: %d projection(s) at %d site(s) (%d stacked under their base "
+                "matrix) in layers %d-%d, %.1f MiB%s%s\n",
+                path.c_str(), rank_seen, alpha, (alpha > 0 && rank_seen ? alpha / rank_seen : 1.0) * user_scale, used / 2, sites,
+                stacked, l0, l1 - 1, ((double) vram_bytes - (double) vram0) / 1048576.0, tp_n > 1 ? " (this slice)" : "",
+                mtp_skipped ? " (the MTP block's tensors left out)" : "");
+    return lora_width;
+}
+
 void DenseModel::load(const std::string & path, bool verbose, int first, int end, bool embd, bool head, bool want_mtp,
                       int tpn, int tpr) {
     gguf.open(path);
