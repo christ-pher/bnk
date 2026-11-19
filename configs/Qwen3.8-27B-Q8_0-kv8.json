@@ -1,0 +1,47 @@
+{
+  "notes": "Qwen3.8-27B Q8_0 for several conversations at once: the same model, drafter and sampling as Qwen3.8-27B-Q8_0.json, with the KV cache in 8 bits (--kv8 1: 16 KiB per token per GPU instead of 32, KL vs the fp16 cache 1e-3) and four slots. Context 204,800 (a 200K client window): four conversations at full length take ~3.1 GiB each per GPU, which fits beside the weights; at 262,144 they would not. Estimated from the fp16 config's VRAM use, not yet run with all four slots full.",
+  "aliases": [
+    "qwen27b-kv8",
+    "27b-kv8"
+  ],
+  "source": {
+    "repo": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    "files": [
+      "Qwen3.8-27B-Q8_0.gguf"
+    ],
+    "mmproj": "mmproj-BF16.gguf"
+  },
+  "mtp": "builtin",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0
+  },
+  "speculation": {
+    "draft": 7,
+    "draft_min_p": 0.8,
+    "dflash_min_p": 0.2
+  },
+  "thinking_loop_guard": true,
+  "server_args": [
+    "--model-id",
+    "Qwen3.8-27B",
+    "--ctx",
+    "204800",
+    "--max-tokens",
+    "32768",
+    "--slots",
+    "4",
+    "--park-gib",
+    "0"
+  ],
+  "engine_args": [
+    "--tp",
+    "1",
+    "--kv8",
+    "1"
+  ],
+  "dflash": "dflash2-27b.gguf"
+}
