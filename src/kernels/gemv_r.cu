@@ -14,7 +14,8 @@ namespace bnk {
 
 // the output cell of (token t, row r): y, or the second output from row sp.r1 on
 __device__ __forceinline__ float * gemv_out(const GemvSplit & sp, float * y, int64_t ldy, int t, int r) {
-    return r < sp.r1 ? y + (int64_t) t * ldy + r : sp.y2 + (int64_t) t * sp.ldy2 + (r - sp.r1);
+    return r < sp.r1 ? y + (int64_t) t * ldy + r
+                     : r < sp.r2 ? sp.y2 + (int64_t) t * sp.ldy2 + (r - sp.r1) : sp.y3 + (int64_t) t * sp.ldy3 + (r - sp.r2);
 }
 
 static int sm_count2() {
@@ -367,7 +368,8 @@ void gemv_f16_act(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy
 
 void gemv_r(const QMat & W, const ActQ8 & a, int T, float * y, int64_t ldy, bool accumulate, cudaStream_t s, GemvSplit sp) {
     sp.wscale = W.scale;
-    if (a.h && T >= mma_min_tokens() && mma_min_tokens() > 0) return launch_mma(W, a, T, y, ldy, accumulate, s, sp);
+    const int mm = sp.mma_min > 0 ? sp.mma_min : mma_min_tokens();
+    if (a.h && T >= mm && mm > 0) return launch_mma(W, a, T, y, ldy, accumulate, s, sp);
     if (T > 8) {   // the dp4a kernels hold at most 8 tokens: two calls (the weights read twice)
         gemv_r(W, a, 8, y, ldy, accumulate, s, sp);
         gemv_r(W, act_rows(a, 8), T - 8, y + 8 * ldy, ldy, accumulate, s, split_rows(sp, 8));

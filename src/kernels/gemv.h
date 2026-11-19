@@ -70,6 +70,14 @@ struct GemvSplit {
     // grp_rows a multiple of 16.
     int grp_rows = 0;
     int64_t grp_cols = 0;
+    // a third output: rows from r2 (> r1) on go to y3 (row stride ldy3): a LoRA adapter's A rows stacked under
+    // the base matrix (gate | up | A)
+    int r2 = 0x7fffffff;
+    float * y3 = nullptr;
+    int64_t ldy3 = 0;
+    // > 0: the tensor-core kernel (fp16 activations) from this many rows on, in place of the default threshold
+    // (BNK_GEMV_MMA_MIN, 4): a LoRA A product is too small a signal for the int8 activations of the dp4a kernels
+    int mma_min = 0;
 };
 
 // the same activations / split output from token t0 on (a window of more than 8 tokens as two calls)
@@ -85,6 +93,7 @@ inline ActQ8 act_rows(const ActQ8 & a, int t0) {
 inline GemvSplit split_rows(const GemvSplit & sp, int t0) {
     GemvSplit r = sp;
     if (r.y2) r.y2 += (int64_t) t0 * r.ldy2;
+    if (r.y3) r.y3 += (int64_t) t0 * r.ldy3;
     return r;
 }
 

@@ -26,6 +26,7 @@ void DenseEngine::prefill_alloc(int N) {
     p.ao.alloc((size_t) N * c.n_head * c.head_dim);
     p.sg.alloc((size_t) N * FF); p.su.alloc((size_t) N * FF);
     p.tok.alloc(N);
+    if (model_.lora_width) p.lt.alloc((size_t) N * model_.lora_width);
     // GEMM workspace: the largest matrix dequantized at once (gate / up / down: FF x E), and N x max K inputs
     size_t maxw = (size_t) FF * E;
     for (int il = l0_; il < l1_; ++il) {
@@ -66,6 +67,7 @@ void DenseEngine::pf_attn(int il, int N) {
     gemm_.run_h(L.wq, gemm_.xbuf(), E, N, p.qfull, H * D * 2);
     gemm_.run_h(L.wk, gemm_.xbuf(), E, N, p.k, Hkv * D);
     gemm_.run_h(L.wv, gemm_.xbuf(), E, N, p.v, Hkv * D);
+    if (L.lora_qkv.valid()) pf_lora(L.lora_qkv, gemm_.xbuf(), nullptr, E, N, p.qfull, H * D * 2, p.k, Hkv * D, p.v, Hkv * D);
     attn_prep(p.qfull, p.k, p.v, F(L.q_norm), F(L.k_norm), p.q, cur_->kc[il], cur_->vc[il], N, H, Hkv, D, c.n_rot, c.rope_base,
               &d_par_->pos0, c.rms_eps, st_, mrope_of(cur_));
     // the tensor-core kernel (head dim 256); BNK_PF_ATTN_TC=0: the one-warp-per-row kernel
@@ -74,6 +76,7 @@ void DenseEngine::pf_attn(int il, int N) {
           attention_prefill_tc(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_)))
         attention_prefill(p.q, cur_->kc[il], cur_->vc[il], p.qfull, p.ao, N, H, Hkv, D, pos0, 1.f / sqrtf((float) D), st_);
     gemm_.run(L.wo, p.ao, H * D, N, p.out, E);
+    if (L.lora_o.valid()) pf_lora(L.lora_o, nullptr, p.ao, H * D, N, p.out, E);
 }
 
 void DenseEngine::pf_ffn(int il, int N) {
@@ -84,8 +87,22 @@ void DenseEngine::pf_ffn(int il, int N) {
     f32_to_f16(p.xn, gemm_.xbuf(), (int64_t) N * E, st_);
     gemm_.run_h(L.gate, gemm_.xbuf(), E, N, p.sg, FF);
     gemm_.run_h(L.up, gemm_.xbuf(), E, N, p.su, FF);
+    if (L.lora_gu.valid()) pf_lora(L.lora_gu, gemm_.xbuf(), nullptr, E, N, p.sg, FF, p.su, FF);
     silu_mul(p.sg, p.su, p.sg, (int64_t) N * FF, st_);
     gemm_.run(L.down, p.sg, FF, N, p.out, E);
+    if (L.lora_down.valid()) pf_lora(L.lora_down, nullptr, p.sg, FF, N, p.out, E);
+}
+
+// A LoRA site over a chunk: T = X A^T (X in fp16 already, or fp32), then y_i += T_i B_i^T. The fp32 products
+// (gemm_.run) convert their input into gemm_.xbuf(): the callers are done with it by then.
+void DenseEngine::pf_lora(const DenseLora & L, const half * xh, const float * x, int64_t ldx, int N, float * y0, int64_t ld0,
+                          float * y1, int64_t ld1, float * y2, int64_t ld2) {
+    float * y[3] = {y0, y1, y2};
+    const int64_t ld[3] = {ld0, ld1, ld2};
+    if (xh) gemm_.run_h(L.a, xh, ldx, N, pf_.lt, L.width);
+    else gemm_.run(L.a, x, ldx, N, pf_.lt, L.width);
+    for (int i = 0; i < 3; ++i)
+        if (L.b[i].valid() && y[i]) gemm_.run(L.b[i], pf_.lt.p + L.off[i], L.width, N, y[i], ld[i], true);
 }
 
 void DenseEngine::prefill_chunk(const int32_t * tokens, int N) {

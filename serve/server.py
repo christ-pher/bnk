@@ -95,6 +95,16 @@ class State:
                     self.draft_defaults["draft_min_p"] = spec["dflash_min_p"]
             else:
                 print(f"bnk: note: no DFlash2 drafter at {dfl}; drafting with the MTP (tools/dflash_gguf.py writes it)", flush=True)
+        # a LoRA adapter applied at run time by the dense engine (configs/*.json "lora": a file name in the cache
+        # directory, or a path; "lora_scale" multiplies it): docs/LORA.md
+        self.lora = None
+        lora = self.config.get("lora")
+        if lora:
+            lora = os.path.expanduser(lora)
+            lora = lora if os.path.isabs(lora) else os.path.join(os.path.expanduser(args.cache_dir), lora)
+            if not os.path.exists(lora):
+                raise SystemExit(f"bnk: the config's LoRA adapter {lora} is missing (docs/LORA.md has the download)")
+            self.lora = lora
         # the guard: --no-think-guard, else BNK_THINK_GUARD, else the model config, else on
         if args.think_guard is None and os.environ.get("BNK_THINK_GUARD"):
             args.think_guard = os.environ["BNK_THINK_GUARD"] != "0"
@@ -124,6 +134,10 @@ class State:
                 print(f"bnk: note: no cold-experts file at {cold}; running without (tools/requant_experts writes it)", flush=True)
         if self.dflash:
             eargs += ["--dflash", self.dflash]
+        if self.lora:
+            eargs += ["--lora", self.lora]
+            if "lora_scale" in self.config:
+                eargs += ["--lora-scale", str(self.config["lora_scale"])]
         if args.mtp:
             eargs += ["--mtp", args.mtp, "--draft", str(args.draft)]
             if args.draft_vocab:
@@ -422,8 +436,17 @@ def title_request(body: dict) -> bool:
 
 
 def chat_prompt(body: dict) -> tuple[list[int], bool]:
-    kwargs = dict(body.get("chat_template_kwargs") or {})
-    thinking = kwargs.get("enable_thinking", body.get("enable_thinking", True))
+    # the config's defaults (vLLM's --default-chat-template-kwargs: {"enable_thinking": false} for a model tuned
+    # without thinking), then the request's
+    defaults = dict(S.config.get("chat_template_kwargs") or {})
+    kwargs = {**defaults, **(body.get("chat_template_kwargs") or {})}
+    req = body.get("chat_template_kwargs") or {}
+    thinking = req.get("enable_thinking", body.get("enable_thinking", defaults.get("enable_thinking", True)))
+    # a request's reasoning_effort asks for thinking (pi sends it for a thinking level on a "reasoning": true model),
+    # over a config default of off, unless the request says enable_thinking itself
+    asked = "enable_thinking" in req or "enable_thinking" in body
+    if body.get("reasoning_effort") not in (None, "", "none") and not asked:
+        thinking = True
     title = title_request(body)
     if title:
         thinking = False

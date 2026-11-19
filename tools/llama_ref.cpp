@@ -77,6 +77,14 @@ int main(int argc, char ** argv) {
     cp.cb_eval_user_data = &d;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) return 3;
+    // REF_LORA=adapter.gguf (REF_LORA_SCALE, default 1): the reference with a LoRA adapter, for bnk's --lora
+    if (const char * lp = getenv("REF_LORA")) {
+        llama_adapter_lora * ad = llama_adapter_lora_init(model, lp);
+        if (!ad) return 5;
+        float sc = getenv("REF_LORA_SCALE") ? (float) atof(getenv("REF_LORA_SCALE")) : 1.f;
+        if (llama_set_adapters_lora(ctx, &ad, 1, &sc)) return 6;
+        fprintf(stderr, "lora %s scale %g\n", lp, sc);
+    }
 
     llama_batch b = llama_batch_init((int) toks.size(), 0, 1);
     for (size_t i = 0; i < toks.size(); ++i) {

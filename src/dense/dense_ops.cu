@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <algorithm>
 
 #include <cuda_fp16.h>
 
@@ -139,6 +141,128 @@ void add_rows(float * y, const float * x, int64_t n, cudaStream_t s) {
 }
 void add_rows_f16x2(float * y, const half * a, const half * b, int64_t n, cudaStream_t s) {
     add_rows_f16x2_k<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, a, b, n);
+}
+
+
+namespace {
+struct LoraUpArgs {
+    const half * b[3];
+    float * y[3];
+    int64_t ld[3];
+    int rows[3];
+    int off[3];
+};
+
+// one thread per output row (of the three matrices in turn); the A product sits in shared memory and is read as a
+// broadcast. RANK > 0: the row's weights in 16-byte loads issued together (RANK / 8 of them), else a plain loop.
+template <int RANK, int NT>
+__global__ void lora_up_k(LoraUpArgs p, const float * __restrict__ t, int T, int width, int rank_rt) {
+    extern __shared__ float ts[];
+    for (int i = threadIdx.x; i < T * width; i += blockDim.x) ts[i] = t[i];
+    __syncthreads();
+    const int rank = RANK > 0 ? RANK : rank_rt;
+    const int total = p.rows[0] + p.rows[1] + p.rows[2];
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < total; g += gridDim.x * blockDim.x) {
+        int i = 0, row = g;
+        if (row >= p.rows[0]) {
+            row -= p.rows[0];
+            i = 1;
+            if (row >= p.rows[1]) {
+                row -= p.rows[1];
+                i = 2;
+            }
+        }
+        const half * br = p.b[i] + (int64_t) row * rank;
+        const float * tb = ts + p.off[i];
+        float acc[NT];
+#pragma unroll
+        for (int tt = 0; tt < NT; ++tt) acc[tt] = 0.f;
+        if constexpr (RANK > 0) {
+            uint4 wv[RANK / 8];
+#pragma unroll
+            for (int j = 0; j < RANK / 8; ++j) wv[j] = ((const uint4 *) br)[j];
+            const float4 * tb4 = (const float4 *) tb;   // width and the offsets are multiples of 8
+            const int w4 = width / 4;
+#pragma unroll
+            for (int j = 0; j < RANK / 8; ++j) {
+                const half2 * h = (const half2 *) &wv[j];
+                const float2 w0 = __half22float2(h[0]), w1 = __half22float2(h[1]), w2 = __half22float2(h[2]),
+                             w3 = __half22float2(h[3]);
+#pragma unroll
+                for (int tt = 0; tt < NT; ++tt) {
+                    if (NT == kMaxGemvRows && tt >= T) break;
+                    const float4 a = tb4[tt * w4 + 2 * j], c = tb4[tt * w4 + 2 * j + 1];
+                    acc[tt] += w0.x * a.x + w0.y * a.y + w1.x * a.z + w1.y * a.w + w2.x * c.x + w2.y * c.y + w3.x * c.z + w3.y * c.w;
+                }
+            }
+        } else {
+            for (int k = 0; k < rank; k += 2) {
+                const float2 w = __half22float2(*(const half2 *) (br + k));
+#pragma unroll
+                for (int tt = 0; tt < NT; ++tt)
+                    if (tt < T) acc[tt] += w.x * tb[tt * width + k] + w.y * tb[tt * width + k + 1];
+            }
+        }
+        float * y = p.y[i];
+        const int64_t ld = p.ld[i];
+#pragma unroll
+        for (int tt = 0; tt < NT; ++tt)
+            if (tt < T) y[tt * ld + row] += acc[tt];
+    }
+}
+template <int NT>
+void launch_lora_up(const LoraUpArgs & p, const float * t, int T, int width, int rank, int grid, int threads, size_t sh,
+                    cudaStream_t s) {
+    switch (rank) {
+        case 8: lora_up_k<8, NT><<<grid, threads, sh, s>>>(p, t, T, width, rank); break;
+        case 16: lora_up_k<16, NT><<<grid, threads, sh, s>>>(p, t, T, width, rank); break;
+        case 32: lora_up_k<32, NT><<<grid, threads, sh, s>>>(p, t, T, width, rank); break;
+        case 64: lora_up_k<64, NT><<<grid, threads, sh, s>>>(p, t, T, width, rank); break;
+        default: lora_up_k<0, NT><<<grid, threads, sh, s>>>(p, t, T, width, rank); break;
+    }
+}
+}  // namespace
+
+void lora_up(const QMat * b, float * const * y, const int64_t * ld, const int * off, int n, const float * t, int T,
+             int width, cudaStream_t s) {
+    LoraUpArgs p{};
+    int total = 0, rank = 0, k = 0;
+    for (int i = 0; i < n && i < 3; ++i, ++k) {
+        if (!b[i].valid() || !y[i]) {
+            --k;
+            continue;
+        }
+        p.b[k] = (const half *) b[i].data;
+        p.y[k] = y[i];
+        p.ld[k] = ld[i];
+        p.rows[k] = (int) b[i].rows;
+        p.off[k] = off[i];
+        if (rank && rank != (int) b[i].cols) throw std::runtime_error("lora_up: B matrices of different ranks");
+        rank = (int) b[i].cols;
+        total += (int) b[i].rows;
+    }
+    if (!total) return;
+    if (T < 1 || T > kMaxGemvRows) throw std::runtime_error("lora_up: window out of range");
+    static int sms = 0;
+    if (!sms) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    }
+    const int threads = 256, grid = std::min((total + threads - 1) / threads, sms * 4);
+    const size_t sh = (size_t) T * width * sizeof(float);
+    switch (T) {   // the window's rows exactly up to 8 (the decode and verify windows), 16 as the bound beyond
+        case 1: launch_lora_up<1>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 2: launch_lora_up<2>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 3: launch_lora_up<3>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 4: launch_lora_up<4>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 5: launch_lora_up<5>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 6: launch_lora_up<6>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 7: launch_lora_up<7>(p, t, T, width, rank, grid, threads, sh, s); break;
+        case 8: launch_lora_up<8>(p, t, T, width, rank, grid, threads, sh, s); break;
+        default: launch_lora_up<kMaxGemvRows>(p, t, T, width, rank, grid, threads, sh, s); break;
+    }
+    check_launch("lora_up");
 }
 
 }  // namespace bnk

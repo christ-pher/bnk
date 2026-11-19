@@ -12,6 +12,8 @@
 
 namespace bnk {
 
+int lora_mma_min();   // (below, with the LoRA sites)
+
 static const float * F(const QMat & m) { return (const float *) m.data; }
 
 // Debug dumps of one layer's intermediates (BNK_DUMP_DIR, BNK_DUMP_LAYER; eager mode only): appended per window.
@@ -311,6 +313,7 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     const bool want_mtp = last_ && !opt.mtp.empty();
     model_.load(path, opt.verbose, l0_, l1_, first() || want_mtp, last_, want_mtp, tp_n_, tp_rank_);
     if (l1_ < 0) l1_ = model_.cfg.n_layer;
+    if (!opt.lora.empty()) model_.load_lora(opt.lora, opt.lora_scale, opt.verbose);
     const Config & c = model_.lc;   // this slice's dimensions (the whole model's unless tensor parallel)
     if (head) {
         layer_routed.assign(c.n_layer, 0);
@@ -327,6 +330,7 @@ void DenseEngine::load_stage(const std::string & path, const EngineOptions & opt
     attn_scratch_.alloc(std::max(attention_scratch_floats(W, c.n_head, c.head_dim, opt.max_ctx),
                                  attention_decode_tc_scratch_floats(W, c.n_head, c.head_dim)));
     sg_.alloc(W * FF); su_.alloc(W * FF);
+    if (model_.lora_width) lora_t_.alloc((size_t) W * model_.lora_width);
     if (last_) logits_.alloc((size_t) W * c.n_vocab);
     argmax_dev_.alloc(W);
     const int64_t maxcols = std::max<int64_t>({(int64_t) E, (int64_t) FF, (int64_t) VI, (int64_t) c.n_head * c.head_dim});
@@ -678,12 +682,20 @@ void DenseEngine::attn(int il, int T) {
     const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, H = c.n_head, Hkv = c.n_head_kv, D = c.head_dim;
-    gemv(L.wq, &act_, nullptr, 0, T, qfull_, H * D * 2, false, st_);
+    if (L.lora_qkv.host.valid()) {   // q with A's rows under it: A x into lora_t_
+        GemvSplit sp{H * D * 2, lora_t_, (int64_t) L.lora_qkv.width};
+        sp.mma_min = lora_mma_min();
+        gemv(L.lora_qkv.host, &act_, nullptr, 0, T, qfull_, H * D * 2, false, st_, sp);
+    } else {
+        if (L.lora_qkv.valid()) lora_a(L.lora_qkv, T);
+        gemv(L.wq, &act_, nullptr, 0, T, qfull_, H * D * 2, false, st_);
+    }
     if (L.wkv.valid()) gemv(L.wkv, &act_, nullptr, 0, T, k_, Hkv * D, false, st_, GemvSplit{Hkv * D, v_, (int64_t) Hkv * D});
     else {
         gemv(L.wk, &act_, nullptr, 0, T, k_, Hkv * D, false, st_);
         gemv(L.wv, &act_, nullptr, 0, T, v_, Hkv * D, false, st_);
     }
+    if (L.lora_qkv.valid()) lora_b(L.lora_qkv, T, qfull_, H * D * 2, k_, Hkv * D, v_, Hkv * D);
     dbg(st_, tp_rank_, il, "Qcur_full", qfull_, (size_t) T * H * D * 2);
     dbg(st_, tp_rank_, il, "Vcur", v_, (size_t) T * Hkv * D);
     for (size_t wi = 0; wi < wins_.size(); ++wi) {
@@ -702,21 +714,77 @@ void DenseEngine::attn(int il, int T) {
     }
     dbg(st_, tp_rank_, il, "attn_gated", attn_o_, (size_t) T * H * D);
     quantize_act(attn_o_, H * D, T, H * D, act_, st_);
-    gemv(L.wo, &act_, nullptr, 0, T, out_, E, false, st_);
+    if (L.lora_o.host.valid()) {
+        GemvSplit sp{E, lora_t_, (int64_t) L.lora_o.width};
+        sp.mma_min = lora_mma_min();
+        gemv(L.lora_o.host, &act_, nullptr, 0, T, out_, E, false, st_, sp);
+    }
+    else {
+        if (L.lora_o.valid()) lora_a(L.lora_o, T);
+        gemv(L.wo, &act_, nullptr, 0, T, out_, E, false, st_);
+    }
+    if (L.lora_o.valid()) lora_b(L.lora_o, T, out_, E);
 }
 
 void DenseEngine::ffn(int il, int T) {
     const Config & c = model_.lc;
     const DenseLayer & L = model_.layers[il];
     const int E = c.n_embd, FF = c.n_ff;
-    if (L.gu.valid()) gemv(L.gu, &act_, nullptr, 0, T, sg_, FF, false, st_, GemvSplit{FF, su_, FF});
-    else {
-        gemv(L.gate, &act_, nullptr, 0, T, sg_, FF, false, st_);
-        gemv(L.up, &act_, nullptr, 0, T, su_, FF, false, st_);
+    if (L.lora_gu.host.valid()) {   // gate | up | A: three outputs
+        GemvSplit sp{FF, su_, FF};
+        sp.r2 = 2 * FF;
+        sp.y3 = lora_t_;
+        sp.ldy3 = L.lora_gu.width;
+        sp.mma_min = lora_mma_min();
+        gemv(L.lora_gu.host, &act_, nullptr, 0, T, sg_, FF, false, st_, sp);
+    } else {
+        if (L.lora_gu.valid()) lora_a(L.lora_gu, T);
+        if (L.gu.valid()) gemv(L.gu, &act_, nullptr, 0, T, sg_, FF, false, st_, GemvSplit{FF, su_, FF});
+        else {
+            gemv(L.gate, &act_, nullptr, 0, T, sg_, FF, false, st_);
+            gemv(L.up, &act_, nullptr, 0, T, su_, FF, false, st_);
+        }
     }
+    if (L.lora_gu.valid()) lora_b(L.lora_gu, T, sg_, FF, su_, FF);
     // silu(gate) * up inside the quantization pass of down's input
     quantize_act_silu_mul(sg_, su_, FF, T, FF, act_, st_);
-    gemv(L.down, &act_, nullptr, 0, T, ffn_out_, E, false, st_);
+    if (L.lora_down.host.valid()) {
+        GemvSplit sp{E, lora_t_, (int64_t) L.lora_down.width};
+        sp.mma_min = lora_mma_min();
+        gemv(L.lora_down.host, &act_, nullptr, 0, T, ffn_out_, E, false, st_, sp);
+    }
+    else {
+        if (L.lora_down.valid()) lora_a(L.lora_down, T);
+        gemv(L.down, &act_, nullptr, 0, T, ffn_out_, E, false, st_);
+    }
+    if (L.lora_down.valid()) lora_b(L.lora_down, T, ffn_out_, E);
+}
+
+// the GEMVs that carry A rows run on the tensor cores (fp16 activations) at every window size: through the dp4a
+// kernels' int8 activations A x is off by 0.4-0.8% (tests/test_lora.cu) and the adapter's effect blurs (KL vs llama.cpp
+// with the adapter 0.0039-0.0053 at one-row windows against 0.0021 from four rows on). BNK_LORA_MMA_MIN=N: from N rows.
+int lora_mma_min() {
+    static const int n = getenv("BNK_LORA_MMA_MIN") ? atoi(getenv("BNK_LORA_MMA_MIN")) : 1;
+    return n;
+}
+
+void DenseEngine::lora_a(const DenseLora & L, int T) {
+    GemvSplit sp;
+    sp.mma_min = lora_mma_min();
+    gemv(L.a, &act_, nullptr, 0, T, lora_t_, L.width, false, fork(1), sp);
+}
+
+void DenseEngine::lora_b(const DenseLora & L, int T, float * y0, int64_t ld0, float * y1, int64_t ld1, float * y2, int64_t ld2) {
+    if (!L.host.valid()) join(1);   // A ran on its own on the side stream
+    static const bool fused = !getenv("BNK_LORA_FUSED") || atoi(getenv("BNK_LORA_FUSED")) != 0;
+    float * y[3] = {y0, y1, y2};
+    const int64_t ld[3] = {ld0, ld1, ld2};
+    if (fused) {
+        lora_up(L.b, y, ld, L.off, 3, lora_t_, T, L.width, st_);
+        return;
+    }
+    for (int i = 0; i < 3; ++i)   // BNK_LORA_FUSED=0: one float GEMV per matrix (the reference for lora_up)
+        if (L.b[i].valid() && y[i]) gemv(L.b[i], nullptr, lora_t_.p + L.off[i], L.width, T, y[i], ld[i], true, st_);
 }
 
 void DenseEngine::head(int T) {
