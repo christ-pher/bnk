@@ -536,11 +536,36 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.close_connection = True
+        # SSE comment pings while nothing else is sent (queued behind another request, a long prompt being read):
+        # clients drop a stream whose body is silent for a while (Node's undici after 300 s: UND_ERR_BODY_TIMEOUT)
+        self._wlock = threading.Lock()
+        self._last_write = time.time()
+        self._hb_stop = threading.Event()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self, every: float = 15.0):
+        while not self._hb_stop.wait(5.0):
+            if time.time() - self._last_write >= every:
+                try:
+                    self._write(b": ping\n\n")
+                except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+                    self._hb_stop.set()   # the client is gone: the dashboard stream's loop ends on it
+                    return
+
+    def _write(self, data: bytes):
+        with self._wlock:
+            self.wfile.write(data)
+            self.wfile.flush()
+            self._last_write = time.time()
+
+    def finish(self):
+        if getattr(self, "_hb_stop", None) is not None:
+            self._hb_stop.set()
+        super().finish()
 
     def _sse(self, obj, event: str | None = None):
         s = (f"event: {event}\n" if event else "") + "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
-        self.wfile.write(s.encode())
-        self.wfile.flush()
+        self._write(s.encode())
 
     # ---- routes
     def do_OPTIONS(self):
@@ -589,17 +614,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._sse_start()
             self._sse(self._overview(), "init")
-            last = time.time()
-            while True:
+            while True:   # the heartbeat keeps proxies and the browser from timing the stream out
                 try:
                     event, data = q.get(timeout=10)
                     self._sse(data, event)
                 except queue.Empty:
-                    pass
-                if time.time() - last > 10:   # keep proxies and the browser from timing the stream out
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-                    last = time.time()
+                    if self._hb_stop.is_set():
+                        break
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
@@ -703,8 +724,7 @@ class Handler(BaseHTTPRequestHandler):
         self._sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "timings": timings})
         if (body.get("stream_options") or {}).get("include_usage"):
             self._sse({**base, "choices": [], "usage": usage})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._write(b"data: [DONE]\n\n")
 
     # ---- OpenAI completions
     def _completions(self, body):
@@ -733,8 +753,7 @@ class Handler(BaseHTTPRequestHandler):
         _, _, _, finish, usage, _ = run(ids, params, max_tokens, stops, False, emit)
         self._sse({"id": cid, "object": "text_completion", "created": now(), "model": S.model_id,
                    "choices": [{"index": 0, "text": "", "finish_reason": finish}], "usage": usage})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._write(b"data: [DONE]\n\n")
 
     # ---- Anthropic messages
     def _anthropic(self, body):
