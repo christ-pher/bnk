@@ -27,6 +27,7 @@ from .telemetry import Telemetry
 from .gguf_meta import read_metadata
 from .vision import ImageError, Images, anthropic_image, call_order, image_parts
 from .tokenizer import StreamDecoder, Tokenizer
+from .usage import Usage
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web" / "dist"      # the built dashboard (serve/web: npm run build)
@@ -154,6 +155,9 @@ class State:
                              on_log=lambda line: self.telemetry.bus.publish("log", {"t": time.time(), "line": line}))
         self.convs = Conversations(self.tok, self.im_start, self.telemetry.bus.publish, parking=args.park_gib > 0)
         self.telemetry.decoding = self.convs.decoding
+        # token usage across runs and models (the Usage page): per config, else per model id
+        self.usage = Usage(str(Path(args.cache_dir).expanduser() / "usage.sqlite"),
+                           Path(args.config).stem if args.config else self.model_id, self.model_id)
 
 
 S: State | None = None
@@ -250,6 +254,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                 S.convs.status(cid, "generating", rid)
                 if not first_prefill:   # the prompt's own read (not a resumed slice's): it may set the record
                     S.telemetry.prompt_read(len(prompt_ids) - (ev.get("reused") or 0), ev.get("ms") or 0)
+                    S.usage.add(requests=1, input=len(prompt_ids), cached=min(ev.get("reused") or 0, len(prompt_ids)))
                 first_prefill = first_prefill or ev
                 slice_t0 = time.time()
                 with S.lock:
@@ -264,6 +269,7 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                     continue
                 generated.extend(ev["ids"])
                 tail.extend(ev["ids"])
+                S.usage.add(output=len(ev["ids"]))
                 S.convs.produced(cid, len(ev["ids"]))
                 piece = dec.feed(ev["ids"])
                 with S.lock:
@@ -583,6 +589,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self._overview())
         if path == "/api/stream":
             return self._stream()
+        if path == "/api/usage":
+            return self._json(200, S.usage.report())
         if path == "/api/layers":
             q = dict(x.split("=", 1) for x in self.path.partition("?")[2].split("&") if "=" in x)
             w = q.get("window", "life")
