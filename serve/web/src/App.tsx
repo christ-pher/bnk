@@ -1,4 +1,4 @@
-import { Cpu, Gauge, LayoutDashboard, ListOrdered, MessageSquare, MessagesSquare, Moon, ScrollText, Sun, Zap } from "lucide-react"
+import { BarChart3, Cpu, Gauge, LayoutDashboard, ListOrdered, MessageSquare, MessagesSquare, Moon, ScrollText, Sun, Zap } from "lucide-react"
 import { useEffect, useState } from "react"
 
 import { ChatSheet, type ChatSettings, type Msg } from "@/components/chat/chat-sheet"
@@ -31,6 +31,7 @@ import { OverviewPage } from "@/pages/overview"
 import { PerformancePage } from "@/pages/performance"
 import { RequestsPage } from "@/pages/requests"
 import { SystemPage } from "@/pages/system"
+import { UsagePage } from "@/pages/usage"
 
 const PAGES = [
   { id: "overview", title: "Overview", icon: LayoutDashboard, ranged: true },
@@ -39,6 +40,7 @@ const PAGES = [
   { id: "system", title: "System", icon: Cpu, ranged: true },
   { id: "conversations", title: "Conversations", icon: MessagesSquare, ranged: false },
   { id: "requests", title: "Requests", icon: ListOrdered, ranged: false },
+  { id: "usage", title: "Usage", icon: BarChart3, ranged: false },
   { id: "logs", title: "Logs", icon: ScrollText, ranged: false },
 ] as const
 type PageId = (typeof PAGES)[number]["id"]
@@ -123,6 +125,7 @@ export default function App() {
             {page === "system" && <SystemPage range={range} />}
             {page === "conversations" && <ConversationsPage />}
             {page === "requests" && <RequestsPage />}
+            {page === "usage" && <UsagePage />}
             {page === "logs" && <LogsPage />}
           </main>
         </SidebarInset>
