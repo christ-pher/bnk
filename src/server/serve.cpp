@@ -757,6 +757,11 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         }
     }
     eng.save_counts();
+    try {
+        eng.persist();   // the conversations, for the next start (DeepSeek: to disk)
+    } catch (const std::exception & e) {
+        fprintf(stderr, "bnk: could not keep the conversations: %s\n", e.what());
+    }
     reader.detach();
     return 0;
 }

@@ -136,6 +136,8 @@ public:
     virtual int parked() const = 0;
     virtual size_t parked_bytes() const = 0;
     virtual void drop_parked_all() = 0;
+    // at shutdown: keep what can be kept for the next start (the DeepSeek engine writes its conversations to disk)
+    virtual void persist() {}
     virtual void save_counts() = 0;
 
     // ---- forwards

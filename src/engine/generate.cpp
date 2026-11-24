@@ -259,6 +259,14 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     stats.prompt_tokens += (int64_t) prompt.size();
     stats.reused_tokens += (int64_t) keep;
     int32_t b;
+    // BNK_DUMP_LOGITS=FILE (checks: tools/ds_park_check.py): every request's first logits row, appended as f32
+    if (static const char * dump = getenv("BNK_DUMP_LOGITS"); dump && *dump) {
+        const std::vector<float> l = eng_.logits_host(eng_.last_T - 1);
+        if (FILE * f = fopen(dump, "ab")) {
+            fwrite(l.data(), sizeof(float), l.size(), f);
+            fclose(f);
+        }
+    }
     if (sp_.greedy()) {
         b = eng_.argmax(eng_.last_T - 1);
     } else {

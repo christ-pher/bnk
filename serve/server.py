@@ -117,6 +117,10 @@ class State:
             args.content_guard = bool(self.config.get("content_loop_guard", True))
         eargs = ["--model", args.model, "--ctx", str(args.ctx), "--park-gib", str(args.park_gib),
                  "--slots", str(args.slots)]
+        # parked conversations on disk too (the DeepSeek engine; docs/DS-PARK-PLAN.md): BNK_PARK_DISK_GIB=0 turns it off
+        if args.park_gib > 0:
+            eargs += ["--park-dir", str(Path(args.cache_dir).expanduser() / "park"),
+                      "--park-disk-gib", os.environ.get("BNK_PARK_DISK_GIB", "32")]
         if args.gpus:
             eargs += ["--gpus", args.gpus]
         if args.split:

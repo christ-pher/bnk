@@ -47,7 +47,14 @@ architecture `deepseek41-engram`, `blk.{1,14}.engram_embd.weight` IQ4_NL [256 x 
   under that, else IQ2_XS).
 * **KV**: a ring of 136 (window 128 + the window's rows) latents of 512 fp16 per layer; compressed latents (512)
   and indexer keys (128) per source layer, fp16, mapped as the context grows (ratio 2: half a row per token).
-  Under 1 GB per conversation at 256K tokens.
+  Under 1 GB per conversation at 256K tokens. A snapshot holds the compressor's open groups and every layer's
+  ring (the 128 positions before it: a reply past 8 tokens overwrites their slots, so a rollback brings them back;
+  before 2026-11-24 it did not, and every turn that rolled back read a wrong window).
+* **Parking and disk** (`ds_park.cpp`, `docs/DS-PARK-PLAN.md`): another conversation's request parks the live one
+  in pinned RAM (`--park-gib`, keeping `BNK_DS_PARK_FREE_GIB`=16 of RAM free) and brings it back on its next turn;
+  a prompt sharing a long prefix with a parked one starts from its snapshot. Entries leaving RAM and, at shutdown,
+  every conversation go to `<cache-dir>/park/ds-<identity>/` (`--park-disk-gib`, default 32; `BNK_PARK_DISK_GIB=0`
+  off) and come back from there, after a restart too.
 
 ## Where the code lives
 

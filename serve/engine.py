@@ -225,6 +225,6 @@ class Engine:
         if self.alive():
             try:
                 self._send({"op": "quit"})
-                self.proc.wait(timeout=10)
+                self.proc.wait(timeout=60)   # the DeepSeek engine writes its conversations to disk first
             except Exception:
                 self.proc.kill()

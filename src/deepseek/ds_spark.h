@@ -55,6 +55,12 @@ public:
     void select(int slot) { cur_ = slot; }
     // the ring is valid up to position `pos` (a new or rolled-back conversation in the current slot)
     void restart(int pos);
+    // the current slot's rings (device pointer, bytes) and how far they are valid: a parked conversation keeps them
+    template <typename F> void each_ring(F && f) {
+        for (auto & r : slots_[cur_].ring) f((void *) r.p, r.n * sizeof(half));
+    }
+    void fed(int * lo, int * hi) const { *lo = slots_[cur_].fed_lo; *hi = slots_[cur_].fed_hi; }
+    void set_fed(int lo, int hi) { slots_[cur_].fed_lo = lo; slots_[cur_].fed_hi = hi; blocks_[cur_] = Block{}; }
 
     // Drafter: run() feeds the n verified rows' latents into the rings at cells cell0.. and, with `draft`, drafts a
     // block after the last of them (returns draft 0); step() hands out drafts 1.. of the block (-1 when the block

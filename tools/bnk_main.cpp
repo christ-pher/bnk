@@ -166,6 +166,8 @@ int main(int argc, char ** argv) {
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next()), adapt_set = true;
         else if (a == "--park-gib") opt.park_gib = std::stod(next());
         else if (a == "--park-min") opt.park_min = std::stoi(next());
+        else if (a == "--park-dir") opt.park_dir = next();
+        else if (a == "--park-disk-gib") opt.park_disk_gib = std::stod(next());
         else if (a == "--kv8") opt.kv8 = std::stoi(next()) != 0;
         else if (a == "--slots") opt.slots = std::stoi(next());
         else if (a == "--gpus") { const std::string v = next(); opt.gpus = v == "all" ? std::vector<int>{-1} : int_list(v); }
