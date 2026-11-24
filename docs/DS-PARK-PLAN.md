@@ -64,3 +64,35 @@ The Qwen design, without slot forking (one slot):
 - A restart in between: the first turn's prompt time (cold read vs disk resume).
 - Quality: greedy, a resumed turn's tokens equal the never-parked run's.
 - Decode speed unchanged (the parking is outside the forward).
+
+## Results (2026-11-24, ds-xs on the two V100s)
+
+Three bugs found and fixed on the way, two of them older than this branch:
+
+1. **Snapshots without the window ring** (phase 0 above). Before: turn 2 after a 300-token reply decoded differently
+   from a fresh read of the same prompt; after: identical.
+2. **No snapshots at all for DeepSeek.** `serve/server.py` placed them at `<|im_start|>`, which this tokenizer lacks,
+   so every new user turn read the whole prompt again (119K tokens: 134 s), parked or not. Now before the last
+   `<｜Assistant｜>` and the first `<｜User｜>`.
+3. **Ctrl-C / SIGTERM killed the engine before the server's quit** (the signal reaches the whole process group), so
+   nothing reached the disk. The engine now ends its loop on the first SIGINT / SIGTERM and persists.
+
+Exactness (`tools/ds_park_check.py --poison`): the engine is not bit-deterministic run to run (first-token KL
+3e-3..5e-2 between identical runs), so a check compares logits against the spread of three reference runs, with the
+live slot filled with NaN before every restore. extend 2.0e-2 / rerender 8.4e-3 / disk 2.2e-2, all within the
+noise; the control (open groups left NaN, `BNK_DS_PARK_BREAK=1`) 13.8.
+
+Two agents taking turns (`tools/multi_agent_bench.py 2 300000 3 300`, time slices on):
+
+| | first turn (cold) | later turns: read | later turns: whole turn | decode |
+| --- | --- | --- | --- | --- |
+| before (master behaviour) | 125-131 s for 114-119K | 125-134 s (reused 0) | ~145 s | 26-28 tok/s |
+| this branch | 125-131 s | **2.0-5.6 s** (reused all but the new ~300-500 tokens) | **28-31 s** | 28.6-29.4 tok/s |
+
+Parking a 119K-token conversation: 0.37 GiB (3.2 KB a token), 20-550 ms (a reused spare buffer is the fast case);
+restore 17-20 ms.
+
+Across a restart (one agent at 119K tokens; SIGTERM to the server's process group, then a fresh start): the stop
+wrote 7 conversations (2.6 GiB) in 2.9 s, the start found them, and the next turn reused 119,399 of 119,415 tokens
+and read for **1.0 s** (437 ms of it the disk read) against 132 s cold. That turn decoded at 20.1 tok/s against 29.9
+before the restart, probably the expert cache adapting again after the start (not measured further).
