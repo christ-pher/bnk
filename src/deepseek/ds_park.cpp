@@ -270,12 +270,31 @@ bool DsEngine::park_copy(uint64_t id, bool move_ckpts) {
     return true;
 }
 
+// BNK_DS_PARK_POISON=1 (tools/ds_park_check.py --poison): before a restore or a fork, every buffer of the live
+// slot's state is filled with NaN (all bits set, fp16 and fp32 alike), so a part the restore does not bring back,
+// or a kernel reading past what is valid, turns the logits into NaN instead of hiding in the run-to-run noise.
+static bool poison_on() {
+    static const bool v = env_int("BNK_DS_PARK_POISON", 0) != 0;
+    return v;
+}
+
+void DsEngine::poison_here() {
+    DeviceScope ds(dev_);
+    for (int il = l0_; il < l1_; ++il) {
+        if (cur_->ckv_buf[il].mapped()) CUDA_CHECK(cudaMemsetAsync(cur_->ckv_buf[il].ptr(), 0xff, cur_->ckv_buf[il].mapped(), st_));
+        if (cur_->ikc_buf[il].mapped()) CUDA_CHECK(cudaMemsetAsync(cur_->ikc_buf[il].ptr(), 0xff, cur_->ikc_buf[il].mapped(), st_));
+    }
+    each_snap([&](void * d, size_t b) { CUDA_CHECK(cudaMemsetAsync(d, 0xff, b, st_)); });
+    if (spark_) spark_->each_ring([&](void * d, size_t b) { CUDA_CHECK(cudaMemsetAsync(d, 0xff, b, st_)); });
+}
+
 // Makes parked conversation `id` the live one (the live state is overwritten: park it first to keep it).
 void DsEngine::restore(uint64_t id) {
     join_commit();
     const double t0 = now_ms();
     const int n = (int) parked_[find_parked(id)].history.size();
     ensure_ctx(n + kMaxWindow);
+    if (poison_on()) for (DsEngine * s = this; s; s = s->next_.get()) s->poison_here();
     for (DsEngine * s = this; s; s = s->next_.get()) s->restore_copy(id, false);   // every stage's copies in flight
     for (DsEngine * s = this; s; s = s->next_.get()) s->restore_copy(id, true);
     park_stats.restores++;
@@ -333,6 +352,7 @@ void DsEngine::fork_parked(uint64_t id, int pos) {
     join_commit();
     const double t0 = now_ms();
     ensure_ctx(pos + kMaxWindow);
+    if (poison_on()) for (DsEngine * s = this; s; s = s->next_.get()) s->poison_here();
     for (DsEngine * s = this; s; s = s->next_.get()) s->fork_copy(id, pos, false);
     for (DsEngine * s = this; s; s = s->next_.get()) s->fork_copy(id, pos, true);
     park_stats.forks++;

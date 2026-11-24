@@ -276,6 +276,7 @@ private:
     void park(uint64_t keep, bool move_ckpts);
     bool park_copy(uint64_t id, bool move_ckpts);
     void restore(uint64_t id);
+    void poison_here();   // checks: the live slot's state buffers filled with NaN
     void restore_copy(uint64_t id, bool finish);
     void fork_parked(uint64_t id, int pos);
     void fork_copy(uint64_t id, int pos, bool finish);

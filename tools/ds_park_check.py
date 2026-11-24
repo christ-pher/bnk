@@ -37,6 +37,7 @@ ap.add_argument("--first", type=int, default=8, help="turn 1's reply length (sho
 ap.add_argument("--long", type=int, default=300, help="turn 1's reply length in the window case")
 ap.add_argument("--ctx-chars", type=int, default=12000)
 ap.add_argument("--park-dir", default=str(ROOT / "build" / "park-check"))
+ap.add_argument("--poison", action="store_true", help="BNK_DS_PARK_POISON=1: the slot is NaN before every restore or fork, so a part left out turns the logits into NaN")
 ap.add_argument("--log", default="", help="the engine's stderr (default: inherited)")
 a = ap.parse_args()
 
@@ -49,6 +50,8 @@ Path(a.park_dir).mkdir(parents=True, exist_ok=True)
 dump.unlink(missing_ok=True)
 env = dict(os.environ, BNK_EXACT="1", BNK_DS_ADAPT="0", BNK_DS_LOOKUP="0", BNK_CPU_US_PER_EXPERT_TOKEN="1e9",
            BNK_PARK_DIR=a.park_dir, BNK_DUMP_LOGITS=str(dump))
+if a.poison:
+    env["BNK_DS_PARK_POISON"] = "1"
 log = open(a.log, "ab") if a.log else None
 eng = None
 n = 0
@@ -146,6 +149,10 @@ def report(case, refs, test, want_reused):
     """refs / test: (tokens, reused, logits). Passes when the test's KL from the references is within the spread
     of the references' KL from each other (the run-to-run noise)."""
     global ok
+    if not np.isfinite(test[2]).all():
+        ok = False
+        print(f"{case:9s}: the test's logits are not finite (NaN: a part of the state was not restored) -> BAD", flush=True)
+        return
     noise = max(kl(refs[i][2], refs[j][2]) for i in range(len(refs)) for j in range(len(refs)) if i != j)
     d = float(np.median([kl(r[2], test[2]) for r in refs]))
     tops = {int(np.argmax(r[2])) for r in refs}
