@@ -8,6 +8,7 @@ import argparse
 import collections
 import json
 import os
+import signal
 import queue
 import re
 import sys
@@ -57,6 +58,9 @@ class State:
         self.waiting = 0
         self.lock = threading.Lock()
         self.im_start = self.tok.id_of("<|im_start|>")
+        # DeepSeek-V4.1 has no <|im_start|>: its turns start at <｜User｜> / <｜Assistant｜> (the snapshots below)
+        self.ds_user = self.tok.id_of("<｜User｜>") if self.im_start is None else None
+        self.ds_assistant = self.tok.id_of("<｜Assistant｜>") if self.im_start is None else None
         # images (--mmproj): prepared here, encoded by the engine; their raw pixels go to a folder it reads
         self.images = None
         self.image_pad = self.tok.id_of("<|image_pad|>")
@@ -236,17 +240,28 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
         # shares everything before it (even when the client re-renders this turn's answer differently)
         # and where the first turn after a leading system message begins: other conversations with the same
         # system prompt (an agent's workers) start from that snapshot instead of reading it again
+        cps = []
         if S.im_start is not None and allow_guard:
             last = len(ids) - 1 - ids[::-1].index(S.im_start) if S.im_start in ids else -1
-            cps = []
             if ids and ids[0] == S.im_start and S.im_start in ids[1:]:
                 first = ids.index(S.im_start, 1)
                 if 0 < first < last:
                     cps.append(first)
             if last > 0:
                 cps.append(last)
-            if cps:
-                extra["checkpoints"] = cps
+        elif S.ds_assistant is not None and allow_guard and S.ds_assistant in ids:
+            # DeepSeek: before the last <｜Assistant｜> (the next turn re-renders this answer without its reasoning,
+            # so it shares everything up to there) and before the first <｜User｜> (after the system prompt).
+            # Without these a DeepSeek conversation had no snapshot and every new user turn read it all again.
+            last = len(ids) - 1 - ids[::-1].index(S.ds_assistant)
+            if S.ds_user is not None and S.ds_user in ids:
+                first = ids.index(S.ds_user)
+                if 0 < first < last:
+                    cps.append(first)
+            if last > 0:
+                cps.append(last)
+        if cps:
+            extra["checkpoints"] = cps
         gen = S.engine.generate(ids, {**params, **extra, "max_tokens": max_tokens - len(generated), "stop_ids": S.stop_ids},
                                 on_start=lambda r: S.convs.status(cid, "reading", r))
         wrap_pending, wrap_deadline, outcome = False, 0, None
@@ -980,6 +995,9 @@ def main():
     srv = Server((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"bnk: listening on http://{args.host}:{args.port}  (UI at /, OpenAI API at /v1)", flush=True)
+    def on_term(*_):   # SIGTERM like Ctrl-C: the engine gets its quit and keeps its conversations (DeepSeek: to disk)
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

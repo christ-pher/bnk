@@ -14,6 +14,7 @@
 //        in-flight work included, so a reader gets exact rates from the differences of two snapshots.
 #include "server/serve.h"
 
+#include <signal.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
@@ -239,7 +240,18 @@ struct Active {
     Current cur;
 };
 
+// SIGINT / SIGTERM (Ctrl-C in the server's terminal reaches the engine too, as does a signal to the process group):
+// the loop ends as on a quit, so the engine keeps its conversations (persist) instead of dying first. A second
+// signal ends it at once.
+static std::atomic<bool> g_stop{false};
+static void on_stop_signal(int sig) {
+    g_stop = true;
+    signal(sig, SIG_DFL);
+}
+
 int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & model_name) {
+    signal(SIGINT, on_stop_signal);
+    signal(SIGTERM, on_stop_signal);
     const int n_slots = eng.slots();
     Totals tot;
     std::mutex mu;
@@ -693,7 +705,7 @@ int serve_main(EngineApi & eng, const GenOptions & gopt, const std::string & mod
         chunk_t0 = now_ms();
     };
     static double last_save = now_ms();
-    while (!quit) {
+    while (!quit && !g_stop) {
         // 1. admit waiting requests while slots are free (each prompt read in turn)
         Json req;
         bool have = false;
