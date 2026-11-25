@@ -460,30 +460,53 @@ def title_request(body: dict) -> bool:
     return False
 
 
+def template_effort(eff):
+    """A thinking level (OpenAI's minimal / low / medium / high / xhigh, max, or a number 1-100) in the model
+    template's own terms, so a config or request can use any of them on any model."""
+    num = eff if isinstance(eff, int) and not isinstance(eff, bool) else (int(eff) if isinstance(eff, str) and eff.isdigit() else None)
+    if "DSML" in S.tok.chat_template:
+        # DeepSeek-V4.1: an integer budget 1-100 or low / high / max (50 / 75 / 100)
+        if num is not None:
+            return str(min(max(num, 1), 100))
+        return {"minimal": "25", "medium": "62", "xhigh": "max"}.get(eff, eff)
+    # Qwen3.8 (and its post-trains): low / medium / xhigh
+    if num is not None:
+        return "low" if num <= 50 else "medium" if num < 75 else "xhigh"
+    return {"minimal": "low", "high": "xhigh", "max": "xhigh"}.get(eff, eff)
+
+
 def chat_prompt(body: dict) -> tuple[list[int], bool]:
     # the config's defaults (vLLM's --default-chat-template-kwargs: {"enable_thinking": false} for a model tuned
     # without thinking), then the request's
     defaults = dict(S.config.get("chat_template_kwargs") or {})
-    kwargs = {**defaults, **(body.get("chat_template_kwargs") or {})}
     req = body.get("chat_template_kwargs") or {}
+    kwargs = {**defaults, **req}
     thinking = req.get("enable_thinking", body.get("enable_thinking", defaults.get("enable_thinking", True)))
-    # a request's reasoning_effort asks for thinking (pi sends it for a thinking level on a "reasoning": true model),
-    # over a config default of off, unless the request says enable_thinking itself
     asked = "enable_thinking" in req or "enable_thinking" in body
-    if body.get("reasoning_effort") not in (None, "", "none") and not asked:
-        thinking = True
+    # the thinking level: the request's (its chat_template_kwargs, else a top-level reasoning_effort: pi sends that
+    # for a thinking level on a "reasoning": true model), else the config's default
+    if req.get("reasoning_effort") not in (None, ""):
+        eff, from_request = req["reasoning_effort"], True
+    elif body.get("reasoning_effort") not in (None, ""):
+        eff, from_request = body["reasoning_effort"], True
+    else:
+        eff, from_request = defaults.get("reasoning_effort"), False
+    kwargs.pop("reasoning_effort", None)
+    eff = eff.strip().lower() if isinstance(eff, str) else eff
+    if from_request:
+        # a level asks for thinking over a config default of off, unless the request says enable_thinking itself;
+        # "none" turns it off
+        if eff == "none":
+            thinking = False
+        elif not asked:
+            thinking = True
+    elif eff == "none" and not asked:   # a config default of "none": off, as enable_thinking false
+        thinking = False
+    if eff not in (None, "", "none"):
+        kwargs["reasoning_effort"] = template_effort(eff)
     title = title_request(body)
     if title:
         thinking = False
-    if body.get("reasoning_effort") and "reasoning_effort" not in kwargs:
-        eff = body["reasoning_effort"]
-        if eff == "none":
-            thinking = False
-        elif "DSML" in S.tok.chat_template:
-            # DeepSeek-V4.1: an integer budget 1-100 or low / high / max (50 / 75 / 100); OpenAI's other levels mapped
-            kwargs["reasoning_effort"] = {"minimal": "25", "medium": "62", "xhigh": "max"}.get(eff, eff)
-        else:
-            kwargs["reasoning_effort"] = {"high": "xhigh", "minimal": "low"}.get(eff, eff)
     kwargs["enable_thinking"] = bool(thinking)
     messages = body.get("messages", [])
     if S.template.native_system:   # DeepSeek's order of parallel tool results (and of the images in them)

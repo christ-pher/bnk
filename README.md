@@ -806,7 +806,12 @@ especially `top_k` 0); everything else picks its candidates on the GPU.
 
 **APIs** - OpenAI `POST /v1/chat/completions` and `/v1/completions` (streaming, tools, `reasoning_content`),
 Anthropic `POST /v1/messages`, `GET /v1/models`. Thinking is on by default; turn it off per request with
-`"chat_template_kwargs": {"enable_thinking": false}`. Requests may also set `draft` and `draft_min_p`.
+`"chat_template_kwargs": {"enable_thinking": false}`, or set a level with `reasoning_effort` (`none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`, or a number 1-100), translated to the model's own levels (Qwen3.8 and its
+post-trains: low / medium / xhigh; DeepSeek-V4.1: low / high / max or a budget 1-100). A config sets the defaults the
+same way, e.g. `"chat_template_kwargs": {"reasoning_effort": "low"}` or `{"enable_thinking": false}`; a request's own
+level or `enable_thinking` beats them (`tests/test_thinking_default.py`). Requests may also set `draft` and
+`draft_min_p`.
 
 ```bash
 curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
