@@ -87,3 +87,23 @@ experts BF16). Architecture `inkling2_loop`; reference: mainline llama.cpp `src/
 3. Prompt-path MoE on tensor cores (grouped by expert), bigger chunks.
 4. Fewer, fused small kernels.
 5. The DSpark drafter.
+
+### Overhaul results (2026-11-25, through the server, both GPUs)
+
+| prompt | read before -> now | decode before -> now |
+|---|---|---|
+| short | - | 47.6 -> 55 tok/s |
+| 2.9K | 507 -> 1,046 tok/s | 37.4 -> 52.8 tok/s |
+| 11K | 491 -> 1,100 tok/s | 28.8 -> 51.2 tok/s |
+| 40K | 305 -> 1,040 tok/s | 15.8 -> 48.1 tok/s |
+
+Context 131K -> 262K (each GPU holds half the KV cache: 4.1 GiB at 262K, 15.5 GiB free). Logits still match the
+reference (2,934 tokens: NLL 2.1130 vs 2.1101, top-1 97.0%).
+
+* Steps done: 1 (tensor-core attention: the long-context cliff), 2 (tensor parallel: half the weights a GPU), 3
+  (tensor-core experts in the prompt path), part of 4 (stacked projections, fused routing + plan, mix + norm in one
+  block: 2,426 -> 1,977 launches a token).
+* Decode is now bound by ~2,000 dependent small kernels a token on each GPU (14.4 ms of work at 82% busy; the
+  weights themselves are ~4 ms a GPU): tensor parallel halved the weight reads but the replicated small kernels and
+  the 96 exchanges stay. The biggest lever left is verifying several tokens a window (the small kernels cost the
+  same for 4 rows as for 1): the DSpark drafter (step 5).
