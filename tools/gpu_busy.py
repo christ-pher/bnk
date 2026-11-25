@@ -76,7 +76,7 @@ class Sampler(threading.Thread):
         return (sum(vals) / len(vals), len(vals)) if vals else (float("nan"), 0)
 
 
-def request(url, chars, max_tokens, think):
+def request(url, chars, max_tokens, think, seed=None, note=None):
     files = sorted((ROOT / "src").glob("**/*.cpp"))
     ctx, n = [], 0
     for f in files:
@@ -86,9 +86,11 @@ def request(url, chars, max_tokens, think):
         if n >= chars:
             break
     body = {"messages": [{"role": "system", "content": "You review C++ code.\n\n" + "".join(ctx)[:chars]},
-                         {"role": "user", "content": f"Describe what these files do. Note: {time.time()}"}],
+                         {"role": "user", "content": f"Describe what these files do. Note: {time.time() if note is None else note}"}],
             "max_tokens": max_tokens, "stream": True, "stream_options": {"include_usage": True},
             "chat_template_kwargs": {"enable_thinking": think}}
+    if seed is not None:
+        body["seed"] = seed
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), {"content-type": "application/json"})
     t0 = time.time()
     first = None
@@ -114,6 +116,8 @@ def main():
     ap.add_argument("--prompt-chars", type=int, default=20000)
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--think", action="store_true")
+    ap.add_argument("--seed", type=int, default=None, help="sampling seed (the same text decodes the same way)")
+    ap.add_argument("--note", default=None, help="the user message's suffix (default: the time, so no two prompts match)")
     ap.add_argument("--watch", type=float, default=0, help="no request: sample for this many seconds")
     a = ap.parse_args()
     nv = Nvml()
@@ -126,7 +130,7 @@ def main():
         info = ""
     else:
         time.sleep(0.5)
-        t0, t1, t2, usage, tm = request(a.url, a.prompt_chars, a.max_tokens, a.think)
+        t0, t1, t2, usage, tm = request(a.url, a.prompt_chars, a.max_tokens, a.think, a.seed, a.note)
         phases = [("prompt read", t0, t1), ("decode", t1, t2)]
         gen = usage.get("completion_tokens", 0)
         info = (f"prompt {usage.get('prompt_tokens')} tokens (reused {tm.get('reused')}) in {t1 - t0:.1f} s; "

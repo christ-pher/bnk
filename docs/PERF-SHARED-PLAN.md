@@ -35,8 +35,20 @@ tensor-parallel path.
 `<counts>.resident` (BNKR v1: n_layer, n_expert, then (layer, expert) pairs hottest first by the adaptive score) is
 written with the counts (every 60 s while serving, and at quit). At load, `warm_ranking` puts it ahead of the counts'
 ranking (`ExpertCache::init` drops repeats and completes the rest), so the cache starts where the last run left it.
-`BNK_WARM_START=0` turns it off. Both MoE engines. Test: `build/test_expert_counts`. To measure: decode right after a
-restart, warm vs `BNK_WARM_START=0`.
+`BNK_WARM_START=0` turns it off. Both MoE engines. Test: `build/test_expert_counts`.
+
+Measured (2026-11-25, ds-xs, both GPUs, DSpark on): the cache adapted over four code requests (30.2 -> 37.8 tok/s), the
+server stopped (the resident file: 4,296 experts, as resident), then restarted with the same files twice. The same
+seeded 400-token request three times after each start:
+
+| | request 1 | 2 | 3 |
+| --- | --- | --- | --- |
+| before the restart | 34.2 | 38.2 | |
+| restart, `BNK_WARM_START=0` (master) | 26.4 | 32.1 | 33.4 |
+| restart, warm start | **31.3** | **38.1** | **36.4** |
+
+The first request after a start is 18% faster and the next ones are at the pre-restart speed; without it the cache
+needs several requests to adapt back. (Run-to-run spread of one request is ~10%: 34.2 vs 38.2 on the same seed.)
 
 ## Step 3: the CPU pool (measured 2026-11-25, `bench_ds_cpu` layer 10, 3 experts a call, pinned, 8 chunks a thread)
 
