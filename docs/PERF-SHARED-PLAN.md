@@ -117,3 +117,24 @@ machine idle (no production server) the one-token call is 0.578 / 0.580 ms at 24
 production server's threads on the cores; idle, the siblings give ~3% and the pool is still unstable above 40.
 Defaults unchanged. The one thing wait=1 does buy: idle workers sleep after ~1 ms instead of spinning ~46 ms (an
 idle server showed ~190% CPU).
+
+## Found while profiling: sampling a row's tail on the host (DeepSeek decode +10%)
+
+`bnk run` with the production settings (DSpark, draft 5, temperature 1.0, top-p 1.0, top-k 0; 6,464-token code prompt,
+800 tokens, seed 11) put a round at 81 ms: verify 56.5, draft 14.9, and **9.4 ms of host sampling** (`sample_ms`, not
+printed before). Without top-k, top-p or min-p every token within 30 nats of the max is a candidate (~100K), far past
+the GPU's 1,024, so `distribution_head` gave up on 781 of ~1,060 rows and the whole 129K-logit row went to the host.
+
+Now (`Sampler::draw_head_tail`): the head is exact (the GPU's normalizer covers the whole vocabulary) and the rest of
+the row (its mass: one minus the head's) is fetched only when a draw lands there, a draft token is outside the head,
+or the drafter's distribution reaches past it. Exact: `build/test_sampler` draws 400K times from a 2,000-token row
+with a 48% tail, plain / excluding a token / the residual against a draft, and the total variation from the exact
+distribution equals the whole-row draw's (0.0175-0.0183 vs 0.0179-0.0180). `BNK_SAMPLE_WHOLE_ROW=1` restores the old
+path.
+
+| same run | sampling a round | whole rows on the host | decode |
+| --- | --- | --- | --- |
+| before | 9.38 ms | 781 | 36.33 tok/s |
+| after | **2.99 ms** | 91 (777 from the head) | **39.82 tok/s (+9.6%)** |
+
+Any model served without top-k / top-p / min-p takes this path (the DeepSeek configs; the Qwen configs use top-k 20).

@@ -737,6 +737,8 @@ int main(int argc, char ** argv) {
            gs.verify_ms / std::max<int64_t>(1, gs.rounds), gs.commit_ms / std::max<int64_t>(1, gs.rounds),
            gs.draft_ms / std::max<int64_t>(1, gs.rounds), tm.cpu_experts_ms / std::max(1, tm.calls), tm.ple_ms / std::max(1, tm.calls),
            tm.wait_ms / std::max(1, tm.calls));
+    printf("sampling: %.2f ms per round on the host, %lld rows from the whole vocabulary on the host, %lld from the GPU's head\n",
+           gs.sample_ms / std::max<int64_t>(1, gs.rounds), (long long) gs.host_rows, (long long) gs.lazy_rows);
     printf("drafting: run %.2f ms per round, %.2f further steps per round at %.2f ms each\n",
            gs.draft_run_ms / std::max<int64_t>(1, gs.rounds), (double) gs.draft_steps / std::max<int64_t>(1, gs.rounds),
            (gs.draft_ms - gs.draft_run_ms) / std::max<int64_t>(1, gs.draft_steps));

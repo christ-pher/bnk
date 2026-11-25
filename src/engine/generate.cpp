@@ -361,20 +361,60 @@ int Generator::verify_window(int T, int r0, int32_t * bonus_out) {
             eng_.logits_rows_host(T, logits_host_.data(), r0);
         }
         bonus = -1;
+        // Without a top-p / min-p cut (DeepSeek's temperature 1, top-p 1, top-k 0), a row's candidates are every token
+        // within 30 nats of the max (~100K), far past the GPU's 1,024: the head is exact (normalized over the whole
+        // vocabulary) and the rest of the row only matters to a draw that lands there (probability: the head's
+        // complement) or a draft outside the head. So the row comes to the host only then, not for every row (9.4 ms
+        // a round of 81 on DeepSeek). BNK_SAMPLE_WHOLE_ROW=1: every such row from the host, as before.
+        static const bool lazy_env = !getenv("BNK_SAMPLE_WHOLE_ROW");
+        const bool lazy = lazy_env && !(sp_.min_p > 0.f || sp_.top_p < 1.f);
+        bool tail = false;       // dist_ holds the head only; tail_mass is the rest of the row
+        double tail_mass = 0;
+        auto whole_row = [&](int i) {
+            logits_host_.resize(V);
+            eng_.logits_rows_host(1, logits_host_.data(), r0 + i);
+            std::vector<int32_t> recent;
+            sampler_.distribution(logits_host_.data(), V, sp_, recent, dist_);
+            ++stats.host_rows;
+            tail = false;
+        };
+        auto in_head = [&](int32_t t) {
+            for (auto & c : dist_)
+                if (c.first == t) return true;
+            return false;
+        };
+        // a draw from the row without `exclude` (a point-mass draft that was rejected), or from max(0, p - q)
+        auto draw_row = [&](int i, int32_t exclude, const std::vector<std::pair<int32_t, float>> * q) -> int32_t {
+            if (tail && q)
+                for (auto & c : *q)
+                    if (c.second > 0.f && !in_head(c.first)) { whole_row(i); break; }   // q reaches into the tail
+            if (!tail) return q ? sampler_.draw_residual(dist_, *q) : sampler_.draw(dist_, exclude);
+            const std::vector<std::pair<int32_t, float>> head = dist_;
+            return sampler_.draw_head_tail(head, tail_mass, exclude, q, [&]() -> const std::vector<std::pair<int32_t, float>> & {
+                whole_row(i);
+                return dist_;
+            });
+        };
         for (int i = 0; i < T; ++i) {
+            tail = false;
             if (!gpu) {
                 std::vector<int32_t> recent;
                 recent_tail(recent);
                 sampler_.distribution(logits_host_.data() + (size_t) i * V, V, sp_, recent, dist_);
-            } else if (!row_distribution(i, dist_)) {   // the cut lies beyond the GPU's candidates: the whole row
-                logits_host_.resize(V);
-                eng_.logits_rows_host(1, logits_host_.data(), r0 + i);
-                std::vector<int32_t> recent;
-                sampler_.distribution(logits_host_.data(), V, sp_, recent, dist_);
-                ++stats.host_rows;
+            } else if (!row_distribution(i, dist_)) {   // the cut lies beyond the GPU's candidates
+                if (lazy && !dist_.empty()) {
+                    double s = 0;
+                    for (auto & c : dist_) s += c.second;
+                    tail = true;
+                    tail_mass = std::max(0.0, 1.0 - s);
+                    ++stats.lazy_rows;
+                } else {
+                    whole_row(i);
+                }
             }
-            if (i == T - 1) { bonus = sampler_.draw(dist_); break; }
+            if (i == T - 1) { bonus = draw_row(i, -1, nullptr); break; }
             const int32_t d = win[i + 1];
+            if (tail && !in_head(d)) whole_row(i);   // the draft's own probability is in the tail
             float pd = 0.f;
             for (auto & c : dist_)
                 if (c.first == d) { pd = c.second; break; }
@@ -392,7 +432,7 @@ int Generator::verify_window(int T, int r0, int32_t * bonus_out) {
                 ++a;
                 continue;
             }
-            bonus = q ? sampler_.draw_residual(dist_, *q) : sampler_.draw(dist_, d);
+            bonus = draw_row(i, q ? -1 : d, q);
             break;
         }
         stats.sample_ms += now_ms() - t0;

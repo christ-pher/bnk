@@ -112,5 +112,70 @@ int main() {
                     }
     }
     printf("%d cases, %d mismatches: %s\n", cases, bad, bad ? "FAIL" : "PASS");
+
+    // draw_head_tail (the GPU's head with the rest of the row fetched only when a draw lands there) is distributed as
+    // draw() / draw_residual() over the whole row: histograms of N draws, total variation against the exact
+    // distribution, beside the same for the whole-row draw (the sampling noise)
+    {
+        std::mt19937 g(7);
+        std::normal_distribution<float> nd(0.f, 2.f);
+        const int V = 2000, K = 64, N = 400000;
+        std::vector<float> l(V);
+        for (auto & x : l) x = nd(g);
+        SamplingParams sp;
+        sp.temperature = 1.f;
+        Sampler sm;
+        sm.seed(11);
+        Dist full;
+        sm.distribution(l.data(), V, sp, {}, full);
+        Dist sorted = full;
+        std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+        Dist head(sorted.begin(), sorted.begin() + K);
+        double hs = 0;
+        for (auto & c : head) hs += c.second;
+        const double tail = 1.0 - hs;
+        Dist q{{head[0].first, 0.5f}, {head[3].first, 0.3f}, {head[10].first, 0.2f}};   // a draft's distribution
+        const int32_t excl = head[1].first;
+        int whole_calls = 0;
+        auto whole = [&]() -> const Dist & { ++whole_calls; return full; };
+        // the exact targets
+        auto target = [&](int mode) {
+            std::vector<double> p(V, 0.0);
+            double tot = 0;
+            for (auto & c : full) {
+                double v = c.second;
+                if (mode == 1 && c.first == excl) v = 0;
+                if (mode == 2) {
+                    double qc = 0;
+                    for (auto & d : q) if (d.first == c.first) qc = d.second;
+                    v = std::max(0.0, v - qc);
+                }
+                p[c.first] = v;
+                tot += v;
+            }
+            for (auto & v : p) v /= tot;
+            return p;
+        };
+        auto tv = [&](const std::vector<int> & h, const std::vector<double> & p) {
+            double d = 0;
+            for (int t = 0; t < V; ++t) d += std::fabs((double) h[t] / N - p[t]);
+            return d / 2;
+        };
+        const char * names[3] = {"plain", "excluding a token", "residual vs a draft"};
+        for (int mode = 0; mode < 3; ++mode) {
+            std::vector<int> ht(V, 0), hw(V, 0);
+            for (int n = 0; n < N; ++n) {
+                ht[sm.draw_head_tail(head, tail, mode == 1 ? excl : -1, mode == 2 ? &q : nullptr, whole)]++;
+                hw[mode == 2 ? sm.draw_residual(full, q) : sm.draw(full, mode == 1 ? excl : -1)]++;
+            }
+            const auto p = target(mode);
+            const double a = tv(ht, p), b = tv(hw, p);
+            const bool ok = a < 1.5 * b + 0.002;
+            bad += !ok;
+            printf("head/tail draw, %s: total variation %.4f (whole-row draw %.4f); the row fetched for %.1f%% of draws "
+                   "(tail mass %.3f) -> %s\n", names[mode], a, b, 100.0 * whole_calls / N, tail, ok ? "PASS" : "FAIL");
+            whole_calls = 0;
+        }
+    }
     return bad ? 1 : 0;
 }

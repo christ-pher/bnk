@@ -1,6 +1,7 @@
 // Token sampling on the host: temperature, top-k, top-p, min-p, repetition/presence penalties.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <random>
 #include <utility>
@@ -46,6 +47,37 @@ public:
     // from max(0, p - q), normalized (p: dist; q: a sampled draft's distribution); p itself when that is empty
     int32_t draw_residual(const std::vector<std::pair<int32_t, float>> & p, const std::vector<std::pair<int32_t, float>> & q);
     float uniform() { return std::uniform_real_distribution<float>(0.f, 1.f)(rng_); }
+    // A draw from a row known only by its head (tokens with their exact probabilities, normalized over the whole row)
+    // and the rest's mass `tail`: without `exclude`, or from max(0, p - q) when q is given (q: no mass outside the
+    // head). Only a draw that lands in the rest calls whole(), which returns the whole row's distribution; the
+    // result is distributed exactly as draw() / draw_residual() over the whole row.
+    template <typename W>
+    int32_t draw_head_tail(const std::vector<std::pair<int32_t, float>> & head, double tail, int32_t exclude,
+                           const std::vector<std::pair<int32_t, float>> * q, W && whole) {
+        std::vector<std::pair<int32_t, float>> h;
+        double hm = 0;
+        for (auto & c : head) {
+            if (c.first == exclude) continue;
+            float v = c.second;
+            if (q) {
+                float qc = 0.f;
+                for (auto & d : *q)
+                    if (d.first == c.first) { qc = d.second; break; }
+                v = v > qc ? v - qc : 0.f;
+            }
+            if (v > 0.f) { h.emplace_back(c.first, v); hm += v; }
+        }
+        if (tail <= 0 || std::uniform_real_distribution<double>(0.0, hm + tail)(rng_) < hm)
+            return h.empty() ? draw(head, exclude) : draw(h);
+        std::vector<int32_t> ids;
+        for (auto & c : head) ids.push_back(c.first);
+        std::sort(ids.begin(), ids.end());
+        const std::vector<std::pair<int32_t, float>> & all = whole();
+        std::vector<std::pair<int32_t, float>> t;
+        for (auto & c : all)
+            if (c.first != exclude && !std::binary_search(ids.begin(), ids.end(), c.first)) t.push_back(c);
+        return t.empty() ? (h.empty() ? draw(head, exclude) : draw(h)) : draw(t);
+    }
 
 private:
     std::mt19937_64 rng_{std::random_device{}()};  // per process; a request's "seed" makes it reproducible
