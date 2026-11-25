@@ -22,6 +22,7 @@
 namespace bnk {
 
 constexpr int kInkWin = 16;   // rows of a decode / verify window
+constexpr int kInkAttnSplits = 32;   // most key splits of the attention
 
 class InkEngine : public EngineApi {
 public:

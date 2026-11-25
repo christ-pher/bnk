@@ -73,16 +73,22 @@ int main(int argc, char ** argv) {
     { std::ifstream f(argv[2]); int t; while (f >> t) toks.push_back(t); }
     const int N = (int) toks.size();
     const int P = argc > 5 ? atoi(argv[5]) : std::min(N - 1, 16);
-    int fd = open(argv[3], O_RDONLY);
-    if (fd < 0) { perror("ref"); return 1; }
-    const size_t bytes = lseek(fd, 0, SEEK_END);
-    const float * ref = (const float *) mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
-    const int V = (int) (bytes / 4 / N);
+    const bool no_ref = std::string(argv[3]) == "-";   // speed modes only
+    const float * ref = nullptr;
+    int V = 0;
+    if (!no_ref) {
+        int fd = open(argv[3], O_RDONLY);
+        if (fd < 0) { perror("ref"); return 1; }
+        const size_t bytes = lseek(fd, 0, SEEK_END);
+        ref = (const float *) mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        V = (int) (bytes / 4 / N);
+    }
 
     EngineOptions opt;
     opt.max_ctx = N + 64;
     InkEngine eng;
     eng.load(argv[1], opt);
+    if (no_ref) V = eng.cfg().n_vocab;
     if (eng.cfg().n_vocab != V) { fprintf(stderr, "vocabulary %d vs reference %d\n", eng.cfg().n_vocab, V); return 1; }
     std::vector<float> host((size_t) kInkWin * V);
     Stats near, far, all;
@@ -100,6 +106,15 @@ int main(int argc, char ** argv) {
         }
     };
     const double t0 = now_ms();
+    if (mode == "pp") {   // prompt speed: every token as a prompt, twice (the first warms up)
+        for (int rep = 0; rep < 2; ++rep) {
+            eng.reset();
+            const double a = now_ms();
+            eng.prefill(toks);
+            printf("prompt: %d tokens in %.2f s (%.0f tok/s)\n", N, (now_ms() - a) / 1000, N / ((now_ms() - a) / 1000));
+        }
+        return 0;
+    }
     if (mode == "speed") {   // decode speed: P prompt tokens, then 64 one-token forwards (greedy)
         eng.prefill(std::vector<int32_t>(toks.begin(), toks.begin() + P));
         int32_t t = eng.argmax(eng.last_T - 1);

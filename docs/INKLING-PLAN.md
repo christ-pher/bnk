@@ -75,3 +75,15 @@ experts BF16). Architecture `inkling2_loop`; reference: mainline llama.cpp `src/
     split-K attention, prompt speed (the MoE prompt path: moe_tc-style grouped tensor-core experts, flash prompt
     attention), the DSpark drafter (dspark-Inkling-2-Mini-Q8_0.gguf, block 8, taps the looped layers), vision
     (mmproj-F16.gguf), the second GPU (tensor parallel would halve the weight traffic), more slots.
+
+## Overhaul (2026-11-25, the user: "only one of the GPUs was being used")
+
+1. Attention: decode split over the keys (a block per KV head, window row and key range; the three query heads of
+   a KV head together, K/V tiles in shared memory), a combine pass; prompts: tensor-core flash attention with the
+   relative bias, the sink and the window. Long contexts were the cliff (40K: decode 15.8 tok/s, prompts 305 tok/s).
+2. Tensor parallel over both V100s: half the query / KV heads (12 / 4), half of every expert's FFN width (576 of
+   1,152), half the vocabulary each; the depth mixes, norms, loop controls and routers on both. Two all-reduces a
+   visit (after the attention's output projection, after the MoE) of [T][E] over P2P, captured in one graph.
+3. Prompt-path MoE on tensor cores (grouped by expert), bigger chunks.
+4. Fewer, fused small kernels.
+5. The DSpark drafter.

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "inkling/ink_attn.h"
 #include "inkling/ink_ops.h"
 #include "kernels/ops.h"
 
@@ -70,6 +71,9 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     ctrl_gain_.alloc((size_t) W * E); ctrl_forget_.alloc((size_t) W * E);
     tau_.alloc(W);
     mix_sc_.alloc(ink_mix_scratch_floats(W));
+    // prompt chunks: up to 8 splits of W rows; decode windows: up to kInkAttnSplits of kInkWin rows (fewer row-splits)
+    static_assert(kInkWin * kInkAttnSplits <= 512 * 8, "attention scratch");
+    attn_scratch_.alloc(ink_attn_scratch_floats(W, c.n_head, std::max(c.n_swa, c.rel_extent), std::max(8, kInkWin * kInkAttnSplits / W + 1)));
     rlog_.alloc((size_t) W * c.n_expert);
     gx_.alloc((size_t) R * E); gu_.alloc((size_t) R * 2 * F); gh_.alloc((size_t) R * F); gd_.alloc((size_t) R * E);
     blocks_buf_.alloc((size_t) kMaxBlocks * W * E);
@@ -333,8 +337,23 @@ void InkEngine::layer(int v, int ip, int T, int pos0, std::vector<const float *>
 
     Visit & V = visits_[v];
     ink_kv_store(kc_, vc_, V.K, V.V, V.ring, d_pos_, T, KVD, st_);
-    ink_attention(q_, r_, sink_, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, d_pos_, T, H, KVH, D,
-                  1.f / sqrtf((float) D), attn_, nullptr, 0, st_);
+    static const bool old_attn = env_int("BNK_INK_OLD_ATTN", 0) != 0;   // tests: the first (CUDA-core) kernel
+    if (old_attn) {
+        ink_attention(q_, r_, sink_, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, d_pos_, T, H, KVH, D,
+                      1.f / sqrtf((float) D), attn_, nullptr, 0, st_);
+    } else {
+        // key splits: decode windows a fixed number (the graph's grid), prompt chunks by their keys
+        int ns;
+        if (T <= kInkWin) {
+            ns = V.window ? env_int("BNK_INK_SPLITS_SWA", 8) : env_int("BNK_INK_SPLITS", 32);
+        } else {
+            const int keys = V.window ? std::min(pos0 + T, V.window + T) : pos0 + T;
+            ns = std::max(1, std::min(8, keys / 4096));   // the scratch holds 8 splits of a chunk
+        }
+        ns = std::max(1, std::min(ns, kInkAttnSplits));
+        ink_attention_tc(q_, r_, sink_, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, d_pos_, pos0, T,
+                         H, KVH, D, 1.f / sqrtf((float) D), ns, attn_, attn_scratch_, st_);
+    }
     mm(L.wgate, a[0], E, T, gate_, QD);
     ink_mul_sigmoid(attn_, gate_, (int64_t) T * QD, st_);
     mm(L.wo, attn_, QD, T, conv_in_, E);
