@@ -130,6 +130,9 @@ See the bottom of this file as the work progresses.
   dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
   12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
   windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.
+* 2026-11-25, v0.6.1 (`docs/DS-PARK-PLAN.md`): parked conversations in host RAM and on disk (written on RAM eviction
+  and at quit, read back at the next start), snapshots that keep the window ring, DeepSeek snapshot markers in the
+  server. Later turns of alternating agents at ~120K: 125-134 s -> 2.0-5.6 s; after a restart 132 s -> 1.0 s.
 * 2026-10-26, later (`docs/DSPARK.md`): the DSpark draft head ported (its GGUF through upstream llama.cpp's `--dspark`
   converter, experts MXFP4 in RAM on the CPU pool): code decode 30.8 -> 45 tok/s (52 with the cache warm), prose +5%.
   Found on the way: the SwiGLU clamp symbols were set on the first GPU only, so the second stage's experts ran

@@ -21,6 +21,12 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-11-25, v0.6.1: DeepSeek conversations parked in RAM and kept on disk** (`docs/DS-PARK-PLAN.md`): two
+  agents taking turns at ~115-120K tokens read a later turn in 2.0-5.6 s (was 125-134 s, the whole prompt again),
+  whole turns ~145 s -> 28-31 s; after a restart the next turn read in 1.0 s against 132 s cold (the states written at
+  quit, `--park-dir`, `BNK_PARK_DISK_GIB`). Fixed on the way: snapshots now keep the window ring (a rollback after a
+  long reply read a stale window), the server places DeepSeek snapshots (it looked for `<|im_start|>`, so every new
+  user turn re-read the prompt), and SIGINT/SIGTERM let the engine persist before it exits. Decode unchanged.
 * **2026-10-26, v0.6.0: the DeepSeek expert cache follows the routing** (`docs/DEEPSEEK-NEXT.md`): adaptive exchange
   of resident experts (the leaving one gets a host copy in a spare blob first; every 4 forwards, 8 in flight a GPU),
   a capped routing-counts file, a teacher-forced verify-window bench (`BNK_ORACLE`). Misses on an essay 79% -> 29%
