@@ -111,6 +111,38 @@ __global__ void k_conv(const float * x, int64_t ldx, float * y, int T, int C, fl
     }
 }
 
+// prompt chunks: a thread per (channel, token), the state read for the first three rows, advanced afterwards
+__global__ void k_conv_par(const float * x, int64_t ldx, float * y, int T, int C, const float * state, int64_t lds,
+                           const float * w, const float * dyn, int ld_dyn, int H, float scale) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= C) return;
+    float X[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        X[k] = tt >= 0 ? x[(int64_t) tt * ldx + c] : state[(int64_t) (3 + tt) * lds + c];
+    }
+    float o = w[c * 4] * X[0] + w[c * 4 + 1] * X[1] + w[c * 4 + 2] * X[2] + w[c * 4 + 3] * X[3];
+    if (dyn) {
+        const float * d = dyn + (int64_t) t * ld_dyn + (c / (C / H)) * 4;
+        o += d[0] * X[3] + d[1] * X[2] + d[2] * X[1] + d[3] * X[0];
+    }
+    y[(int64_t) t * C + c] = (X[3] + o) * scale;
+}
+
+__global__ void k_conv_keep(const float * x, int64_t ldx, int n, int C, float * state, int64_t lds) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float h[3] = {state[c], state[lds + c], state[2 * lds + c]};
+    for (int t = max(0, n - 3); t < n; ++t) { h[0] = h[1]; h[1] = h[2]; h[2] = x[(int64_t) t * ldx + c]; }
+    if (n < 3) {   // fewer than three new rows: the shift above started from the old state's last rows
+        float g[3] = {state[c], state[lds + c], state[2 * lds + c]};
+        for (int t = 0; t < n; ++t) { g[0] = g[1]; g[1] = g[2]; g[2] = x[(int64_t) t * ldx + c]; }
+        h[0] = g[0]; h[1] = g[1]; h[2] = g[2];
+    }
+    state[c] = h[0]; state[lds + c] = h[1]; state[2 * lds + c] = h[2];
+}
+
 __global__ void k_conv_advance(const float * x, float * state, int n, int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -333,7 +365,12 @@ void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float 
 
 void ink_conv(const float * x, int64_t ldx, float * y, int T, int C, float * state, int64_t ld_state, const float * w,
               const float * dyn, int ld_dyn, int H, float scale, int n_keep, cudaStream_t s) {
-    k_conv<<<(C + 127) / 128, 128, 0, s>>>(x, ldx, y, T, C, state, ld_state, w, dyn, ld_dyn, H, scale, n_keep);
+    if (T > 16) {
+        k_conv_par<<<dim3((C + 127) / 128, T), 128, 0, s>>>(x, ldx, y, T, C, state, ld_state, w, dyn, ld_dyn, H, scale);
+        if (n_keep > 0) k_conv_keep<<<(C + 127) / 128, 128, 0, s>>>(x, ldx, n_keep, C, state, ld_state);
+    } else {
+        k_conv<<<(C + 127) / 128, 128, 0, s>>>(x, ldx, y, T, C, state, ld_state, w, dyn, ld_dyn, H, scale, n_keep);
+    }
     check_launch("ink_conv");
 }
 

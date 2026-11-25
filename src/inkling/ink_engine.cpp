@@ -8,6 +8,7 @@
 
 #include "inkling/ink_attn.h"
 #include "inkling/ink_ops.h"
+#include "kernels/gemm.h"
 #include "kernels/ops.h"
 
 namespace bnk {
@@ -88,6 +89,9 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     plan_buf_.alloc(sizeof(InkMoePlan));
     mh_.alloc((size_t) kInkMaxPairs * F); my_.alloc((size_t) kInkMaxPairs * E); mgu_.alloc((size_t) kInkMaxPairs * 2 * F);
     mq_.alloc((size_t) kInkMaxPairs * E); mqd_.alloc((size_t) kInkMaxPairs * E / 32);
+    xh_.alloc((size_t) W * E); hh_.alloc((size_t) R * F); dh_.alloc((size_t) R * E);
+    tc_items_gu_.alloc(c.n_expert); tc_items_dn_.alloc(c.n_expert); tc_blocks_.alloc(R / kTcTile + c.n_expert);
+    moe_tc_set_situ(c.situ_beta, c.situ_lin);
     graphs_on_ = opt.use_graphs && env_int("BNK_INK_GRAPHS", 1) != 0;
     const int64_t maxcols = 2 * E;
     actq_.alloc((size_t) kInkWin * maxcols); actd_.alloc((size_t) kInkWin * maxcols / 32);
@@ -267,6 +271,37 @@ void InkEngine::moe(const InkLayer & L, const float * x, int T, float * out) {
     }
     CUDA_CHECK(cudaMemcpyAsync(rows_dev_.p, rows.data(), (size_t) n * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(inv_dev_.p, inv.data(), (size_t) n * 4, cudaMemcpyHostToDevice, st_));
+    static const bool tc_off = env_int("BNK_INK_MOE_TC", 1) == 0;   // tests: the grouped GEMV / GEMM path
+    if (!tc_off && L.gate_up.type == 40 && L.down.type == 40) {   // NVFP4
+        // the tensor-core experts: one launch for every (expert, 64-token tile, row tile) of gate | up, one of down
+        std::vector<TcItem> igu, idn;
+        std::vector<TcBlock> bl;
+        for (int e = 0; e < c.n_expert; ++e) {
+            const int m = cnt[e + 1] - cnt[e];
+            if (!m) continue;
+            const int item = (int) igu.size();
+            igu.push_back(TcItem{(const uint8_t *) L.gate_up.data + (size_t) e * 2 * F * L.gate_up.row_bytes, cnt[e], m, e});
+            idn.push_back(TcItem{(const uint8_t *) L.down.data + (size_t) e * E * L.down.row_bytes, cnt[e], m, e});
+            for (int t0 = 0; t0 < m; t0 += kTcTile) bl.push_back(TcBlock{item, t0});
+        }
+        CUDA_CHECK(cudaMemcpyAsync(tc_items_gu_.p, igu.data(), igu.size() * sizeof(TcItem), cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(tc_items_dn_.p, idn.data(), idn.size() * sizeof(TcItem), cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(tc_blocks_.p, bl.data(), bl.size() * sizeof(TcBlock), cudaMemcpyHostToDevice, st_));
+        MoeLayerDesc dg{}, dd{};
+        dg.gate_bytes = (size_t) F * L.gate_up.row_bytes;   // the up rows follow the gate rows
+        dg.grow = L.gate_up.row_bytes;
+        dg.gate_type = L.gate_up.type;
+        dg.scales.gate = dg.scales.up = L.d_gu_scale;
+        dd.drow = L.down.row_bytes;
+        dd.down_type = L.down.type;
+        dd.scales.down = L.d_down_scale;
+        f32_to_f16(x, xh_, (int64_t) T * E, st_);
+        moe_tc_gu(tc_items_gu_, tc_blocks_, (int) bl.size(), dg, xh_, E, rows_dev_, hh_, E, F, st_);
+        moe_tc_down(tc_items_dn_, tc_blocks_, (int) bl.size(), dd, hh_, dh_, E, F, st_);
+        moe_gather_sum(dh_, inv_dev_, w_dev_, T, k, E, nullptr, nullptr, nullptr, out, st_);
+        CUDA_CHECK(cudaStreamSynchronize(st_));   // the host vectors above go out of scope
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(wg_dev_.p, wg.data(), (size_t) n * 4, cudaMemcpyHostToDevice, st_));
     ink_gather(x, E, rows_dev_, n, E, gx_, st_);
     for (int e = 0; e < c.n_expert; ++e) {

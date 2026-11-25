@@ -18,6 +18,7 @@
 #include "inkling/ink_moe.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
+#include "kernels/moe.h"
 
 namespace bnk {
 
@@ -142,6 +143,10 @@ private:
     DevBuf<uint8_t> plan_buf_;       // InkMoePlan
     DevBuf<float> mgu_, mh_, my_;    // the device MoE's gate | up, h and per-pair outputs
     DevBuf<int8_t> mq_;              // ... its int8 activations
+    // the prompt path's tensor-core experts (moe_tc): fp16 input, h and outputs, the grouping
+    DevBuf<half> xh_, hh_, dh_;
+    DevBuf<TcItem> tc_items_gu_, tc_items_dn_;
+    DevBuf<TcBlock> tc_blocks_;
     DevBuf<float> mqd_;
     bool graphs_on_ = true;
     cudaGraphExec_t graphs_[kInkWin + 1][2] = {};   // per window rows and commit (keep) mode

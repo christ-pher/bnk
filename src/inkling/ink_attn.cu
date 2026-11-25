@@ -31,19 +31,29 @@ struct Pos0 {
     __device__ __forceinline__ int get() const { return dev ? *dev : value; }
 };
 
-// table[t][h][d] = (R[t][h] . rel_bias[d] - sink[t][h]) * log2(e) for d < extent, -sink * log2(e) at d = extent
-__global__ void k_rel_table(const float * R, const float * rel_bias, const float * sink, int H, int n_rel, int extent,
+// table[t][h][d] = (R[t][h] . rel_bias[d] - sink[t][h]) * log2(e) for d < extent, -sink * log2(e) at d = extent;
+// a block: 256 distances x 32 (t, h) rows, both operands in shared memory (n_rel = 16)
+__global__ void k_rel_table(const float * R, const float * rel_bias, const float * sink, int TH, int n_rel, int extent,
                             float * table) {
-    const int th = blockIdx.y;
-    __shared__ float r[32];
-    if (threadIdx.x < n_rel) r[threadIdx.x] = R[(int64_t) th * n_rel + threadIdx.x];
+    __shared__ float rb[256][17];
+    __shared__ float rr[32][17];
+    const int d0 = blockIdx.x * 256, th0 = blockIdx.y * 32;
+    for (int i = threadIdx.x; i < 256 * n_rel; i += blockDim.x) {
+        const int d = d0 + i / n_rel;
+        rb[i / n_rel][i % n_rel] = d < extent ? rel_bias[(int64_t) d * n_rel + i % n_rel] : 0.f;
+    }
+    for (int i = threadIdx.x; i < 32 * n_rel; i += blockDim.x) {
+        const int th = th0 + i / n_rel;
+        rr[i / n_rel][i % n_rel] = th < TH ? R[(int64_t) th * n_rel + i % n_rel] : 0.f;
+    }
     __syncthreads();
-    const float sk = sink[th];
-    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d <= extent; d += gridDim.x * blockDim.x) {
+    const int d = d0 + threadIdx.x;
+    if (d > extent) return;
+    for (int r = 0; r < 32 && th0 + r < TH; ++r) {
         float b = 0;
-        if (d < extent)
-            for (int i = 0; i < n_rel; ++i) b += r[i] * rel_bias[(int64_t) d * n_rel + i];
-        table[(int64_t) th * (extent + 1) + d] = (b - sk) * kLog2e;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) b += rr[r][i] * rb[threadIdx.x][i];
+        table[(int64_t) (th0 + r) * (extent + 1) + d] = (b - sink[th0 + r]) * kLog2e;
     }
 }
 
@@ -295,7 +305,8 @@ void ink_attention_tc(const float * q, const float * R, const float * sink, cons
     float * table = scratch;
     float * part_o = scratch + (size_t) T * H * (extent + 1);
     float * part_ml = part_o + (size_t) nsplit * T * H * kD;
-    k_rel_table<<<dim3((extent + 256) / 256, T * H), 256, 0, s>>>(R, rel_bias, sink, H, n_rel, extent, table);
+    if (n_rel != 16) throw std::runtime_error("ink_attention_tc: 16 relative channels");
+    k_rel_table<<<dim3((extent + 256) / 256, (T * H + 31) / 32), 256, 0, s>>>(R, rel_bias, sink, T * H, n_rel, extent, table);
     const Pos0 p0{pos0, pos0_dev};
     switch (H / KVH) {
         case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, s); break;
