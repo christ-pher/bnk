@@ -253,6 +253,65 @@ merge and the ranking. Measured (IQ2_XS, both GPUs, the served ranking file, `BN
    `forward_pipe` untested; vision ported 2026-10-28 (docs/VISION.md); the Qwen engine's prefill may queue its small copies behind the expert
    prefetch too (the copy-engine finding of v0.5.1).
 
+## Ideas list (2026-11-25, after v0.6.1's parking; not started)
+
+Decode today: ~30 tok/s plain, ~37 average with DSpark. A token is ~20 ms of CPU experts (29-39% of the picks are
+not resident) and ~18 ms of GPU work near its floor (weight reads). Gains below are estimates unless marked.
+
+**Decode**
+
+1. **A faster one-token IQ2_XXS / IQ2_XS dot on Zen 2** (next step 1 above). The pool reads 34 GB/s of ~100+: twice
+   as fast takes ~10 ms off a token, ~+30% decode. The biggest lever and the riskiest (Maya's table variant lost to L2).
+2. **DSpark's experts in VRAM** (an MXFP4 R-layout; `docs/DSPARK.md` "not done"). A draft round is 11-12.5 ms, mostly 45
+   CPU expert reads; cheaper rounds let the schedule keep more drafts on prose. ~+10-25% where drafting runs. Costs
+   resident backbone experts. GPU 0 is idle while the last stage drafts, so its VRAM is the natural place (item 9).
+3. **DSpark's schedule from measured costs** (`BNK_DS_SPARK_ROUND_MS` / `_ROW_MS` are constants tuned on a warm cache).
+   Small effort, small gain on prose and cold caches.
+4. **Start warm after a restart.** The v0.6.1 restart test decoded its first turn at 20.1 tok/s against 29.9 before
+   (unconfirmed cause: the resident set falls back to the counts ranking and adapts again). Save the resident set at
+   quit and load it. Small effort; pays at every start.
+
+**Several agents**
+
+5. **Two conversations at once.** `--slots 1` today, so agents take turns (parking made the turns cheap, not
+   parallel). Batched rows share the dense GEMVs and any expert both need. Rough 1.3-1.6x combined throughput for two.
+   See item 8 for the two-lane variant, which already exists in code.
+
+**Prompts**
+
+6. **GPU 1 runs layers 8-19 of a long prompt's skipped groups** (`docs/PREFILL-SKIP-PLAN.md` item 2b): planned ~+45%
+   at 70K, decode unchanged, a few days. Worth less now that conversations survive in RAM and on disk.
+7. **Stage handoff by peer copy** instead of through pinned host memory (`ds_prefill.cpp` / `ds_engine.cpp` `xfer`):
+   640 MiB per 8,192-token group, ~110 ms host-staged vs ~50 ms peer (13 GB/s measured 2026-11-25). ~1%. Cheap.
+
+**Both GPUs busy** (how the work is spread today, and where each card waits)
+
+Today: layers 0-19 on GPU 0, 20-39 plus the head and DSpark on GPU 1. One conversation's decode runs the stages in
+turn, and in each layer the GPU waits for the CPU's share of the experts, so each card is busy roughly a quarter to a
+third of a token (estimate from the stage times above; to be measured, item 11). Prompt groups are pipelined over the
+cards when a prompt has several; a long prompt's skipped groups leave GPU 1 idle (item 6). The engine has two decode
+lanes (`forward_pipe`, used by the server when two requests are in flight) but the configs run one slot, so it never
+runs, and it is untested on DeepSeek. Lookahead (GPU 0 runs the next window while GPU 1 finishes; Qwen engine) is not
+implemented for DeepSeek (`lookahead_ok` false).
+
+The cards idle because the CPU is the bottleneck, so filling them means either more work in flight or moving CPU
+work onto them:
+
+8. **Two lanes with two slots** (`--slots 2`): two agents decode with one on each card at a time. The code exists. The
+   CPU pool serves one caller at a time, so the gain is the GPU and CPU phases of the two lanes overlapping, bounded
+   by the pool's ~20 ms a token: roughly 30 -> 45-50 tok/s combined for two agents (estimate). Needs: a test
+   (`bnk multi --pipe`), the second slot's VRAM (compressed KV is small: ~3 KB a token), the parking path with two slots.
+9. **Draft on the idle card.** GPU 0 waits while GPU 1 drafts (11-12.5 ms a round). DSpark's dense part and (item 2)
+   its experts on GPU 0 would overlap with GPU 1's head and sampling.
+10. **Rebalance the split.** GPU 1 carries the head, the drafter and less expert room. The sweep only moved the split
+   earlier (8, 14: slower decode); 21-22 is untested. A flag and a reload each.
+11. **Measure first.** Per-stage busy time over a served decode (nsys, or `nvidia-smi dmon` beside a request), so the
+   numbers above are measured, not inferred.
+
+Already measured and dropped (do not retry without a new idea): the PCIe pull lane (slows every kernel while it pulls),
+the DMA mailbox lane, thread counts other than 24 pinned, 8-chunk groups, B.2 stage-2 early streaming, IQ1_M, dense
+requantizing (user's decision).
+
 ## Commands
 
 ```bash
