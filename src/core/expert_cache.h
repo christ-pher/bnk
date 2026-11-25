@@ -31,6 +31,15 @@ std::vector<uint32_t> load_counts(const std::string & path, int n_layer, int n_e
 // delta += old, then halved (all of it) while the total exceeds the cap (BNK_COUNTS_CAP routings, default 2^28): the
 // file ranks by a sliding window of the recent workload rather than everything ever served
 void merge_counts(std::vector<uint32_t> & delta, const std::vector<uint32_t> & old);
+// The warm start: the experts that were in VRAM at the last save (`<counts>.resident`, BNKR), hottest first. The
+// counts file ranks by a long window of routings while the adaptive tier follows the recent ones, so after a
+// restart the counts ranking alone rebuilds an older placement and the cache has to adapt again.
+Ranking load_resident(const std::string & path, int n_layer, int n_expert);
+bool save_resident(const std::string & path, const Ranking & r, int n_layer, int n_expert);
+inline std::string resident_path(const std::string & counts_path) { return counts_path + ".resident"; }
+// The load-time ranking from a counts file: the saved resident set first (unless BNK_WARM_START=0), then the
+// counts' ranking (init() completes it and drops repeats). `warm` reports whether a resident set was used.
+Ranking warm_ranking(const std::string & counts_path, int n_layer, int n_expert, bool * warm = nullptr);
 
 class ExpertCache {
 public:
@@ -93,6 +102,8 @@ public:
     int64_t swaps_done = 0;
     const std::vector<int> & slot_experts(int il) const { return slot_expert_[il]; }
     int slot_of(int il, int e) const { return slot_of_host_[(size_t) il * n_expert_ + e]; }
+    // this cache's resident experts (mapped, or on their way into a slot), hottest first by the adaptive score
+    Ranking resident_ranking() const;
 
 private:
     const Model * m_ = nullptr;

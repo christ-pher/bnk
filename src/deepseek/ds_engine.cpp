@@ -163,8 +163,9 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
     const Config & c = model_.cfg;
     store_->layout(model_.ev);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
-    if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
-    if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    bool warm = false;
+    if (rank.empty() && !opt.counts_out.empty()) rank = warm_ranking(opt.counts_out, c.n_layer, c.n_expert, &warm);
+    if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : warm ? "the last run's resident set, then the counts" : "loaded");
     // Before the caches take the free VRAM: the DSpark drafter's weights and buffers (on the last stage's GPU) and the
     // exchange's settings (its staging is held back in init_cache), so the budgets account for them (a 67K-token
     // prompt ran out of VRAM for its compressed KV when the drafter came after the budget)
@@ -613,6 +614,14 @@ int DsEngine::rollback_here(int max_pos) {
 
 void DsEngine::save_counts() {
     for (DsEngine * s = this; s; s = s->next_.get()) s->save_counts_here();
+    // the warm start: what every stage holds in VRAM now, for the next load (expert_cache.h warm_ranking)
+    if (opt_.counts_out.empty()) return;
+    Ranking res;
+    for (const DsEngine * s = this; s; s = s->next_.get()) {
+        const Ranking r = s->cache_.resident_ranking();
+        res.insert(res.end(), r.begin(), r.end());
+    }
+    if (!res.empty()) save_resident(resident_path(opt_.counts_out), res, model_.cfg.n_layer, model_.cfg.n_expert);
 }
 
 void DsEngine::save_counts_here() {

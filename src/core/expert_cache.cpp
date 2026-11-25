@@ -21,6 +21,59 @@ Ranking load_ranking(const std::string & path, int n_layer, int n_expert) {
     return r;
 }
 
+Ranking load_resident(const std::string & path, int n_layer, int n_expert) {
+    Ranking r;
+    FILE * f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+    if (!f) return r;
+    char magic[4];
+    uint32_t h[4];
+    if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BNKR", 4) && fread(h, 4, 4, f) == 4 && h[0] == 1 &&
+        h[1] == (uint32_t) n_layer && h[2] == (uint32_t) n_expert && h[3] <= (uint32_t) n_layer * n_expert) {
+        std::vector<uint16_t> p((size_t) h[3] * 2);
+        if (fread(p.data(), 2, p.size(), f) == p.size())
+            for (size_t i = 0; i < h[3]; ++i)
+                if (p[2 * i] < n_layer && p[2 * i + 1] < n_expert) r.emplace_back(p[2 * i], p[2 * i + 1]);
+    }
+    fclose(f);
+    return r;
+}
+
+bool save_resident(const std::string & path, const Ranking & r, int n_layer, int n_expert) {
+    const std::string tmp = path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const uint32_t h[4] = {1, (uint32_t) n_layer, (uint32_t) n_expert, (uint32_t) r.size()};
+    std::vector<uint16_t> p;
+    p.reserve(r.size() * 2);
+    for (auto [l, e] : r) { p.push_back((uint16_t) l); p.push_back((uint16_t) e); }
+    bool ok = fwrite("BNKR", 1, 4, f) == 4 && fwrite(h, 4, 4, f) == 4 && fwrite(p.data(), 2, p.size(), f) == p.size();
+    ok = fclose(f) == 0 && ok;
+    return ok && rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+Ranking warm_ranking(const std::string & counts_path, int n_layer, int n_expert, bool * warm) {
+    if (warm) *warm = false;
+    Ranking counts = load_ranking(counts_path, n_layer, n_expert);
+    static const bool on = !getenv("BNK_WARM_START") || atoi(getenv("BNK_WARM_START")) != 0;
+    if (!on || counts_path.empty()) return counts;
+    Ranking r = load_resident(resident_path(counts_path), n_layer, n_expert);
+    if (r.empty()) return counts;
+    if (warm) *warm = true;
+    r.insert(r.end(), counts.begin(), counts.end());
+    return r;
+}
+
+Ranking ExpertCache::resident_ranking() const {
+    Ranking r;
+    for (int il = l0_; il < l1_; ++il)
+        for (int e : slot_expert_[il])
+            if (e >= 0) r.emplace_back(il, e);
+    std::stable_sort(r.begin(), r.end(), [&](const auto & a, const auto & b) {
+        return value(a.first, a.second) > value(b.first, b.second);
+    });
+    return r;
+}
+
 Ranking ranking_from_counts(const std::vector<uint32_t> & counts, int n_layer, int n_expert) {
     std::vector<int> idx((size_t) n_layer * n_expert);
     std::iota(idx.begin(), idx.end(), 0);
