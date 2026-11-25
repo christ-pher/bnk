@@ -43,23 +43,33 @@ __global__ void k_rms(const float * x, int64_t ldx, const float * w, float * y, 
 
 // the depth mix in two passes: per (token, state) its 1/rms and the queries' scores; then the rows, parallel over E
 __global__ void k_mix_scores(InkStates st, const float * q, int nq, int E, float * sc) {
-    __shared__ float red[8];
+    __shared__ float red[8][5];
     const int t = blockIdx.x, s = blockIdx.y;
     const float * x = st.p[s] + (int64_t) t * E;
-    float ss = 0, d[4] = {0, 0, 0, 0};
+    float v5[5] = {0, 0, 0, 0, 0};   // the sum of squares, then the queries' dots
     for (int i = threadIdx.x; i < E; i += blockDim.x) {
         const float v = x[i];
-        ss += v * v;
-        for (int j = 0; j < nq; ++j) d[j] += q[(int64_t) j * E + i] * v;
+        v5[0] += v * v;
+        for (int j = 0; j < nq; ++j) v5[1 + j] += q[(int64_t) j * E + i] * v;
     }
-    ss = block_sum256(ss, red);
-    float dj[4];
-    for (int j = 0; j < nq; ++j) dj[j] = block_sum256(d[j], red);
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+#pragma unroll
+    for (int k = 0; k < 5; ++k) {
+        v5[k] = warp_sum(v5[k]);
+        if (l == 0) red[w][k] = v5[k];
+    }
+    __syncthreads();
+    if (threadIdx.x < 5) {
+        float a = 0;
+        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) a += red[i][threadIdx.x];
+        red[0][threadIdx.x] = a;   // each thread sums and writes its own column only
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         float * o = sc + ((int64_t) t * kInkMaxStates + s) * 5;
-        const float r = rsqrtf(ss / E + 1e-6f);
+        const float r = rsqrtf(red[0][0] / E + 1e-6f);
         o[0] = r;
-        for (int j = 0; j < nq; ++j) o[1 + j] = dj[j] * r * rsqrtf((float) E);
+        for (int j = 0; j < nq; ++j) o[1 + j] = red[0][1 + j] * r * rsqrtf((float) E);
     }
 }
 
@@ -84,6 +94,108 @@ __global__ void k_mix_out(InkStates st, int nq, int T, int E, const float * sc, 
         for (int j = 0; j < nq; ++j) acc[j] += w[j][s] * v;
     }
     for (int j = 0; j < nq; ++j) out[((int64_t) j * T + t) * E + i] = acc[j];
+}
+
+// one block (1024 threads) per token: every state's sum of squares and query dots in one pass, the softmax, the
+// mixed rows, their norms
+struct InkNorms { const float * w[4]; };
+constexpr int kMixT = 512;
+template <int NQ>
+__global__ void __launch_bounds__(kMixT) k_mix_norm(InkStates st, const float * q, int T, int E, InkNorms nm,
+                                                   float eps, float * out) {
+    constexpr int nq = NQ;
+    constexpr int NV = 1 + NQ;   // per state: the sum of squares, then the dots
+    __shared__ float red[kMixT / 32][kInkMaxStates * NV];
+    __shared__ float tot[kInkMaxStates * 5];
+    __shared__ float wts[4][kInkMaxStates];
+    __shared__ float rr[4];
+    const int t = blockIdx.x, S = st.n, w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    float acc[kInkMaxStates * NV];
+#pragma unroll
+    for (int i = 0; i < kInkMaxStates * NV; ++i) acc[i] = 0.f;
+    for (int i = threadIdx.x; i < E; i += kMixT) {
+        float qv[NQ];
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) qv[j] = q[(int64_t) j * E + i];
+#pragma unroll
+        for (int s2 = 0; s2 < kInkMaxStates; ++s2) {
+            if (s2 < S) {
+                const float v = st.p[s2][(int64_t) t * E + i];
+                acc[s2 * NV] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) acc[s2 * NV + 1 + j] += qv[j] * v;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kInkMaxStates * NV; ++i) {
+        if (i / NV < S) {
+            const float v = warp_sum(acc[i]);
+            if (l == 0) red[w][i] = v;
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < S * NV; i += kMixT) {
+        float a = 0;
+        for (int k = 0; k < kMixT / 32; ++k) a += red[k][i];
+        tot[(i / NV) * 5 + i % NV] = a;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        const int j = threadIdx.x;
+        float sc[kInkMaxStates], m = -FLT_MAX;
+        for (int s2 = 0; s2 < S; ++s2) {
+            const float r = rsqrtf(tot[s2 * 5] / E + 1e-6f);
+            sc[s2] = tot[s2 * 5 + 1 + j] * r * rsqrtf((float) E);
+            m = fmaxf(m, sc[s2]);
+        }
+        float z = 0;
+        for (int s2 = 0; s2 < S; ++s2) z += __expf(sc[s2] - m);
+        for (int s2 = 0; s2 < S; ++s2) wts[j][s2] = __expf(sc[s2] - m) / z * rsqrtf(tot[s2 * 5] / E + 1e-6f);
+    }
+    __syncthreads();
+    // the rows (kept in registers: E / kMixT values a thread), then their norms
+    constexpr int kPer = 8;   // E <= 4096
+    float o[NQ][kPer];
+    float ss[NQ];
+#pragma unroll
+    for (int j = 0; j < NQ; ++j) ss[j] = 0.f;
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kMixT;
+#pragma unroll
+        for (int j = 0; j < NQ; ++j) o[j][k] = 0.f;
+        if (i < E) {
+            for (int s2 = 0; s2 < S; ++s2) {
+                const float v = st.p[s2][(int64_t) t * E + i];
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) o[j][k] += wts[j][s2] * v;
+            }
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) ss[j] += o[j][k] * o[j][k];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < NQ; ++j) {
+        const float v = warp_sum(ss[j]);
+        if (l == 0) red[w][j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < NQ) {
+        float a = 0;
+        for (int i = 0; i < kMixT / 32; ++i) a += red[i][threadIdx.x];
+        rr[threadIdx.x] = rsqrtf(a / E + eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kMixT;
+        if (i >= E) continue;
+#pragma unroll
+        for (int j = 0; j < NQ; ++j)
+            out[((int64_t) j * T + t) * E + i] = nm.w[j] ? o[j][k] * rr[j] * nm.w[j][i] : o[j][k];
+    }
 }
 
 // one thread per channel, the tokens in order
@@ -152,11 +264,12 @@ __global__ void k_conv_advance(const float * x, float * state, int n, int C) {
 }
 
 // one warp per (t, h) row of D values
-__global__ void k_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau) {
+__global__ void k_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau,
+                             int64_t ld) {
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (row >= T * H) return;
     const int t = row / H, h = row % H;
-    float * xr = x + (int64_t) row * D;
+    float * xr = x + (int64_t) t * ld + (int64_t) h * D;
     float ss = 0;
     for (int i = lane; i < D; i += 32) {
         const float v = xr[i] * (scale ? scale[h * D + i] : 1.f);
@@ -328,10 +441,19 @@ __global__ void k_concat_rms2(const float * a, const float * b, float * y, int E
     }
 }
 
-__global__ void k_ctrl_combine(float * out, const float * cur, const float * msg, const float * g, const float * f,
-                               int64_t n) {
-    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
-        out[i] = cur[i] - tanhf(f[i]) * cur[i] + tanhf(g[i]) * msg[i];
+__global__ void k_ctrl_combine(float * out, const float * cur, const float * msg, const float * gf, int E) {
+    const int t = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < E; i += gridDim.x * blockDim.x) {
+        const int64_t o = (int64_t) t * E + i;
+        const float g = gf[(int64_t) t * 2 * E + i], f = gf[(int64_t) t * 2 * E + E + i];
+        out[o] = cur[o] - tanhf(f) * cur[o] + tanhf(g) * msg[o];
+    }
+}
+
+__global__ void k_mul_sigmoid_rows(float * x, const float * g, int64_t ldg, int n) {
+    const int t = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        x[(int64_t) t * n + i] *= 1.f / (1.f + __expf(-g[(int64_t) t * ldg + i]));
 }
 
 __global__ void k_softcap(float * x, int64_t n, float cap) {
@@ -363,6 +485,20 @@ void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float 
     check_launch("ink_mix");
 }
 
+void ink_mix_norm(const InkStates & st, const float * q, int nq, int T, int E, const float * const * norm, float eps,
+                  float * out, cudaStream_t s) {
+    if (st.n < 1 || st.n > kInkMaxStates || nq < 1 || nq > 4 || E > 8 * kMixT) throw std::runtime_error("ink_mix_norm: out of range");
+    InkNorms nm{};
+    for (int j = 0; j < nq; ++j) nm.w[j] = norm ? norm[j] : nullptr;
+    switch (nq) {
+        case 1: k_mix_norm<1><<<T, kMixT, 0, s>>>(st, q, T, E, nm, eps, out); break;
+        case 2: k_mix_norm<2><<<T, kMixT, 0, s>>>(st, q, T, E, nm, eps, out); break;
+        case 3: k_mix_norm<3><<<T, kMixT, 0, s>>>(st, q, T, E, nm, eps, out); break;
+        default: k_mix_norm<4><<<T, kMixT, 0, s>>>(st, q, T, E, nm, eps, out); break;
+    }
+    check_launch("ink_mix_norm");
+}
+
 void ink_conv(const float * x, int64_t ldx, float * y, int T, int C, float * state, int64_t ld_state, const float * w,
               const float * dyn, int ld_dyn, int H, float scale, int n_keep, cudaStream_t s) {
     if (T > 16) {
@@ -380,9 +516,10 @@ void ink_conv_advance(const float * x, float * state, int n, int C, cudaStream_t
     check_launch("ink_conv_advance");
 }
 
-void ink_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau, cudaStream_t s) {
+void ink_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau, cudaStream_t s,
+                    int64_t ld) {
     const int rows = T * H;
-    k_clip_heads<<<(rows + 7) / 8, 256, 0, s>>>(x, T, H, D, scale, thr, tau);
+    k_clip_heads<<<(rows + 7) / 8, 256, 0, s>>>(x, T, H, D, scale, thr, tau, ld ? ld : (int64_t) H * D);
     check_launch("ink_clip_heads");
 }
 
@@ -443,10 +580,14 @@ void ink_concat_rms2(const float * a, const float * b, float * y, int T, int E, 
     check_launch("ink_concat_rms2");
 }
 
-void ink_ctrl_combine(float * out, const float * cur, const float * msg, const float * g, const float * f, int64_t n,
-                      cudaStream_t s) {
-    k_ctrl_combine<<<grid_for(n), 256, 0, s>>>(out, cur, msg, g, f, n);
+void ink_ctrl_combine(float * out, const float * cur, const float * msg, const float * gf, int T, int E, cudaStream_t s) {
+    k_ctrl_combine<<<dim3((E + 255) / 256, T), 256, 0, s>>>(out, cur, msg, gf, E);
     check_launch("ink_ctrl_combine");
+}
+
+void ink_mul_sigmoid_rows(float * x, const float * g, int64_t ldg, int T, int n, cudaStream_t s) {
+    k_mul_sigmoid_rows<<<dim3((n + 255) / 256, T), 256, 0, s>>>(x, g, ldg, n);
+    check_launch("ink_mul_sigmoid_rows");
 }
 
 void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s) {

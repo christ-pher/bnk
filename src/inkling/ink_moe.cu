@@ -4,6 +4,7 @@
 // (with the per-expert global scales) and BF16 (the last layer).
 #include "inkling/ink_moe.h"
 
+#include <cfloat>
 #include <cuda_bf16.h>
 #include <stdexcept>
 
@@ -56,6 +57,83 @@ __global__ void k_plan(const int32_t * ids, const float * w, int n, int k, int n
 // y[slot][r] = scale[e] * W_e[r] . x[src(slot)] for the rows r < R of each routed expert e (rows_e rows per expert):
 // a warp per row, its lanes over the row in 4-byte words (coalesced), x of up to NT slots in shared memory; src is
 // the slot's token (x by token) or the slot itself (x by slot)
+// routing (a warp per token: sigmoid, the top k of sigmoid + bias, weights / (sum + 1e-20) * w_scale) and the plan
+// in one block
+__global__ void k_route_plan(const float * logits, const float * bias, int T, int n_exp, int k, float w_scale,
+                             InkMoePlan * P) {
+    __shared__ int ids[kInkMaxPairs];
+    __shared__ float ws[kInkMaxPairs];
+    __shared__ int cnt[kInkMaxExperts + 1];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int per = (n_exp + 31) / 32;
+    for (int t = warp; t < T; t += nw) {
+        float p[8], sel[8];
+        for (int i = 0; i < per; ++i) {
+            const int e = lane + 32 * i;
+            if (e < n_exp) {
+                p[i] = 1.f / (1.f + expf(-logits[(int64_t) t * n_exp + e]));
+                sel[i] = p[i] + bias[e];
+            } else {
+                p[i] = 0; sel[i] = -FLT_MAX;
+            }
+        }
+        float sum = 0;
+        for (int j = 0; j < k; ++j) {
+            float bv = -FLT_MAX;
+            int be = 0x7fffffff;
+            for (int i = 0; i < per; ++i) {
+                const int e = lane + 32 * i;
+                if (sel[i] > bv || (sel[i] == bv && e < be)) { bv = sel[i]; be = e; }
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+                if (ov > bv || (ov == bv && oe < be)) { bv = ov; be = oe; }
+            }
+            float pv = 0;
+            if ((be & 31) == lane) {
+                pv = p[be / 32];
+                sel[be / 32] = -FLT_MAX;
+            }
+            pv = __shfl_sync(0xffffffffu, pv, be & 31);
+            if (lane == 0) { ids[t * k + j] = be; ws[t * k + j] = pv; }
+            sum += pv;
+        }
+        __syncwarp();
+        if (lane < k) ws[t * k + lane] = ws[t * k + lane] / (sum + 1e-20f) * w_scale;
+    }
+    const int n = T * k;
+    for (int e = threadIdx.x; e <= n_exp; e += blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    for (int q = threadIdx.x; q < n; q += blockDim.x) atomicAdd(&cnt[ids[q] + 1], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int nu = 0;
+        for (int e = 0; e < n_exp; ++e) {
+            if (cnt[e + 1]) {
+                P->expert[nu] = e;
+                P->start[nu] = cnt[e];
+                ++nu;
+            }
+            cnt[e + 1] += cnt[e];
+        }
+        P->start[nu] = n;
+        P->n_u = nu;
+        P->k = k;
+    }
+    __syncthreads();
+    for (int q = threadIdx.x; q < n; q += blockDim.x) {
+        const int e = ids[q];
+        int rank = 0;
+        for (int r = 0; r < q; ++r) rank += ids[r] == e;
+        const int slot = cnt[e] + rank;
+        P->tok[slot] = q / k;
+        P->wt[slot] = ws[q];
+        P->pair_slot[q] = slot;
+        P->slot_e[slot] = e;
+    }
+}
+
 template <int FMT, int NT, int RW>
 __global__ void __launch_bounds__(256) k_egemv(const InkMoePlan * P, const float * x, bool by_slot, int cols,
         const uint8_t * W, size_t row_bytes, int rows_e, const float * scale, float * y) {
@@ -272,7 +350,8 @@ void ink_moe_window(const InkMoeArgs & a, cudaStream_t s) {
     const int n = a.T * a.k;
     if (a.T < 1 || a.T > kInkWinMax || n > kInkMaxPairs || a.n_exp > kInkMaxExperts)
         throw std::runtime_error("ink_moe_window: window out of range");
-    k_plan<<<1, 128, 0, s>>>(a.ids, a.w, n, a.k, a.n_exp, a.plan);
+    if (a.logits) k_route_plan<<<1, 256, 0, s>>>(a.logits, a.bias, a.T, a.n_exp, a.k, a.w_scale, a.plan);
+    else k_plan<<<1, 128, 0, s>>>(a.ids, a.w, n, a.k, a.n_exp, a.plan);
     static const bool fq = getenv("BNK_INK_MOE_F32") != nullptr;   // tests: fp32 activations (shared-memory bound)
     const bool q = a.q && !fq;
     ActQ8 aq;

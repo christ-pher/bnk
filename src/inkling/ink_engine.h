@@ -162,8 +162,8 @@ private:
     int64_t ckpt_age_ = 0;
 
     // activations (capacity chunk_ rows)
-    DevBuf<float> x_, inp_sa_, ffn_inp_, mixed_, ins_[3], q_, r_, sink_, dyn_k_, dyn_v_, attn_, gate_, o_, tmp_,
-        moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gain_, ctrl_forget_, msg_, tau_, gx_, gu_, gh_, gd_, rb_;
+    DevBuf<float> x_, ffn_inp_, mixed_, ins_[3], attn_, o_, tmp_,
+        moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gf_, proj_, msg_, tau_, gx_, gu_, gh_, gd_, rb_;
     DevBuf<float> mix_sc_;       // the depth mix's scores
     DevBuf<float> blocks_buf_;   // [kMaxBlocks][chunk][E]
     static constexpr int kMaxBlocks = 12;
@@ -198,12 +198,13 @@ private:
     void run(const int32_t * tokens, int T, bool commit_all);
     void mm(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc = false);
 
+    // norms: each output row's RMS-norm weight (null: none)
     void mix(const std::vector<const float *> & blocks, const float * cur, const float * query, int nq, int T,
-             float * out);
+             float * out, const float * const * norms = nullptr);
     void control(float * cur, const float * msg, const InkLoop & loop, int j, int T);
     void moe(const InkLayer & L, const float * x, int T, float * out);
     void conv(int v, int off, int C, const float * x_rows, int64_t ldx, float * y, int T, const float * w,
-              const float * dyn, int H, bool keep);
+              const float * dyn, int64_t ld_dyn, int H, bool keep);
 };
 
 }  // namespace bnk

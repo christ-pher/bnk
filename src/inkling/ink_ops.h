@@ -21,6 +21,11 @@ void ink_rms(const float * x, int64_t ldx, const float * w, float * y, int64_t l
              cudaStream_t s);
 // The depth mix: per token, softmax over the states s of q_j . rms(x_s) / sqrt(E), out_j = sum_s p_js rms(x_s);
 // out [nq][T][E]. The last state is cur.
+// Decode windows (T <= 16): the mix in one block per token (scores, softmax, rows), each output row optionally
+// RMS-normed with its own weight (norm[j], null: not normed; eps): the attention's / FFN's / head's input norm folded
+// in. out [nq][T][E].
+void ink_mix_norm(const InkStates & st, const float * q, int nq, int T, int E, const float * const * norm, float eps,
+                  float * out, cudaStream_t s);
 // scratch: ink_mix_scratch_floats(T)
 void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float * out, float * scratch, cudaStream_t s);
 inline size_t ink_mix_scratch_floats(int T) { return (size_t) T * kInkMaxStates * 5; }
@@ -33,7 +38,8 @@ void ink_conv(const float * x, int64_t ldx, float * y, int T, int C, float * sta
 // advances the state (3 rows of C) past the first n rows of x (stride C): a verify window's commit
 void ink_conv_advance(const float * x, float * state, int n, int C, cudaStream_t s);
 // x[t][h] (D values) = clip(x * scale[h]) * tau[t]: rows scaled to an L2 norm of at most thr (scale, tau optional)
-void ink_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau, cudaStream_t s);
+void ink_clip_heads(float * x, int T, int H, int D, const float * scale, float thr, const float * tau, cudaStream_t s,
+                    int64_t ld = 0);   // ld: the rows' stride (0: H * D)
 // (pos0: device memory, so a captured graph reads the window's position at launch)
 // writes k and v rows [T][KVD] into the caches' cells (pos0 + t) % ring
 void ink_kv_store(const float * k, const float * v, half * K, half * V, int ring, const int * pos0, int T, int KVD,
@@ -46,6 +52,8 @@ void ink_attention(const float * q, const float * R, const float * sink, const h
                    float scale, float * out, float * scratch, int scratch_cap, cudaStream_t s);
 size_t ink_attention_scratch_floats(int T, int H, int D, int max_ctx);
 void ink_mul_sigmoid(float * x, const float * g, int64_t n, cudaStream_t s);
+// x[t][i] *= sigmoid(g[t * ldg + i]) for x [T][n]
+void ink_mul_sigmoid_rows(float * x, const float * g, int64_t ldg, int T, int n, cudaStream_t s);
 void ink_add(float * y, const float * a, const float * b, int64_t n, cudaStream_t s);
 // Routing: p = sigmoid(logit), the top k of p + bias, weights p / (sum + 1e-20) * w_scale
 void ink_route(const float * logits, const float * bias, int T, int n_exp, int k, float w_scale, int32_t * ids,
@@ -58,9 +66,8 @@ void ink_gather(const float * x, int64_t ldx, const int32_t * rows, int n, int E
 void ink_moe_sum(float * out, const float * src, const int32_t * inv, int T, int k, int E, cudaStream_t s);
 // y[t] = [rms(a[t]); rms(b[t])] (2E)
 void ink_concat_rms2(const float * a, const float * b, float * y, int T, int E, float eps, cudaStream_t s);
-// out = cur - tanh(f) cur + tanh(g) msg
-void ink_ctrl_combine(float * out, const float * cur, const float * msg, const float * g, const float * f, int64_t n,
-                      cudaStream_t s);
+// out = cur - tanh(f) cur + tanh(g) msg over [T][E]; g | f the rows of gf [T][2E]
+void ink_ctrl_combine(float * out, const float * cur, const float * msg, const float * gf, int T, int E, cudaStream_t s);
 // y = x rounded to bf16 (tests: the CPU reference's activations for BF16 products)
 void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s);
 void ink_softcap(float * x, int64_t n, float cap, cudaStream_t s);

@@ -25,6 +25,10 @@ struct InkMoePlan {
 struct InkMoeArgs {
     const int32_t * ids = nullptr;   // [T][k] routed experts
     const float * w = nullptr;       // [T][k] routing weights
+    // or the router's logits [T][n_exp] (routed here with the plan, one launch): sigmoid, the top k of
+    // sigmoid + bias, the weights normalized and scaled
+    const float * logits = nullptr, * bias = nullptr;
+    float w_scale = 1;
     int T = 0, k = 0, n_exp = 0, E = 0, F = 0;
     const float * x = nullptr;       // [T][E] the FFN input (normed)
     const uint8_t * gate_up = nullptr; int gu_type = 0; size_t gu_row_bytes = 0; const float * gu_scale = nullptr;

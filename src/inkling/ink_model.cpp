@@ -86,6 +86,24 @@ QMat InkModel::upload_rows(const std::string & name, const Ranges & rows) {
     return upload_bytes(name, host, n, t.ne[0], (int) t.type);
 }
 
+QMat InkModel::upload_stack(const std::vector<std::pair<std::string, Ranges>> & parts) {
+    std::vector<uint8_t> host;
+    int64_t n = 0, cols = -1;
+    int type = -1;
+    for (const auto & [name, rows] : parts) {
+        const TensorRef & t = gguf.get(name);
+        if (cols >= 0 && (t.ne[0] != cols || (int) t.type != type)) throw std::runtime_error("inkling: cannot stack " + name);
+        cols = t.ne[0];
+        type = (int) t.type;
+        const size_t rb = t.row_bytes();
+        for (auto [r0, r1] : rows) {
+            host.insert(host.end(), t.data + (size_t) r0 * rb, t.data + (size_t) r1 * rb);
+            n += r1 - r0;
+        }
+    }
+    return upload_bytes(parts[0].first, host, n, cols, type);
+}
+
 QMat InkModel::upload_cols(const std::string & name, const Ranges & cols) {
     const TensorRef & t = gguf.get(name);
     const size_t rb = t.row_bytes();
@@ -183,13 +201,6 @@ void InkModel::load(const std::string & path, bool verbose, int tp_n, int tp_ran
     const int64_t h0 = (int64_t) tp_rank * H, kv0 = (int64_t) tp_rank * KV, f0 = (int64_t) tp_rank * F;
     (void) H_all; (void) KVH_all;
     const bool tp = tp_n > 1;
-    // matrices split by output rows: this rank's rows [o0, o0 + n) of every block of `per` rows
-    auto rows_of = [&](const std::string & name, int64_t o0, int64_t n, int64_t blocks, int64_t per) {
-        if (!tp) return upload(name);
-        Ranges r;
-        for (int64_t b = 0; b < blocks; ++b) r.push_back({b * per + o0, b * per + o0 + n});
-        return upload_rows(name, r);
-    };
     tok_embd = upload("token_embd.weight");
     tok_norm = upload_f32("token_embd_norm.weight", E);
     c.vocab_n = (c.n_vocab + tp_n - 1) / tp_n;
@@ -205,14 +216,48 @@ void InkModel::load(const std::string & path, bool verbose, int tp_n, int tp_ran
     for (int il = 0; il < c.n_layer; ++il) {
         InkLayer & L = layers[il];
         L.swa = c.swa[il];
-        // the attention: this rank's query heads (q, gate, rel, sink rows; out columns) and KV heads (k, v rows)
-        L.wq = rows_of(blk(il, "attn_q.weight"), h0 * D, (int64_t) H * D, 1, 0);
-        L.wk = rows_of(blk(il, "attn_k.weight"), kv0, KV, 1, 0);
-        L.wv = rows_of(blk(il, "attn_v.weight"), kv0, KV, 1, 0);
+        // the attention: this rank's query heads (q, gate, rel, sink rows; out columns) and KV heads (k, v rows),
+        // stacked by input
+        {
+            const int64_t QD = (int64_t) H * D, nr = (int64_t) H * c.n_rel, kp0 = kv0 / D * C, nkp = (int64_t) c.n_head_kv * C;
+            std::vector<std::pair<std::string, Ranges>> parts = {
+                {blk(il, "attn_q.weight"), {{h0 * D, h0 * D + QD}}},
+                {blk(il, "attn_gate.weight"), {{h0 * D, h0 * D + QD}}},
+                {blk(il, "attn_rel.weight"), {{h0 * c.n_rel, h0 * c.n_rel + nr}}},
+                {blk(il, "attn_sink_proj.weight"), {{h0, h0 + H}}},
+                {blk(il, "attn_k.weight"), {{kv0, kv0 + KV}}}};
+            L.off_gate = (int) QD;
+            L.off_rel = (int) (2 * QD);
+            L.off_sink = (int) (2 * QD + nr);
+            L.off_k = (int) (2 * QD + nr + H);
+            int off = L.off_k + KV;
+            if (!c.swa[il]) {
+                parts.push_back({blk(il, "attn_k_conv_proj.weight"), {{kp0, kp0 + nkp}}});
+                L.off_kp = off;
+                off += (int) nkp;
+            }
+            parts.push_back({blk(il, "attn_v.weight"), {{kv0, kv0 + KV}}});
+            L.off_v = off;
+            off += KV;
+            if (!c.swa[il]) {
+                parts.push_back({blk(il, "attn_v_conv_proj.weight"), {{kp0, kp0 + nkp}}});
+                L.off_vp = off;
+                off += (int) nkp;
+            }
+            L.proj = upload_stack(parts);
+            if (L.proj.rows != off) throw std::runtime_error("inkling: stacked projections");
+            L.wq = qmat_rows(L.proj, 0, QD);
+            L.wgate = qmat_rows(L.proj, L.off_gate, QD);
+            L.wrel = qmat_rows(L.proj, L.off_rel, nr);
+            L.wsink = qmat_rows(L.proj, L.off_sink, H);
+            L.wk = qmat_rows(L.proj, L.off_k, KV);
+            L.wv = qmat_rows(L.proj, L.off_v, KV);
+            if (!c.swa[il]) {
+                L.k_conv_proj = qmat_rows(L.proj, L.off_kp, nkp);
+                L.v_conv_proj = qmat_rows(L.proj, L.off_vp, nkp);
+            }
+        }
         L.wo = tp ? upload_cols(blk(il, "attn_output.weight"), {{h0 * D, (h0 + H) * D}}) : upload(blk(il, "attn_output.weight"));
-        L.wgate = rows_of(blk(il, "attn_gate.weight"), h0 * D, (int64_t) H * D, 1, 0);
-        L.wrel = rows_of(blk(il, "attn_rel.weight"), h0 * c.n_rel, (int64_t) H * c.n_rel, 1, 0);
-        L.wsink = rows_of(blk(il, "attn_sink_proj.weight"), h0, H, 1, 0);
         L.q_clip = upload_f32_range(blk(il, "attn_q_clip.weight"), h0 * D, (int64_t) H * D);
         L.rel_clip = upload_f32_range(blk(il, "attn_rel_clip.weight"), h0 * c.n_rel, (int64_t) H * c.n_rel);
         L.rel_bias = upload_f32(blk(il, "attn_rel_bias.weight"), (size_t) c.extent(il) * c.n_rel);
@@ -226,8 +271,6 @@ void InkModel::load(const std::string & path, bool verbose, int tp_n, int tp_ran
             L.q_norm = upload_f32(blk(il, "attn_q_inp_norm.weight"), E);
             L.k_norm = upload_f32(blk(il, "attn_k_inp_norm.weight"), E);
             L.v_norm = upload_f32(blk(il, "attn_v_inp_norm.weight"), E);
-            L.k_conv_proj = rows_of(blk(il, "attn_k_conv_proj.weight"), kv0 / D * C, (int64_t) c.n_head_kv * C, 1, 0);
-            L.v_conv_proj = rows_of(blk(il, "attn_v_conv_proj.weight"), kv0 / D * C, (int64_t) c.n_head_kv * C, 1, 0);
         }
         if (il > 0) {
             L.attn_res_nq = L.swa ? 1 : 3;
@@ -272,8 +315,9 @@ void InkModel::load(const std::string & path, bool verbose, int tp_n, int tp_ran
         for (int j = 0; j < 4; ++j) {
             const std::string p = std::string("loop_") + ctl[j] + "_ctrl_";
             P.down[j] = upload(blk(il, (p + "down.weight").c_str()));
-            P.gain[j] = upload(blk(il, (p + "gain.weight").c_str()));
-            P.forget[j] = upload(blk(il, (p + "forget.weight").c_str()));
+            P.gf[j] = upload_stack({{blk(il, (p + "gain.weight").c_str()), {{0, E}}}, {blk(il, (p + "forget.weight").c_str()), {{0, E}}}});
+            P.gain[j] = qmat_rows(P.gf[j], 0, E);
+            P.forget[j] = qmat_rows(P.gf[j], E, E);
             if (P.down[j].cols != 2 * E || P.down[j].rows != c.gate_rank || P.gain[j].cols != c.gate_rank)
                 throw std::runtime_error("inkling: loop control shapes");
         }

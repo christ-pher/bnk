@@ -15,6 +15,6 @@ size_t ink_attn_scratch_floats(int T, int H, int extent, int max_splits);
 void ink_attention_tc(const float * q, const float * R, const float * sink, const half * K, const half * V, int ring,
                       const float * rel_bias, int extent, int n_rel, int window, const int * pos0_dev, int pos0,
                       int T, int H, int KVH, int D, float scale, int nsplit, float * out, float * scratch,
-                      cudaStream_t s);
+                      cudaStream_t s, int64_t ldq = 0, int64_t ldr = 0, int64_t lds = 0);   // the rows' strides (0: packed)
 
 }  // namespace bnk

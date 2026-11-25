@@ -33,8 +33,8 @@ struct Pos0 {
 
 // table[t][h][d] = (R[t][h] . rel_bias[d] - sink[t][h]) * log2(e) for d < extent, -sink * log2(e) at d = extent;
 // a block: 256 distances x 32 (t, h) rows, both operands in shared memory (n_rel = 16)
-__global__ void k_rel_table(const float * R, const float * rel_bias, const float * sink, int TH, int n_rel, int extent,
-                            float * table) {
+__global__ void k_rel_table(const float * R, int64_t ldr, const float * sink, int64_t lds, const float * rel_bias,
+                            int TH, int H, int n_rel, int extent, float * table) {
     __shared__ float rb[256][17];
     __shared__ float rr[32][17];
     const int d0 = blockIdx.x * 256, th0 = blockIdx.y * 32;
@@ -44,7 +44,7 @@ __global__ void k_rel_table(const float * R, const float * rel_bias, const float
     }
     for (int i = threadIdx.x; i < 32 * n_rel; i += blockDim.x) {
         const int th = th0 + i / n_rel;
-        rr[i / n_rel][i % n_rel] = th < TH ? R[(int64_t) th * n_rel + i % n_rel] : 0.f;
+        rr[i / n_rel][i % n_rel] = th < TH ? R[(int64_t) (th / H) * ldr + (th % H) * n_rel + i % n_rel] : 0.f;
     }
     __syncthreads();
     const int d = d0 + threadIdx.x;
@@ -53,7 +53,8 @@ __global__ void k_rel_table(const float * R, const float * rel_bias, const float
         float b = 0;
 #pragma unroll
         for (int i = 0; i < 16; ++i) b += rr[r][i] * rb[threadIdx.x][i];
-        table[(int64_t) (th0 + r) * (extent + 1) + d] = (b - sink[th0 + r]) * kLog2e;
+        const int th = th0 + r;
+        table[(int64_t) th * (extent + 1) + d] = (b - sink[(int64_t) (th / H) * lds + th % H]) * kLog2e;
     }
 }
 
@@ -61,7 +62,7 @@ template <int G>
 __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q, const half * __restrict__ kc,
         const half * __restrict__ vc, const float * __restrict__ table, float * __restrict__ out,
         float * __restrict__ part_o, float * __restrict__ part_ml, int N, int H, int Hkv, int ring, int extent,
-        int window, Pos0 p0, float scale, int nsplit) {
+        int window, Pos0 p0, float scale, int nsplit, int64_t ldq) {
     __shared__ __align__(16) half ks[kKeys * kKS];
     __shared__ __align__(16) half vt[kD * kVS];
     __shared__ __align__(16) half ps[G][kRows * kKeys];
@@ -82,7 +83,7 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
     uint32_t qa[16];
     {
         const int rr = min(my_row, N - 1);
-        const float * qr = q + ((int64_t) rr * H + h) * kD + qp * 32;
+        const float * qr = q + (int64_t) rr * ldq + (int64_t) h * kD + qp * 32;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const float4 f = *(const float4 *) (qr + 4 * i);
@@ -284,10 +285,10 @@ __global__ void k_attn_combine(const float * __restrict__ part_o, const float * 
 template <int G>
 void launch(const float * q, const half * kc, const half * vc, const float * table, float * out, float * part_o,
             float * part_ml, int N, int H, int Hkv, int ring, int extent, int window, Pos0 p0, float scale, int nsplit,
-            cudaStream_t s) {
+            int64_t ldq, cudaStream_t s) {
     const dim3 grid((N + kRows - 1) / kRows, Hkv, nsplit);
     k_attn_tc<G><<<grid, 32 * G, 0, s>>>(q, kc, vc, table, out, part_o, part_ml, N, H, Hkv, ring, extent, window, p0,
-                                         scale, nsplit);
+                                         scale, nsplit, ldq);
     if (nsplit > 1) k_attn_combine<<<N * H, kD, 0, s>>>(part_o, part_ml, out, N, H, nsplit);
 }
 
@@ -300,19 +301,23 @@ size_t ink_attn_scratch_floats(int T, int H, int extent, int max_splits) {
 void ink_attention_tc(const float * q, const float * R, const float * sink, const half * K, const half * V, int ring,
                       const float * rel_bias, int extent, int n_rel, int window, const int * pos0_dev, int pos0,
                       int T, int H, int KVH, int D, float scale, int nsplit, float * out, float * scratch,
-                      cudaStream_t s) {
+                      cudaStream_t s, int64_t ldq, int64_t ldr, int64_t lds) {
+    if (!ldq) ldq = (int64_t) H * D;
+    if (!ldr) ldr = (int64_t) H * n_rel;
+    if (!lds) lds = H;
     if (D != kD || H % KVH || n_rel > 32) throw std::runtime_error("ink_attention_tc: unsupported shape");
     float * table = scratch;
     float * part_o = scratch + (size_t) T * H * (extent + 1);
     float * part_ml = part_o + (size_t) nsplit * T * H * kD;
     if (n_rel != 16) throw std::runtime_error("ink_attention_tc: 16 relative channels");
-    k_rel_table<<<dim3((extent + 256) / 256, (T * H + 31) / 32), 256, 0, s>>>(R, rel_bias, sink, T * H, n_rel, extent, table);
+    k_rel_table<<<dim3((extent + 256) / 256, (T * H + 31) / 32), 256, 0, s>>>(R, ldr, sink, lds, rel_bias, T * H, H, n_rel,
+                                                                              extent, table);
     const Pos0 p0{pos0, pos0_dev};
     switch (H / KVH) {
-        case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, s); break;
-        case 2: launch<2>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, s); break;
-        case 3: launch<3>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, s); break;
-        case 4: launch<4>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, s); break;
+        case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
+        case 2: launch<2>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
+        case 3: launch<3>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
+        case 4: launch<4>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
         default: throw std::runtime_error("ink_attention_tc: query heads per KV head");
     }
     check_launch("ink_attention_tc");

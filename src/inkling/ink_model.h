@@ -48,6 +48,11 @@ struct InkLayer {
     // attention (BF16 matrices): q, k, v, out, the output gate, the relative-position queries, the sink logits;
     // full layers: the input-dependent conv taps of k and v
     QMat wq, wk, wv, wo, wgate, wrel, wsink, k_conv_proj, v_conv_proj;
+    // the projections stacked by input (one GEMV each): q | gate | rel | sink (the q input), k [| k taps] (the k
+    // input), v [| v taps] (the v input); window layers read one input for all of them when no loop message
+    // makes the three differ. wq ... v_conv_proj above are row views of it.
+    QMat proj;
+    int off_gate = 0, off_rel = 0, off_sink = 0, off_k = 0, off_kp = 0, off_v = 0, off_vp = 0;
     // f32 vectors (device)
     const float * attn_norm = nullptr;                                     // window layers
     const float * q_norm = nullptr, * k_norm = nullptr, * v_norm = nullptr;  // full layers: per input
@@ -73,6 +78,7 @@ struct InkLayer {
 struct InkLoop {
     const float * msg_query = nullptr;   // [4][E]
     QMat down[4], gain[4], forget[4];
+    QMat gf[4];   // gain | forget stacked (one GEMV); gain / forget are its row views
 };
 
 struct InkModel {
@@ -101,6 +107,8 @@ private:
     QMat upload_bytes(const std::string & name, const std::vector<uint8_t> & host, int64_t rows, int64_t cols, int type);
     // the rows [r0, r1) of each range, or the columns [c0, c1) of every row (whole quant blocks), as one matrix
     QMat upload_rows(const std::string & name, const Ranges & rows);
+    // several tensors' row ranges stacked into one matrix (same format and width)
+    QMat upload_stack(const std::vector<std::pair<std::string, Ranges>> & parts);
     QMat upload_cols(const std::string & name, const Ranges & cols);
     const float * upload_f32_range(const std::string & name, int64_t off, int64_t n);
     QMat upload(const std::string & name, bool required = true);
