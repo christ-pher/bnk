@@ -138,3 +138,19 @@ path.
 | after | **2.99 ms** | 91 (777 from the head) | **39.82 tok/s (+9.6%)** |
 
 Any model served without top-k / top-p / min-p takes this path (the DeepSeek configs; the Qwen configs use top-k 20).
+
+## Found while profiling: the drafter's Markov step on the host
+
+DSpark's `draft_block` brought each block position's 129K-float logits row and its 129K-float Markov bias to the host,
+then ran 129K `expf`, a cumulative sum and a partial sort per position, with a sync per position. Now on the GPU
+(`ds_add` + `topk_rows`, K = 64): only the head's ids and values cross, the draft is drawn from the head renormalized,
+and that head is the draft's distribution (exactly known, so rejection sampling stays exact; before, the verifier got
+the top 64 of an untruncated distribution). K = 256 was tried first: the verifier's residual loop and the draft
+entries outside its own 1,024-token head cost more than the drafter saved (sampling 3.0 -> 6.2 ms a round).
+
+| `bnk run`, production settings, 800 tokens | seed 11 | seed 12 | draft a round | tokens a round |
+| --- | --- | --- | --- | --- |
+| host Markov step (`BNK_DS_SPARK_HOST_DRAFT=1`) | 41.1 | 39.2 tok/s | 14.4-14.8 ms | 2.88 / 2.73 |
+| GPU Markov step | 40.6 | 42.1 tok/s | **12.2-13.0 ms** | 2.76 / 2.94 |
+
+With the sampling fix: 36.3 -> ~41 tok/s on this prompt (+13%).

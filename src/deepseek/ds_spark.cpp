@@ -318,7 +318,10 @@ void DsSpark::stage_forward(int il, int T) {
 // the block after `anchor` at position `pos`: embed anchor + noise, the stages, the head, the Markov chain and the
 // confidence head on the host
 void DsSpark::draft_block(int32_t anchor, int pos) {
-    const int T = block_, E = c_.n_embd, V = c_.n_vocab, RK = (int) markov_w1_.cols;
+    // BNK_DS_SPARK_ROWS=n: draft blocks of n rows instead of the model's block size (the schedule keeps ~2.5 drafts a
+    // round, and each row costs its routed experts on the CPU; drafts need not be exact, only their distribution known)
+    static const int rows_env = env_int("BNK_DS_SPARK_ROWS", 0);
+    const int T = rows_env >= 2 && rows_env < block_ ? rows_env : block_, E = c_.n_embd, V = c_.n_vocab, RK = (int) markov_w1_.cols;
     const double t_draft0 = now_ms();
     Block & b = blocks_[cur_];
     b = Block{};
