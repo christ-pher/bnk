@@ -104,28 +104,39 @@ constexpr int kMixT = 512;
 template <int NQ>
 __global__ void __launch_bounds__(kMixT) k_mix_norm(InkStates st, const float * q, int T, int E, InkNorms nm,
                                                    float eps, float * out) {
-    constexpr int nq = NQ;
     constexpr int NV = 1 + NQ;   // per state: the sum of squares, then the dots
+    constexpr int kPer = 5;      // E <= 2560: a thread's elements, every state's kept in registers
     __shared__ float red[kMixT / 32][kInkMaxStates * NV];
-    __shared__ float tot[kInkMaxStates * 5];
-    __shared__ float wts[4][kInkMaxStates];
-    __shared__ float rr[4];
+    __shared__ float tot[kInkMaxStates * NV];
+    __shared__ float wts[NQ][kInkMaxStates];
+    __shared__ float rr[NQ];
     const int t = blockIdx.x, S = st.n, w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    const int per = (E + kMixT - 1) / kMixT;
+    float xv[kInkMaxStates][kPer];
+    // every load first (states x elements in flight), then the arithmetic
+#pragma unroll
+    for (int s2 = 0; s2 < kInkMaxStates; ++s2)
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = threadIdx.x + k * kMixT;
+            xv[s2][k] = (s2 < S && k < per && i < E) ? st.p[s2][(int64_t) t * E + i] : 0.f;
+        }
     float acc[kInkMaxStates * NV];
 #pragma unroll
     for (int i = 0; i < kInkMaxStates * NV; ++i) acc[i] = 0.f;
-    for (int i = threadIdx.x; i < E; i += kMixT) {
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * kMixT;
+        if (k >= per || i >= E) break;
         float qv[NQ];
 #pragma unroll
         for (int j = 0; j < NQ; ++j) qv[j] = q[(int64_t) j * E + i];
 #pragma unroll
         for (int s2 = 0; s2 < kInkMaxStates; ++s2) {
-            if (s2 < S) {
-                const float v = st.p[s2][(int64_t) t * E + i];
-                acc[s2 * NV] += v * v;
+            const float v = xv[s2][k];
+            acc[s2 * NV] += v * v;
 #pragma unroll
-                for (int j = 0; j < NQ; ++j) acc[s2 * NV + 1 + j] += qv[j] * v;
-            }
+            for (int j = 0; j < NQ; ++j) acc[s2 * NV + 1 + j] += qv[j] * v;
         }
     }
 #pragma unroll
@@ -139,41 +150,35 @@ __global__ void __launch_bounds__(kMixT) k_mix_norm(InkStates st, const float * 
     for (int i = threadIdx.x; i < S * NV; i += kMixT) {
         float a = 0;
         for (int k = 0; k < kMixT / 32; ++k) a += red[k][i];
-        tot[(i / NV) * 5 + i % NV] = a;
+        tot[i] = a;
     }
     __syncthreads();
-    if (threadIdx.x < nq) {
+    if (threadIdx.x < NQ) {
         const int j = threadIdx.x;
         float sc[kInkMaxStates], m = -FLT_MAX;
         for (int s2 = 0; s2 < S; ++s2) {
-            const float r = rsqrtf(tot[s2 * 5] / E + 1e-6f);
-            sc[s2] = tot[s2 * 5 + 1 + j] * r * rsqrtf((float) E);
+            const float r = rsqrtf(tot[s2 * NV] / E + 1e-6f);
+            sc[s2] = tot[s2 * NV + 1 + j] * r * rsqrtf((float) E);
             m = fmaxf(m, sc[s2]);
         }
         float z = 0;
         for (int s2 = 0; s2 < S; ++s2) z += __expf(sc[s2] - m);
-        for (int s2 = 0; s2 < S; ++s2) wts[j][s2] = __expf(sc[s2] - m) / z * rsqrtf(tot[s2 * 5] / E + 1e-6f);
+        for (int s2 = 0; s2 < kInkMaxStates; ++s2)
+            wts[j][s2] = s2 < S ? __expf(sc[s2] - m) / z * rsqrtf(tot[s2 * NV] / E + 1e-6f) : 0.f;
     }
     __syncthreads();
-    // the rows (kept in registers: E / kMixT values a thread), then their norms
-    constexpr int kPer = 8;   // E <= 4096
     float o[NQ][kPer];
     float ss[NQ];
 #pragma unroll
-    for (int j = 0; j < NQ; ++j) ss[j] = 0.f;
+    for (int j = 0; j < NQ; ++j) {
+        ss[j] = 0.f;
 #pragma unroll
-    for (int k = 0; k < kPer; ++k) {
-        const int i = threadIdx.x + k * kMixT;
+        for (int k = 0; k < kPer; ++k) {
+            float a = 0.f;
 #pragma unroll
-        for (int j = 0; j < NQ; ++j) o[j][k] = 0.f;
-        if (i < E) {
-            for (int s2 = 0; s2 < S; ++s2) {
-                const float v = st.p[s2][(int64_t) t * E + i];
-#pragma unroll
-                for (int j = 0; j < NQ; ++j) o[j][k] += wts[j][s2] * v;
-            }
-#pragma unroll
-            for (int j = 0; j < NQ; ++j) ss[j] += o[j][k] * o[j][k];
+            for (int s2 = 0; s2 < kInkMaxStates; ++s2) a += wts[j][s2] * xv[s2][k];
+            o[j][k] = a;
+            ss[j] += a * a;   // elements past E are 0
         }
     }
     __syncthreads();
@@ -192,7 +197,7 @@ __global__ void __launch_bounds__(kMixT) k_mix_norm(InkStates st, const float * 
 #pragma unroll
     for (int k = 0; k < kPer; ++k) {
         const int i = threadIdx.x + k * kMixT;
-        if (i >= E) continue;
+        if (k >= per || i >= E) break;
 #pragma unroll
         for (int j = 0; j < NQ; ++j)
             out[((int64_t) j * T + t) * E + i] = nm.w[j] ? o[j][k] * rr[j] * nm.w[j][i] : o[j][k];
@@ -699,7 +704,7 @@ void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float 
 
 void ink_mix_norm(const InkStates & st, const float * q, int nq, int T, int E, const float * const * norm, float eps,
                   float * out, cudaStream_t s) {
-    if (st.n < 1 || st.n > kInkMaxStates || nq < 1 || nq > 4 || E > 8 * kMixT) throw std::runtime_error("ink_mix_norm: out of range");
+    if (st.n < 1 || st.n > kInkMaxStates || nq < 1 || nq > 4 || E > 5 * kMixT) throw std::runtime_error("ink_mix_norm: out of range");
     InkNorms nm{};
     for (int j = 0; j < nq; ++j) nm.w[j] = norm ? norm[j] : nullptr;
     switch (nq) {
