@@ -114,6 +114,7 @@ public:
     }
     void set_draft(int n) { opt_.max_draft = n; }
     void set_draft_min_p(float p) { opt_.min_p = p; }
+    bool lookup_alone() const;
     void set_lookup(int n, int max_drafts, int agree) { opt_.lookup_n = n; opt_.lookup_max = max_drafts; opt_.lookup_agree = agree; index_ = LookupIndex(std::max(n, 1)); }
     GenStats stats;
 

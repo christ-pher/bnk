@@ -100,6 +100,15 @@ int main(int argc, char ** argv) {
         }
     };
     const double t0 = now_ms();
+    if (mode == "speed") {   // decode speed: P prompt tokens, then 64 one-token forwards (greedy)
+        eng.prefill(std::vector<int32_t>(toks.begin(), toks.begin() + P));
+        int32_t t = eng.argmax(eng.last_T - 1);
+        for (int i = 0; i < 4; ++i) { eng.forward(&t, 1, true); t = eng.argmax(0); }   // graphs captured
+        const double a = now_ms();
+        for (int i = 0; i < 64; ++i) { eng.forward(&t, 1, true); t = eng.argmax(0); }
+        printf("decode: %.2f ms per token (%.1f tok/s) at position %d\n", (now_ms() - a) / 64, 64000.0 / (now_ms() - a), eng.pos());
+        return 0;
+    }
     if (mode == "prefill") {
         eng.logits_hook = check;
         eng.prefill(toks);

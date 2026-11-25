@@ -63,6 +63,7 @@ struct InkLayer {
     const float * exp_bias = nullptr;
     QMat gate_up, down;
     std::vector<float> gu_scale, down_scale;
+    const float * d_gu_scale = nullptr, * d_down_scale = nullptr;   // device copies (null: float experts)
 };
 
 // a core layer's loop controls: the four message queries (q, k, v, ffn) and per control down / gain / forget
@@ -93,6 +94,7 @@ struct InkModel {
 private:
     std::vector<void *> allocs_;
     QMat upload(const std::string & name, bool required = true);
+    const float * upload_vec(const std::vector<float> & v);
     const float * upload_f32(const std::string & name, size_t expect, bool required = true);
 };
 

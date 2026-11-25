@@ -80,6 +80,7 @@ add_library(bnk_core STATIC
   src/deepseek/ds_spark.cpp
   src/inkling/ink_model.cpp
   src/inkling/ink_ops.cu
+  src/inkling/ink_moe.cu
   src/inkling/ink_engine.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)

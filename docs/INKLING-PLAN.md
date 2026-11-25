@@ -51,3 +51,27 @@ experts BF16). Architecture `inkling2_loop`; reference: mainline llama.cpp `src/
 4. Later: the DSpark drafter, vision, conversation slots / parking.
 
 ## Log
+* 2026-11-25: steps 1-3 (first part) done on one V100.
+  * **Correctness** (tests/test_inkling against llama.cpp's CPU build, `ref_logits`): 26-token prompt top-1 100%,
+    mean KL 0.0003; 2,934-token markdown/code prompt top-1 96.8%, mean KL 0.005, flat over positions (no step at the
+    512-token chunks, the 1,024-token window or the relative-bias extent), next-token NLL 2.1124 vs the reference's
+    2.1101. Decode, prompt chunks and part-committed verify windows (8 rows, 1-8 kept) give the same logits across
+    the window boundary. The reference rounds BF16 products' activations to BF16 (BNK_INK_BF16ACT=1 does the same
+    here: KL 0.0043 -> 0.0040, so not the gap); the rest is the two implementations' fp32 / fp16 / int8 noise.
+  * **Server**: tokenizer exact (3,125 tokens of mixed text), template, InklingParser (thinking, text, JSON tool
+    calls), thinking levels, the loop guard's wrap-up, snapshots at the prompt's end (a tool turn reused 213 of
+    278 tokens). The generator now verifies prompt-lookup copies without a drafter (BNK_LOOKUP_ALONE=0 off).
+  * **Speed** (decode, one V100, the 150 W cap): 36 tok/s first (host round trip per layer visit for the MoE) ->
+    47.6 tok/s prose: the MoE on the device (a plan grouping the window's pairs by expert, gate | up and down as
+    dp4a products on int8 activations, NVFP4 rows read once per expert: 450 GB/s; fp32 activations were shared-
+    memory bound at ~300 GB/s), positions in device memory and one CUDA graph per window size, the depth mix in
+    two passes. Copy tasks 88 tok/s (lookup drafts: 769 of 828 accepted, 2.98 tokens a round). Prompts: ~330 tok/s
+    on short reads (the grouped GEMM path; not tuned yet).
+  * **Where decode time goes** (nsys, 19.8 ms a token): BF16 projections 4.7 ms (~560 GB/s), NVFP4 experts 3.9 ms,
+    ~2,000 small kernels a token (norms, mix scores, clipping, convolutions, loop controls: each latency bound at
+    3-10 us), attention 0.9 ms, layer 23's BF16 experts 0.6 ms (shared-memory bound). The weight traffic is ~5.5 GB
+    a token: ~110-120 tok/s is one V100's ceiling.
+  * **Next**: fuse the small kernels (mix + norm, the three clips, k | v conv, the q / k / v loop controls),
+    split-K attention, prompt speed (the MoE prompt path: moe_tc-style grouped tensor-core experts, flash prompt
+    attention), the DSpark drafter (dspark-Inkling-2-Mini-Q8_0.gguf, block 8, taps the looped layers), vision
+    (mmproj-F16.gguf), the second GPU (tensor parallel would halve the weight traffic), more slots.

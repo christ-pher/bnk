@@ -41,46 +41,49 @@ __global__ void k_rms(const float * x, int64_t ldx, const float * w, float * y, 
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * r * (w ? w[i] : 1.f);
 }
 
-// one block per token; states S <= kInkMaxStates, queries nq <= 4
-__global__ void k_mix(InkStates st, const float * q, int nq, int T, int E, float * out) {
+// the depth mix in two passes: per (token, state) its 1/rms and the queries' scores; then the rows, parallel over E
+__global__ void k_mix_scores(InkStates st, const float * q, int nq, int E, float * sc) {
     __shared__ float red[8];
-    __shared__ float rms[kInkMaxStates], sc[4][kInkMaxStates];
-    const int t = blockIdx.x, S = st.n;
-    for (int s = 0; s < S; ++s) {
-        const float * x = st.p[s] + (int64_t) t * E;
-        float ss = 0, d[4] = {0, 0, 0, 0};
-        for (int i = threadIdx.x; i < E; i += blockDim.x) {
-            const float v = x[i];
-            ss += v * v;
-            for (int j = 0; j < nq; ++j) d[j] += q[(int64_t) j * E + i] * v;
-        }
-        ss = block_sum256(ss, red);
-        float dj[4];
-        for (int j = 0; j < nq; ++j) dj[j] = block_sum256(d[j], red);
-        if (threadIdx.x == 0) {
-            const float r = rsqrtf(ss / E + 1e-6f);
-            rms[s] = r;
-            for (int j = 0; j < nq; ++j) sc[j][s] = dj[j] * r * rsqrtf((float) E);
-        }
+    const int t = blockIdx.x, s = blockIdx.y;
+    const float * x = st.p[s] + (int64_t) t * E;
+    float ss = 0, d[4] = {0, 0, 0, 0};
+    for (int i = threadIdx.x; i < E; i += blockDim.x) {
+        const float v = x[i];
+        ss += v * v;
+        for (int j = 0; j < nq; ++j) d[j] += q[(int64_t) j * E + i] * v;
     }
-    __syncthreads();
+    ss = block_sum256(ss, red);
+    float dj[4];
+    for (int j = 0; j < nq; ++j) dj[j] = block_sum256(d[j], red);
+    if (threadIdx.x == 0) {
+        float * o = sc + ((int64_t) t * kInkMaxStates + s) * 5;
+        const float r = rsqrtf(ss / E + 1e-6f);
+        o[0] = r;
+        for (int j = 0; j < nq; ++j) o[1 + j] = dj[j] * r * rsqrtf((float) E);
+    }
+}
+
+__global__ void k_mix_out(InkStates st, int nq, int T, int E, const float * sc, float * out) {
+    __shared__ float w[4][kInkMaxStates];
+    const int t = blockIdx.y, S = st.n;
     if (threadIdx.x < nq) {
         const int j = threadIdx.x;
+        const float * o = sc + (int64_t) t * kInkMaxStates * 5;
         float m = -FLT_MAX;
-        for (int s = 0; s < S; ++s) m = fmaxf(m, sc[j][s]);
+        for (int s = 0; s < S; ++s) m = fmaxf(m, o[s * 5 + 1 + j]);
         float z = 0;
-        for (int s = 0; s < S; ++s) z += __expf(sc[j][s] - m);
-        for (int s = 0; s < S; ++s) sc[j][s] = __expf(sc[j][s] - m) / z * rms[s];
+        for (int s = 0; s < S; ++s) z += __expf(o[s * 5 + 1 + j] - m);
+        for (int s = 0; s < S; ++s) w[j][s] = __expf(o[s * 5 + 1 + j] - m) / z * o[s * 5];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < E; i += blockDim.x) {
-        float acc[4] = {0, 0, 0, 0};
-        for (int s = 0; s < S; ++s) {
-            const float v = st.p[s][(int64_t) t * E + i];
-            for (int j = 0; j < nq; ++j) acc[j] += sc[j][s] * v;
-        }
-        for (int j = 0; j < nq; ++j) out[((int64_t) j * T + t) * E + i] = acc[j];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    float acc[4] = {0, 0, 0, 0};
+    for (int s = 0; s < S; ++s) {
+        const float v = st.p[s][(int64_t) t * E + i];
+        for (int j = 0; j < nq; ++j) acc[j] += w[j][s] * v;
     }
+    for (int j = 0; j < nq; ++j) out[((int64_t) j * T + t) * E + i] = acc[j];
 }
 
 // one thread per channel, the tokens in order
@@ -132,9 +135,9 @@ __global__ void k_clip_heads(float * x, int T, int H, int D, const float * scale
     for (int i = lane; i < D; i += 32) xr[i] = xr[i] * (scale ? scale[h * D + i] : 1.f) * f;
 }
 
-__global__ void k_kv_store(const float * k, const float * v, half * K, half * V, int ring, int pos0, int KVD) {
+__global__ void k_kv_store(const float * k, const float * v, half * K, half * V, int ring, const int * pos0p, int KVD) {
     const int t = blockIdx.y;
-    const int64_t cell = (int64_t) ((pos0 + t) % ring);
+    const int64_t cell = (int64_t) ((*pos0p + t) % ring);
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < KVD; i += gridDim.x * blockDim.x) {
         K[cell * KVD + i] = __float2half(k[(int64_t) t * KVD + i]);
         V[cell * KVD + i] = __float2half(v[(int64_t) t * KVD + i]);
@@ -145,7 +148,8 @@ __global__ void k_kv_store(const float * k, const float * v, half * K, half * V,
 constexpr int kAttnWarps = 8;
 __global__ void __launch_bounds__(256) k_attention(const float * q, const float * R, const float * sink,
         const half * K, const half * V, int ring, const float * rel_bias, int extent, int n_rel, int window,
-        int pos0, int H, int KVH, float scale, float * out) {
+        const int * pos0p, int H, int KVH, float scale, float * out) {
+    const int pos0 = *pos0p;
     extern __shared__ float table[];   // [extent + 1]
     __shared__ float sm[kAttnWarps], sl[kAttnWarps];
     __shared__ float sacc[kAttnWarps][128];
@@ -320,9 +324,10 @@ void ink_rms(const float * x, int64_t ldx, const float * w, float * y, int64_t l
     check_launch("ink_rms");
 }
 
-void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float * out, cudaStream_t s) {
+void ink_mix(const InkStates & st, const float * q, int nq, int T, int E, float * out, float * scratch, cudaStream_t s) {
     if (st.n < 1 || st.n > kInkMaxStates || nq < 1 || nq > 4) throw std::runtime_error("ink_mix: states or queries out of range");
-    k_mix<<<T, 256, 0, s>>>(st, q, nq, T, E, out);
+    k_mix_scores<<<dim3(T, st.n), 256, 0, s>>>(st, q, nq, E, scratch);
+    k_mix_out<<<dim3((E + 255) / 256, T), 256, 0, s>>>(st, nq, T, E, scratch, out);
     check_launch("ink_mix");
 }
 
@@ -344,7 +349,7 @@ void ink_clip_heads(float * x, int T, int H, int D, const float * scale, float t
     check_launch("ink_clip_heads");
 }
 
-void ink_kv_store(const float * k, const float * v, half * K, half * V, int ring, int pos0, int T, int KVD,
+void ink_kv_store(const float * k, const float * v, half * K, half * V, int ring, const int * pos0, int T, int KVD,
                   cudaStream_t s) {
     k_kv_store<<<dim3((KVD + 255) / 256, T), 256, 0, s>>>(k, v, K, V, ring, pos0, KVD);
     check_launch("ink_kv_store");
@@ -353,7 +358,7 @@ void ink_kv_store(const float * k, const float * v, half * K, half * V, int ring
 size_t ink_attention_scratch_floats(int, int, int, int) { return 0; }
 
 void ink_attention(const float * q, const float * R, const float * sink, const half * K, const half * V, int ring,
-                   const float * rel_bias, int extent, int n_rel, int window, int pos0, int T, int H, int KVH, int D,
+                   const float * rel_bias, int extent, int n_rel, int window, const int * pos0, int T, int H, int KVH, int D,
                    float scale, float * out, float *, int, cudaStream_t s) {
     if (D != 128) throw std::runtime_error("ink_attention: head dim 128 only");
     const size_t sh = (size_t) (extent + 1) * sizeof(float);

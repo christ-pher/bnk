@@ -16,7 +16,12 @@ constexpr int kInkCkpts = 4;   // snapshots kept (each holds the window rings: ~
 }
 
 InkEngine::~InkEngine() {
+    for (auto & row : graphs_)
+        for (auto & g : row)
+            if (g) cudaGraphExecDestroy(g);
     if (h_tok_) cudaFreeHost(h_tok_);
+    if (h_pos_) cudaFreeHost(h_pos_);
+    if (h_tau_) cudaFreeHost(h_tau_);
     if (st_) cudaStreamDestroy(st_);
 }
 
@@ -64,6 +69,7 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     ctrl_in_.alloc((size_t) W * 2 * E); ctrl_g_.alloc((size_t) W * c.gate_rank);
     ctrl_gain_.alloc((size_t) W * E); ctrl_forget_.alloc((size_t) W * E);
     tau_.alloc(W);
+    mix_sc_.alloc(ink_mix_scratch_floats(W));
     rlog_.alloc((size_t) W * c.n_expert);
     gx_.alloc((size_t) R * E); gu_.alloc((size_t) R * 2 * F); gh_.alloc((size_t) R * F); gd_.alloc((size_t) R * E);
     blocks_buf_.alloc((size_t) kMaxBlocks * W * E);
@@ -72,6 +78,13 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     w_dev_.alloc(R); wg_dev_.alloc(R);
     h_ids_.resize(R); h_w_.resize(R);
     CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_pos_, 4, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_tau_, W * 4, cudaHostAllocDefault));
+    d_pos_.alloc(1);
+    plan_buf_.alloc(sizeof(InkMoePlan));
+    mh_.alloc((size_t) kInkMaxPairs * F); my_.alloc((size_t) kInkMaxPairs * E); mgu_.alloc((size_t) kInkMaxPairs * 2 * F);
+    mq_.alloc((size_t) kInkMaxPairs * E); mqd_.alloc((size_t) kInkMaxPairs * E / 32);
+    graphs_on_ = opt.use_graphs && env_int("BNK_INK_GRAPHS", 1) != 0;
     const int64_t maxcols = 2 * E;
     actq_.alloc((size_t) kInkWin * maxcols); actd_.alloc((size_t) kInkWin * maxcols / 32);
     acts_.alloc((size_t) kInkWin * maxcols / 16); acth_.alloc((size_t) kInkWin * maxcols);
@@ -188,7 +201,7 @@ void InkEngine::mix(const std::vector<const float *> & blocks, const float * cur
     InkStates st;
     for (const float * b : blocks) st.p[st.n++] = b;
     st.p[st.n++] = cur;
-    ink_mix(st, query, nq, T, model_.cfg.E, out, st_);
+    ink_mix(st, query, nq, T, model_.cfg.E, out, mix_sc_, st_);
 }
 
 void InkEngine::control(float * cur, const float * msg, const InkLoop & loop, int j, int T) {
@@ -219,6 +232,19 @@ void InkEngine::moe(const InkLayer & L, const float * x, int T, float * out) {
     const int E = c.E, F = c.n_ff, k = c.n_used, n = T * k;
     mm(L.router, x, E, T, rlog_, c.n_expert);
     ink_route(rlog_, L.exp_bias, T, c.n_expert, k, c.w_scale, ids_dev_, w_dev_, st_);
+    static const bool host_moe = env_int("BNK_INK_HOST_MOE", 0) != 0;   // tests: the grouped GEMV / GEMM path
+    if (T <= kInkWin && !host_moe) {
+        InkMoeArgs a;
+        a.ids = ids_dev_; a.w = w_dev_; a.T = T; a.k = k; a.n_exp = c.n_expert; a.E = E; a.F = F; a.x = x;
+        a.gate_up = (const uint8_t *) L.gate_up.data; a.gu_type = L.gate_up.type; a.gu_row_bytes = L.gate_up.row_bytes;
+        a.gu_scale = L.d_gu_scale;
+        a.down = (const uint8_t *) L.down.data; a.down_type = L.down.type; a.down_row_bytes = L.down.row_bytes;
+        a.down_scale = L.d_down_scale;
+        a.beta = c.situ_beta; a.lb = c.situ_lin;
+        a.plan = (InkMoePlan *) plan_buf_.p; a.gu = mgu_; a.h = mh_; a.y = my_; a.out = out; a.q = mq_; a.qd = mqd_;
+        ink_moe_window(a, st_);
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(h_ids_.data(), ids_dev_.p, (size_t) n * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_w_.data(), w_dev_.p, (size_t) n * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -306,8 +332,8 @@ void InkEngine::layer(int v, int ip, int T, int pos0, std::vector<const float *>
     ink_clip_heads(r_, T, H, c.n_rel, L.rel_clip, c.rel_clip, tau, st_);
 
     Visit & V = visits_[v];
-    ink_kv_store(kc_, vc_, V.K, V.V, V.ring, pos0, T, KVD, st_);
-    ink_attention(q_, r_, sink_, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, pos0, T, H, KVH, D,
+    ink_kv_store(kc_, vc_, V.K, V.V, V.ring, d_pos_, T, KVD, st_);
+    ink_attention(q_, r_, sink_, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, d_pos_, T, H, KVH, D,
                   1.f / sqrtf((float) D), attn_, nullptr, 0, st_);
     mm(L.wgate, a[0], E, T, gate_, QD);
     ink_mul_sigmoid(attn_, gate_, (int64_t) T * QD, st_);
@@ -344,11 +370,44 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
     if (T < 1 || T > chunk_) throw std::runtime_error("inkling: window out of range");
     if (pos0 + T > opt_.max_ctx) throw std::runtime_error("inkling: context full");
     memcpy(h_tok_, tokens, (size_t) T * 4);
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_tok_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
-    std::vector<float> tau(T);
+    *h_pos_ = pos0;
     for (int t = 0; t < T; ++t)
-        tau[t] = 1.f + c.log_alpha * logf(std::max(1.f, (float) (pos0 + t + 1) / c.log_floor));
-    CUDA_CHECK(cudaMemcpyAsync(tau_.p, tau.data(), (size_t) T * 4, cudaMemcpyHostToDevice, st_));
+        h_tau_[t] = 1.f + c.log_alpha * logf(std::max(1.f, (float) (pos0 + t + 1) / c.log_floor));
+    if (T <= kInkWin && graphs_on_ && !logits_hook) {
+        cudaGraphExec_t & g = graphs_[T][keep ? 1 : 0];
+        if (!g) {
+            cudaGraph_t gr;
+            CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+            enqueue(T, keep);
+            CUDA_CHECK(cudaStreamEndCapture(st_, &gr));
+            CUDA_CHECK(cudaGraphInstantiate(&g, gr, 0));
+            cudaGraphDestroy(gr);
+            ++captures_;
+        }
+        CUDA_CHECK(cudaGraphLaunch(g, st_));
+    } else {
+        enqueue(T, keep);
+    }
+    logits_rows_ = T <= kInkWin ? T : logits_hook ? T - (T - 1) / kInkWin * kInkWin : 1;
+    if (logits_hook) {
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        if (T <= kInkWin) logits_hook(pos0, T, logits_);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    last_T = logits_rows_;
+    history_.insert(history_.end(), tokens, tokens + T);
+}
+
+// The forward's GPU work for T rows whose inputs are staged (h_tok_, h_pos_, h_tau_): no host round trip for
+// windows of up to kInkWin rows (captured as a graph); prompt chunks group their experts on the host.
+void InkEngine::enqueue(int T, bool keep) {
+    const InkConfig & c = model_.cfg;
+    const int E = c.E;
+    const size_t TE = (size_t) T * E;
+    const int pos0 = *h_pos_;
+    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_tok_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(d_pos_.p, h_pos_, 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(tau_.p, h_tau_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
     dequant_gather(model_.tok_embd, tok_dev_, T, x_, st_);
     ink_rms(x_, E, model_.tok_norm, x_, E, T, E, c.rms_eps, st_);
 
@@ -391,28 +450,18 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
         mm(head, o_.p + (size_t) r0 * E, E, n, logits_, c.n_vocab);
         if (c.softcap > 0) ink_softcap(logits_, (int64_t) n * c.n_vocab, c.softcap, st_);
     };
-    if (logits_hook && T > 1) {
+    if (T <= kInkWin) {
+        head_rows(0, T);   // a decode / verify window: every row
+    } else if (logits_hook) {   // tests: every row of a prompt chunk (the last piece stays in logits_)
         for (int r0 = 0; r0 < T; r0 += kInkWin) {
             const int n = std::min(kInkWin, T - r0);
             head_rows(r0, n);
             CUDA_CHECK(cudaStreamSynchronize(st_));
             logits_hook(pos0 + r0, n, logits_);
         }
-        logits_rows_ = std::min(kInkWin, T - (T - 1) / kInkWin * kInkWin);
-    } else if (T <= kInkWin) {
-        head_rows(0, T);   // a decode / verify window: every row
-        logits_rows_ = T;
     } else {
         head_rows(T - 1, 1);   // a prompt chunk: its last row
-        logits_rows_ = 1;
     }
-    if (logits_hook && T == 1) {
-        CUDA_CHECK(cudaStreamSynchronize(st_));
-        logits_hook(pos0, 1, logits_);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(st_));
-    last_T = logits_rows_;
-    history_.insert(history_.end(), tokens, tokens + T);
 }
 
 void InkEngine::prefill(const std::vector<int32_t> & tokens) {

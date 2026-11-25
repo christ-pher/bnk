@@ -49,6 +49,14 @@ const float * InkModel::upload_f32(const std::string & name, size_t expect, bool
     return (const float *) upload(name).data;
 }
 
+const float * InkModel::upload_vec(const std::vector<float> & v) {
+    void * d = nullptr;
+    if (cudaMalloc(&d, v.size() * 4) != cudaSuccess || cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("inkling: upload failed");
+    allocs_.push_back(d);
+    return (const float *) d;
+}
+
 InkModel::~InkModel() {
     for (void * p : allocs_) cudaFree(p);
 }
@@ -167,6 +175,8 @@ void InkModel::load(const std::string & path, bool verbose) {
                 throw std::runtime_error("inkling: NVFP4 experts without their scales in layer " + std::to_string(il));
             }
         }
+        if (L.gate_up.type == GGML_TYPE_NVFP4) L.d_gu_scale = upload_vec(L.gu_scale);
+        if (L.down.type == GGML_TYPE_NVFP4) L.d_down_scale = upload_vec(L.down_scale);
     }
     loops.resize(c.n_core());
     static const char * ctl[4] = {"q", "k", "v", "ffn"};

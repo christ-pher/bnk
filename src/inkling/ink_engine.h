@@ -15,6 +15,7 @@
 #include "engine/engine.h"
 #include "engine/engine_api.h"
 #include "inkling/ink_model.h"
+#include "inkling/ink_moe.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
 
@@ -41,7 +42,7 @@ public:
     int max_window() const override { return kInkWin; }
     int snap_every() const override { return 0; }
     int cpu_threads() const override { return 0; }
-    int64_t graph_captures() const override { return 0; }
+    int64_t graph_captures() const override { return captures_; }
     size_t graph_bytes() const override { return 0; }
 
     int slots() const override { return 1; }
@@ -124,6 +125,7 @@ private:
     // activations (capacity chunk_ rows)
     DevBuf<float> x_, inp_sa_, ffn_inp_, mixed_, ins_[3], q_, r_, sink_, dyn_k_, dyn_v_, attn_, gate_, o_, tmp_,
         moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gain_, ctrl_forget_, msg_, tau_, gx_, gu_, gh_, gd_, rb_;
+    DevBuf<float> mix_sc_;       // the depth mix's scores
     DevBuf<float> blocks_buf_;   // [kMaxBlocks][chunk][E]
     static constexpr int kMaxBlocks = 12;
     DevBuf<float> logits_;       // [kInkWin][n_vocab_pad] (all_logits: [chunk])
@@ -133,6 +135,17 @@ private:
     DevBuf<double> topk_z_;
     DevBuf<float> attn_scratch_;
     int32_t * h_tok_ = nullptr;
+    int * h_pos_ = nullptr;          // pinned: the window's first position (the graphs copy it to d_pos_)
+    float * h_tau_ = nullptr;        // pinned: the full layers' log-scaled positions
+    DevBuf<int> d_pos_;
+    DevBuf<uint8_t> plan_buf_;       // InkMoePlan
+    DevBuf<float> mgu_, mh_, my_;    // the device MoE's gate | up, h and per-pair outputs
+    DevBuf<int8_t> mq_;              // ... its int8 activations
+    DevBuf<float> mqd_;
+    bool graphs_on_ = true;
+    cudaGraphExec_t graphs_[kInkWin + 1][2] = {};   // per window rows and commit (keep) mode
+    int64_t captures_ = 0;
+    void enqueue(int T, bool keep);
     std::vector<int32_t> h_ids_;
     std::vector<float> h_w_;
     int logits_rows_ = 0;
