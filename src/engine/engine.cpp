@@ -491,8 +491,9 @@ void Engine::load_stage(const std::string & path, const EngineOptions & opt) {
     ensure_ctx_here(std::min(opt.max_ctx, kCtxBaseline));
     if (opt.prefill_chunk > 0) prefill_layout(pf_small_);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
-    if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
-    if (opt.verbose && head) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    bool warm = false;
+    if (rank.empty() && !opt.counts_out.empty()) rank = warm_ranking(opt.counts_out, c.n_layer, c.n_expert, &warm);
+    if (opt.verbose && head) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : warm ? "the last run's resident set, then the counts" : "loaded");
     const size_t avail = budget_.free();
     size_t budget = avail;
     if (opt.expert_cache_gib >= 0) budget = std::min(budget, (size_t) (opt.expert_cache_gib * 1073741824.0));
@@ -808,6 +809,14 @@ void Engine::reset_here() {
 
 void Engine::save_counts() {
     for (Engine * s = this; s; s = s->next_.get()) s->save_counts_here();
+    // the warm start: what every stage holds in VRAM now, for the next load (expert_cache.h warm_ranking)
+    if (opt_.counts_out.empty()) return;
+    Ranking res;
+    for (const Engine * s = this; s; s = s->next_.get()) {
+        const Ranking r = s->cache_.resident_ranking();
+        res.insert(res.end(), r.begin(), r.end());
+    }
+    if (!res.empty()) save_resident(resident_path(opt_.counts_out), res, model_.cfg.n_layer, model_.cfg.n_expert);
 }
 
 void Engine::save_counts_here() {

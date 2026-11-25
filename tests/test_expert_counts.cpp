@@ -1,6 +1,8 @@
 // The routing-counts file's merge (ExpertCache's merge_counts) and the host store's spare blobs, without a GPU.
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "core/expert_cache.h"
@@ -32,6 +34,25 @@ int main() {
     std::vector<uint32_t> c{5, 1, 9, 2};   // 2 layers x 2 experts
     Ranking r = ranking_from_counts(c, 2, 2);
     CHECK(r.size() == 4 && r[0] == std::make_pair(1, 0) && r[1] == std::make_pair(0, 0));
+    // the warm start: the resident set round-trips, a file for another shape is ignored, and warm_ranking puts the
+    // resident set ahead of the counts' ranking
+    char dir[] = "/tmp/bnk-warm-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    const std::string cp = std::string(dir) + "/counts.bnkc";
+    CHECK(save_counts(cp, c, 2, 2));
+    Ranking res{{0, 1}, {1, 1}};
+    CHECK(save_resident(resident_path(cp), res, 2, 2));
+    CHECK(load_resident(resident_path(cp), 2, 2) == res);
+    CHECK(load_resident(resident_path(cp), 3, 2).empty());
+    bool warm = false;
+    Ranking w = warm_ranking(cp, 2, 2, &warm);
+    CHECK(warm && w.size() == 6 && w[0] == std::make_pair(0, 1) && w[1] == std::make_pair(1, 1) && w[2] == std::make_pair(1, 0));
+    CHECK(complete_ranking_public(w, 2, 2, 0, -1).size() == 4);   // the repeats dropped, every pair once
+    unlink(resident_path(cp).c_str());
+    w = warm_ranking(cp, 2, 2, &warm);
+    CHECK(!warm && w == r);
+    unlink(cp.c_str());
+    rmdir(dir);
     printf(fails ? "expert counts: FAILURES\n" : "expert counts: all OK\n");
     return fails ? 1 : 0;
 }

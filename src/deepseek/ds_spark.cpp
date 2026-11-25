@@ -156,6 +156,8 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
         moe_out_.alloc((size_t) T * E); logits_.alloc((size_t) T * c_.n_vocab); bias_.alloc((size_t) c_.n_vocab);
         w1_row_.alloc((size_t) markov_w1_.cols); main_x_.alloc((size_t) W * E); main_xn_.alloc((size_t) W * E);
         ids_.alloc(T); pos_.alloc(1);
+        mrow_.alloc((size_t) c_.n_vocab); mk_vals_.alloc(kDraftK); mk_ids_.alloc(kDraftK);
+        h_mk_vals_.resize(kDraftK); h_mk_ids_.resize(kDraftK);
         const int64_t maxcols = std::max<int64_t>({(int64_t) E, (int64_t) c_.q_lora, HD, GO, (int64_t) c_.n_ff, NT});
         actq_.alloc((size_t) W * maxcols); actd_.alloc((size_t) W * maxcols / 32); acth_.alloc((size_t) W * maxcols);
         act_.q = actq_; act_.d = actd_; act_.h = acth_;
@@ -316,7 +318,10 @@ void DsSpark::stage_forward(int il, int T) {
 // the block after `anchor` at position `pos`: embed anchor + noise, the stages, the head, the Markov chain and the
 // confidence head on the host
 void DsSpark::draft_block(int32_t anchor, int pos) {
-    const int T = block_, E = c_.n_embd, V = c_.n_vocab, RK = (int) markov_w1_.cols;
+    // BNK_DS_SPARK_ROWS=n: draft blocks of n rows instead of the model's block size (the schedule keeps ~2.5 drafts a
+    // round, and each row costs its routed experts on the CPU; drafts need not be exact, only their distribution known)
+    static const int rows_env = env_int("BNK_DS_SPARK_ROWS", 0);
+    const int T = rows_env >= 2 && rows_env < block_ ? rows_env : block_, E = c_.n_embd, V = c_.n_vocab, RK = (int) markov_w1_.cols;
     const double t_draft0 = now_ms();
     Block & b = blocks_[cur_];
     b = Block{};
@@ -344,7 +349,13 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
     dump("mixed", mixed_.p, (size_t) T * E * 4);
     dump("logits", logits_.p, (size_t) T * V * 4);
     if (dumps_left_ > 0) { --dumps_left_; ++dump_n_; }
-    CUDA_CHECK(cudaMemcpyAsync(h_logits_.data(), logits_.p, (size_t) T * V * 4, cudaMemcpyDeviceToHost, st_));
+    // BNK_DS_SPARK_HOST_DRAFT=1: the Markov step on the host over the whole vocabulary (as before 2026-11-25); else on
+    // the GPU: each position's logits + bias, its top kDraftK, and the draft drawn from those (renormalized), so only
+    // kDraftK values a position cross PCIe instead of the 129K-float row (and the host's 129K expf and partial sort)
+    static const bool host_draft = getenv("BNK_DS_SPARK_HOST_DRAFT") != nullptr;
+    static const bool trace = getenv("BNK_DS_SPARK_TRACE") != nullptr;
+    if (host_draft || trace)
+        CUDA_CHECK(cudaMemcpyAsync(h_logits_.data(), logits_.p, (size_t) T * V * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_mixed_.data(), mixed_.p, (size_t) T * E * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
     // the Markov chain: position i's logits plus W2 W1[token_{i-1}], sampled (or argmax) at the request's temperature;
@@ -359,12 +370,19 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
         dequant_gather(markov_w1_, ids_.p, 1, w1_row_, st_);
         quantize_act(w1_row_, RK, 1, RK, act2_, st_);
         gemv(markov_w2_, &act2_, nullptr, 0, 1, bias_, V, false, st_);
-        CUDA_CHECK(cudaMemcpyAsync(h_bias_.data(), bias_.p, (size_t) V * 4, cudaMemcpyDeviceToHost, st_));
+        if (!host_draft) {
+            ds_add(logits_.p + (size_t) i * V, bias_.p, mrow_.p, (size_t) V, st_);
+            topk_rows(mrow_.p, 1, V, kDraftK, mk_ids_.p, mk_vals_.p, st_);
+            CUDA_CHECK(cudaMemcpyAsync(h_mk_ids_.data(), mk_ids_.p, kDraftK * 4, cudaMemcpyDeviceToHost, st_));
+            CUDA_CHECK(cudaMemcpyAsync(h_mk_vals_.data(), mk_vals_.p, kDraftK * 4, cudaMemcpyDeviceToHost, st_));
+        }
+        if (host_draft || trace) CUDA_CHECK(cudaMemcpyAsync(h_bias_.data(), bias_.p, (size_t) V * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaMemcpyAsync(h_w1_.data(), w1_row_.p, (size_t) RK * 4, cudaMemcpyDeviceToHost, st_));
         CUDA_CHECK(cudaStreamSynchronize(st_));
         const float * lg = h_logits_.data() + (size_t) i * V;
         float mx = -INFINITY;
-        for (int v = 0; v < V; ++v) { row[v] = lg[v] + h_bias_[v]; mx = std::max(mx, row[v]); }
+        if (host_draft || trace)
+            for (int v = 0; v < V; ++v) { row[v] = lg[v] + h_bias_[v]; mx = std::max(mx, row[v]); }
         float conf = 1.f;
         if (!conf_w_.empty()) {
             double a = 0;
@@ -375,7 +393,27 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
         }
         int32_t tok;
         std::vector<std::pair<int32_t, float>> dist;
-        if (temperature_ <= 0.f) {
+        if (!host_draft) {   // from the GPU's head: the draft distribution is the head renormalized (exactly known)
+            const int kk = kDraftK;   // (topk_rows leaves its K unordered)
+            int best = 0;
+            for (int j = 1; j < kk; ++j)
+                if (h_mk_vals_[j] > h_mk_vals_[best]) best = j;
+            if (temperature_ <= 0.f) {
+                tok = h_mk_ids_[best];
+            } else {
+                const float inv = 1.f / temperature_, top = h_mk_vals_[best];
+                double z = 0;
+                std::vector<double> e(kk);
+                for (int j = 0; j < kk; ++j) { e[j] = std::exp((double) (h_mk_vals_[j] - top) * inv); z += e[j]; }
+                const double u = std::uniform_real_distribution<double>(0, 1)(rng) * z;
+                double acc = 0;
+                int pick = kk - 1;
+                for (int j = 0; j < kk; ++j) { acc += e[j]; if (acc >= u) { pick = j; break; } }
+                tok = h_mk_ids_[pick];
+                dist.reserve(kk);
+                for (int j = 0; j < kk; ++j) dist.push_back({h_mk_ids_[j], (float) (e[j] / z)});
+            }
+        } else if (temperature_ <= 0.f) {
             tok = (int32_t) (std::max_element(row.begin(), row.end()) - row.begin());
         } else {
             const float inv = 1.f / temperature_;
@@ -394,7 +432,6 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
             for (int j = 0; j < K; ++j) { dist.push_back({order[j], (float) (row[order[j]] / z)}); has |= order[j] == tok; }
             if (!has) dist.push_back({tok, (float) (row[tok] / z)});
         }
-        static const bool trace = getenv("BNK_DS_SPARK_TRACE") != nullptr;
         if (trace) {
             int nan = 0, base_arg = 0;
             float base_mx = -INFINITY, bias_mx = 0.f;

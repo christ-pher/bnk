@@ -107,6 +107,12 @@ private:
     DevBuf<float> qr_, qrn_, q_, kvr_, attn_o_, oa_;
     DevBuf<float> rlogits_, rw_, sg_, su_, shared_out_, cpu_out_, moe_out_, logits_, bias_, w1_row_, main_x_, main_xn_;
     DevBuf<int32_t> rids_, ids_, pos_;
+    // the Markov step on the GPU: a position's logits + bias, its top kDraftK (the draft is sampled from them)
+    static constexpr int kDraftK = 64;
+    DevBuf<float> mrow_, mk_vals_;
+    DevBuf<int32_t> mk_ids_;
+    std::vector<float> h_mk_vals_;
+    std::vector<int32_t> h_mk_ids_;
     DevBuf<int8_t> actq_, actq2_;
     DevBuf<half> acth_, acth2_;
     DevBuf<float> actd_, actd2_;

@@ -31,6 +31,7 @@ struct GenStats {
     double prefill_ms = 0, verify_ms = 0, commit_ms = 0, draft_ms = 0, sample_ms = 0;
     double draft_run_ms = 0;   // the drafter over the kept rows (and the first draft)
     int64_t draft_steps = 0;   // further one-row draft steps
+    int64_t lazy_rows = 0;     // rows sampled from the GPU's head with the rest of the row left on the device (no top-p / min-p cut)
     int64_t host_rows = 0;     // rows sampled from the whole vocabulary on the host after the GPU candidates fell short
     // per draft source: rounds whose drafts came from the lookup / the MTP drafter, their drafts and accepted ones
     int64_t lookup_rounds = 0, lookup_drafted = 0, lookup_accepted = 0;

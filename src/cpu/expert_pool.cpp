@@ -234,17 +234,41 @@ SpinPool::SpinPool(int n_workers, int first_cpu) {
 SpinPool::~SpinPool() {
     stop_ = true;
     gen_.fetch_add(1);
+    gen_.notify_all();   // sleeping workers (BNK_CPU_WAIT=1) see stop_
     for (auto & t : workers_) t.join();
 }
 
+// BNK_CPU_WAIT=1: a waiting thread spins briefly, then yields its CPU, then (a worker) sleeps on a futex until the next
+// run, so a worker preempted by another thread gets a CPU back at once. The pure spin (0, the default) waits out a
+// scheduler slice whenever the pool and the process's other threads want more CPUs than there are: with the SMT
+// siblings in the pool (more than 24 threads on this 24-core EPYC) a one-token call measured 0.6 ms or 9.4 ms by luck.
+static int cpu_wait_mode() {
+    static const int m = env_int("BNK_CPU_WAIT", 0);
+    return m;
+}
+static constexpr int kWaitSpin = 50000;   // pause instructions (~65 cycles each on Zen 2: ~1.2 ms) before yielding
+static constexpr int kWaitYield = 2000;   // sched_yield calls before a worker sleeps
+
 void SpinPool::loop(int id) {
     uint64_t seen = 0;
+    const int mode = cpu_wait_mode();
     while (true) {
         int spins = 0;
         uint64_t g;
         while ((g = gen_.load(std::memory_order_acquire)) == seen) {
-            if (++spins > 2000000) usleep(20);
-            else __builtin_ia32_pause();
+            if (mode == 0) {
+                if (++spins > 2000000) usleep(20);
+                else __builtin_ia32_pause();
+            } else if (++spins < kWaitSpin) {
+                __builtin_ia32_pause();
+            } else if (spins < kWaitSpin + kWaitYield) {
+                sched_yield();
+            } else {   // asleep until run() bumps gen_ (wait() returns at once if it already has)
+                sleepers_.fetch_add(1);
+                gen_.wait(seen);
+                sleepers_.fetch_sub(1);
+                spins = 0;
+            }
         }
         seen = g;
         if (stop_) return;
@@ -255,10 +279,17 @@ void SpinPool::loop(int id) {
 
 void SpinPool::run(const std::function<void(int, int)> & fn) {
     fn_ = &fn;
-    const uint64_t g = gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const uint64_t g = gen_.fetch_add(1) + 1;
+    const int mode = cpu_wait_mode();
+    if (mode && sleepers_.load()) gen_.notify_all();
     fn(0, size());
-    for (size_t i = 1; i <= workers_.size(); ++i)
-        while (done_[i].v.load(std::memory_order_acquire) != g) __builtin_ia32_pause();
+    for (size_t i = 1; i <= workers_.size(); ++i) {
+        int spins = 0;
+        while (done_[i].v.load(std::memory_order_acquire) != g) {
+            if (mode && ++spins >= kWaitSpin) sched_yield();
+            else __builtin_ia32_pause();
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------ experts

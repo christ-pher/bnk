@@ -87,11 +87,11 @@ DsEngine::~DsEngine() {
     for (auto & kv : fwd_graphs_) if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
     for (auto & q : seqs_) {
         for (auto & k : q->ckpts) if (k.host) cudaFreeHost(k.host);
-        for (auto & l : q->commit_graphs) for (auto & r : l) for (auto g : r) if (g) cudaGraphExecDestroy(g);
+        for (auto & l : q->commit_graphs) for (auto & w : l) for (auto & r : w) for (auto g : r) if (g) cudaGraphExecDestroy(g);
     }
     if (mail_) cudaFreeHost(mail_);
-    if (h_par_) cudaFreeHost(h_par_);
-    if (d_par_) cudaFree(d_par_);
+    if (h_par_base_) cudaFreeHost(h_par_base_);
+    if (d_par_base_) cudaFree(d_par_base_);
     if (h_tok_) cudaFreeHost(h_tok_);
     for (auto p : h_eg_rows_) cudaFreeHost(p);
     if (!first()) for (float * b : xfer_in_) if (b) cudaFreeHost(b);
@@ -163,8 +163,9 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
     const Config & c = model_.cfg;
     store_->layout(model_.ev);
     Ranking rank = load_ranking(opt.profile, c.n_layer, c.n_expert);
-    if (rank.empty() && !opt.counts_out.empty()) rank = load_ranking(opt.counts_out, c.n_layer, c.n_expert);
-    if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : "loaded");
+    bool warm = false;
+    if (rank.empty() && !opt.counts_out.empty()) rank = warm_ranking(opt.counts_out, c.n_layer, c.n_expert, &warm);
+    if (opt.verbose) fprintf(stderr, "bnk: expert ranking: %s\n", rank.empty() ? "none (uniform)" : warm ? "the last run's resident set, then the counts" : "loaded");
     // Before the caches take the free VRAM: the DSpark drafter's weights and buffers (on the last stage's GPU) and the
     // exchange's settings (its staging is held back in init_cache), so the budgets account for them (a 67K-token
     // prompt ran out of VRAM for its compressed KV when the drafter came after the budget)
@@ -337,8 +338,10 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     mail_stride_ = MoeMsg::bytes(E);
     CUDA_CHECK(cudaHostAlloc((void **) &mail_, mail_stride_ * c.n_layer, cudaHostAllocMapped));
     memset(mail_, 0, mail_stride_ * c.n_layer);
-    CUDA_CHECK(cudaHostAlloc((void **) &h_par_, kMaxSlots * sizeof(WinParams), cudaHostAllocMapped));
-    CUDA_CHECK(cudaMalloc(&d_par_, kMaxSlots * sizeof(WinParams)));
+    CUDA_CHECK(cudaHostAlloc((void **) &h_par_base_, kLanes * kMaxSlots * sizeof(WinParams), cudaHostAllocMapped));
+    CUDA_CHECK(cudaMalloc(&d_par_base_, kLanes * kMaxSlots * sizeof(WinParams)));
+    h_par_ = h_par_base_;
+    d_par_ = d_par_base_;
     CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocMapped));
     if (!first())
         for (float *& b : xfer_in_) CUDA_CHECK(cudaHostAlloc((void **) &b, xfer_floats() * 4, cudaHostAllocPortable));
@@ -613,6 +616,14 @@ int DsEngine::rollback_here(int max_pos) {
 
 void DsEngine::save_counts() {
     for (DsEngine * s = this; s; s = s->next_.get()) s->save_counts_here();
+    // the warm start: what every stage holds in VRAM now, for the next load (expert_cache.h warm_ranking)
+    if (opt_.counts_out.empty()) return;
+    Ranking res;
+    for (const DsEngine * s = this; s; s = s->next_.get()) {
+        const Ranking r = s->cache_.resident_ranking();
+        res.insert(res.end(), r.begin(), r.end());
+    }
+    if (!res.empty()) save_resident(resident_path(opt_.counts_out), res, model_.cfg.n_layer, model_.cfg.n_expert);
 }
 
 void DsEngine::save_counts_here() {
@@ -1107,6 +1118,8 @@ void DsEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     if (lane < 0 || lane >= kLanes || (lane > 0 && first() && last_))
         throw std::runtime_error("forward: no lane " + std::to_string(lane));
     lane_ = lane;
+    h_par_ = h_par_base_ + (size_t) lane * kMaxSlots;
+    d_par_ = d_par_base_ + (size_t) lane * kMaxSlots;
     Seq * keep = cur_;
     int R = 0;
     for (const auto & b : batch) {
@@ -1134,6 +1147,7 @@ void DsEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
         q->history.insert(q->history.end(), b.tokens, b.tokens + b.T);
         q->last_r0 = r0;
         q->last_lane = lane;
+        q->last_wi = (int) wins_.size() - 1;
         for (int j = 0; j < b.T; ++j) {
             // (image cells go through the prompt path only: as a token here, a placeholder id would index the embeddings
             // out of bounds)
@@ -1145,6 +1159,7 @@ void DsEngine::fwd_prepare(const std::vector<BatchWin> & batch, int lane) {
     }
     key.push_back(lane);
     key.push_back(max_cells);
+    lane_wins_[lane] = wins_;
     use(keep);
     last_T = R;
     ctx_grid_ = max_cells;
@@ -1342,13 +1357,16 @@ void DsEngine::enqueue_commit(int cnt) {
     const DsConfig & c = model_.ds;
     const int D = c.head_dim, ln = cur_->last_lane;
     const size_t r0 = (size_t) cur_->last_r0;
+    // the windows of this slot's lane's last forward (in two lanes the stage may have run the other lane since)
+    const std::vector<Win> & lw = lane_wins_[ln];
+    const WinParams * par = d_par_base_ + (size_t) ln * kMaxSlots;
     size_t wi = 0;
-    while (wi < wins_.size() && wins_[wi].q != cur_) ++wi;
-    if (wi == wins_.size()) throw std::runtime_error("commit: the slot was not in the last forward");
+    while (wi < lw.size() && lw[wi].q != cur_) ++wi;
+    if (wi == lw.size()) throw std::runtime_error("commit: the slot was not in its lane's last forward");
     for (int il = l0_; il < l1_; ++il)
         if (c.is_kv_src(il) && c.ratio[il] > 1)
             ds_compress_commit(ckv_raw_[ln][il].p + r0 * D, sc_raw_[ln][il].p + r0 * D, cur_->st_kv[il], cur_->st_sc[il], cnt,
-                               c.ratio[il], D, &d_par_[wi].pos0, st_);
+                               c.ratio[il], D, &par[wi].pos0, st_);
 }
 
 void DsEngine::join_commit() {
@@ -1375,7 +1393,7 @@ void DsEngine::commit_here(int cnt) {
     for (int il = l0_; il < l1_; ++il) any |= model_.ds.is_kv_src(il) && model_.ds.ratio[il] > 1;
     if (!any) return;
     if (opt_.use_graphs) {
-        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_lane][cur_->last_r0][cnt];
+        cudaGraphExec_t & cg = cur_->commit_graphs[cur_->last_lane][cur_->last_wi][cur_->last_r0][cnt];
         if (!cg) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
