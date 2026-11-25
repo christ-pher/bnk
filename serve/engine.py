@@ -29,6 +29,8 @@ class Engine:
         self._line: collections.deque = collections.deque()
         self._running = 0     # requests the engine is serving now (up to its conversation slots, batched)
         self.qlock = threading.Lock()
+        self.wlock = threading.Lock()   # stdin is unbuffered: two huge prompt lines written at once interleave in
+                                        # the pipe, the engine parses neither, and the requests wait forever
         self.started_at = None
         self.log_tail = collections.deque(maxlen=400)
         self.env = env
@@ -131,8 +133,9 @@ class Engine:
         if self.proc is None or self.proc.poll() is not None:
             raise EngineError("the engine is not running")
         try:
-            self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-            self.proc.stdin.flush()
+            with self.wlock:   # one complete line at a time, whatever else thread is sending
+                self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+                self.proc.stdin.flush()
         except OSError as e:   # it is exiting (a broken pipe would read as a dropped client upstream)
             raise EngineError(f"the engine is not running ({e})") from None
 
@@ -199,7 +202,11 @@ class Engine:
                     continue
                 started = False
                 while True:
-                    msg = q.get()
+                    try:
+                        msg = q.get(timeout=1800)
+                    except queue.Empty:   # an answer that never comes (a line the engine could not parse):
+                        self.cancel(rid)  # give up rather than hold a turn slot for the next client forever
+                        raise EngineError("the engine sent nothing for this request in half an hour") from None
                     if msg.get("exited") and not started and not attempt:
                         break   # retry
                     started = True
