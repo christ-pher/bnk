@@ -72,3 +72,22 @@ The production server was up but idle (~2 cores busy) during these runs.
   here (~40% of the RAM's bandwidth) at roughly 33 cycles a 64-weight step: load-port bound by the grid and sign
   table lookups (~30 loads a step), not by arithmetic or memory. A faster kernel needs fewer lookups per weight (a
   new decode scheme), not tuning. Left open; no quick win.
+
+## Step 4: two DeepSeek slots in two lanes
+
+`--slots 2` failed at once: "commit: the slot was not in the last forward", raised inside a commit graph's capture
+(the GPU context was lost). In two lanes (`forward_pipe`) GPU 0 runs lane A's batch while GPU 1 runs lane B's, so when
+a slot commits, a stage's last forward can be the other lane's: the commit looked its window up in that forward's
+`wins_`, and its kernel read the window's position from `d_par_`, which the other lane's forward had overwritten.
+Fixed: the window parameters (`h_par_` / `d_par_`) and the window list are kept per lane (`lane_wins_`), and the
+commit reads its own lane's. Also: the commit graphs were cached by (lane, first row, count) but read the window's
+`d_par_` entry by its index in the batch, so two batch shapes with the same first row could share a graph; the
+key now includes that index (older than this branch; only multi-slot batches hit it).
+
+Measured (2026-11-25, `tools/multi_agent_bench.py 2 40000 3 300`, both agents' conversations already on disk, so the
+numbers are decode and turn overhead, not cold reads):
+
+| | wall | combined tok/s | per agent | GPU busy (scaled to the run) |
+| --- | --- | --- | --- | --- |
+| `--slots 1` | 58-59 s | 30.3-30.8 | 31-34 tok/s, in turn | ~38% |
+| `--slots 2` (two lanes) | 43-45 s | **39.8-42.0** (+31-36%) | 18.5-24 tok/s, at once | ~55-59% |

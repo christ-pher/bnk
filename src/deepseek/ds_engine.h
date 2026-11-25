@@ -102,6 +102,7 @@ public:
     void forward(const int32_t * tokens, int T, bool commit_all = true) override;
     void forward_batch(const std::vector<BatchWin> & wins) override;
     static constexpr int kLanes = 2;
+    static constexpr int kMaxSlots = 8;
     void forward_pipe(const std::vector<BatchWin> & first, int first_lane, const std::vector<BatchWin> & second,
                       int second_lane) override;
     int row0_of(int slot) const override { return seqs_.at(slot)->last_r0; }
@@ -225,14 +226,16 @@ private:
         std::vector<DevBuf<half>> ckc, ikc;      // views
         std::vector<DevBuf<float>> st_kv, st_sc; // kv-source layers with ratio > 1: the open group's raw rows
         int ctx_mapped = 0;
-        cudaGraphExec_t commit_graphs[kLanes][kMaxWindow][kMaxWindow + 1] = {};
-        int last_r0 = 0, last_lane = 0;
+        // by lane, the window's index in its batch (the graph reads that window's d_par_ entry), first row, count
+        cudaGraphExec_t commit_graphs[kLanes][kMaxSlots][kMaxWindow][kMaxWindow + 1] = {};
+        int last_r0 = 0, last_lane = 0, last_wi = 0;
         bool used = false;
     };
     std::vector<std::unique_ptr<Seq>> seqs_;
     Seq * cur_ = nullptr;
     struct Win { Seq * q; int r0, T, pos0; bool commit; };
     std::vector<Win> wins_;
+    std::vector<Win> lane_wins_[kLanes];   // each lane's last forward's windows (what a commit of that lane looks up)
     struct FwdGraph { cudaGraphExec_t exec = nullptr; uint64_t used = 0; size_t bytes = 0; };
     std::map<std::vector<int>, FwdGraph> fwd_graphs_;
     uint64_t fwd_graph_age_ = 0;
@@ -240,7 +243,6 @@ private:
     size_t graph_bytes_ = 0;
     static constexpr int kMaxFwdGraphs = 32;
     static constexpr size_t kGraphBytesEst = 24ull << 20;
-    static constexpr int kMaxSlots = 8;
     static constexpr int kCtxStep = 8192, kCtxBaseline = 16384;
     int ctx_grid_ = 0;   // the context bucket the graph being captured / run sizes its grids for (cells)
     void alloc_seq(Seq & q);
@@ -312,9 +314,12 @@ private:
     void disk_drop_all();
     uint32_t seq_ = 0;
 
-    // window inputs (pinned host) and their device copy
-    WinParams * h_par_ = nullptr;
+    // window inputs (pinned host) and their device copy, one set per lane: in two lanes a stage runs the other lane's
+    // forward before this lane's windows are committed, and the commit reads its windows' positions from d_par_
+    WinParams * h_par_ = nullptr;   // the current lane's (fwd_prepare points them at lane_ * kMaxSlots)
     WinParams * d_par_ = nullptr;
+    WinParams * h_par_base_ = nullptr;
+    WinParams * d_par_base_ = nullptr;
     int32_t * h_tok_ = nullptr;
     std::vector<uint8_t *> h_eg_rows_;   // per Engram layer: [W][cols] table rows, mapped
 
