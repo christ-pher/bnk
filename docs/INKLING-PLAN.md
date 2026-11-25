@@ -107,3 +107,20 @@ reference (2,934 tokens: NLL 2.1130 vs 2.1101, top-1 97.0%).
   weights themselves are ~4 ms a GPU): tensor parallel halved the weight reads but the replicated small kernels and
   the 96 exchanges stay. The biggest lever left is verifying several tokens a window (the small kernels cost the
   same for 4 rows as for 1): the DSpark drafter (step 5).
+
+### Merged kernels and the drafter (2026-11-25, later)
+
+* Merged kernels (1,977 -> 1,274 launches a token on each GPU): convolutions as jobs of one launch (the exchange's
+  add folded into their input, the residual / copies into their output), the clips and v's norm in one, the loop
+  controls batched with their norm folded into the combine, the decode mix holding every state in registers. Plain
+  decode (two GPUs) 57.4 -> 68.6 tok/s.
+* The DSpark drafter (src/inkling/ink_spark): checked against a NumPy reference of llama.cpp's graphs (identical drafts
+  from the same features) and its taps against llama.cpp's own tensors (l_out-4 / -28 / -46, result_norm); greedy
+  acceptance as llama.cpp's on the same prompts (prose ~0.8, code ~1.6 drafts a round). The first try accepted 5%:
+  the three stream taps were never captured (a no-op edit), only the normed output.
+* Each verify row costs ~2.6 ms (its 8 experts' weights a visit), so 2 drafts a round is fastest; the drafter stops
+  its block at the round's drafts (Drafter::set_max_drafts): 3.3 ms a round.
+* Through the server (temperature 1): prose 68, code 92, explanations 86 tok/s; after an 11K prompt 80, after 40K 69
+  (55 / 51 / 48 before the drafter).
+* Next: the drafter's head and Markov bias split over both GPUs (GPU 1 idles while GPU 0 drafts), its block as a
+  graph, cheaper verify rows (the window's experts), vision, more slots.
