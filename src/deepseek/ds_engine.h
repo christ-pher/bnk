@@ -85,12 +85,17 @@ public:
     const std::vector<int32_t> & history() const override { return cur_->history; }
     void checkpoint() override;
     int rollback(int max_pos) override;
-    void select_conversation(const std::vector<int32_t> &) override {}
+    // parked conversations (ds_park.cpp, docs/DS-PARK-PLAN.md): the state that can reuse the most of `prompt`
+    // becomes the live one: the live state, a parked one it continues (restored), or the prefix a parked one shares
+    // with it (copied out up to that one's snapshot; the entry stays). The live conversation is parked first when the
+    // request would lose at least park_min tokens of it. No-op unless park_gib > 0.
+    void select_conversation(const std::vector<int32_t> & prompt) override;
     int reusable(const std::vector<int32_t> & prompt) const override;
+    int park_min() const override { return opt_.park_min; }
     void set_busy(const std::vector<int> &) override {}
-    int parked() const override { return 0; }
-    size_t parked_bytes() const override { return 0; }
-    void drop_parked_all() override {}
+    int parked() const override { return (int) parked_.size(); }
+    size_t parked_bytes() const override;
+    void drop_parked_all() override;
     void save_counts() override;
 
     void prefill(const std::vector<int32_t> & tokens) override;
@@ -205,7 +210,7 @@ private:
     void engram_hash(int e, const std::vector<int32_t> & hist, int p, uint64_t * rows) const;
     void quantize_rows(const float * x, int64_t ldx, int T, int64_t cols, ActQ8 & a) { quantize_act(x, ldx, T, cols, a, st_); }
 
-    struct Checkpoint { int pos = -1; uint64_t age = 0; float * host = nullptr; };
+    struct Checkpoint { int pos = -1; uint64_t age = 0; uint8_t * host = nullptr; };   // host: snap_bytes()
     uint64_t ckpt_age_ = 0;
     static constexpr int kMaxCheckpoints = 8;
     // One conversation's state on this stage: history, the window ring and (at source layers) the compressed
@@ -242,6 +247,69 @@ private:
     void use(Seq * q);
     template <typename F> void each_state(F && f);
     size_t state_floats();
+    // what a snapshot holds (device pointer, bytes): the open groups, then every layer's window ring (the 128
+    // positions before the snapshot: later positions overwrite their slots, so a rollback must bring them back)
+    template <typename F> void each_snap(F && f);
+    size_t snap_bytes();
+
+    // ---- parking (ds_park.cpp). Each stage keeps its own entry of a parked conversation (same `used` stamp on
+    // every stage): host = this stage's per-position rows up to the history's end, then its snapshot of the live
+    // state (each_snap), then (the stage with DSpark) the drafter's rings.
+    struct Parked {
+        std::vector<int32_t> history;
+        std::vector<Checkpoint> ckpts;   // host buffers of snap_bytes()
+        uint8_t * host = nullptr;
+        size_t cap = 0, bytes = 0;       // bytes: host's part in use plus the snapshots
+        uint64_t used = 0;               // the park stamp: identifies the entry on every stage, larger = newer
+        int spark_lo = 0, spark_hi = 0;
+    };
+    std::vector<Parked> parked_;
+    uint64_t park_age_ = 0;
+    std::vector<std::pair<uint8_t *, size_t>> pin_spare_;   // freed park buffers, reused by the next park
+    std::vector<uint8_t *> ck_spare_;                         // freed snapshot buffers
+    template <typename F> void each_ctx(int n, F && f);       // the rows holding positions [0, n): (device, bytes)
+    size_t park_bytes_here(int n);
+    uint8_t * pinned_take(size_t bytes, size_t * cap);
+    void pinned_give(uint8_t * p, size_t cap);
+    uint8_t * ck_take();
+    void ck_give(uint8_t * p);
+    void park(uint64_t keep, bool move_ckpts);
+    bool park_copy(uint64_t id, bool move_ckpts);
+    void restore(uint64_t id);
+    void poison_here();   // checks: the live slot's state buffers filled with NaN
+    void restore_copy(uint64_t id, bool finish);
+    void fork_parked(uint64_t id, int pos);
+    void fork_copy(uint64_t id, int pos, bool finish);
+    void drop_parked(size_t i);
+    void drop_parked_id(uint64_t id);
+    int find_parked(uint64_t id) const;
+    // ---- parked conversations on disk (the first stage's; ds_park.cpp). One file a conversation under
+    // park_dir_ (the model's identity in its name): its history, snapshot positions and every stage's entry.
+    struct DiskEntry {
+        std::string path;
+        std::vector<int32_t> history;
+        std::vector<Checkpoint> ckpts;   // positions only
+        size_t bytes = 0;
+        int64_t stamp = 0;               // write order (oldest out first)
+    };
+    struct Worker;
+    std::string park_dir_;
+    size_t disk_limit_ = 0;
+    std::vector<DiskEntry> disk_;
+    std::mutex disk_mu_;
+    std::unique_ptr<Worker> disk_worker_;   // writes evicted entries in the background
+    int64_t disk_stamp_ = 0;
+    std::string model_path_;
+public:
+    void persist() override;
+private:
+    void disk_init();
+    uint64_t disk_identity();
+    // writes the entry `id` of every stage to disk, taking it out of RAM (async: the writer frees its buffers)
+    void disk_write(uint64_t id, bool async);
+    uint64_t disk_load(size_t i);   // disk entry i into RAM as a parked entry on every stage: its id (0: failed)
+    void disk_trim();
+    void disk_drop_all();
     uint32_t seq_ = 0;
 
     // window inputs (pinned host) and their device copy
@@ -420,6 +488,11 @@ private:
         int n_sub = 0;                           // score sub-chunks per chunk
     } pf_;
 };
+
+template <typename F> void DsEngine::each_snap(F && f) {
+    each_state([&](float * d, size_t n) { f((void *) d, n * sizeof(float)); });
+    for (int il = l0_; il < l1_; ++il) f((void *) cur_->ring[il].p, cur_->ring[il].n * sizeof(half));
+}
 
 template <typename F> void DsEngine::each_state(F && f) {
     const DsConfig & c = model_.ds;

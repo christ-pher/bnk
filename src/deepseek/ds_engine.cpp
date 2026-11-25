@@ -233,6 +233,8 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
         fprintf(stderr, "bnk: experts: %d of %d resident in VRAM (no host copy), %d in RAM\n", resident, c.n_layer * c.n_expert,
                 store_->kept());
     CUDA_CHECK(cudaSetDevice(dev_));
+    model_path_ = path;
+    disk_init();
 }
 
 void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
@@ -386,7 +388,7 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     cur_->used = true;
     ensure_ctx_here(std::min(opt.max_ctx, kCtxBaseline));
     reset_here();
-    const size_t ck = state_floats() * 4;
+    const size_t ck = snap_bytes();
     for (auto & q : seqs_)
         while ((int) q->ckpts.size() < kMaxCheckpoints) {
             q->ckpts.emplace_back();
@@ -472,6 +474,12 @@ void DsEngine::alloc_seq(Seq & q) {
             }
         }
     }
+}
+
+size_t DsEngine::snap_bytes() {
+    size_t n = 0;
+    each_snap([&](void *, size_t b) { n += b; });
+    return n;
 }
 
 size_t DsEngine::state_floats() {
@@ -565,9 +573,9 @@ void DsEngine::checkpoint_here() {
     if (!slot)
         slot = &*std::min_element(cur_->ckpts.begin(), cur_->ckpts.end(), [](const Checkpoint & a, const Checkpoint & b) { return a.age < b.age; });
     size_t off = 0;
-    each_state([&](float * d, size_t n) {
-        CUDA_CHECK(cudaMemcpyAsync(slot->host + off, d, n * 4, cudaMemcpyDeviceToHost, st_));
-        off += n;
+    each_snap([&](void * d, size_t b) {
+        CUDA_CHECK(cudaMemcpyAsync(slot->host + off, d, b, cudaMemcpyDeviceToHost, st_));
+        off += b;
     });
     CUDA_CHECK(cudaStreamSynchronize(st_));
     slot->pos = p;
@@ -589,9 +597,9 @@ int DsEngine::rollback_here(int max_pos) {
         if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
     if (!best) return -1;
     size_t off = 0;
-    each_state([&](float * d, size_t n) {
-        CUDA_CHECK(cudaMemcpyAsync(d, best->host + off, n * 4, cudaMemcpyHostToDevice, st_));
-        off += n;
+    each_snap([&](void * d, size_t b) {
+        CUDA_CHECK(cudaMemcpyAsync(d, best->host + off, b, cudaMemcpyHostToDevice, st_));
+        off += b;
     });
     CUDA_CHECK(cudaStreamSynchronize(st_));
     cur_->history.resize(best->pos);
@@ -601,19 +609,6 @@ int DsEngine::rollback_here(int max_pos) {
         if (k.pos > best->pos) k.pos = -1;
     if (spark_) spark_->restart(best->pos);
     return best->pos;
-}
-
-int DsEngine::reusable(const std::vector<int32_t> & prompt) const {
-    const auto & h = cur_->history;
-    size_t common = 0;
-    while (common < h.size() && common < prompt.size() && h[common] == prompt[common]) ++common;
-    if (!h.empty() && common == h.size() && h.size() < prompt.size()) return (int) h.size();
-    if (common == 0) return 0;
-    const int lim = (int) std::min(common, prompt.size() - 1);
-    int best = 0;
-    for (const auto & k : cur_->ckpts)
-        if (k.pos >= 0 && k.pos <= lim && k.pos <= (int) h.size()) best = std::max(best, k.pos);
-    return best;
 }
 
 void DsEngine::save_counts() {

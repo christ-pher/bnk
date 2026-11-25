@@ -83,6 +83,10 @@ struct EngineOptions {
     // instead of its prompt being read again. 0 = off (one conversation at a time, as before).
     double park_gib = 0;
     int park_min = 2048;             // conversations shorter than this are not worth parking
+    // DeepSeek engine: parked conversations also go to disk (docs/DS-PARK-PLAN.md) when they leave RAM and at
+    // shutdown, and come back from there (after a restart too). Empty dir or park_disk_gib 0 = off.
+    std::string park_dir;
+    double park_disk_gib = 32;
     // K/V cache cells in 8 bits (a fp16 scale per 32 values, as q8_0): 1,088 instead of 2,048 bytes per cell and
     // attention layer, so long contexts leave the expert cache more VRAM
     bool kv8 = false;

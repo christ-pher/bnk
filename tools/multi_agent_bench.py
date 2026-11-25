@@ -8,12 +8,13 @@ Compare a server started with `--park-gib 0 --slice 0` (one conversation at a ti
 defaults."""
 import glob
 import json
+import os
 import sys
 import threading
 import time
 import urllib.request
 
-URL = "http://localhost:8080/v1/chat/completions"
+URL = os.environ.get("BNK_URL", "http://localhost:8080") + "/v1/chat/completions"
 agents = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 target_chars = int(sys.argv[2]) if len(sys.argv) > 2 else 120_000
 turns = int(sys.argv[3]) if len(sys.argv) > 3 else 4
