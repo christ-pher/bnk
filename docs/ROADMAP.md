@@ -21,6 +21,11 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-11-25, v0.6.2: DeepSeek sampling, drafting and two slots** (`docs/PERF-SHARED-PLAN.md`): exact lazy-tail
+  sampling (the GPU's head, the whole row only when a draw lands outside it; host sampling 9.4 -> 3.0 ms a round), the
+  DSpark Markov step on the GPU, two conversation slots (lanes' window state fixed), warm start of the resident experts
+  for both MoE engines, `tools/gpu_busy.py`. One agent ~33 -> ~42 tok/s; two agents 30.5 -> 44.7 tok/s combined.
+  Measured and dropped: SMT pool threads, 27B fp16 exchange, GPU 1 in prompt reads, DSpark experts in VRAM.
 * **2026-11-25, v0.6.1: DeepSeek conversations parked in RAM and kept on disk** (`docs/DS-PARK-PLAN.md`): two
   agents taking turns at ~115-120K tokens read a later turn in 2.0-5.6 s (was 125-134 s, the whole prompt again),
   whole turns ~145 s -> 28-31 s; after a restart the next turn read in 1.0 s against 132 s cold (the states written at

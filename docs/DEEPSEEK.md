@@ -130,6 +130,10 @@ See the bottom of this file as the work progresses.
   dynamically (`BNK_CPU_CHUNKS` 8), reads Engram rows on several threads, and prompt-lookup drafting runs (copying text:
   12.3 -> 32 tok/s; plain decode 12.95 -> 17.0 tok/s with the split-key attention and the multi-block mixes for small
   windows). Multi-row CPU kernels, batched-key attention and SMT threads were measured slower and dropped.
+* 2026-11-25, v0.6.2 (`docs/PERF-SHARED-PLAN.md`): sampling without top-k / top-p draws from the GPU's exact top 1,024
+  and fetches the rest of the row only when a draw lands there (9.4 -> 3.0 ms a round), the DSpark Markov step on the
+  GPU (draft round 14.6 -> 12.6 ms), two conversation slots (two lanes crashed on the first commit; fixed), warm start
+  from the last run's resident experts. One agent ~33 -> ~42 tok/s, two agents 30.5 -> 44.7 tok/s combined.
 * 2026-11-25, v0.6.1 (`docs/DS-PARK-PLAN.md`): parked conversations in host RAM and on disk (written on RAM eviction
   and at quit, read back at the next start), snapshots that keep the window ring, DeepSeek snapshot markers in the
   server. Later turns of alternating agents at ~120K: 125-134 s -> 2.0-5.6 s; after a restart 132 s -> 1.0 s.

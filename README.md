@@ -13,7 +13,7 @@ in VRAM, tensor parallel over the two cards (`docs/DENSE.md`): Q8_0 at 104 tok/s
 
 Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384 experts) through a third engine
 (`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
-tables read from the NVMe, experts split between VRAM and RAM without a copy, the resident set following the routing while serving (v0.6.0), conversations parked in RAM and kept on disk across restarts (v0.6.1); 22-36 tok/s decode, 650-830 tok/s on long prompts.
+tables read from the NVMe, experts split between VRAM and RAM without a copy, the resident set following the routing while serving (v0.6.0), conversations parked in RAM and kept on disk across restarts (v0.6.1), two conversation slots and faster sampling and drafting (v0.6.2); 30-45 tok/s decode, 650-830 tok/s on long prompts.
 
 All three read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
 `image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`; DeepSeek since 2026-10-28).
