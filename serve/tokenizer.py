@@ -43,6 +43,13 @@ JOYAI_LLM = [r"\p{N}{1,3}",
              r"[一-龥぀-ゟ゠-ヿ]+",
              r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"]
 PRE_SEQUENCES = {"joyai-llm": JOYAI_LLM}
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O (the o200k tokenizer.json expression): Inkling 2 ("inkling2", which llama.cpp
+# also reads with ignore_merges: a pre-token that is a vocabulary entry is that token, before any merge)
+GPT4O = (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+         r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+         r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+PRE_SINGLE = {"inkling2": GPT4O, "gpt-4o": GPT4O}
+IGNORE_MERGES = {"inkling2"}
 
 
 def _split_sequence(text: str, pres: list) -> list[str]:
@@ -89,7 +96,8 @@ class Tokenizer:
         # control (3) and user-defined (4) tokens are matched literally in text
         self.special = {t: i for i, t in enumerate(tokens) if types and types[i] in (3, 4)}
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
-        self.pre = regex.compile(QWEN35)
+        self.pre = regex.compile(PRE_SINGLE.get(pre, QWEN35))
+        self.ignore_merges = pre in IGNORE_MERGES
         self.pre_seq = [regex.compile(r) for r in PRE_SEQUENCES.get(pre, [])]
         self.cache: dict[str, list[int]] = {}
         self.wcache: dict[str, list[int]] = {}
@@ -175,7 +183,8 @@ class Tokenizer:
         self._recent = []
         self._recent_lock = threading.Lock()
         self.special_re = regex.compile("|".join(regex.escape(s) for s in sorted(self.special, key=len, reverse=True)))
-        self.pre = regex.compile(QWEN35)
+        self.pre = regex.compile(PRE_SINGLE.get(getattr(self, "pre_name", ""), QWEN35))
+        self.ignore_merges = getattr(self, "pre_name", "") in IGNORE_MERGES
         self.pre_seq = [regex.compile(r) for r in PRE_SEQUENCES.get(getattr(self, "pre_name", ""), [])]
 
     # ----------------------------------------------------------------- encode
@@ -183,6 +192,8 @@ class Tokenizer:
         hit = self.cache.get(word)
         if hit is not None:
             return hit
+        if getattr(self, "ignore_merges", False) and word in self.vocab:
+            return [self.vocab[word]]
         parts = list(word)
         while len(parts) > 1:
             best, bi = None, -1

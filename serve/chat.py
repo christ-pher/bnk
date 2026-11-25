@@ -16,6 +16,14 @@ def _text(content) -> str:
     return content or ""
 
 
+# Inkling 2's template (its <|message_*|> roles): a list of blocks per turn, each closed by <|end_message|>
+INKLING_MARK = "<|message_user|>"
+
+
+def is_inkling(source: str) -> bool:
+    return INKLING_MARK in source and "<|content_image|>" in source
+
+
 class ChatTemplate:
     def __init__(self, source: str):
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True)
@@ -23,14 +31,23 @@ class ChatTemplate:
         def raise_exception(msg):
             raise jinja2.exceptions.TemplateError(msg)
 
-        def tojson(v, indent=None, **_):
-            return json.dumps(v, ensure_ascii=False, indent=indent)
+        def tojson(v, indent=None, sort_keys=False, separators=None, **_):
+            # Inkling's template asks for sorted keys and compact separators (how its tool specs and calls were
+            # trained); the others take the defaults
+            return json.dumps(v, ensure_ascii=False, indent=indent, sort_keys=sort_keys,
+                              separators=tuple(separators) if separators else None)
 
         env.globals["raise_exception"] = raise_exception
         env.filters["tojson"] = tojson
+        self.inkling = is_inkling(source)
+        if self.inkling:
+            # Hugging Face's {% generation %} marks (assistant-token masks for training) are not jinja2 tags
+            source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "", source)
         self.template = env.from_string(source)
         # DeepSeek-V4.1's template renders system messages anywhere in the conversation (<｜System｜>)
         self.native_system = "<｜System｜>" in source
+        # templates that render a system message anywhere in the conversation (DeepSeek's, Inkling's)
+        self.system_anywhere = self.native_system or self.inkling
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kwargs) -> str:
         # Qwen templates take one system message, first ("System message must be at the beginning"), and some know
@@ -50,7 +67,7 @@ class ChatTemplate:
         for m in messages[lead:]:
             m = dict(m)
             if m.get("role") in ("system", "developer"):
-                m["role"] = "system" if self.native_system else "user"
+                m["role"] = "system" if self.system_anywhere else "user"
             # OpenAI tool calls carry JSON-string arguments; the template wants a mapping
             if m.get("tool_calls"):
                 calls = []
@@ -243,6 +260,126 @@ class OutputParser:
                 if calls:
                     content = self.clean_content.strip()
         return out, content.strip() if calls else self.content_all, calls
+
+
+class InklingParser:
+    """OutputParser for Inkling 2: the answer is a list of blocks, each <|message_model|> then
+    <|content_thinking|> (reasoning) or <|content_text|> (content) or NAME<|content_invoke_tool_json|>{"name": ..,
+    "args": {..}} (a tool call), closed by <|end_message|>; the turn ends with <|content_model_end_sampling|>
+    (llama.cpp's common/parsers/inkling.cpp). Text outside any block counts as content."""
+    HEADER, THINK, TEXT, TOOL, END = ("<|message_model|>", "<|content_thinking|>", "<|content_text|>",
+                                      "<|content_invoke_tool_json|>", "<|end_message|>")
+    EOS = "<|content_model_end_sampling|>"
+    MARKS = (HEADER, THINK, TEXT, TOOL, END, EOS)
+    # the thinking-loop guard's wrap-up closes the thinking block and opens the answer's
+    WRAP_CLOSE = END + HEADER + TEXT
+
+    def __init__(self, thinking: bool, tools=None):
+        self.tools = tools
+        self.state = "between"   # between blocks | head (after a header) | reasoning | content | tool
+        self.mode = "reasoning" if thinking else "content"
+        self.buf = ""
+        self.head = ""
+        self.tool_json = ""
+        self.content_all = ""
+        self.reasoning_all = ""
+        self.calls = []
+        self.in_tool = False
+        self.partial_call = ""
+        self.clean_content = ""
+
+    def _emit(self, out, kind, text):
+        if not text:
+            return
+        if kind == "reasoning":
+            self.reasoning_all += text
+        else:
+            if not self.content_all.strip():
+                text = text.lstrip()
+                if not text:
+                    return
+            self.content_all += text
+        out.append((kind, text))
+
+    def _call(self, name, raw):
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(obj, dict):
+            return False
+        args = obj.get("args", obj.get("arguments", {}))
+        self.calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                           "function": {"name": (obj.get("name") or name).strip(),
+                                        "arguments": json.dumps(args if args is not None else {}, ensure_ascii=False)}})
+        return True
+
+    def feed(self, text: str):
+        self.buf += text
+        out = []
+        while self.buf:
+            i = min((j for j in (self.buf.find(m) for m in self.MARKS) if j >= 0), default=-1)
+            if i < 0:
+                keep = max(_partial_suffix(self.buf, m) for m in self.MARKS)
+                chunk, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+                self._text(out, chunk)
+                break
+            self._text(out, self.buf[:i])
+            mark = next(m for m in self.MARKS if self.buf.startswith(m, i))
+            self.buf = self.buf[i + len(mark):]
+            self._mark(mark)
+        return out
+
+    def _text(self, out, chunk):
+        if not chunk:
+            return
+        if self.state == "reasoning":
+            self._emit(out, "reasoning", chunk)
+        elif self.state == "content" or self.state == "between":
+            self._emit(out, "content", chunk)
+        elif self.state == "head":
+            self.head += chunk   # a tool's name, before <|content_invoke_tool_json|>
+        elif self.state == "tool":
+            self.tool_json += chunk
+
+    def _mark(self, mark):
+        if mark == self.HEADER:
+            self.state, self.head = "head", ""
+        elif mark == self.THINK and self.state == "head":
+            self.state, self.mode = "reasoning", "reasoning"
+        elif mark == self.TEXT and self.state in ("head", "between"):
+            self.state, self.mode = "content", "content"
+        elif mark == self.TOOL and self.state == "head":
+            self.state, self.mode, self.tool_json, self.in_tool = "tool", "content", "", True
+        elif mark == self.END:
+            if self.state == "tool":
+                if self._call(self.head, self.tool_json):
+                    self.in_tool = False
+                    self.tool_json = ""
+                else:
+                    self.partial_call = self.head + self.TOOL + self.tool_json
+            elif self.state == "reasoning":
+                self.mode = "content"
+            self.state = "between"
+        elif mark == self.EOS:
+            self.state = "between"
+
+    def finish(self):
+        out = []
+        if self.buf:
+            self._text(out, self.buf)
+            self.buf = ""
+        if self.state == "tool" and self.tool_json:
+            # cut off inside a call (or it never closed): kept apart for the server to report
+            if not self._call(self.head, self.tool_json):
+                self.partial_call = self.head + self.TOOL + self.tool_json
+        self.clean_content = self.content_all
+        content = self.content_all.strip() if self.calls else self.content_all
+        return out, content, self.calls
+
+
+def make_parser(template: "ChatTemplate", thinking: bool, tools=None):
+    return InklingParser(thinking, tools) if getattr(template, "inkling", False) else OutputParser(thinking, tools)
 
 
 def _partial_suffix(s: str, tag: str) -> int:
