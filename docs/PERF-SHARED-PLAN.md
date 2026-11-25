@@ -37,3 +37,26 @@ written with the counts (every 60 s while serving, and at quit). At load, `warm_
 ranking (`ExpertCache::init` drops repeats and completes the rest), so the cache starts where the last run left it.
 `BNK_WARM_START=0` turns it off. Both MoE engines. Test: `build/test_expert_counts`. To measure: decode right after a
 restart, warm vs `BNK_WARM_START=0`.
+
+## Step 3: the CPU pool (measured 2026-11-25, `bench_ds_cpu` layer 10, 3 experts a call, pinned, 8 chunks a thread)
+
+The production server was up but idle (~2 cores busy) during these runs.
+
+| Threads | T=1 decode, 3 experts | T=4 verify |
+| --- | --- | --- |
+| 24 (default) | 0.676-0.690 ms (3 runs: stable) | 1.16 ms |
+| 32 | 0.630 | 1.12 |
+| 36 | 0.615 / 0.690 / **1.509** | |
+| 40 | 0.608 / 0.804 / 0.620 / 0.624 | 1.12 |
+| 44 | **9.38** | 1.08 |
+| 48 | **1.48** | 1.96 |
+
+- The SMT siblings buy ~10% at best (0.68 -> 0.61 ms) and make the pool unstable: a spinning barrier with more
+  workers than free CPUs waits out a preempted worker's scheduler slice (44 threads: 14x slower). Not shippable as
+  is. It would need a barrier that survives preemption (spin briefly, then futex), and the server's own threads
+  (Python, GPU service, Engram) leave fewer free CPUs than the bench sees.
+- One-token kernels: ggml's `vec_dot` 0.676-0.683 ms, bnk's `mdot` from one token (`BNK_CPU_MDOT1=1`) 0.713-0.764,
+  the signed-grid table (`BNK_CPU_XXS_CT=1`) 0.804-0.848. ggml's stays fastest. The pool reaches 43 GB/s of weights
+  here (~40% of the RAM's bandwidth) at roughly 33 cycles a 64-weight step: load-port bound by the grid and sign
+  table lookups (~30 loads a step), not by arithmetic or memory. A faster kernel needs fewer lookups per weight (a
+  new decode scheme), not tuning. Left open; no quick win.
