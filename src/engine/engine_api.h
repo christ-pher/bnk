@@ -59,6 +59,8 @@ public:
     // min(1, p/q), else draws from max(0, p - q): the target's distribution exactly. nullptr: a greedy draft
     // (a point mass: accepted with probability p).
     virtual void set_temperature(float) {}
+    // the most drafts a round will use (the generator's max_draft): a block drafter can stop its chain there
+    virtual void set_max_drafts(int) {}
     virtual const std::vector<std::pair<int32_t, float>> * draft_dist(int /*slot*/, int /*i*/) const { return nullptr; }
     double ms = 0;
     int64_t calls = 0;

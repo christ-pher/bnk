@@ -62,7 +62,8 @@ template <int G>
 __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q, const half * __restrict__ kc,
         const half * __restrict__ vc, const float * __restrict__ table, float * __restrict__ out,
         float * __restrict__ part_o, float * __restrict__ part_ml, int N, int H, int Hkv, int ring, int extent,
-        int window, Pos0 p0, float scale, int nsplit, int64_t ldq) {
+        int window, Pos0 p0, float scale, int nsplit, int64_t ldq, int flags) {
+    const bool uniform = flags & 1, sinkless = flags & 2;
     __shared__ __align__(16) half ks[kKeys * kKS];
     __shared__ __align__(16) half vt[kD * kVS];
     __shared__ __align__(16) half ps[G][kRows * kKeys];
@@ -73,8 +74,10 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
     const int pos0 = p0.get();
     const int r0 = blockIdx.x * kRows;
     const int my_row = r0 + j;
-    const int n_kv = min(pos0 + N, pos0 + r0 + kRows);   // keys the block's rows may see, exclusive
-    const int lo = window > 0 ? max(0, pos0 + r0 - window + 1) : 0;
+    // uniform: every row sees what the last row sees (a draft block: non-causal over itself, the window from its
+    // first row; the caller widens the window by the block's rows)
+    const int n_kv = uniform ? pos0 + N : min(pos0 + N, pos0 + r0 + kRows);   // keys the block's rows may see, exclusive
+    const int lo = window > 0 ? max(0, (uniform ? pos0 + N - 1 : pos0 + r0) - window + 1) : 0;
     const int per = nsplit > 1 ? ((n_kv - lo + nsplit - 1) / nsplit + kKeys - 1) / kKeys * kKeys : n_kv - lo;
     const int kbeg = lo + split * per, kend = min(n_kv, kbeg + per);
     const int KVD = Hkv * kD;
@@ -92,10 +95,10 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
         }
     }
     const int crow0 = (lane & 1) + ((lane >> 4) << 2), crow1 = crow0 + 2;
-    const int qpos0 = pos0 + r0 + crow0, qpos1 = qpos0 + 2;
+    const int qpos0 = uniform ? pos0 + N - 1 : pos0 + r0 + crow0, qpos1 = uniform ? qpos0 : qpos0 + 2;
     const int trow0 = min(r0 + crow0, N - 1), trow1 = min(r0 + crow1, N - 1);
-    const float * tab0 = table + ((int64_t) trow0 * H + h) * (extent + 1);
-    const float * tab1 = table + ((int64_t) trow1 * H + h) * (extent + 1);
+    const float * tab0 = table ? table + ((int64_t) trow0 * H + h) * (extent + 1) : nullptr;
+    const float * tab1 = table ? table + ((int64_t) trow1 * H + h) * (extent + 1) : nullptr;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.f, l1 = 0.f;
     float o[4][8];
 #pragma unroll
@@ -159,8 +162,10 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
                 if (d < 0 || key >= kend || (window > 0 && d >= window)) {
                     s[st][i] = -FLT_MAX;
                 } else {
-                    const float * tab = r1 ? tab1 : tab0;
-                    s[st][i] += tab[d < extent ? d : extent];
+                    if (table) {
+                        const float * tab = r1 ? tab1 : tab0;
+                        s[st][i] += tab[d < extent ? d : extent];
+                    }
                 }
             }
         float tm0 = -FLT_MAX, tm1 = -FLT_MAX;
@@ -231,8 +236,8 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
             const int row = r0 + rr;
             if (row >= N) continue;
             const float m = (i & 2) ? m1 : m0, l = (i & 2) ? l1 : l0;
-            const float M = fmaxf(m, 0.f), c = l > 0.f ? exp2f(m - M) : 0.f;
-            const float inv = 1.f / (l * c + exp2f(-M));
+            const float M = sinkless ? m : fmaxf(m, 0.f), c = l > 0.f ? exp2f(m - M) : 0.f;
+            const float inv = 1.f / (l * c + (sinkless ? 0.f : exp2f(-M)));
             float * orow = out + ((int64_t) row * H + h) * kD;
 #pragma unroll
             for (int n = 0; n < 4; ++n) {
@@ -263,14 +268,14 @@ __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q
 
 // out = (sum_s O_s c_s) / (sum_s l_s c_s + 2^(-M)), c_s = 2^(m_s - M), M over the splits and the sink's 0
 __global__ void k_attn_combine(const float * __restrict__ part_o, const float * __restrict__ part_ml,
-                               float * __restrict__ out, int N, int H, int nsplit) {
+                               float * __restrict__ out, int N, int H, int nsplit, int sinkless) {
     const int th = blockIdx.x, i = threadIdx.x;
-    float M = 0.f;
+    float M = sinkless ? -FLT_MAX : 0.f;
     for (int s = 0; s < nsplit; ++s) {
         const int64_t e = ((int64_t) s * N * H + th) * 2;
         if (part_ml[e + 1] > 0.f) M = fmaxf(M, part_ml[e]);
     }
-    float L = exp2f(-M), o = 0.f;
+    float L = sinkless ? 0.f : exp2f(-M), o = 0.f;
     for (int s = 0; s < nsplit; ++s) {
         const int64_t e = ((int64_t) s * N * H + th) * 2;
         const float l = part_ml[e + 1];
@@ -285,11 +290,11 @@ __global__ void k_attn_combine(const float * __restrict__ part_o, const float * 
 template <int G>
 void launch(const float * q, const half * kc, const half * vc, const float * table, float * out, float * part_o,
             float * part_ml, int N, int H, int Hkv, int ring, int extent, int window, Pos0 p0, float scale, int nsplit,
-            int64_t ldq, cudaStream_t s) {
+            int64_t ldq, int flags, cudaStream_t s) {
     const dim3 grid((N + kRows - 1) / kRows, Hkv, nsplit);
     k_attn_tc<G><<<grid, 32 * G, 0, s>>>(q, kc, vc, table, out, part_o, part_ml, N, H, Hkv, ring, extent, window, p0,
-                                         scale, nsplit, ldq);
-    if (nsplit > 1) k_attn_combine<<<N * H, kD, 0, s>>>(part_o, part_ml, out, N, H, nsplit);
+                                         scale, nsplit, ldq, flags);
+    if (nsplit > 1) k_attn_combine<<<N * H, kD, 0, s>>>(part_o, part_ml, out, N, H, nsplit, (flags & 2) ? 1 : 0);
 }
 
 }  // namespace
@@ -314,13 +319,30 @@ void ink_attention_tc(const float * q, const float * R, const float * sink, cons
                                                                               extent, table);
     const Pos0 p0{pos0, pos0_dev};
     switch (H / KVH) {
-        case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
-        case 2: launch<2>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
-        case 3: launch<3>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
-        case 4: launch<4>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, s); break;
+        case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, 0, s); break;
+        case 2: launch<2>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, 0, s); break;
+        case 3: launch<3>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, 0, s); break;
+        case 4: launch<4>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, 0, s); break;
         default: throw std::runtime_error("ink_attention_tc: query heads per KV head");
     }
     check_launch("ink_attention_tc");
+}
+
+void ink_attention_plain(const float * q, int64_t ldq, const half * K, const half * V, int ring, int window,
+                         const int * pos0_dev, int pos0, int T, int H, int KVH, float scale, bool uniform, int nsplit,
+                         float * out, float * scratch, cudaStream_t s) {
+    float * part_o = scratch;
+    float * part_ml = part_o + (size_t) nsplit * T * H * kD;
+    const Pos0 p0{pos0, pos0_dev};
+    const int flags = (uniform ? 1 : 0) | 2;
+    switch (H / KVH) {
+        case 1: launch<1>(q, K, V, nullptr, out, part_o, part_ml, T, H, KVH, ring, 0, window, p0, scale, nsplit, ldq, flags, s); break;
+        case 2: launch<2>(q, K, V, nullptr, out, part_o, part_ml, T, H, KVH, ring, 0, window, p0, scale, nsplit, ldq, flags, s); break;
+        case 3: launch<3>(q, K, V, nullptr, out, part_o, part_ml, T, H, KVH, ring, 0, window, p0, scale, nsplit, ldq, flags, s); break;
+        case 4: launch<4>(q, K, V, nullptr, out, part_o, part_ml, T, H, KVH, ring, 0, window, p0, scale, nsplit, ldq, flags, s); break;
+        default: throw std::runtime_error("ink_attention_plain: query heads per KV head");
+    }
+    check_launch("ink_attention_plain");
 }
 
 }  // namespace bnk

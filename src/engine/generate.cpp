@@ -201,7 +201,10 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     }
     use_slot();
     sp_ = sp;
-    if (mtp_) mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
+    if (mtp_) {
+        mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
+        mtp_->set_max_drafts(opt_.max_draft);
+    }
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
     drafts_.clear();

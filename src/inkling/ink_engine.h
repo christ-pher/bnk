@@ -23,6 +23,7 @@
 #include "engine/engine_api.h"
 #include "inkling/ink_model.h"
 #include "inkling/ink_moe.h"
+#include "inkling/ink_spark.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
@@ -47,8 +48,9 @@ public:
     StageInfo stage_info(int i) const override;
     std::string model_name() const override { return model_.gguf.get_str("general.name", "bnk"); }
     const Config & cfg() const override { return model_.base; }
-    int res_dim() const override { return model_.cfg.E; }
-    Drafter * mtp() override { return nullptr; }
+    // with the drafter: the rows it reads are the target's features of the last forward ([T][4 E], residual_dev)
+    int res_dim() const override { return spark_ ? InkSpark::kTaps * model_.cfg.E : model_.cfg.E; }
+    Drafter * mtp() override { return spark_ ? spark_.get() : nullptr; }
     int max_ctx() const override { return opt_.max_ctx; }
     int max_window() const override { return kInkWin; }
     int snap_every() const override { return 0; }
@@ -82,7 +84,7 @@ public:
     }
     int row0_of(int) const override { return 0; }
     void commit(int c) override;
-    const float * residual_dev() const override { return nullptr; }
+    const float * residual_dev() const override { return spark_ ? feat_.p : nullptr; }
     void set_mtp_pending(const float *, int) override {}
     const float * mtp_pending_R() const override { return nullptr; }
     int mtp_pending_cell() const override { return -1; }
@@ -109,6 +111,11 @@ private:
     InkEngine * peer_ = nullptr;           // the other rank
     std::unique_ptr<InkEngine> rank1_;     // owned by rank 0
     bool p2p_ = false;
+    // the DSpark drafter (opt.mtp: dspark-Inkling-2-Mini-*.gguf) on rank 0, and the target features it reads: the
+    // stream at the input of visits 5, 23, 41 (in visit order) and the normed output, [chunk][4 E]
+    std::unique_ptr<InkSpark> spark_;
+    DevBuf<float> feat_;
+    int tap_of_visit_[64];
     DevBuf<float> inbox_[2][2];            // [point: attention / MoE][visit parity]: the peer's partial [W][E]
     std::vector<cudaEvent_t> ev_[2];       // per point and visit: this rank's partial is in the peer's inbox
     cudaEvent_t ev_head_ = nullptr, ev_fork_ = nullptr, ev_join_ = nullptr;
@@ -159,7 +166,7 @@ private:
     int pending_T_ = 0;      // rows of an uncommitted verify window
 
     // checkpoints: conv states and the window rings on the host
-    struct Ckpt { int pos = -1; std::vector<float> conv; std::vector<half> ring; int64_t age = 0; };
+    struct Ckpt { int pos = -1; std::vector<float> conv; std::vector<half> ring; std::vector<uint8_t> spark; int64_t age = 0; };
     std::vector<Ckpt> ckpts_;
     int64_t ckpt_age_ = 0;
 

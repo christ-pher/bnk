@@ -17,4 +17,10 @@ void ink_attention_tc(const float * q, const float * R, const float * sink, cons
                       int T, int H, int KVH, int D, float scale, int nsplit, float * out, float * scratch,
                       cudaStream_t s, int64_t ldq = 0, int64_t ldr = 0, int64_t lds = 0);   // the rows' strides (0: packed)
 
+// Plain attention (no bias table, no sink) over ring caches: the drafter's. uniform: every row sees what the last
+// row sees (non-causal within the block). scratch: nsplit * T * H * 130 floats.
+void ink_attention_plain(const float * q, int64_t ldq, const half * K, const half * V, int ring, int window,
+                         const int * pos0_dev, int pos0, int T, int H, int KVH, float scale, bool uniform, int nsplit,
+                         float * out, float * scratch, cudaStream_t s);
+
 }  // namespace bnk

@@ -78,6 +78,19 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
         rank1_->h_pos_ = h_pos_;
         rank1_->h_tau_ = h_tau_;
     }
+    CUDA_CHECK(cudaSetDevice(dev_));   // rank 0's GPU current again (rank 1's load set its own)
+    if (!opt.mtp.empty() && env_int("BNK_INK_SPARK", 1) != 0) {
+        DeviceScope ds(dev_);
+        spark_ = std::make_unique<InkSpark>();
+        spark_->load(opt.mtp, model_.gguf, model_.tok_embd, model_.cfg.n_vocab, opt.max_ctx, chunk_, st_, opt.verbose);
+        std::fill(std::begin(tap_of_visit_), std::end(tap_of_visit_), -1);
+        const auto & tv = spark_->target_visits();
+        for (int k = 0; k < (int) tv.size(); ++k)
+            if (tv[k] < model_.cfg.n_visits()) tap_of_visit_[tv[k]] = k;
+            else if (tv[k] != model_.cfg.n_visits() || k != InkSpark::kTaps - 1)
+                throw std::runtime_error("inkling: the drafter's last tap must be the normed output");
+        feat_.alloc((size_t) chunk_ * InkSpark::kTaps * model_.cfg.E);
+    }
     if (opt.verbose) {
         for (InkEngine * r : ranks()) {
             DeviceScope ds(r->dev_);
@@ -183,6 +196,7 @@ void InkEngine::reset() {
     pending_T_ = 0;
     for (auto & k : ckpts_) k.pos = -1;
     for (InkEngine * r : ranks()) r->reset_here();
+    if (spark_) spark_->restart(0);
 }
 
 void InkEngine::reset_here() {
@@ -245,6 +259,7 @@ void InkEngine::checkpoint() {
     if (slot < 0)
         slot = (int) (std::min_element(ckpts_.begin(), ckpts_.end(), [](const Ckpt & a, const Ckpt & b) { return a.age < b.age; }) - ckpts_.begin());
     for (InkEngine * r : ranks()) r->save_ckpt(slot, p);
+    if (spark_) spark_->save(ckpts_[slot].spark);
     ckpts_[slot].age = ++ckpt_age_;
 }
 
@@ -257,6 +272,10 @@ int InkEngine::rollback(int max_pos) {
     if (best < 0) return -1;
     for (InkEngine * r : ranks()) r->load_ckpt(best);
     const int p = ckpts_[best].pos;
+    if (spark_) {
+        spark_->load_state(ckpts_[best].spark);
+        if (spark_->fed() != p) spark_->restart(p);
+    }
     history_.resize(p);
     pending_T_ = 0;
     ckpts_[best].age = ++ckpt_age_;
@@ -715,7 +734,15 @@ void InkEngine::enqueue(int T, bool keep) {
     for (InkEngine * r : rk) r->fwd_in(T);
     // core layers in passes > 0 take loop controls: each rank its own copy of them (rank 0's read over PCIe made
     // rank 1's controls 4-10x slower)
+    int order = 0;   // the visit's place in the token's order (the drafter's taps are counted so)
     auto visit = [&](int v, int ip, bool looped) {
+        if (spark_ && tap_of_visit_[order] >= 0) {   // rank 0's stream at the visit's input
+            DeviceScope d0(dev_);
+            const int E = c.E;
+            CUDA_CHECK(cudaMemcpy2DAsync(feat_.p + (size_t) tap_of_visit_[order] * E, (size_t) InkSpark::kTaps * E * 4, x_.p,
+                                         (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, st_));
+        }
+        ++order;
         for (InkEngine * r : rk) {
             const InkLoop * loop = looped ? &r->model_.loops[ip - c.loop_start] : nullptr;
             r->visit_a(v, ip, T, pos0, loop, keep);
@@ -742,6 +769,12 @@ void InkEngine::enqueue(int T, bool keep) {
     }
     for (int il = c.loop_end; il < c.n_layer; ++il) visit(il, il, false);
     for (InkEngine * r : rk) r->head_prep(T);
+    if (spark_) {   // the normed output: the last tap
+        DeviceScope d0(dev_);
+        const int E = c.E;
+        CUDA_CHECK(cudaMemcpy2DAsync(feat_.p + (size_t) (InkSpark::kTaps - 1) * E, (size_t) InkSpark::kTaps * E * 4, o_.p,
+                                     (size_t) E * 4, (size_t) E * 4, T, cudaMemcpyDeviceToDevice, st_));
+    }
     auto head = [&](int r0, int n) {
         for (InkEngine * r : rk) r->head_rows(r0, n);
         if (rank1_) {   // rank 0 waits for rank 1's logits rows (and joins its stream back)
@@ -770,7 +803,13 @@ void InkEngine::prefill(const std::vector<int32_t> & tokens) {
     const double t0 = now_ms();
     for (size_t i = 0; i < tokens.size(); i += chunk_) {
         const int n = (int) std::min<size_t>(chunk_, tokens.size() - i);
+        const int p0 = pos();
         run(tokens.data() + i, n, true);
+        if (spark_) {
+            DeviceScope d0(dev_);
+            if (spark_->fed() != p0) spark_->restart(std::min(spark_->fed(), p0));
+            if (spark_->fed() == p0) spark_->feed(feat_, n, p0);
+        }
         if (on_prefill_progress) on_prefill_progress(i + n, tokens.size());
     }
     times.total_ms += now_ms() - t0;

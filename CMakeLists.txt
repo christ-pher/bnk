@@ -82,6 +82,7 @@ add_library(bnk_core STATIC
   src/inkling/ink_ops.cu
   src/inkling/ink_moe.cu
   src/inkling/ink_attn.cu
+  src/inkling/ink_spark.cu
   src/inkling/ink_engine.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
