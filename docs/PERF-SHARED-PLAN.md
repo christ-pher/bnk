@@ -91,3 +91,16 @@ numbers are decode and turn overhead, not cold reads):
 | --- | --- | --- | --- | --- |
 | `--slots 1` | 58-59 s | 30.3-30.8 | 31-34 tok/s, in turn | ~38% |
 | `--slots 2` (two lanes) | 43-45 s | **39.8-42.0** (+31-36%) | 18.5-24 tok/s, at once | ~55-59% |
+
+Quality (`bnk multi`, greedy, `BNK_EXACT=1`, no drafter, two prompts x 300 tokens): two `--solo` runs agree for 44 / 43
+tokens (the engine's run-to-run noise), `--pipe` agrees with them for 44-87 / 22 tokens and stays coherent to the end
+(a hash-table answer with its C code, a short story). Speed there: one after another 29.2 tok/s, two lanes **46.0 tok/s
+combined** (23.0 each). The second slot costs ~3% of the expert cache (4,155 resident instead of 4,296), so a lone
+agent's decode drops slightly; the configs keep `--slots 1` until that is measured.
+
+## Step 7: not pursued
+
+The decode exchanges are 5-8 rows (50-80 KB): fp16 saves ~4 us of link time each but adds a conversion and a second
+add per exchange (two more graph nodes, ~1-2 us each), so the net is about zero; the prompt path already sends fp16,
+where the rows are hundreds of KB. Peer stores from inside the kernels remain the only real lever (~3%), kernel work
+of the kind the user stopped earlier.
