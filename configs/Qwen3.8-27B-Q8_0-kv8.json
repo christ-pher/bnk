@@ -19,6 +19,9 @@
     "top_k": 20,
     "min_p": 0.0
   },
+  "chat_template_kwargs": {
+    "reasoning_effort": "xhigh"
+  },
   "speculation": {
     "draft": 7,
     "draft_min_p": 0.8,
