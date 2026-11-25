@@ -21,9 +21,14 @@
 
 using namespace bnk;
 
+static std::vector<std::pair<double, int>> g_rows;   // (KL, position) of every row (WORST=n prints the n worst)
+static int g_pos = 0, g_next = -1;
+struct Stats;
+static Stats * g_all = nullptr;
 struct Stats {
     int n = 0, top1 = 0;
-    double kl = 0, maxd = 0;
+    double kl = 0, maxd = 0, nll_o = 0, nll_r = 0;
+    int nn = 0;
     void add(const float * ours, const float * ref, int V) {
         int a = 0, b = 0;
         double mo = -1e30, mr = -1e30, d = 0;
@@ -41,13 +46,20 @@ struct Stats {
             const double pr = std::exp(ref[i] - mr) / zr;
             if (pr > 1e-12) k += pr * ((ref[i] - mr - std::log(zr)) - (ours[i] - mo - std::log(zo)));
         }
+        if (g_next >= 0) {
+            nll_o += -(ours[g_next] - mo - std::log(zo));
+            nll_r += -(ref[g_next] - mr - std::log(zr));
+            ++nn;
+        }
         ++n;
+        if (this == g_all) g_rows.push_back({k, g_pos});
         top1 += a == b;
         kl += k;
         maxd = std::max(maxd, d);
     }
     void print(const char * what) const {
-        if (n) printf("%-22s %5d rows: top-1 agreement %.2f%%, mean KL %.5f, max |diff| %.3f\n", what, n, 100.0 * top1 / n, kl / n, maxd);
+        if (n) printf("%-22s %5d rows: top-1 agreement %.2f%%, mean KL %.5f, max |diff| %.3f; next-token NLL ours %.4f, ref %.4f\n",
+                      what, n, 100.0 * top1 / n, kl / n, maxd, nn ? nll_o / nn : 0., nn ? nll_r / nn : 0.);
     }
 };
 
@@ -74,12 +86,17 @@ int main(int argc, char ** argv) {
     if (eng.cfg().n_vocab != V) { fprintf(stderr, "vocabulary %d vs reference %d\n", eng.cfg().n_vocab, V); return 1; }
     std::vector<float> host((size_t) kInkWin * V);
     Stats near, far, all;
+    g_all = &all;
+    std::vector<Stats> bucket(64);   // per 256 positions
     auto check = [&](int pos0, int n, const float * dev) {
         cudaMemcpy(host.data(), dev, (size_t) n * V * 4, cudaMemcpyDeviceToHost);
         for (int r = 0; r < n; ++r) {
             const int p = pos0 + r;
+            g_pos = p;
+            g_next = p + 1 < N ? toks[p + 1] : -1;
             (p < 1024 ? near : far).add(host.data() + (size_t) r * V, ref + (size_t) p * V, V);
             all.add(host.data() + (size_t) r * V, ref + (size_t) p * V, V);
+            bucket[std::min(63, p / 256)].add(host.data() + (size_t) r * V, ref + (size_t) p * V, V);
         }
     };
     const double t0 = now_ms();
@@ -118,5 +135,14 @@ int main(int argc, char ** argv) {
     near.print("positions < 1024");
     far.print("positions >= 1024");
     all.print("all");
+    if (const char * w = getenv("WORST")) {
+        std::sort(g_rows.rbegin(), g_rows.rend());
+        for (int i = 0; i < std::min<int>(atoi(w), g_rows.size()); ++i)
+            printf("  KL %.4f at position %d (token %d -> next %d)\n", g_rows[i].first, g_rows[i].second, toks[g_rows[i].second],
+                   g_rows[i].second + 1 < N ? toks[g_rows[i].second + 1] : -1);
+    }
+    if (getenv("BUCKETS"))
+        for (int b = 0; b < 64; ++b)
+            if (bucket[b].n) { char nm[32]; snprintf(nm, sizeof nm, "  [%d, %d)", b * 256, b * 256 + 256); bucket[b].print(nm); }
     return 0;
 }

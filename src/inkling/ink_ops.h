@@ -58,6 +58,8 @@ void ink_concat_rms2(const float * a, const float * b, float * y, int T, int E, 
 // out = cur - tanh(f) cur + tanh(g) msg
 void ink_ctrl_combine(float * out, const float * cur, const float * msg, const float * g, const float * f, int64_t n,
                       cudaStream_t s);
+// y = x rounded to bf16 (tests: the CPU reference's activations for BF16 products)
+void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s);
 void ink_softcap(float * x, int64_t n, float cap, cudaStream_t s);
 
 }  // namespace bnk

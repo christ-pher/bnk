@@ -172,6 +172,13 @@ int InkEngine::reusable(const std::vector<int32_t> & prompt) const {
 // ------------------------------------------------------------------------------------------------ pieces
 void InkEngine::mm(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc) {
     if (T <= 0) return;
+    static const bool bf16act = env_int("BNK_INK_BF16ACT", 0) != 0;   // tests: activations rounded as the CPU reference does
+    if (bf16act && W.type == 30) {
+        if (!rb_.p) rb_.alloc((size_t) chunk_ * 2 * model_.cfg.E);
+        ink_round_bf16(x, ldx, T, (int) W.cols, rb_, st_);
+        x = rb_;
+        ldx = W.cols;
+    }
     if (T <= kMaxGemvRows) gemv_auto(W, x, ldx, T, y, ldy, acc, act_, st_);
     else gemm_.run(W, x, ldx, T, y, ldy, acc);
 }

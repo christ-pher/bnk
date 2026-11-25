@@ -1,6 +1,7 @@
 #include "inkling/ink_ops.h"
 
 #include <cfloat>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <stdexcept>
 
@@ -302,6 +303,12 @@ __global__ void k_softcap(float * x, int64_t n, float cap) {
         x[i] = cap * tanhf(x[i] / cap);
 }
 
+__global__ void k_round_bf16(const float * x, int64_t ldx, int cols, float * y) {
+    const int t = blockIdx.y;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += gridDim.x * blockDim.x)
+        y[(int64_t) t * cols + i] = __bfloat162float(__float2bfloat16(x[(int64_t) t * ldx + i]));
+}
+
 int grid_for(int64_t n, int threads = 256) { return (int) std::min<int64_t>((n + threads - 1) / threads, 4096); }
 
 }  // namespace
@@ -398,6 +405,11 @@ void ink_ctrl_combine(float * out, const float * cur, const float * msg, const f
                       cudaStream_t s) {
     k_ctrl_combine<<<grid_for(n), 256, 0, s>>>(out, cur, msg, g, f, n);
     check_launch("ink_ctrl_combine");
+}
+
+void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s) {
+    k_round_bf16<<<dim3((cols + 255) / 256, T), 256, 0, s>>>(x, ldx, cols, y);
+    check_launch("ink_round_bf16");
 }
 
 void ink_softcap(float * x, int64_t n, float cap, cudaStream_t s) {

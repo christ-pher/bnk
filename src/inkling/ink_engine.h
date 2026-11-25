@@ -123,7 +123,7 @@ private:
 
     // activations (capacity chunk_ rows)
     DevBuf<float> x_, inp_sa_, ffn_inp_, mixed_, ins_[3], q_, r_, sink_, dyn_k_, dyn_v_, attn_, gate_, o_, tmp_,
-        moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gain_, ctrl_forget_, msg_, tau_, gx_, gu_, gh_, gd_;
+        moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gain_, ctrl_forget_, msg_, tau_, gx_, gu_, gh_, gd_, rb_;
     DevBuf<float> blocks_buf_;   // [kMaxBlocks][chunk][E]
     static constexpr int kMaxBlocks = 12;
     DevBuf<float> logits_;       // [kInkWin][n_vocab_pad] (all_logits: [chunk])
