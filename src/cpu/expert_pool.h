@@ -90,6 +90,7 @@ private:
     alignas(64) std::atomic<uint64_t> gen_{0};
     std::unique_ptr<Flag[]> done_;
     std::atomic<bool> stop_{false};
+    std::atomic<int> sleepers_{0};   // workers asleep on gen_ (BNK_CPU_WAIT=1)
     const std::function<void(int, int)> * fn_ = nullptr;
 };
 

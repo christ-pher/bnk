@@ -104,3 +104,16 @@ The decode exchanges are 5-8 rows (50-80 KB): fp16 saves ~4 us of link time each
 add per exchange (two more graph nodes, ~1-2 us each), so the net is about zero; the prompt path already sends fp16,
 where the rows are hundreds of KB. Peer stores from inside the kernels remain the only real lever (~3%), kernel work
 of the kind the user stopped earlier.
+
+Single agent on `--slots 2` vs `--slots 1` (the same seeded 400-token request, four times each, warm start on): 31.2 /
+37.8 / 36.8 / 36.5 against 31.5 / 36.7 / 36.1 / 37.3 tok/s. No measurable cost, so the DeepSeek config now runs two
+slots (`configs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS.json`).
+
+## Step 3, again on an idle machine: the pool's wait
+
+`BNK_CPU_WAIT=1` (new, opt-in): a waiting thread spins ~1.2 ms, then yields, then a worker sleeps on a futex. With the
+machine idle (no production server) the one-token call is 0.578 / 0.580 ms at 24 threads (spin) and 0.576 / 0.552
+(wait=1, 24), 0.567 / 0.550 (40), 0.568 / 1.018 (44), 1.423 / 0.684 (48). The earlier "+10% from SMT" was mostly the
+production server's threads on the cores; idle, the siblings give ~3% and the pool is still unstable above 40.
+Defaults unchanged. The one thing wait=1 does buy: idle workers sleep after ~1 ms instead of spinning ~46 ms (an
+idle server showed ~190% CPU).
