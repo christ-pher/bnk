@@ -57,11 +57,65 @@ const float * InkModel::upload_vec(const std::vector<float> & v) {
     return (const float *) d;
 }
 
+QMat InkModel::upload_bytes(const std::string & name, const std::vector<uint8_t> & host, int64_t rows, int64_t cols,
+                            int type) {
+    void * d = nullptr;
+    if (cudaMalloc(&d, host.size()) != cudaSuccess) throw std::runtime_error("inkling: cudaMalloc failed for " + name);
+    if (cudaMemcpy(d, host.data(), host.size(), cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("inkling: upload failed for " + name);
+    allocs_.push_back(d);
+    vram_bytes += host.size();
+    QMat m;
+    m.data = d;
+    m.type = type;
+    m.rows = rows;
+    m.cols = cols;
+    m.row_bytes = ggml_row_size((ggml_type) type, cols);
+    return m;
+}
+
+QMat InkModel::upload_rows(const std::string & name, const Ranges & rows) {
+    const TensorRef & t = gguf.get(name);
+    const size_t rb = t.row_bytes();
+    std::vector<uint8_t> host;
+    int64_t n = 0;
+    for (auto [r0, r1] : rows) {
+        host.insert(host.end(), t.data + (size_t) r0 * rb, t.data + (size_t) r1 * rb);
+        n += r1 - r0;
+    }
+    return upload_bytes(name, host, n, t.ne[0], (int) t.type);
+}
+
+QMat InkModel::upload_cols(const std::string & name, const Ranges & cols) {
+    const TensorRef & t = gguf.get(name);
+    const size_t rb = t.row_bytes();
+    const int64_t bs = ggml_blck_size(t.type);
+    const size_t ts = ggml_type_size(t.type);
+    int64_t nc = 0;
+    for (auto [c0, c1] : cols) {
+        if (c0 % bs || c1 % bs) throw std::runtime_error("inkling: a column slice inside a quant block: " + name);
+        nc += c1 - c0;
+    }
+    std::vector<uint8_t> host;
+    host.reserve((size_t) t.nrows() * nc / bs * ts);
+    for (int64_t r = 0; r < t.nrows(); ++r)
+        for (auto [c0, c1] : cols)
+            host.insert(host.end(), t.data + r * rb + c0 / bs * ts, t.data + r * rb + c1 / bs * ts);
+    return upload_bytes(name, host, t.nrows(), nc, (int) t.type);
+}
+
+const float * InkModel::upload_f32_range(const std::string & name, int64_t off, int64_t n) {
+    const TensorRef & t = gguf.get(name);
+    if (t.type != GGML_TYPE_F32 || (int64_t) (t.nbytes / 4) < off + n) throw std::runtime_error("inkling: " + name);
+    std::vector<float> v((const float *) t.data + off, (const float *) t.data + off + n);
+    return upload_vec(v);
+}
+
 InkModel::~InkModel() {
     for (void * p : allocs_) cudaFree(p);
 }
 
-void InkModel::load(const std::string & path, bool verbose) {
+void InkModel::load(const std::string & path, bool verbose, int tp_n, int tp_rank) {
     gguf.open(path);
     const std::string arch = gguf.get_str("general.architecture");
     if (arch != "inkling2_loop") throw std::runtime_error("inkling: unsupported architecture '" + arch + "'");
@@ -101,7 +155,7 @@ void InkModel::load(const std::string & path, bool verbose) {
     for (int64_t v : gguf.get_int_arr(k("attention.sliding_window_pattern"))) c.swa.push_back(v != 0);
     if ((int) c.swa.size() != c.n_layer || c.head_dim != 128 || c.n_head % c.n_head_kv || c.n_conv != 4 ||
         c.n_rel != 16 || c.loop_start <= 0 || c.loop_end > c.n_layer || c.loop_start % c.res_block ||
-        c.loop_end % c.res_block || c.loop_count < 2 || c.n_ff * 2 != (int) gguf.get("blk.0.ffn_gate_up_exps.weight").ne[1])
+        c.loop_end % c.res_block || c.loop_count < 2 || (int64_t) c.n_ff * 2 * c.n_expert != gguf.get("blk.0.ffn_gate_up_exps.weight").nrows())
         throw std::runtime_error("inkling: unexpected dimensions (this port expects Inkling-2-Mini's)");
 
     base.n_layer = c.n_layer;
@@ -118,10 +172,30 @@ void InkModel::load(const std::string & path, bool verbose) {
     base.eos_token = c.eos;
     base.pad_token = c.pad;
 
-    const int E = c.E, H = c.n_head, KV = c.kv_dim(), C = c.n_conv;
+    if (tp_n < 1 || c.n_head_kv % tp_n || c.n_ff % (64 * tp_n)) throw std::runtime_error("inkling: tensor parallel over this many GPUs");
+    c.tp_n = tp_n;
+    c.tp_rank = tp_rank;
+    const int H_all = c.n_head, KVH_all = c.n_head_kv, F_all = c.n_ff;
+    c.n_head /= tp_n;
+    c.n_head_kv /= tp_n;
+    c.n_ff /= tp_n;
+    const int E = c.E, H = c.n_head, KV = c.kv_dim(), C = c.n_conv, D = c.head_dim, F = c.n_ff;
+    const int64_t h0 = (int64_t) tp_rank * H, kv0 = (int64_t) tp_rank * KV, f0 = (int64_t) tp_rank * F;
+    (void) H_all; (void) KVH_all;
+    const bool tp = tp_n > 1;
+    // matrices split by output rows: this rank's rows [o0, o0 + n) of every block of `per` rows
+    auto rows_of = [&](const std::string & name, int64_t o0, int64_t n, int64_t blocks, int64_t per) {
+        if (!tp) return upload(name);
+        Ranges r;
+        for (int64_t b = 0; b < blocks; ++b) r.push_back({b * per + o0, b * per + o0 + n});
+        return upload_rows(name, r);
+    };
     tok_embd = upload("token_embd.weight");
     tok_norm = upload_f32("token_embd_norm.weight", E);
-    output = upload("output.weight");
+    c.vocab_n = (c.n_vocab + tp_n - 1) / tp_n;
+    c.vocab0 = tp_rank * c.vocab_n;
+    c.vocab_n = std::min(c.vocab_n, c.n_vocab - c.vocab0);
+    output = upload_rows("output.weight", {{c.vocab0, c.vocab0 + c.vocab_n}});
     output_norm = upload_f32("output_norm.weight", E);
     output_res_query = upload_f32("output_res_query.weight", E);
     if (tok_embd.type != GGML_TYPE_BF16 || output.type != GGML_TYPE_BF16 || tok_embd.rows != c.n_vocab_pad)
@@ -131,18 +205,19 @@ void InkModel::load(const std::string & path, bool verbose) {
     for (int il = 0; il < c.n_layer; ++il) {
         InkLayer & L = layers[il];
         L.swa = c.swa[il];
-        L.wq = upload(blk(il, "attn_q.weight"));
-        L.wk = upload(blk(il, "attn_k.weight"));
-        L.wv = upload(blk(il, "attn_v.weight"));
-        L.wo = upload(blk(il, "attn_output.weight"));
-        L.wgate = upload(blk(il, "attn_gate.weight"));
-        L.wrel = upload(blk(il, "attn_rel.weight"));
-        L.wsink = upload(blk(il, "attn_sink_proj.weight"));
-        L.q_clip = upload_f32(blk(il, "attn_q_clip.weight"), (size_t) H * c.head_dim);
-        L.rel_clip = upload_f32(blk(il, "attn_rel_clip.weight"), (size_t) H * c.n_rel);
+        // the attention: this rank's query heads (q, gate, rel, sink rows; out columns) and KV heads (k, v rows)
+        L.wq = rows_of(blk(il, "attn_q.weight"), h0 * D, (int64_t) H * D, 1, 0);
+        L.wk = rows_of(blk(il, "attn_k.weight"), kv0, KV, 1, 0);
+        L.wv = rows_of(blk(il, "attn_v.weight"), kv0, KV, 1, 0);
+        L.wo = tp ? upload_cols(blk(il, "attn_output.weight"), {{h0 * D, (h0 + H) * D}}) : upload(blk(il, "attn_output.weight"));
+        L.wgate = rows_of(blk(il, "attn_gate.weight"), h0 * D, (int64_t) H * D, 1, 0);
+        L.wrel = rows_of(blk(il, "attn_rel.weight"), h0 * c.n_rel, (int64_t) H * c.n_rel, 1, 0);
+        L.wsink = rows_of(blk(il, "attn_sink_proj.weight"), h0, H, 1, 0);
+        L.q_clip = upload_f32_range(blk(il, "attn_q_clip.weight"), h0 * D, (int64_t) H * D);
+        L.rel_clip = upload_f32_range(blk(il, "attn_rel_clip.weight"), h0 * c.n_rel, (int64_t) H * c.n_rel);
         L.rel_bias = upload_f32(blk(il, "attn_rel_bias.weight"), (size_t) c.extent(il) * c.n_rel);
-        L.k_conv = upload_f32(blk(il, "attn_k_conv.weight"), (size_t) KV * C);
-        L.v_conv = upload_f32(blk(il, "attn_v_conv.weight"), (size_t) KV * C);
+        L.k_conv = upload_f32_range(blk(il, "attn_k_conv.weight"), kv0 * C, (int64_t) KV * C);
+        L.v_conv = upload_f32_range(blk(il, "attn_v_conv.weight"), kv0 * C, (int64_t) KV * C);
         L.attn_post_conv = upload_f32(blk(il, "attn_post_conv.weight"), (size_t) E * C);
         L.ffn_post_conv = upload_f32(blk(il, "ffn_post_conv.weight"), (size_t) E * C);
         if (L.swa) {
@@ -151,8 +226,8 @@ void InkModel::load(const std::string & path, bool verbose) {
             L.q_norm = upload_f32(blk(il, "attn_q_inp_norm.weight"), E);
             L.k_norm = upload_f32(blk(il, "attn_k_inp_norm.weight"), E);
             L.v_norm = upload_f32(blk(il, "attn_v_inp_norm.weight"), E);
-            L.k_conv_proj = upload(blk(il, "attn_k_conv_proj.weight"));
-            L.v_conv_proj = upload(blk(il, "attn_v_conv_proj.weight"));
+            L.k_conv_proj = rows_of(blk(il, "attn_k_conv_proj.weight"), kv0 / D * C, (int64_t) c.n_head_kv * C, 1, 0);
+            L.v_conv_proj = rows_of(blk(il, "attn_v_conv_proj.weight"), kv0 / D * C, (int64_t) c.n_head_kv * C, 1, 0);
         }
         if (il > 0) {
             L.attn_res_nq = L.swa ? 1 : 3;
@@ -163,8 +238,19 @@ void InkModel::load(const std::string & path, bool verbose) {
         L.router = upload(blk(il, "ffn_gate_inp.weight"));
         if (L.router.type != GGML_TYPE_F32 || L.router.rows != c.n_expert) throw std::runtime_error("inkling: router");
         L.exp_bias = upload_f32(blk(il, "exp_probs_b.bias"), c.n_expert);
-        L.gate_up = upload(blk(il, "ffn_gate_up_exps.weight"));
-        L.down = upload(blk(il, "ffn_down_exps.weight"));
+        // the experts: this rank's share of every expert's FFN width (its gate rows, the same up rows; down columns)
+        if (tp) {
+            Ranges gu;
+            for (int64_t e = 0; e < c.n_expert; ++e) {
+                gu.push_back({e * 2 * F_all + f0, e * 2 * F_all + f0 + F});
+                gu.push_back({e * 2 * F_all + F_all + f0, e * 2 * F_all + F_all + f0 + F});
+            }
+            L.gate_up = upload_rows(blk(il, "ffn_gate_up_exps.weight"), gu);
+            L.down = upload_cols(blk(il, "ffn_down_exps.weight"), {{f0, f0 + F}});
+        } else {
+            L.gate_up = upload(blk(il, "ffn_gate_up_exps.weight"));
+            L.down = upload(blk(il, "ffn_down_exps.weight"));
+        }
         L.gu_scale.assign(c.n_expert, 1.f);
         L.down_scale.assign(c.n_expert, 1.f);
         for (auto [nm, dst] : {std::pair{"ffn_gate_up_exps.scale", &L.gu_scale}, {"ffn_down_exps.scale", &L.down_scale}}) {
@@ -193,9 +279,11 @@ void InkModel::load(const std::string & path, bool verbose) {
         }
     }
     if (verbose)
-        fprintf(stderr, "bnk: inkling: %d layers (core %d-%d x %d = %d visits), %d experts (%d used, %s), %.2f GiB in VRAM\n",
+        fprintf(stderr, "bnk: inkling: %d layers (core %d-%d x %d = %d visits), %d experts (%d used, %s), %.2f GiB in VRAM%s\n",
                 c.n_layer, c.loop_start, c.loop_end - 1, c.loop_count, c.n_visits(), c.n_expert, c.n_used,
-                ggml_type_name((ggml_type) layers[0].gate_up.type), vram_bytes / double(1 << 30));
+                ggml_type_name((ggml_type) layers[0].gate_up.type), vram_bytes / double(1 << 30),
+                tp ? (" (rank " + std::to_string(tp_rank) + " of " + std::to_string(tp_n) + ": " + std::to_string(H) + " query heads, " +
+                      std::to_string(c.n_head_kv) + " KV heads, FFN " + std::to_string(F) + ")").c_str() : "");
 }
 
 }  // namespace bnk

@@ -14,16 +14,24 @@
 namespace bnk {
 
 namespace {
-constexpr int kInkCkpts = 4;   // snapshots kept (each holds the window rings: ~250 MB of host RAM)
+constexpr int kInkCkpts = 4;   // snapshots kept (each holds the window rings: ~250 MB of host RAM per rank)
 }
 
 InkEngine::~InkEngine() {
+    rank1_.reset();
+    DeviceScope ds(dev_);
     for (auto & row : graphs_)
         for (auto & g : row)
             if (g) cudaGraphExecDestroy(g);
-    if (h_tok_) cudaFreeHost(h_tok_);
-    if (h_pos_) cudaFreeHost(h_pos_);
-    if (h_tau_) cudaFreeHost(h_tau_);
+    for (auto & evs : ev_)
+        for (cudaEvent_t e : evs) cudaEventDestroy(e);
+    for (cudaEvent_t e : {ev_head_, ev_fork_, ev_join_})
+        if (e) cudaEventDestroy(e);
+    if (tp_rank_ == 0) {   // the pinned inputs belong to rank 0 (rank 1 reads them)
+        if (h_tok_) cudaFreeHost(h_tok_);
+        if (h_pos_) cudaFreeHost(h_pos_);
+        if (h_tau_) cudaFreeHost(h_tau_);
+    }
     if (st_) cudaStreamDestroy(st_);
 }
 
@@ -36,11 +44,61 @@ StageInfo InkEngine::stage_info(int) const {
 }
 
 void InkEngine::load(const std::string & path, const EngineOptions & opt) {
+    // the GPUs: --gpus (-1 or empty: every GPU, up to two); tensor parallel over two (BNK_INK_TP=0: one)
+    std::vector<int> gpus;
+    int ndev = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&ndev));
+    if (opt.gpus.empty() || opt.gpus[0] < 0) {
+        for (int d = 0; d < std::min(ndev, 2); ++d) gpus.push_back(d);
+    } else {
+        gpus = opt.gpus;
+    }
+    if (env_int("BNK_INK_TP", 1) == 0 || gpus.size() < 2) gpus.resize(1);
+    if (gpus.size() > 2) gpus.resize(2);
+    const int n = (int) gpus.size();
+    load_rank(path, opt, gpus[0], n, 0);
+    if (n == 2) {
+        rank1_ = std::make_unique<InkEngine>();
+        rank1_->load_rank(path, opt, gpus[1], n, 1);
+        peer_ = rank1_.get();
+        rank1_->peer_ = this;
+        int ab = 0, ba = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&ab, dev_, rank1_->dev_));
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&ba, rank1_->dev_, dev_));
+        if (!ab || !ba) throw std::runtime_error("inkling: tensor parallel needs peer access between the GPUs (docs/DUAL-GPU.md)");
+        for (InkEngine * r : ranks()) {
+            DeviceScope ds(r->dev_);
+            const cudaError_t e = cudaDeviceEnablePeerAccess(r->peer_->dev_, 0);
+            if (e == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+            else CUDA_CHECK(e);
+            r->p2p_ = true;
+        }
+        // rank 1 reads rank 0's pinned inputs
+        rank1_->h_tok_ = h_tok_;
+        rank1_->h_pos_ = h_pos_;
+        rank1_->h_tau_ = h_tau_;
+    }
+    if (opt.verbose) {
+        for (InkEngine * r : ranks()) {
+            DeviceScope ds(r->dev_);
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            fprintf(stderr, "bnk: inkling: GPU %d: context %d, K/V %.2f GiB (window rings of %d cells), prompt chunks of %d, "
+                            "%.1f GiB free\n", r->dev_, opt.max_ctx, r->kv_bytes_ / double(1 << 30), r->ring_, r->chunk_,
+                    fr / double(1 << 30));
+        }
+        if (n == 2) fprintf(stderr, "bnk: inkling: tensor parallel over GPUs %d and %d (peer copies)\n", gpus[0], gpus[1]);
+    }
+}
+
+void InkEngine::load_rank(const std::string & path, const EngineOptions & opt, int dev, int tp_n, int tp_rank) {
     opt_ = opt;
-    if (!opt.gpus.empty() && opt.gpus[0] >= 0) dev_ = opt.gpus[0];
+    dev_ = dev;
+    tp_n_ = tp_n;
+    tp_rank_ = tp_rank;
     CUDA_CHECK(cudaSetDevice(dev_));
     DeviceScope ds(dev_);
-    model_.load(path, opt.verbose);
+    model_.load(path, opt.verbose, tp_n, tp_rank);
     const InkConfig & c = model_.cfg;
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
     chunk_ = std::max(kInkWin, std::min(env_int("BNK_INK_CHUNK", 512), 2048));
@@ -78,13 +136,15 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     rlog_.alloc((size_t) W * c.n_expert);
     gx_.alloc((size_t) R * E); gu_.alloc((size_t) R * 2 * F); gh_.alloc((size_t) R * F); gd_.alloc((size_t) R * E);
     blocks_buf_.alloc((size_t) kMaxBlocks * W * E);
-    logits_.alloc((size_t) kInkWin * c.n_vocab);
+    logits_.alloc((size_t) kInkWin * (tp_rank == 0 ? c.n_vocab : c.vocab_n));
     tok_dev_.alloc(W); ids_dev_.alloc(R); rows_dev_.alloc(R); inv_dev_.alloc(R); argmax_dev_.alloc(kInkWin);
     w_dev_.alloc(R); wg_dev_.alloc(R);
     h_ids_.resize(R); h_w_.resize(R);
-    CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc((void **) &h_pos_, 4, cudaHostAllocDefault));
-    CUDA_CHECK(cudaHostAlloc((void **) &h_tau_, W * 4, cudaHostAllocDefault));
+    if (tp_rank == 0) {
+        CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocPortable));
+        CUDA_CHECK(cudaHostAlloc((void **) &h_pos_, 4, cudaHostAllocPortable));
+        CUDA_CHECK(cudaHostAlloc((void **) &h_tau_, W * 4, cudaHostAllocPortable));
+    }
     d_pos_.alloc(1);
     plan_buf_.alloc(sizeof(InkMoePlan));
     mh_.alloc((size_t) kInkMaxPairs * F); my_.alloc((size_t) kInkMaxPairs * E); mgu_.alloc((size_t) kInkMaxPairs * 2 * F);
@@ -92,6 +152,18 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     xh_.alloc((size_t) W * E); hh_.alloc((size_t) R * F); dh_.alloc((size_t) R * E);
     tc_items_gu_.alloc(c.n_expert); tc_items_dn_.alloc(c.n_expert); tc_blocks_.alloc(R / kTcTile + c.n_expert);
     moe_tc_set_situ(c.situ_beta, c.situ_lin);
+    if (tp_n > 1) {
+        for (auto & pt : inbox_)
+            for (auto & b : pt) b.alloc((size_t) W * E);
+        for (auto & evs : ev_) {
+            evs.resize(c.n_visits());
+            for (cudaEvent_t & e : evs) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_head_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming));
+        if (tp_rank == 1) head_part_.alloc((size_t) kInkWin * c.vocab_n);
+    }
     graphs_on_ = opt.use_graphs && env_int("BNK_INK_GRAPHS", 1) != 0;
     const int64_t maxcols = 2 * E;
     actq_.alloc((size_t) kInkWin * maxcols); actd_.alloc((size_t) kInkWin * maxcols / 32);
@@ -99,82 +171,98 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     act_.q = actq_; act_.d = actd_; act_.s = acts_; act_.h = acth_;
     gemm_.init(st_, (size_t) std::max<int64_t>((int64_t) c.q_dim() * E, (int64_t) 2 * F * E), (size_t) W * 2 * E);
     ckpts_.resize(kInkCkpts);
-    reset();
-    if (opt.verbose) {
-        size_t fr = 0, tot = 0;
-        cudaMemGetInfo(&fr, &tot);
-        fprintf(stderr, "bnk: inkling: context %d, K/V %.2f GiB (window rings of %d cells), prompt chunks of %d, %.1f GiB "
-                        "free on GPU %d\n", opt.max_ctx, kv_bytes_ / double(1 << 30), ring_, chunk_, fr / double(1 << 30), dev_);
-    }
+    reset_here();
 }
 
 // ------------------------------------------------------------------------------------------------ state
 void InkEngine::reset() {
-    DeviceScope ds(dev_);
     history_.clear();
     pending_T_ = 0;
     for (auto & k : ckpts_) k.pos = -1;
+    for (InkEngine * r : ranks()) r->reset_here();
+}
+
+void InkEngine::reset_here() {
+    DeviceScope ds(dev_);
     for (auto & V : visits_) CUDA_CHECK(cudaMemsetAsync(V.conv.p, 0, V.conv.n * 4, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
-void InkEngine::checkpoint() {
+// a snapshot: every rank's conv states and window rings into its slot `slot`
+void InkEngine::save_ckpt(int slot, int p) {
     DeviceScope ds(dev_);
-    const int p = pos();
-    if (p == 0) return;
-    for (auto & k : ckpts_)
-        if (k.pos == p) { k.age = ++ckpt_age_; return; }
-    Ckpt * slot = nullptr;
-    for (auto & k : ckpts_)
-        if (k.pos < 0) { slot = &k; break; }
-    if (!slot) slot = &*std::min_element(ckpts_.begin(), ckpts_.end(), [](const Ckpt & a, const Ckpt & b) { return a.age < b.age; });
+    Ckpt & k = ckpts_[slot];
     size_t nconv = 0, nring = 0;
     for (auto & V : visits_) {
         nconv += V.conv.n;
         if (V.window) nring += V.K.n + V.V.n;
     }
-    slot->conv.resize(nconv);
-    slot->ring.resize(nring);
+    k.conv.resize(nconv);
+    k.ring.resize(nring);
     size_t oc = 0, orr = 0;
     for (auto & V : visits_) {
-        CUDA_CHECK(cudaMemcpyAsync(slot->conv.data() + oc, V.conv.p, V.conv.n * 4, cudaMemcpyDeviceToHost, st_));
+        CUDA_CHECK(cudaMemcpyAsync(k.conv.data() + oc, V.conv.p, V.conv.n * 4, cudaMemcpyDeviceToHost, st_));
         oc += V.conv.n;
         if (V.window) {
-            CUDA_CHECK(cudaMemcpyAsync(slot->ring.data() + orr, V.K.p, V.K.n * 2, cudaMemcpyDeviceToHost, st_));
+            CUDA_CHECK(cudaMemcpyAsync(k.ring.data() + orr, V.K.p, V.K.n * 2, cudaMemcpyDeviceToHost, st_));
             orr += V.K.n;
-            CUDA_CHECK(cudaMemcpyAsync(slot->ring.data() + orr, V.V.p, V.V.n * 2, cudaMemcpyDeviceToHost, st_));
+            CUDA_CHECK(cudaMemcpyAsync(k.ring.data() + orr, V.V.p, V.V.n * 2, cudaMemcpyDeviceToHost, st_));
             orr += V.V.n;
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    slot->pos = p;
-    slot->age = ++ckpt_age_;
+    k.pos = p;
+}
+
+void InkEngine::load_ckpt(int slot) {
+    DeviceScope ds(dev_);
+    const Ckpt & k = ckpts_[slot];
+    size_t oc = 0, orr = 0;
+    for (auto & V : visits_) {
+        CUDA_CHECK(cudaMemcpyAsync(V.conv.p, k.conv.data() + oc, V.conv.n * 4, cudaMemcpyHostToDevice, st_));
+        oc += V.conv.n;
+        if (V.window) {
+            CUDA_CHECK(cudaMemcpyAsync(V.K.p, k.ring.data() + orr, V.K.n * 2, cudaMemcpyHostToDevice, st_));
+            orr += V.K.n;
+            CUDA_CHECK(cudaMemcpyAsync(V.V.p, k.ring.data() + orr, V.V.n * 2, cudaMemcpyHostToDevice, st_));
+            orr += V.V.n;
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+void InkEngine::checkpoint() {
+    const int p = pos();
+    if (p == 0) return;
+    for (auto & k : ckpts_)
+        if (k.pos == p) { k.age = ++ckpt_age_; return; }
+    int slot = -1;
+    for (int i = 0; i < (int) ckpts_.size(); ++i)
+        if (ckpts_[i].pos < 0) { slot = i; break; }
+    if (slot < 0)
+        slot = (int) (std::min_element(ckpts_.begin(), ckpts_.end(), [](const Ckpt & a, const Ckpt & b) { return a.age < b.age; }) - ckpts_.begin());
+    for (InkEngine * r : ranks()) r->save_ckpt(slot, p);
+    ckpts_[slot].age = ++ckpt_age_;
 }
 
 int InkEngine::rollback(int max_pos) {
-    DeviceScope ds(dev_);
-    Ckpt * best = nullptr;
-    for (auto & k : ckpts_)
-        if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (!best || k.pos > best->pos)) best = &k;
-    if (!best) return -1;
-    size_t oc = 0, orr = 0;
-    for (auto & V : visits_) {
-        CUDA_CHECK(cudaMemcpyAsync(V.conv.p, best->conv.data() + oc, V.conv.n * 4, cudaMemcpyHostToDevice, st_));
-        oc += V.conv.n;
-        if (V.window) {
-            CUDA_CHECK(cudaMemcpyAsync(V.K.p, best->ring.data() + orr, V.K.n * 2, cudaMemcpyHostToDevice, st_));
-            orr += V.K.n;
-            CUDA_CHECK(cudaMemcpyAsync(V.V.p, best->ring.data() + orr, V.V.n * 2, cudaMemcpyHostToDevice, st_));
-            orr += V.V.n;
-        }
+    int best = -1;
+    for (int i = 0; i < (int) ckpts_.size(); ++i) {
+        const auto & k = ckpts_[i];
+        if (k.pos >= 0 && k.pos <= max_pos && k.pos <= pos() && (best < 0 || k.pos > ckpts_[best].pos)) best = i;
     }
-    CUDA_CHECK(cudaStreamSynchronize(st_));
-    history_.resize(best->pos);
+    if (best < 0) return -1;
+    for (InkEngine * r : ranks()) r->load_ckpt(best);
+    const int p = ckpts_[best].pos;
+    history_.resize(p);
     pending_T_ = 0;
-    best->age = ++ckpt_age_;
+    ckpts_[best].age = ++ckpt_age_;
     for (auto & k : ckpts_)
-        if (k.pos > best->pos) k.pos = -1;
-    return best->pos;
+        if (k.pos > p) k.pos = -1;
+    for (InkEngine * r : ranks())
+        for (auto & k : r->ckpts_)
+            if (k.pos > p) k.pos = -1;
+    return p;
 }
 
 int InkEngine::reusable(const std::vector<int32_t> & prompt) const {
@@ -188,6 +276,25 @@ int InkEngine::reusable(const std::vector<int32_t> & prompt) const {
     for (const auto & k : ckpts_)
         if (k.pos >= 0 && k.pos <= lim && k.pos <= (int) h.size()) best = std::max(best, k.pos);
     return best;
+}
+
+// ------------------------------------------------------------------------------------------------ exchange
+// The all-reduce of a [T][E] partial with the peer, in two phases so that each rank records its event before the
+// other waits for it (a capture may not wait on an event recorded later): send pushes this rank's partial into the
+// peer's inbox for (point, visit parity) and marks it; recv waits for the peer's mark and adds the inbox. Both
+// ranks add the same two fp32 values, so their replicated state stays bit for bit identical.
+void InkEngine::send(int point, int v, const float * buf, int T) {
+    if (tp_n_ == 1) return;
+    DeviceScope ds(dev_);
+    CUDA_CHECK(cudaMemcpyAsync(peer_->inbox_[point][v & 1].p, buf, (size_t) T * model_.cfg.E * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaEventRecord(ev_[point][v], st_));
+}
+
+void InkEngine::recv(int point, int v, float * buf, int T) {
+    if (tp_n_ == 1) return;
+    DeviceScope ds(dev_);
+    CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->ev_[point][v], 0));
+    ink_add(buf, buf, inbox_[point][v & 1], (int64_t) T * model_.cfg.E, st_);
 }
 
 // ------------------------------------------------------------------------------------------------ pieces
@@ -320,19 +427,23 @@ float * InkEngine::fresh_block() {
     return blocks_buf_.p + (size_t) blk_next_++ * chunk_ * model_.cfg.E;
 }
 
-// One layer visit (llama.cpp's llama_model_inkling2::graph::build_layer).
-void InkEngine::layer(int v, int ip, int T, int pos0, std::vector<const float *> & blocks, const float * msgs,
-                      const InkLoop * loop, bool keep) {
+// ------------------------------------------------------------------------------------------------ the visit
+// A layer visit (llama.cpp's llama_model_inkling2::graph::build_layer) in three phases around the two all-reduces.
+// visit_a: the attention's inputs (depth mix, loop controls, norms), this rank's heads, the out projection's
+// partial into conv_in_.
+void InkEngine::visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bool keep) {
+    DeviceScope ds(dev_);
     const InkConfig & c = model_.cfg;
     const InkLayer & L = model_.layers[ip];
     const int E = c.E, H = c.n_head, KVH = c.n_head_kv, D = c.head_dim, KVD = c.kv_dim(), QD = c.q_dim();
     const size_t TE = (size_t) T * E;
     const bool swa = L.swa;
+    const float * msgs = loop ? msg_.p : nullptr;
+    if (loop) mix(bank_, bank_out_, loop->msg_query, 4, T, msg_);
 
-    // the attention's inputs
     const float * in[3] = {x_, x_, x_};
     if (L.attn_res_query) {
-        mix(blocks, x_, L.attn_res_query, L.attn_res_nq, T, mixed_);
+        mix(blocks_, x_, L.attn_res_query, L.attn_res_nq, T, mixed_);
         for (int j = 0; j < 3; ++j) in[j] = mixed_.p + (swa ? 0 : j) * TE;
     }
     float * a[3] = {ins_[0].p, ins_[1].p, ins_[2].p};
@@ -354,7 +465,6 @@ void InkEngine::layer(int v, int ip, int T, int pos0, std::vector<const float *>
         ink_rms(in[2], E, L.v_norm, a[2], E, T, E, c.rms_eps, st_);
     }
 
-    // q, k, v, the relative-position queries, the sinks
     mm(L.wq, a[0], E, T, q_, QD);
     mm(L.wk, a[1], E, T, conv_in_, KVD);
     if (!swa) mm(L.k_conv_proj, a[1], E, T, dyn_k_, KVH * c.n_conv);
@@ -391,35 +501,109 @@ void InkEngine::layer(int v, int ip, int T, int pos0, std::vector<const float *>
     }
     mm(L.wgate, a[0], E, T, gate_, QD);
     ink_mul_sigmoid(attn_, gate_, (int64_t) T * QD, st_);
-    mm(L.wo, attn_, QD, T, conv_in_, E);
-    conv(v, 2 * KVD, E, conv_in_, E, tmp_, T, L.attn_post_conv, nullptr, 1, keep);
+    mm(L.wo, attn_, QD, T, conv_in_, E);   // this rank's heads' share of the output (all-reduced next)
+}
 
+// visit_b: the out projection's sum through its conv, the residual / blocks, the FFN's input, this rank's share of
+// the experts into moe_
+void InkEngine::visit_b(int v, int ip, int T, const InkLoop * loop, bool keep) {
+    DeviceScope ds(dev_);
+    const InkConfig & c = model_.cfg;
+    const InkLayer & L = model_.layers[ip];
+    const int E = c.E, KVD = c.kv_dim();
+    const size_t TE = (size_t) T * E;
+    conv(v, 2 * KVD, E, conv_in_, E, tmp_, T, L.attn_post_conv, nullptr, 1, keep);
     // the first layer of each block starts a new residual stream; its input joins the blocks
     if (ip % c.res_block == 0) {
-        // a fresh buffer per push (the bank of the previous pass keeps pointing at its own)
-        float * b = fresh_block();
+        float * b = fresh_block();   // a fresh buffer per push (the bank of the previous pass keeps pointing at its own)
         CUDA_CHECK(cudaMemcpyAsync(b, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
-        blocks.push_back(b);
+        blocks_.push_back(b);
         CUDA_CHECK(cudaMemcpyAsync(x_, tmp_, TE * 4, cudaMemcpyDeviceToDevice, st_));
     } else {
         ink_add(x_, x_, tmp_, (int64_t) TE, st_);
     }
     CUDA_CHECK(cudaMemcpyAsync(ffn_inp_, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
-
-    // MoE
-    mix(blocks, ffn_inp_, L.ffn_res_query, 1, T, mixed_);
-    if (msgs) control(mixed_, msgs + 3 * TE, *loop, 3, T);
+    mix(blocks_, ffn_inp_, L.ffn_res_query, 1, T, mixed_);
+    if (loop) control(mixed_, msg_.p + 3 * TE, *loop, 3, T);
     ink_rms(mixed_, E, L.ffn_norm, o_, E, T, E, c.rms_eps, st_);
     moe(L, o_, T, moe_);
-    conv(v, 2 * KVD + E, E, moe_, E, tmp_, T, L.ffn_post_conv, nullptr, 1, keep);
-    ink_add(x_, ffn_inp_, tmp_, (int64_t) TE, st_);
+}
+
+// visit_c: the MoE's sum through its conv, the residual
+void InkEngine::visit_c(int v, int T, bool keep) {
+    DeviceScope ds(dev_);
+    const InkConfig & c = model_.cfg;
+    const int E = c.E, KVD = c.kv_dim();
+    const int ip = v < c.n_layer ? v : c.loop_start + (v - c.n_layer) % c.n_core();
+    conv(v, 2 * KVD + E, E, moe_, E, tmp_, T, model_.layers[ip].ffn_post_conv, nullptr, 1, keep);
+    ink_add(x_, ffn_inp_, tmp_, (int64_t) T * E, st_);
+}
+
+// the window's inputs (staged in rank 0's pinned buffers) and the embedding
+void InkEngine::fwd_in(int T) {
+    DeviceScope ds(dev_);
+    const InkConfig & c = model_.cfg;
+    const int E = c.E;
+    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_tok_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(d_pos_.p, h_pos_, 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(tau_.p, h_tau_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
+    dequant_gather(model_.tok_embd, tok_dev_, T, x_, st_);
+    ink_rms(x_, E, model_.tok_norm, x_, E, T, E, c.rms_eps, st_);
+    blk_next_ = 0;
+    blocks_.clear();
+    bank_.clear();
+    bank_out_ = nullptr;
+}
+
+// the start of a pass through the core: pass 0 keeps the prelude's output; the later ones mix the previous pass's
+// bank into their messages and start again from the prelude
+void InkEngine::pass_begin(int pass, int T) {
+    DeviceScope ds(dev_);
+    const size_t TE = (size_t) T * model_.cfg.E;
+    if (pass == 0) {
+        prelude_ = fresh_block();
+        CUDA_CHECK(cudaMemcpyAsync(prelude_, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
+        prelude_blocks_ = blocks_;
+        return;
+    }
+    bank_.assign(blocks_.begin() + prelude_blocks_.size() + 1, blocks_.end());
+    bank_out_ = fresh_block();
+    CUDA_CHECK(cudaMemcpyAsync(bank_out_, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(x_, prelude_, TE * 4, cudaMemcpyDeviceToDevice, st_));
+    blocks_ = prelude_blocks_;
+}
+
+// the output: mixed over the blocks and normed (head_prep), then rows [r0, r0 + n) through this rank's vocabulary
+// rows, soft-capped, into logits rows 0.. (rank 1's go into rank 0's logits after its own)
+void InkEngine::head_prep(int T) {
+    DeviceScope ds(dev_);
+    const InkConfig & c = model_.cfg;
+    mix(blocks_, x_, model_.output_res_query, 1, T, mixed_);
+    ink_rms(mixed_, c.E, model_.output_norm, o_, c.E, T, c.E, c.rms_eps, st_);
+}
+
+void InkEngine::head_rows(int r0, int n) {
+    DeviceScope ds(dev_);
+    const InkConfig & c = model_.cfg;
+    const int E = c.E, V = c.n_vocab;
+    float * dst = tp_rank_ == 0 ? logits_.p + c.vocab0 : head_part_.p;
+    const int ld = tp_rank_ == 0 ? V : c.vocab_n;
+    mm(model_.output, o_.p + (size_t) r0 * E, E, n, dst, ld);
+    if (c.softcap > 0) {
+        if (ld == c.vocab_n) ink_softcap(dst, (int64_t) n * ld, c.softcap, st_);
+        else
+            for (int i = 0; i < n; ++i) ink_softcap(dst + (size_t) i * ld, c.vocab_n, c.softcap, st_);
+    }
+    if (tp_rank_ == 1) {
+        CUDA_CHECK(cudaMemcpy2DAsync(peer_->logits_.p + c.vocab0, (size_t) V * 4, dst, (size_t) ld * 4,
+                                     (size_t) c.vocab_n * 4, n, cudaMemcpyDeviceToDevice, st_));
+        CUDA_CHECK(cudaEventRecord(ev_head_, st_));
+    }
 }
 
 // The whole forward over T rows at positions pos()..pos()+T-1 (llama_model_inkling2_loop::graph).
 void InkEngine::run(const int32_t * tokens, int T, bool keep) {
     const InkConfig & c = model_.cfg;
-    const int E = c.E;
-    const size_t TE = (size_t) T * E;
     const int pos0 = pos();
     if (T < 1 || T > chunk_) throw std::runtime_error("inkling: window out of range");
     if (pos0 + T > opt_.max_ctx) throw std::runtime_error("inkling: context full");
@@ -427,6 +611,7 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
     *h_pos_ = pos0;
     for (int t = 0; t < T; ++t)
         h_tau_[t] = 1.f + c.log_alpha * logf(std::max(1.f, (float) (pos0 + t + 1) / c.log_floor));
+    DeviceScope ds(dev_);
     if (T <= kInkWin && graphs_on_ && !logits_hook) {
         cudaGraphExec_t & g = graphs_[T][keep ? 1 : 0];
         if (!g) {
@@ -442,84 +627,79 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
     } else {
         enqueue(T, keep);
     }
-    logits_rows_ = T <= kInkWin ? T : logits_hook ? T - (T - 1) / kInkWin * kInkWin : 1;
-    if (logits_hook) {
-        CUDA_CHECK(cudaStreamSynchronize(st_));
-        if (T <= kInkWin) logits_hook(pos0, T, logits_);
-    }
+    logits_rows_ = T <= kInkWin ? T : logits_hook ? hook_last_.second : 1;
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    if (logits_hook) logits_hook(T <= kInkWin ? pos0 : hook_last_.first, logits_rows_, logits_);
     last_T = logits_rows_;
     history_.insert(history_.end(), tokens, tokens + T);
 }
 
-// The forward's GPU work for T rows whose inputs are staged (h_tok_, h_pos_, h_tau_): no host round trip for
-// windows of up to kInkWin rows (captured as a graph); prompt chunks group their experts on the host.
+// The forward's GPU work for T rows whose inputs are staged (h_tok_, h_pos_, h_tau_), on every rank: each phase on
+// each rank, then the exchange. Decode windows have no host round trip (one graph over both GPUs: rank 1's stream
+// forks from rank 0's and joins it at the end); prompt chunks group their experts on the host.
 void InkEngine::enqueue(int T, bool keep) {
     const InkConfig & c = model_.cfg;
-    const int E = c.E;
-    const size_t TE = (size_t) T * E;
     const int pos0 = *h_pos_;
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_tok_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(d_pos_.p, h_pos_, 4, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(tau_.p, h_tau_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
-    dequant_gather(model_.tok_embd, tok_dev_, T, x_, st_);
-    ink_rms(x_, E, model_.tok_norm, x_, E, T, E, c.rms_eps, st_);
-
-    blk_next_ = 0;
-    auto fresh = [&]() { return fresh_block(); };
-    std::vector<const float *> blocks;
-    int v = 0;
-    for (int il = 0; il < c.loop_start; ++il) layer(v++, il, T, pos0, blocks, nullptr, nullptr, keep);
-    float * prelude = fresh();
-    CUDA_CHECK(cudaMemcpyAsync(prelude, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
-    const std::vector<const float *> prelude_blocks = blocks;
-    for (int pass = 0; pass < c.loop_count; ++pass) {
-        std::vector<const float *> bank;
-        float * bank_out = nullptr;
-        if (pass > 0) {
-            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-            bank_out = fresh();
-            CUDA_CHECK(cudaMemcpyAsync(bank_out, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
-            CUDA_CHECK(cudaMemcpyAsync(x_, prelude, TE * 4, cudaMemcpyDeviceToDevice, st_));
-            blocks = prelude_blocks;
+    auto rk = ranks();
+    if (rank1_) {   // rank 1 starts after rank 0's previous work (and joins a capture)
+        CUDA_CHECK(cudaEventRecord(ev_fork_, st_));
+        DeviceScope d1(rank1_->dev_);
+        CUDA_CHECK(cudaStreamWaitEvent(rank1_->st_, ev_fork_, 0));
+    }
+    for (InkEngine * r : rk) r->fwd_in(T);
+    // core layers in passes > 0 take loop controls: each rank its own copy of them (rank 0's read over PCIe made
+    // rank 1's controls 4-10x slower)
+    auto visit = [&](int v, int ip, bool looped) {
+        for (InkEngine * r : rk) {
+            const InkLoop * loop = looped ? &r->model_.loops[ip - c.loop_start] : nullptr;
+            r->visit_a(v, ip, T, pos0, loop, keep);
+            r->send(0, v, r->conv_in_, T);
         }
+        for (InkEngine * r : rk) {
+            const InkLoop * loop = looped ? &r->model_.loops[ip - c.loop_start] : nullptr;
+            r->recv(0, v, r->conv_in_, T);
+            r->visit_b(v, ip, T, loop, keep);
+            r->send(1, v, r->moe_, T);
+        }
+        for (InkEngine * r : rk) {
+            r->recv(1, v, r->moe_, T);
+            r->visit_c(v, T, keep);
+        }
+    };
+    for (int il = 0; il < c.loop_start; ++il) visit(il, il, false);
+    for (int pass = 0; pass < c.loop_count; ++pass) {
+        for (InkEngine * r : rk) r->pass_begin(pass, T);
         for (int ip = c.loop_start; ip < c.loop_end; ++ip) {
             const int slot = pass == 0 ? ip : c.n_layer + (pass - 1) * c.n_core() + (ip - c.loop_start);
-            if (pass == 0) {
-                layer(slot, ip, T, pos0, blocks, nullptr, nullptr, keep);
-                continue;
-            }
-            const InkLoop & lp = model_.loops[ip - c.loop_start];
-            mix(bank, bank_out, lp.msg_query, 4, T, msg_);
-            layer(slot, ip, T, pos0, blocks, msg_, &lp, keep);
+            visit(slot, ip, pass > 0);
         }
     }
-    for (int il = c.loop_end; il < c.n_layer; ++il) layer(il, il, T, pos0, blocks, nullptr, nullptr, keep);
-
-    // the output: mixed over the blocks, normed, the head (unpadded rows), soft-capped
-    mix(blocks, x_, model_.output_res_query, 1, T, mixed_);
-    ink_rms(mixed_, E, model_.output_norm, o_, E, T, E, c.rms_eps, st_);
-    const QMat head = qmat_rows(model_.output, 0, c.n_vocab);
-    auto head_rows = [&](int r0, int n) {
-        mm(head, o_.p + (size_t) r0 * E, E, n, logits_, c.n_vocab);
-        if (c.softcap > 0) ink_softcap(logits_, (int64_t) n * c.n_vocab, c.softcap, st_);
+    for (int il = c.loop_end; il < c.n_layer; ++il) visit(il, il, false);
+    for (InkEngine * r : rk) r->head_prep(T);
+    auto head = [&](int r0, int n) {
+        for (InkEngine * r : rk) r->head_rows(r0, n);
+        if (rank1_) {   // rank 0 waits for rank 1's logits rows (and joins its stream back)
+            DeviceScope d0(dev_);
+            CUDA_CHECK(cudaStreamWaitEvent(st_, rank1_->ev_head_, 0));
+        }
     };
     if (T <= kInkWin) {
-        head_rows(0, T);   // a decode / verify window: every row
-    } else if (logits_hook) {   // tests: every row of a prompt chunk (the last piece stays in logits_)
+        head(0, T);   // a decode / verify window: every row
+    } else if (logits_hook) {   // tests: every row of a prompt chunk, 16 at a time (the last piece stays in logits_)
         for (int r0 = 0; r0 < T; r0 += kInkWin) {
             const int n = std::min(kInkWin, T - r0);
-            head_rows(r0, n);
+            head(r0, n);
+            DeviceScope d0(dev_);
             CUDA_CHECK(cudaStreamSynchronize(st_));
-            logits_hook(pos0 + r0, n, logits_);
+            if (r0 + n < T) logits_hook(pos0 + r0, n, logits_);   // the last piece: after run()
+            hook_last_ = {pos0 + r0, n};
         }
     } else {
-        head_rows(T - 1, 1);   // a prompt chunk: its last row
+        head(T - 1, 1);   // a prompt chunk: its last row
     }
 }
 
 void InkEngine::prefill(const std::vector<int32_t> & tokens) {
-    DeviceScope ds(dev_);
     if (pending_T_) throw std::runtime_error("inkling: prefill with a verify window pending");
     const double t0 = now_ms();
     for (size_t i = 0; i < tokens.size(); i += chunk_) {
@@ -548,13 +728,17 @@ void InkEngine::forward_batch(const std::vector<BatchWin> & wins) {
 }
 
 void InkEngine::commit(int cnt) {
-    DeviceScope ds(dev_);
     if (pending_T_ == 0) throw std::runtime_error("commit: no verify window pending");
     if (cnt < 1 || cnt > pending_T_) throw std::runtime_error("commit: count out of range");
-    for (auto & V : visits_) ink_conv_advance(V.win_in, V.conv, cnt, conv_ch_, st_);
-    CUDA_CHECK(cudaStreamSynchronize(st_));
+    for (InkEngine * r : ranks()) r->commit_here(cnt);
     history_.resize(history_.size() - (pending_T_ - cnt));
     pending_T_ = 0;
+}
+
+void InkEngine::commit_here(int cnt) {
+    DeviceScope ds(dev_);
+    for (auto & V : visits_) ink_conv_advance(V.win_in, V.conv, cnt, conv_ch_, st_);
+    CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 // ------------------------------------------------------------------------------------------------ logits

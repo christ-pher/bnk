@@ -1,7 +1,14 @@
-// The Inkling 2 engine (inkling2_loop): every weight on one GPU, one conversation slot, the forward over a window
-// of tokens (decode / verify, up to kInkWin) or a prompt chunk. A token visits 48 layers (the core three times);
-// each visit has its own K/V cache (window layers: a ring of window + chunk cells; full layers: the context) and its
-// short-convolution state. docs/INKLING-PLAN.md.
+// The Inkling 2 engine (inkling2_loop): one conversation slot, the forward over a window of tokens (decode /
+// verify, up to kInkWin) or a prompt chunk. A token visits 48 layers (the core three times); each visit has its own
+// K/V cache (window layers: a ring of window + chunk cells; full layers: the context) and its short-convolution
+// state. docs/INKLING-PLAN.md.
+//
+// Two GPUs (EngineOptions::gpus, the default when there are two): tensor parallel. Each rank holds half the query
+// and KV heads (their caches and conv channels), half of every expert's FFN width and half the vocabulary; the
+// depth mixes, norms, loop controls, routers and the post-attention / post-FFN convolutions run on both (the same
+// inputs, the same results). Two all-reduces a visit: the attention's output projection and the MoE, each rank
+// pushing its partial into the peer's inbox. Rank 0 is this object and drives both GPUs; a decode window is one
+// CUDA graph over both devices.
 #pragma once
 
 #include <functional>
@@ -31,7 +38,9 @@ public:
     void load(const std::string & path, const EngineOptions & opt);
 
     // ---- EngineApi
-    std::vector<int> devices() const override { return {dev_}; }
+    std::vector<int> devices() const override {
+        return rank1_ ? std::vector<int>{dev_, rank1_->dev_} : std::vector<int>{dev_};
+    }
     int device() const override { return dev_; }
     int last_device() const override { return dev_; }
     int stages() const override { return 1; }
@@ -95,6 +104,34 @@ public:
 
 private:
     int dev_ = 0;
+    // ---- tensor parallel
+    int tp_n_ = 1, tp_rank_ = 0;
+    InkEngine * peer_ = nullptr;           // the other rank
+    std::unique_ptr<InkEngine> rank1_;     // owned by rank 0
+    bool p2p_ = false;
+    DevBuf<float> inbox_[2][2];            // [point: attention / MoE][visit parity]: the peer's partial [W][E]
+    std::vector<cudaEvent_t> ev_[2];       // per point and visit: this rank's partial is in the peer's inbox
+    cudaEvent_t ev_head_ = nullptr, ev_fork_ = nullptr, ev_join_ = nullptr;
+    DevBuf<float> head_part_;              // rank 1: its vocabulary rows' logits [kInkWin][vocab_n]
+    std::vector<InkEngine *> ranks() { return rank1_ ? std::vector<InkEngine *>{this, rank1_.get()} : std::vector<InkEngine *>{this}; }
+    void load_rank(const std::string & path, const EngineOptions & opt, int dev, int tp_n, int tp_rank);
+    void send(int point, int v, const float * buf, int T);
+    void recv(int point, int v, float * buf, int T);
+    // the visit in three phases around the exchanges (layer() runs them back to back on one GPU)
+    std::vector<const float *> blocks_, prelude_blocks_, bank_;
+    float * prelude_ = nullptr, * bank_out_ = nullptr;
+    void fwd_in(int T);
+    void pass_begin(int pass, int T);
+    void visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bool keep);   // to the out projection's partial
+    void visit_b(int v, int ip, int T, const InkLoop * loop, bool keep);             // to the MoE's partial
+    void visit_c(int v, int T, bool keep);                                           // the FFN's conv and residual
+    void head_prep(int T);
+    void head_rows(int r0, int n);
+    std::pair<int, int> hook_last_{0, 0};
+    void reset_here();
+    void save_ckpt(int slot, int pos);
+    void load_ckpt(int slot);
+    void commit_here(int cnt);
     EngineOptions opt_;
     InkModel model_;
     cudaStream_t st_ = nullptr;
@@ -160,9 +197,7 @@ private:
 
     void run(const int32_t * tokens, int T, bool commit_all);
     void mm(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy, bool acc = false);
-    // one layer visit: slot v of physical layer ip; blocks the depth-mix list; msgs [4][T][E] for passes > 0
-    void layer(int v, int ip, int T, int pos0, std::vector<const float *> & blocks, const float * msgs,
-               const InkLoop * loop, bool keep);
+
     void mix(const std::vector<const float *> & blocks, const float * cur, const float * query, int nq, int T,
              float * out);
     void control(float * cur, const float * msg, const InkLoop & loop, int j, int T);

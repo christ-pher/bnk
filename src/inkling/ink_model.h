@@ -32,6 +32,9 @@ struct InkConfig {
     float softcap = 0;                        // final logit soft cap (30)
     int loop_start = 0, loop_end = 0, loop_count = 1, gate_rank = 0;   // core [start, end) runs loop_count times
     int eos = 0, pad = 0;
+    // tensor parallel: this rank's share (n_head, n_head_kv and n_ff above are the local ones)
+    int tp_n = 1, tp_rank = 0;
+    int vocab0 = 0, vocab_n = 0;              // the head's rows on this rank
 
     int n_core() const { return loop_end - loop_start; }
     int n_visits() const { return n_layer + (loop_count - 1) * n_core(); }   // cache slots (48)
@@ -82,7 +85,8 @@ struct InkModel {
     const float * tok_norm = nullptr, * output_norm = nullptr, * output_res_query = nullptr;
     size_t vram_bytes = 0;
 
-    void load(const std::string & path, bool verbose);
+    // tp_n > 1: rank tp_rank's share of the heads, of every expert's FFN width and of the vocabulary
+    void load(const std::string & path, bool verbose, int tp_n = 1, int tp_rank = 0);
     ~InkModel();
 
     // expert e's rows of a stacked expert matrix (n experts)
@@ -93,6 +97,12 @@ struct InkModel {
 
 private:
     std::vector<void *> allocs_;
+    using Ranges = std::vector<std::pair<int64_t, int64_t>>;
+    QMat upload_bytes(const std::string & name, const std::vector<uint8_t> & host, int64_t rows, int64_t cols, int type);
+    // the rows [r0, r1) of each range, or the columns [c0, c1) of every row (whole quant blocks), as one matrix
+    QMat upload_rows(const std::string & name, const Ranges & rows);
+    QMat upload_cols(const std::string & name, const Ranges & cols);
+    const float * upload_f32_range(const std::string & name, int64_t off, int64_t n);
     QMat upload(const std::string & name, bool required = true);
     const float * upload_vec(const std::vector<float> & v);
     const float * upload_f32(const std::string & name, size_t expect, bool required = true);
