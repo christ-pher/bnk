@@ -132,6 +132,8 @@ private:
     void save_ckpt(int slot, int pos);
     void load_ckpt(int slot);
     void commit_here(int cnt);
+    void controls(const InkLoop * loop, int j0, int n, const float * const * cur, const float * const * msg,
+                  float * const * out, const float * const * norm, int T);
     EngineOptions opt_;
     InkModel model_;
     cudaStream_t st_ = nullptr;
@@ -165,6 +167,8 @@ private:
     DevBuf<float> x_, ffn_inp_, mixed_, ins_[3], attn_, o_, tmp_,
         moe_, rlog_, conv_in_, kc_, vc_, ctrl_in_, ctrl_g_, ctrl_gf_, proj_, msg_, tau_, gx_, gu_, gh_, gd_, rb_;
     DevBuf<float> mix_sc_;       // the depth mix's scores
+    DevBuf<float> conv_scratch_; // prompt chunks' conv inputs
+    const float * peer_in_[2] = {nullptr, nullptr};   // the peer's partials (the inbox) for the next conv
     DevBuf<float> blocks_buf_;   // [kMaxBlocks][chunk][E]
     static constexpr int kMaxBlocks = 12;
     DevBuf<float> logits_;       // [kInkWin][n_vocab_pad] (all_logits: [chunk])

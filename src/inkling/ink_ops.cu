@@ -1,5 +1,6 @@
 #include "inkling/ink_ops.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cuda_bf16.h>
 #include <cmath>
@@ -467,6 +468,217 @@ __global__ void k_round_bf16(const float * x, int64_t ldx, int cols, float * y) 
         y[(int64_t) t * cols + i] = __bfloat162float(__float2bfloat16(x[(int64_t) t * ldx + i]));
 }
 
+struct ConvJobs { InkConvJob j[kInkConvJobs]; };
+
+// decode windows: a thread per (channel, job), the tokens in order
+__global__ void k_conv_jobs(ConvJobs J, int T, int64_t lds, int64_t ldw, int n_keep) {
+    const InkConvJob & jb = J.j[blockIdx.y];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, C = jb.C;
+    if (c >= C) return;
+    float * st = jb.state;
+    float h0 = st[c], h1 = st[lds + c], h2 = st[2 * lds + c];
+    const float w0 = jb.w[c * 4], w1 = jb.w[c * 4 + 1], w2 = jb.w[c * 4 + 2], w3 = jb.w[c * 4 + 3];
+    const int hd = jb.dyn ? c / (C / jb.H) : 0;
+    float k0 = h0, k1 = h1, k2 = h2;
+    for (int t = 0; t < T; ++t) {
+        float xt = jb.x[(int64_t) t * jb.ldx + c];
+        if (jb.x2) xt += jb.x2[(int64_t) t * C + c];
+        if (jb.win) jb.win[(int64_t) t * ldw + c] = xt;
+        float o = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt;
+        if (jb.dyn) {
+            const float * d = jb.dyn + (int64_t) t * jb.ld_dyn + hd * 4;
+            o += d[0] * xt + d[1] * h2 + d[2] * h1 + d[3] * h0;
+        }
+        float y = (xt + o) * jb.scale;
+        if (jb.res) y += jb.res[(int64_t) t * C + c];
+        jb.y[(int64_t) t * C + c] = y;
+        if (jb.y2) jb.y2[(int64_t) t * C + c] = y;
+        h0 = h1; h1 = h2; h2 = xt;
+        if (t + 1 == n_keep) { k0 = h0; k1 = h1; k2 = h2; }
+    }
+    if (n_keep > 0) { st[c] = k0; st[lds + c] = k1; st[2 * lds + c] = k2; }
+}
+
+// prompt chunks: a thread per (channel, token, job); the input sum first (X), the state advanced afterwards
+__global__ void k_conv_jobs_sum(ConvJobs J, int T, float * xs, int64_t ldxs) {
+    const InkConvJob & jb = J.j[blockIdx.z];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= jb.C) return;
+    float xt = jb.x[(int64_t) t * jb.ldx + c];
+    if (jb.x2) xt += jb.x2[(int64_t) t * jb.C + c];
+    xs[(int64_t) blockIdx.z * T * ldxs + (int64_t) t * ldxs + c] = xt;
+}
+__global__ void k_conv_jobs_par(ConvJobs J, int T, const float * xs, int64_t ldxs, int64_t lds) {
+    const InkConvJob & jb = J.j[blockIdx.z];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, C = jb.C;
+    if (c >= C) return;
+    const float * x = xs + (int64_t) blockIdx.z * T * ldxs;
+    float X[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        X[k] = tt >= 0 ? x[(int64_t) tt * ldxs + c] : jb.state[(int64_t) (3 + tt) * lds + c];
+    }
+    float o = jb.w[c * 4] * X[0] + jb.w[c * 4 + 1] * X[1] + jb.w[c * 4 + 2] * X[2] + jb.w[c * 4 + 3] * X[3];
+    if (jb.dyn) {
+        const float * d = jb.dyn + (int64_t) t * jb.ld_dyn + (c / (C / jb.H)) * 4;
+        o += d[0] * X[3] + d[1] * X[2] + d[2] * X[1] + d[3] * X[0];
+    }
+    float y = (X[3] + o) * jb.scale;
+    if (jb.res) y += jb.res[(int64_t) t * C + c];
+    jb.y[(int64_t) t * C + c] = y;
+    if (jb.y2) jb.y2[(int64_t) t * C + c] = y;
+}
+__global__ void k_conv_jobs_keep(ConvJobs J, int T, const float * xs, int64_t ldxs, int64_t lds, int n) {
+    const InkConvJob & jb = J.j[blockIdx.y];
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= jb.C) return;
+    const float * x = xs + (int64_t) blockIdx.y * T * ldxs;
+    float g[3] = {jb.state[c], jb.state[lds + c], jb.state[2 * lds + c]};
+    for (int t = max(0, n - 3); t < n; ++t) { g[0] = g[1]; g[1] = g[2]; g[2] = x[(int64_t) t * ldxs + c]; }
+    if (n < 3) {
+        float h[3] = {jb.state[c], jb.state[lds + c], jb.state[2 * lds + c]};
+        for (int t = 0; t < n; ++t) { h[0] = h[1]; h[1] = h[2]; h[2] = x[(int64_t) t * ldxs + c]; }
+        g[0] = h[0]; g[1] = h[1]; g[2] = h[2];
+    }
+    jb.state[c] = g[0]; jb.state[lds + c] = g[1]; jb.state[2 * lds + c] = g[2];
+}
+
+// a warp per row: q (H rows of D, clipped with q_clip and tau), R (H rows of n_rel, rel_clip and tau), k (KVH rows,
+// clipped), v (KVH rows, RMS-normed) of each token
+__global__ void k_post_proj(float * q, float * R, int64_t ld, const float * q_clip, const float * rel_clip, float qk_clip,
+                            float rel_thr, const float * tau, float * k, float * v, int T, int H, int KVH, int D,
+                            int n_rel, float eps) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int per = 2 * H + 2 * KVH;
+    if (row >= T * per) return;
+    const int t = row / per, r = row % per;
+    float * x;
+    const float * sc = nullptr;
+    int n;
+    float thr, tf = 1.f;
+    bool rms = false;
+    if (r < H) { x = q + (int64_t) t * ld + (int64_t) r * D; sc = q_clip + r * D; n = D; thr = qk_clip; if (tau) tf = tau[t]; }
+    else if (r < 2 * H) { const int h = r - H; x = R + (int64_t) t * ld + (int64_t) h * n_rel; sc = rel_clip + h * n_rel; n = n_rel; thr = rel_thr; if (tau) tf = tau[t]; }
+    else if (r < 2 * H + KVH) { x = k + ((int64_t) t * KVH + (r - 2 * H)) * D; n = D; thr = qk_clip; }
+    else { x = v + ((int64_t) t * KVH + (r - 2 * H - KVH)) * D; n = D; thr = 0; rms = true; }
+    float ss = 0;
+    for (int i = lane; i < n; i += 32) {
+        const float y = x[i] * (sc ? sc[i] : 1.f);
+        ss += y * y;
+    }
+    ss = warp_sum(ss);
+    const float f = rms ? rsqrtf(ss / n + eps) : thr / fmaxf(sqrtf(ss), thr) * tf;
+    for (int i = lane; i < n; i += 32) x[i] = x[i] * (sc ? sc[i] : 1.f) * f;
+}
+
+struct CtrlJobs { InkCtrlJob j[kInkCtrlJobs]; };
+
+__global__ void k_ctrl_concat(CtrlJobs J, int E) {
+    __shared__ float red[8];
+    const InkCtrlJob & jb = J.j[blockIdx.y];
+    const int t = blockIdx.x;
+    for (int part = 0; part < 2; ++part) {
+        const float * x = (part ? jb.msg : jb.cur) + (int64_t) t * E;
+        float ss = 0;
+        for (int i = threadIdx.x; i < E; i += blockDim.x) ss += x[i] * x[i];
+        ss = block_sum256(ss, red);
+        const float r = rsqrtf(ss / E + 1e-6f);
+        for (int i = threadIdx.x; i < E; i += blockDim.x) jb.in2[(int64_t) t * 2 * E + part * E + i] = x[i] * r;
+    }
+}
+
+__device__ __forceinline__ void bf16x8(const uint4 q, float * w) {
+    const uint32_t u[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { w[2 * k] = __uint_as_float(u[k] << 16); w[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u); }
+}
+
+// g[t][r] = down[r] . in2[t] (rank rows of 2E): a warp per (row, job), lanes over the row's 8-value chunks
+template <int NT>
+__global__ void k_ctrl_down(CtrlJobs J, int T, int E, int rank) {
+    const InkCtrlJob & jb = J.j[blockIdx.y];
+    const int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (r >= rank) return;
+    const int K = 2 * E;
+    const uint4 * row = (const uint4 *) ((const uint16_t *) jb.down + (int64_t) r * K);
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int c = lane; c < K / 8; c += 32) {
+        float w[8];
+        bf16x8(row[c], w);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= T) break;
+            const float4 a = *(const float4 *) (jb.in2 + (int64_t) t * K + c * 8);
+            const float4 b = *(const float4 *) (jb.in2 + (int64_t) t * K + c * 8 + 4);
+            acc[t] += w[0] * a.x + w[1] * a.y + w[2] * a.z + w[3] * a.w + w[4] * b.x + w[5] * b.y + w[6] * b.z + w[7] * b.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        if (t >= T) break;
+        const float v = warp_sum(acc[t]);
+        if (lane == 0) jb.g[(int64_t) t * rank + r] = v;
+    }
+}
+
+// gf[t][r] = gfw[r] . g[t] (2E rows of rank): a thread per (row, job), g in shared memory
+template <int NT>
+__global__ void k_ctrl_up(CtrlJobs J, int T, int E, int rank) {
+    extern __shared__ float gs[];   // [T][rank]
+    const InkCtrlJob & jb = J.j[blockIdx.y];
+    for (int i = threadIdx.x; i < T * rank; i += blockDim.x) gs[i] = jb.g[i];
+    __syncthreads();
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= 2 * E) return;
+    const uint4 * row = (const uint4 *) ((const uint16_t *) jb.gfw + (int64_t) r * rank);
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int c = 0; c < rank / 8; ++c) {
+        float w[8];
+        bf16x8(row[c], w);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if (t >= T) break;
+            const float * g = gs + t * rank + c * 8;
+            acc[t] += w[0] * g[0] + w[1] * g[1] + w[2] * g[2] + w[3] * g[3] + w[4] * g[4] + w[5] * g[5] + w[6] * g[6] + w[7] * g[7];
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+        if (t < T) jb.gf[(int64_t) t * 2 * E + r] = acc[t];
+}
+
+// out = cur - tanh(f) cur + tanh(g) msg, then (norm) its RMS norm: a block per (token, job)
+__global__ void k_ctrl_combine_norm(CtrlJobs J, int E, float eps) {
+    __shared__ float red[8];
+    const InkCtrlJob & jb = J.j[blockIdx.y];
+    const int t = blockIdx.x;
+    constexpr int kPer = 16;   // E <= 4096 at 256 threads
+    float o[kPer];
+    float ss = 0;
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * blockDim.x;
+        o[k] = 0.f;
+        if (i < E) {
+            const int64_t x = (int64_t) t * E + i;
+            const float g = jb.gf[(int64_t) t * 2 * E + i], f = jb.gf[(int64_t) t * 2 * E + E + i];
+            o[k] = jb.cur[x] - tanhf(f) * jb.cur[x] + tanhf(g) * jb.msg[x];
+            ss += o[k] * o[k];
+        }
+    }
+    const float r = jb.norm ? rsqrtf(block_sum256(ss, red) / E + eps) : 1.f;
+#pragma unroll
+    for (int k = 0; k < kPer; ++k) {
+        const int i = threadIdx.x + k * blockDim.x;
+        if (i < E) jb.out[(int64_t) t * E + i] = jb.norm ? o[k] * r * jb.norm[i] : o[k];
+    }
+}
+
 int grid_for(int64_t n, int threads = 256) { return (int) std::min<int64_t>((n + threads - 1) / threads, 4096); }
 
 }  // namespace
@@ -593,6 +805,65 @@ void ink_mul_sigmoid_rows(float * x, const float * g, int64_t ldg, int T, int n,
 void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s) {
     k_round_bf16<<<dim3((cols + 255) / 256, T), 256, 0, s>>>(x, ldx, cols, y);
     check_launch("ink_round_bf16");
+}
+
+void ink_conv_jobs(const InkConvJob * jobs, int n, int T, int64_t ld_state, int64_t ld_win, int n_keep, float * xs,
+                   cudaStream_t s) {
+    if (n < 1 || n > kInkConvJobs) throw std::runtime_error("ink_conv_jobs: jobs");
+    ConvJobs J{};
+    int C = 0;
+    for (int i = 0; i < n; ++i) { J.j[i] = jobs[i]; C = std::max(C, jobs[i].C); }
+    if (T <= 16) {
+        k_conv_jobs<<<dim3((C + 127) / 128, n), 128, 0, s>>>(J, T, ld_state, ld_win, n_keep);
+    } else {
+        // the inputs' sums first (the state rows read below are the old ones), then the outputs, then the state
+        k_conv_jobs_sum<<<dim3((C + 127) / 128, T, n), 128, 0, s>>>(J, T, xs, C);
+        k_conv_jobs_par<<<dim3((C + 127) / 128, T, n), 128, 0, s>>>(J, T, xs, C, ld_state);
+        if (n_keep > 0) k_conv_jobs_keep<<<dim3((C + 127) / 128, n), 128, 0, s>>>(J, T, xs, C, ld_state, n_keep);
+    }
+    check_launch("ink_conv_jobs");
+}
+
+void ink_post_proj(float * q, float * R, int64_t ld, const float * q_clip, const float * rel_clip, float qk_clip,
+                   float rel_thr, const float * tau, float * k, float * v, int T, int H, int KVH, int D, int n_rel,
+                   float eps, cudaStream_t s) {
+    const int rows = T * (2 * H + 2 * KVH);
+    k_post_proj<<<(rows + 7) / 8, 256, 0, s>>>(q, R, ld, q_clip, rel_clip, qk_clip, rel_thr, tau, k, v, T, H, KVH, D,
+                                                n_rel, eps);
+    check_launch("ink_post_proj");
+}
+
+static CtrlJobs ctrl_jobs(const InkCtrlJob * jobs, int n) {
+    if (n < 1 || n > kInkCtrlJobs) throw std::runtime_error("ink_ctrl: jobs");
+    CtrlJobs J{};
+    for (int i = 0; i < n; ++i) J.j[i] = jobs[i];
+    return J;
+}
+void ink_ctrl_concat(const InkCtrlJob * jobs, int n, int T, int E, cudaStream_t s) {
+    k_ctrl_concat<<<dim3(T, n), 256, 0, s>>>(ctrl_jobs(jobs, n), E);
+    check_launch("ink_ctrl_concat");
+}
+void ink_ctrl_down(const InkCtrlJob * jobs, int n, int T, int E, int rank, cudaStream_t s) {
+    if (T > 16) throw std::runtime_error("ink_ctrl_down: window");
+    const dim3 g((rank + 7) / 8, n);
+    if (T == 1) k_ctrl_down<1><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    else if (T <= 4) k_ctrl_down<4><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    else k_ctrl_down<16><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    check_launch("ink_ctrl_down");
+}
+void ink_ctrl_up(const InkCtrlJob * jobs, int n, int T, int E, int rank, cudaStream_t s) {
+    if (T > 16 || rank % 8) throw std::runtime_error("ink_ctrl_up: window");
+    const dim3 g((2 * E + 127) / 128, n);
+    const size_t sh = (size_t) T * rank * 4;
+    if (T == 1) k_ctrl_up<1><<<g, 128, sh, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    else if (T <= 4) k_ctrl_up<4><<<g, 128, sh, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    else k_ctrl_up<16><<<g, 128, sh, s>>>(ctrl_jobs(jobs, n), T, E, rank);
+    check_launch("ink_ctrl_up");
+}
+void ink_ctrl_combine_norm(const InkCtrlJob * jobs, int n, int T, int E, float eps, cudaStream_t s) {
+    if (E > 16 * 256) throw std::runtime_error("ink_ctrl_combine_norm: width");
+    k_ctrl_combine_norm<<<dim3(T, n), 256, 0, s>>>(ctrl_jobs(jobs, n), E, eps);
+    check_launch("ink_ctrl_combine_norm");
 }
 
 void ink_softcap(float * x, int64_t n, float cap, cudaStream_t s) {

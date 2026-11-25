@@ -72,4 +72,45 @@ void ink_ctrl_combine(float * out, const float * cur, const float * msg, const f
 void ink_round_bf16(const float * x, int64_t ldx, int T, int cols, float * y, cudaStream_t s);
 void ink_softcap(float * x, int64_t n, float cap, cudaStream_t s);
 
+// ---- merged kernels (fewer launches a visit)
+// Convolutions as jobs of one launch: input x (+ x2, the peer's partial), y = conv(x) * scale + res (res may be y),
+// a second copy y2, the inputs kept for a verify window's commit (win, row stride ld_win)
+struct InkConvJob {
+    const float * x = nullptr, * x2 = nullptr;
+    int64_t ldx = 0;
+    float * y = nullptr, * y2 = nullptr;
+    const float * res = nullptr;
+    int C = 0;
+    float * state = nullptr;        // 3 rows of stride ld_state
+    const float * w = nullptr, * dyn = nullptr;
+    int ld_dyn = 0, H = 1;
+    float scale = 1;
+    float * win = nullptr;
+};
+constexpr int kInkConvJobs = 2;
+// scratch: prompt chunks (T > 16) need n * T * max C floats
+void ink_conv_jobs(const InkConvJob * jobs, int n, int T, int64_t ld_state, int64_t ld_win, int n_keep, float * scratch,
+                   cudaStream_t s);
+// after the projections: q and R clipped (scales, tau), k clipped, v RMS-normed per head; q and R rows of stride ld
+void ink_post_proj(float * q, float * R, int64_t ld, const float * q_clip, const float * rel_clip, float qk_clip,
+                   float rel_thr, const float * tau, float * k, float * v, int T, int H, int KVH, int D, int n_rel,
+                   float eps, cudaStream_t s);
+// Loop controls as jobs: out = (cur - tanh(f) cur + tanh(g) msg), RMS-normed by norm (null: not)
+struct InkCtrlJob {
+    const float * cur = nullptr, * msg = nullptr;
+    float * in2 = nullptr;          // [T][2E]: [rms(cur); rms(msg)]
+    float * g = nullptr;            // [T][rank]
+    float * gf = nullptr;           // [T][2E]: gain | forget
+    float * out = nullptr;
+    const float * norm = nullptr;
+    const void * down = nullptr;    // BF16 [rank][2E]
+    const void * gfw = nullptr;     // BF16 [2E][rank]
+};
+constexpr int kInkCtrlJobs = 4;
+void ink_ctrl_concat(const InkCtrlJob * jobs, int n, int T, int E, cudaStream_t s);
+// the two small products of every job (T <= 16): g = down . in2, gf = gfw . g
+void ink_ctrl_down(const InkCtrlJob * jobs, int n, int T, int E, int rank, cudaStream_t s);
+void ink_ctrl_up(const InkCtrlJob * jobs, int n, int T, int E, int rank, cudaStream_t s);
+void ink_ctrl_combine_norm(const InkCtrlJob * jobs, int n, int T, int E, float eps, cudaStream_t s);
+
 }  // namespace bnk

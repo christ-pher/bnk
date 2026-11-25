@@ -124,8 +124,9 @@ void InkEngine::load_rank(const std::string & path, const EngineOptions & opt, i
     for (auto & b : ins_) b.alloc((size_t) W * E);
     attn_.alloc((size_t) W * c.q_dim());
     conv_in_.alloc((size_t) W * std::max(E, c.q_dim())); kc_.alloc((size_t) W * c.kv_dim()); vc_.alloc((size_t) W * c.kv_dim());
-    ctrl_in_.alloc((size_t) W * 2 * E); ctrl_g_.alloc((size_t) W * c.gate_rank);
-    ctrl_gf_.alloc((size_t) W * 2 * E);
+    ctrl_in_.alloc((size_t) kInkCtrlJobs * W * 2 * E); ctrl_g_.alloc((size_t) kInkCtrlJobs * W * c.gate_rank);
+    ctrl_gf_.alloc((size_t) kInkCtrlJobs * W * 2 * E);
+    conv_scratch_.alloc((size_t) kInkConvJobs * W * std::max(E, c.kv_dim()));
     int max_proj = 0;
     for (const auto & L : model_.layers) max_proj = std::max(max_proj, (int) L.proj.rows);
     proj_.alloc((size_t) W * max_proj);
@@ -292,11 +293,11 @@ void InkEngine::send(int point, int v, const float * buf, int T) {
     CUDA_CHECK(cudaEventRecord(ev_[point][v], st_));
 }
 
-void InkEngine::recv(int point, int v, float * buf, int T) {
+void InkEngine::recv(int point, int v, float *, int) {
     if (tp_n_ == 1) return;
     DeviceScope ds(dev_);
     CUDA_CHECK(cudaStreamWaitEvent(st_, peer_->ev_[point][v], 0));
-    ink_add(buf, buf, inbox_[point][v & 1], (int64_t) T * model_.cfg.E, st_);
+    peer_in_[point] = inbox_[point][v & 1];   // added by the next conv as it reads its input
 }
 
 // ------------------------------------------------------------------------------------------------ pieces
@@ -449,39 +450,26 @@ void InkEngine::visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bo
     const int E = c.E, H = c.n_head, KVH = c.n_head_kv, D = c.head_dim, KVD = c.kv_dim(), QD = c.q_dim();
     const size_t TE = (size_t) T * E;
     const bool swa = L.swa;
-    const float * msgs = loop ? msg_.p : nullptr;
     if (loop) mix(bank_, bank_out_, loop->msg_query, 4, T, msg_);
 
-    const float * in[3] = {x_, x_, x_};
+    // the attention's inputs, normed: the mix and its norms in one pass; with loop messages, the mix, then the q / k
+    // / v controls (batched) with the norms folded into their combine; layer 0 has no mix
     float * a[3] = {ins_[0].p, ins_[1].p, ins_[2].p};
-    bool normed = false;
-    if (L.attn_res_query && !msgs) {   // the mix and the input norms in one pass
-        const float * nw[3] = {swa ? L.attn_norm : L.q_norm, L.k_norm, L.v_norm};
+    const float * nw[3] = {swa ? L.attn_norm : L.q_norm, swa ? L.attn_norm : L.k_norm, swa ? L.attn_norm : L.v_norm};
+    if (L.attn_res_query && !loop) {
         mix(blocks_, x_, L.attn_res_query, L.attn_res_nq, T, mixed_, nw);
         for (int j = 0; j < 3; ++j) a[j] = mixed_.p + (swa ? 0 : j) * TE;
-        normed = true;
     } else if (L.attn_res_query) {
         mix(blocks_, x_, L.attn_res_query, L.attn_res_nq, T, mixed_);
-        for (int j = 0; j < 3; ++j) in[j] = mixed_.p + (swa ? 0 : j) * TE;
-    }
-    if (normed) {
-    } else if (msgs) {
+        const float * cur[3], * msg[3];
         for (int j = 0; j < 3; ++j) {
-            CUDA_CHECK(cudaMemcpyAsync(a[j], in[j], TE * 4, cudaMemcpyDeviceToDevice, st_));
-            control(a[j], msgs + j * TE, *loop, j, T);
-            in[j] = a[j];
+            cur[j] = mixed_.p + (swa ? 0 : j) * TE;
+            msg[j] = msg_.p + j * TE;
         }
-    }
-    if (normed) {
-    } else if (swa && msgs) {
-        for (int j = 0; j < 3; ++j) ink_rms(in[j], E, L.attn_norm, a[j], E, T, E, c.rms_eps, st_);
-    } else if (swa) {
-        ink_rms(in[0], E, L.attn_norm, a[0], E, T, E, c.rms_eps, st_);
+        controls(loop, 0, 3, cur, msg, a, nw, T);
+    } else {   // layer 0: the embedding, normed
+        ink_rms(x_, E, L.attn_norm, a[0], E, T, E, c.rms_eps, st_);
         a[1] = a[2] = a[0];
-    } else {
-        ink_rms(in[0], E, L.q_norm, a[0], E, T, E, c.rms_eps, st_);
-        ink_rms(in[1], E, L.k_norm, a[1], E, T, E, c.rms_eps, st_);
-        ink_rms(in[2], E, L.v_norm, a[2], E, T, E, c.rms_eps, st_);
     }
 
     // the projections stacked by input: one GEMV when the three inputs are the same (window layers without loop
@@ -495,17 +483,31 @@ void InkEngine::visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bo
         mm(qmat_rows(L.proj, L.off_k, L.off_v - L.off_k), a[1], E, T, P + L.off_k, S);
         mm(qmat_rows(L.proj, L.off_v, S - L.off_v), a[2], E, T, P + L.off_v, S);
     }
-    conv(v, 0, KVD, P + L.off_k, S, kc_, T, L.k_conv, swa ? nullptr : P + L.off_kp, S, KVH, keep);
-    conv(v, KVD, KVD, P + L.off_v, S, vc_, T, L.v_conv, swa ? nullptr : P + L.off_vp, S, KVH, keep);
+    // k and v through their convolutions (one launch), then the clips and v's norm (one launch)
+    Visit & V = visits_[v];
+    {
+        const float sc = 1.f / sqrtf((swa ? 1.f : 2.f) * c.n_conv + 1.f);
+        InkConvJob j[2];
+        for (int i = 0; i < 2; ++i) {
+            j[i].x = P + (i ? L.off_v : L.off_k);
+            j[i].ldx = S;
+            j[i].y = i ? vc_.p : kc_.p;
+            j[i].C = KVD;
+            j[i].state = V.conv.p + i * KVD;
+            j[i].w = i ? L.v_conv : L.k_conv;
+            j[i].dyn = swa ? nullptr : P + (i ? L.off_vp : L.off_kp);
+            j[i].ld_dyn = S;
+            j[i].H = KVH;
+            j[i].scale = sc;
+            j[i].win = keep ? nullptr : V.win_in.p + i * KVD;
+        }
+        ink_conv_jobs(j, 2, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
+    }
     float * q = P, * R = P + L.off_rel;
     const float * sink = P + L.off_sink, * gate = P + L.off_gate;
-    const float * tau = swa ? nullptr : tau_.p;
-    ink_clip_heads(q, T, H, D, L.q_clip, c.qk_clip, tau, st_, S);
-    ink_clip_heads(kc_, T, KVH, D, nullptr, c.qk_clip, nullptr, st_);
-    ink_rms(vc_, D, nullptr, vc_, D, T * KVH, D, c.rms_eps, st_);
-    ink_clip_heads(R, T, H, c.n_rel, L.rel_clip, c.rel_clip, tau, st_, S);
+    ink_post_proj(q, R, S, L.q_clip, L.rel_clip, c.qk_clip, c.rel_clip, swa ? nullptr : tau_.p, kc_, vc_, T, H, KVH, D,
+                  c.n_rel, c.rms_eps, st_);
 
-    Visit & V = visits_[v];
     ink_kv_store(kc_, vc_, V.K, V.V, V.ring, d_pos_, T, KVD, st_);
     {
         // key splits: decode windows a fixed number (the graph's grid), prompt chunks by their keys
@@ -524,29 +526,33 @@ void InkEngine::visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bo
     mm(L.wo, attn_, QD, T, conv_in_, E);   // this rank's heads' share of the output (all-reduced next)
 }
 
-// visit_b: the out projection's sum through its conv, the residual / blocks, the FFN's input, this rank's share of
-// the experts into moe_
+// visit_b: the out projection's sum (this rank's partial + the peer's, added as the conv reads them) through its
+// conv into the residual (or a new block), the FFN's input, this rank's share of the experts into moe_
 void InkEngine::visit_b(int v, int ip, int T, const InkLoop * loop, bool keep) {
     DeviceScope ds(dev_);
     const InkConfig & c = model_.cfg;
     const InkLayer & L = model_.layers[ip];
     const int E = c.E, KVD = c.kv_dim();
     const size_t TE = (size_t) T * E;
-    conv(v, 2 * KVD, E, conv_in_, E, tmp_, T, L.attn_post_conv, nullptr, 0, 1, keep);
-    // the first layer of each block starts a new residual stream; its input joins the blocks
-    if (ip % c.res_block == 0) {
-        float * b = fresh_block();   // a fresh buffer per push (the bank of the previous pass keeps pointing at its own)
+    const bool start = ip % c.res_block == 0;
+    if (start) {   // the first layer of a block: its input joins the blocks (a fresh buffer per push), a new stream starts
+        float * b = fresh_block();
         CUDA_CHECK(cudaMemcpyAsync(b, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
         blocks_.push_back(b);
-        CUDA_CHECK(cudaMemcpyAsync(x_, tmp_, TE * 4, cudaMemcpyDeviceToDevice, st_));
-    } else {
-        ink_add(x_, x_, tmp_, (int64_t) TE, st_);
     }
-    CUDA_CHECK(cudaMemcpyAsync(ffn_inp_, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
+    Visit & V = visits_[v];
+    InkConvJob j;
+    j.x = conv_in_; j.x2 = peer_in_[0]; j.ldx = E;
+    j.y = x_; j.y2 = ffn_inp_; j.res = start ? nullptr : x_.p;
+    j.C = E; j.state = V.conv.p + 2 * KVD; j.w = L.attn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
+    j.win = keep ? nullptr : V.win_in.p + 2 * KVD;
+    ink_conv_jobs(&j, 1, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
     if (loop) {
         mix(blocks_, ffn_inp_, L.ffn_res_query, 1, T, mixed_);
-        control(mixed_, msg_.p + 3 * TE, *loop, 3, T);
-        ink_rms(mixed_, E, L.ffn_norm, o_, E, T, E, c.rms_eps, st_);
+        const float * cur[1] = {mixed_.p}, * msg[1] = {msg_.p + 3 * TE};
+        float * out[1] = {o_.p};
+        const float * nrm[1] = {L.ffn_norm};
+        controls(loop, 3, 1, cur, msg, out, nrm, T);
     } else {
         const float * nw[1] = {L.ffn_norm};
         mix(blocks_, ffn_inp_, L.ffn_res_query, 1, T, o_, nw);
@@ -554,14 +560,49 @@ void InkEngine::visit_b(int v, int ip, int T, const InkLoop * loop, bool keep) {
     moe(L, o_, T, moe_);
 }
 
-// visit_c: the MoE's sum through its conv, the residual
+// visit_c: the MoE's sum (this rank's + the peer's) through its conv, plus the FFN's input: the residual
 void InkEngine::visit_c(int v, int T, bool keep) {
     DeviceScope ds(dev_);
     const InkConfig & c = model_.cfg;
     const int E = c.E, KVD = c.kv_dim();
     const int ip = v < c.n_layer ? v : c.loop_start + (v - c.n_layer) % c.n_core();
-    conv(v, 2 * KVD + E, E, moe_, E, tmp_, T, model_.layers[ip].ffn_post_conv, nullptr, 0, 1, keep);
-    ink_add(x_, ffn_inp_, tmp_, (int64_t) T * E, st_);
+    Visit & V = visits_[v];
+    InkConvJob j;
+    j.x = moe_; j.x2 = peer_in_[1]; j.ldx = E;
+    j.y = x_; j.res = ffn_inp_;
+    j.C = E; j.state = V.conv.p + 2 * KVD + E; j.w = model_.layers[ip].ffn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
+    j.win = keep ? nullptr : V.win_in.p + 2 * KVD + E;
+    ink_conv_jobs(&j, 1, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
+}
+
+// Loop controls j0 .. j0 + n - 1 of a visit, batched: out[i] = control(cur[i], msg[i]), RMS-normed by norm[i]
+void InkEngine::controls(const InkLoop * loop, int j0, int n, const float * const * cur, const float * const * msg,
+                         float * const * out, const float * const * norm, int T) {
+    const InkConfig & c = model_.cfg;
+    const int E = c.E, rk = c.gate_rank;
+    InkCtrlJob jb[kInkCtrlJobs];
+    for (int i = 0; i < n; ++i) {
+        jb[i].cur = cur[i];
+        jb[i].msg = msg[i];
+        jb[i].in2 = ctrl_in_.p + (size_t) i * chunk_ * 2 * E;
+        jb[i].g = ctrl_g_.p + (size_t) i * chunk_ * rk;
+        jb[i].gf = ctrl_gf_.p + (size_t) i * chunk_ * 2 * E;
+        jb[i].out = out[i];
+        jb[i].norm = norm[i];
+        jb[i].down = loop->down[j0 + i].data;
+        jb[i].gfw = loop->gf[j0 + i].data;
+    }
+    ink_ctrl_concat(jb, n, T, E, st_);
+    if (T <= kInkWin) {
+        ink_ctrl_down(jb, n, T, E, rk, st_);
+        ink_ctrl_up(jb, n, T, E, rk, st_);
+    } else {
+        for (int i = 0; i < n; ++i) {
+            mm(loop->down[j0 + i], jb[i].in2, 2 * E, T, jb[i].g, rk);
+            mm(loop->gf[j0 + i], jb[i].g, rk, T, jb[i].gf, 2 * E);
+        }
+    }
+    ink_ctrl_combine_norm(jb, n, T, E, c.rms_eps, st_);
 }
 
 // the window's inputs (staged in rank 0's pinned buffers) and the embedding
