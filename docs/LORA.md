@@ -9,11 +9,13 @@ SWE-bench Pro (hard 51) 39.2% -> 64.7% and Terminal-Bench 2.1 39.5% -> 55.8% und
 
 ## Running it
 
+The `pi` and `pi-kv8` configs and the adapter file were removed on 2026-11-25; `--lora` stays in the engine. To bring
+the adapter back, download it and add a config like `Qwen3.8-27B-Q8_0.json` with `"lora"` set (git history, commit
+bb8b25c, has the two configs as they were):
+
 ```sh
 mkdir -p ~/.cache/bnk/pi-adapted
 .venv/bin/hf download harness-hub/Qwen3.8-27B-pi-adapted-GGUF Qwen3.8-27B-pi-lora-F16.gguf --local-dir ~/.cache/bnk/pi-adapted
-./run.sh pi            # configs/Qwen3.8-27B-pi-Q8_0.json: the Q8_0 27B (the same file as qwen27b) + the adapter
-./run.sh pi-kv8        # the same with the 8-bit KV cache: 4 slots, context 204,800 (as Qwen3.8-27B-Q8_0-kv8.json)
 ```
 
 The config's `"lora"` is a file in the cache directory (or a path); `"lora_scale"` multiplies the adapter (0 gives
