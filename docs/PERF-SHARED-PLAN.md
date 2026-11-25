@@ -154,3 +154,12 @@ entries outside its own 1,024-token head cost more than the drafter saved (sampl
 | GPU Markov step | 40.6 | 42.1 tok/s | **12.2-13.0 ms** | 2.76 / 2.94 |
 
 With the sampling fix: 36.3 -> ~41 tok/s on this prompt (+13%).
+
+## The branch end to end (2026-11-25, `./run.sh ds-xs` from the branch: two slots, warm start, both sampling changes)
+
+| | master's behaviour (measured earlier today) | this branch |
+| --- | --- | --- |
+| one agent, the seeded 400-token request x3 after a restart | 26.4 / 32.1 / 33.4 tok/s (no warm start); 31.3 / 38.1 / 36.4 (warm start, before the sampling changes) | **39.5 / 45.0 / 42.3** |
+| two agents x 3 turns (`multi_agent_bench.py 2 40000 3 300`) | 58-59 s, 30.3-30.8 tok/s combined | **40 s, 44.7 tok/s** |
+
+A plain question's answer reads correctly (three sentences on hash functions).
