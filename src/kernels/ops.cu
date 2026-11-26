@@ -895,16 +895,19 @@ void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals
         return;
     }
     const int chunk = (n + G - 1) / G;
-    // the candidates' scratch, per device (grown as needed; never inside a capture: the callers run eagerly)
+    // the candidates' scratch, per device: 8 MiB at first (16 rows of K = 1,024), grown when a call needs more, never
+    // inside a capture (the callers' first call of a size runs eagerly). A buffer outgrown is NOT freed: a captured
+    // graph (the Inkling drafter's) holds its address, and the engine's larger sampling top-k on the same GPU after
+    // the capture freed it under the graph (an illegal access on the next replay)
     static thread_local std::vector<std::pair<void *, size_t>> scratch(16, {nullptr, 0});
     int dev = 0;
     cudaGetDevice(&dev);
     auto & sc = scratch[dev & 15];
     const size_t need = (size_t) T * G * K * 8;
     if (need > sc.second) {
-        if (sc.first) cudaFree(sc.first);
-        if (cudaMalloc(&sc.first, need) != cudaSuccess) throw std::runtime_error("topk_rows: scratch");
-        sc.second = need;
+        const size_t bytes = std::max(need, (size_t) 8 << 20);
+        if (cudaMalloc(&sc.first, bytes) != cudaSuccess) throw std::runtime_error("topk_rows: scratch");
+        sc.second = bytes;
     }
     int32_t * cid = (int32_t *) sc.first;
     float * cv = (float *) ((char *) sc.first + (size_t) T * G * K * 4);

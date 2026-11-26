@@ -21,6 +21,9 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-11-26, v0.6.4: top-k scratch fix**: `topk_rows` freed its scratch when a larger call grew it, under the
+  Inkling drafter's captured graph (the engine's temperature-1 sampling top-k ran after the capture): an illegal
+  access on the first request of most fresh starts. Outgrown buffers are kept now (8 MiB to start).
 * **2026-11-26, v0.6.3: Inkling 2 Mini, the fourth engine** (`docs/INKLING-PLAN.md`, `src/inkling`): Unsloth's
   UD-Q8_K_XL (NVFP4 experts, BF16 the rest) tensor parallel over both V100s (half the heads, of every expert and of the
   vocabulary each; two all-reduces a visit by peer pushes; one CUDA graph over both GPUs a decode window), merged kernels
