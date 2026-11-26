@@ -115,6 +115,16 @@ int main(int argc, char ** argv) {
         }
         return 0;
     }
+    if (mode == "speedw") {   // verify windows of W = BNK_W rows (default 3), the first row committed, 64 times
+        const int Wn = getenv("BNK_W") ? atoi(getenv("BNK_W")) : 3;
+        eng.prefill(std::vector<int32_t>(toks.begin(), toks.begin() + P));
+        std::vector<int32_t> w(Wn, toks[P]);
+        for (int i = 0; i < 4; ++i) { eng.forward(w.data(), Wn, false); eng.commit(1); }
+        const double a = now_ms();
+        for (int i = 0; i < 64; ++i) { eng.forward(w.data(), Wn, false); eng.commit(1); }
+        printf("windows of %d: %.2f ms each\n", Wn, (now_ms() - a) / 64);
+        return 0;
+    }
     if (mode == "speed") {   // decode speed: P prompt tokens, then 64 one-token forwards (greedy)
         eng.prefill(std::vector<int32_t>(toks.begin(), toks.begin() + P));
         int32_t t = eng.argmax(eng.last_T - 1);
