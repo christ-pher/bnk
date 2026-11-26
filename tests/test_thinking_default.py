@@ -14,6 +14,7 @@ from serve import server  # noqa: E402
 
 class Template:   # the end of Qwen3.8's template: an empty think block when thinking is off
     native_system = False
+    inkling = False
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kw):
         self.effort = kw.get("reasoning_effort")
