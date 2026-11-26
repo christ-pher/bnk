@@ -54,7 +54,8 @@ __global__ void k_mix_taps(const float * feats, int E, MixJobs J) {
 // a warp per (row, head) of D = 128: RMS norm with weight w (null: none), NeoX RoPE at position pos0 + row (rope),
 // written back and (cache) stored as fp16 at cell (pos0 + row) % ring
 __global__ void k_head_post(float * x, int64_t ldx, int T, int nh, const float * w, float eps, bool norm, bool rope,
-                            int pos0, float base, half * cache, int ring, int64_t ldc) {
+                            int pos0_host, const int * pos0_dev, float base, half * cache, int ring, int64_t ldc) {
+    const int pos0 = pos0_dev ? *pos0_dev : pos0_host;   // device memory: a captured draft replays with new positions
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (row >= T * nh) return;
     const int t = row / nh, h = row % nh;
@@ -143,30 +144,31 @@ __global__ void k_col(const float * base, const float * bias, const float * b2, 
     }
 }
 
-// one block of 64: the candidates sorted by logit (descending), their softmax at 1/temperature, the drawn one
-// (the first whose cumulative probability passes u; greedy: the first), into prev
-__global__ void k_draw(const float * vals, const int32_t * ids, const float * u, const float * inv_temp, int32_t * prev,
-                       int32_t * tok_out, int32_t * ids_out, float * probs_out) {
+// one block of 128: the candidates of up to two vocabulary parts (64 each; part 1's ids offset by v1), the best 64
+// sorted by logit (descending; ties by id), their softmax at 1/temperature, the drawn one (the first whose
+// cumulative probability passes u; greedy: the first), into prev
+__global__ void k_draw(const float * vals0, const int32_t * ids0, const float * vals1, const int32_t * ids1, int v1,
+                       const float * u, const float * inv_temp, int32_t * prev, int32_t * tok_out, int32_t * ids_out,
+                       float * probs_out) {
+    __shared__ float cv[128];
+    __shared__ int ci[128];
     __shared__ float sv[64];
     __shared__ int si[64];
     __shared__ float sp[64];
     const int t = threadIdx.x;
-    sv[t] = vals[t];
-    si[t] = ids[t];
+    const bool second = t >= 64;
+    if (second && !vals1) { cv[t] = -FLT_MAX; ci[t] = 0x7fffffff; }
+    else { cv[t] = second ? vals1[t - 64] : vals0[t]; ci[t] = second ? ids1[t - 64] + v1 : ids0[t]; }
     __syncthreads();
-    // rank of each candidate (ties by id) -> its place
-    const float v = sv[t];
-    const int id = si[t];
+    const float v = cv[t];
+    const int id = ci[t];
     int rk = 0;
-    for (int k = 0; k < 64; ++k) rk += sv[k] > v || (sv[k] == v && si[k] < id);
-    __syncthreads();
-    sv[rk] = v;
-    si[rk] = id;
+    for (int k = 0; k < 128; ++k) rk += cv[k] > v || (cv[k] == v && ci[k] < id);
+    if (rk < 64) { sv[rk] = v; si[rk] = id; }
     __syncthreads();
     const float it = inv_temp[0];
     const float te = it > 0.f ? it : 1.f;   // greedy: the report's probabilities at temperature 1
-    const float m = sv[0];
-    sp[t] = expf((sv[t] - m) * te);
+    if (t < 64) sp[t] = expf((sv[t] - sv[0]) * te);
     __syncthreads();
     if (t == 0) {
         float z = 0;
@@ -185,13 +187,21 @@ __global__ void k_draw(const float * vals, const int32_t * ids, const float * u,
         tok_out[0] = si[pick];
     }
     __syncthreads();
-    ids_out[t] = si[t];
-    probs_out[t] = sp[t];
+    if (t < 64) {
+        ids_out[t] = si[t];
+        probs_out[t] = sp[t];
+    }
 }
 
 }  // namespace
 
 InkSpark::~InkSpark() {
+    for (auto & g : graphs_)
+        if (g) cudaGraphExecDestroy(g);
+    for (auto & P : parts_)
+        for (cudaEvent_t e : P.evs)
+            if (e) cudaEventDestroy(e);
+    if (h_in_) cudaFreeHost(h_in_);
     for (void * p : allocs_) cudaFree(p);
     if (h_u_) cudaFreeHost(h_u_);
     if (h_out_) cudaFreeHost(h_out_);
@@ -259,8 +269,9 @@ void InkSpark::mm(const QMat & W, const float * x, int64_t ldx, int T, float * y
     else gemm_.run(W, x, ldx, T, y, ldy, false);
 }
 
-void InkSpark::load(const std::string & path, const GgufModel & target, const QMat & tok_embd, int n_vocab, int max_ctx,
-                    int chunk, cudaStream_t st, bool verbose) {
+void InkSpark::load(const std::string & path, const QMat & tok_embd, int n_vocab, const std::vector<HeadPart> & heads,
+                    int max_ctx, int chunk, bool verbose) {
+    const cudaStream_t st = heads.at(0).st;
     gguf_.open(path);
     if (gguf_.get_str("general.architecture") != "dflash" || !gguf_.get_bool("dflash.has_markov_context", false))
         throw std::runtime_error("inkspark: " + path + " is not an Inkling DSpark drafter (dflash with a Markov context)");
@@ -319,35 +330,58 @@ void InkSpark::load(const std::string & path, const GgufModel & target, const QM
     mask_embd_ = upload_f32("mask_embd.weight");
     out_norm_ = upload_f32("output_norm.weight");
     w1_ = upload("markov_w1.weight");
-    w2_ = upload("markov_w2.weight");
-    w2_b_ = upload_f32("markov_w2.bias");
     joint_ = upload("joint_proj.weight");
     joint_b_ = upload_f32("joint_proj.bias");
     mctx_mix_ = upload_f32("markov_ctx_mix.weight", &h_mix_[4]);
     mctx_norm_ = upload_f32("markov_ctx_norm.weight");
-    if (w1_.type != GGML_TYPE_BF16 || w1_.cols != rank_ || w2_.rows != n_vocab || joint_.cols != 2 * rank_ + 2 * E_ ||
+    if (w1_.type != GGML_TYPE_BF16 || w1_.cols != rank_ || (int) gguf_.get("markov_w2.weight").ne[1] != n_vocab || joint_.cols != 2 * rank_ + 2 * E_ ||
         joint_.rows != 3 * rank_ || (int) gguf_.get("mask_embd.weight").ne[1] < block_ - 1)
         throw std::runtime_error("inkspark: Markov head shapes");
     for (int k = 0; k < 5; ++k)   // the layers' (0 .. n_layer - 1) and the Markov head's (4)
         if ((k < n_layer_ || k == 4) && h_mix_[k].size() != (size_t) kTaps) throw std::runtime_error("inkspark: the mixes need 4 taps");
     if (E_ > 9 * 256 || n_layer_ > 4) throw std::runtime_error("inkspark: the mix kernel holds E <= 2304 and up to 4 layers");
-    // the target's token table (its own) and head rows (a full copy: under tensor parallel this GPU holds half)
+    // the target's token table (rank 0's) and head rows: each GPU its own share of the vocabulary, with markov_w2's
+    // rows for it (no copy of the head: the draft rows' logits, the Markov bias and the top 64 are computed where
+    // the rows are; GPU 0 draws from the parts' candidates)
     tok_embd_ = tok_embd;
     if (tok_embd_.type != GGML_TYPE_BF16) throw std::runtime_error("inkspark: expected the target's BF16 token table");
-    head_ = upload_rows_of(target, "output.weight", 0, n_vocab);
+    parts_.resize(heads.size());
+    int v_end = 0;
+    for (size_t pi = 0; pi < heads.size(); ++pi) {
+        Part & P = parts_[pi];
+        const HeadPart & h = heads[pi];
+        P.dev = h.dev; P.st = h.st; P.head = h.head; P.v0 = h.v0; P.vn = (int) h.head.rows;
+        if (P.v0 != v_end) throw std::runtime_error("inkspark: the head parts must tile the vocabulary");
+        v_end = P.v0 + P.vn;
+        DeviceScope dp(P.dev);
+        P.w2 = upload_rows_of(gguf_, "markov_w2.weight", P.v0, P.v0 + P.vn);
+        {
+            const TensorRef & t = gguf_.get("markov_w2.bias");
+            void * d = nullptr;
+            CUDA_CHECK(cudaMalloc(&d, (size_t) P.vn * 4));
+            CUDA_CHECK(cudaMemcpy(d, (const float *) t.data + P.v0, (size_t) P.vn * 4, cudaMemcpyHostToDevice));
+            allocs_.push_back(d);
+            P.w2b = (const float *) d;
+        }
+        P.logits.alloc((size_t) kMaxBlock * P.vn); P.bias.alloc(P.vn); P.col.alloc(P.vn);
+        for (cudaEvent_t & e : P.evs) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        P.topv.alloc(kCand); P.topi.alloc(kCand);
+        if (pi > 0) { P.hid.alloc((size_t) kMaxBlock * E_); P.markov.alloc(rank_); }
+        CUDA_CHECK(cudaEventCreateWithFlags(&P.ev, cudaEventDisableTiming));
+    }
+    if (v_end != n_vocab) throw std::runtime_error("inkspark: the head parts do not cover the vocabulary");
 
     const int W = std::max(chunk, kMaxBlock), B = kMaxBlock;
     mixed_.alloc((size_t) 5 * W * E_);
     kv_.alloc((size_t) W * 2 * KVD);
     x_.alloc((size_t) B * E_); xn_.alloc((size_t) B * E_); qkv_.alloc((size_t) B * S); attn_.alloc((size_t) B * QD);
     o_.alloc((size_t) B * E_); gu_.alloc((size_t) B * 2 * F_); h_.alloc((size_t) B * F_); hid_.alloc((size_t) B * E_);
-    logits_.alloc((size_t) B * n_vocab);
     f_rnn_.alloc(E_); state_.alloc(rank_); joint_in_.alloc(2 * rank_ + 2 * E_); joint_out_.alloc(3 * rank_);
-    markov_.alloc(rank_); bias_.alloc(n_vocab); col_.alloc(n_vocab);
+    markov_.alloc(rank_);
     attn_scratch_.alloc((size_t) 16 * B * H_ * 130);
-    topv_.alloc(kCand); topi_.alloc(kCand);
     draw_tok_.alloc(B); draw_ids_.alloc((size_t) B * kCand); draw_p_.alloc((size_t) B * kCand); draw_u_.alloc(B + 1);
-    tok_dev_.alloc(1); prev_.alloc(1); pos_dev_.alloc(1);
+    tok_dev_.alloc(1); prev_.alloc(1); pos_dev_.alloc(1); in_dev_.alloc(2);
+    CUDA_CHECK(cudaHostAlloc((void **) &h_in_, 2 * sizeof(int32_t), cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc((void **) &h_u_, (B + 1) * sizeof(float), cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc((void **) &h_out_, (size_t) B * (1 + kCand) * sizeof(int32_t), cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc((void **) &h_probs_, (size_t) B * kCand * sizeof(float), cudaHostAllocDefault));
@@ -360,9 +394,9 @@ void InkSpark::load(const std::string & path, const GgufModel & target, const QM
     loaded_ = true;
     if (verbose)
         fprintf(stderr, "bnk: inkling: DSpark drafter %s: %d layers, blocks of %d (%d drafts), taps at visits %d/%d/%d/%d, "
-                        "Markov rank %d, %.2f GiB in VRAM (with a copy of the head)\n",
+                        "Markov rank %d, %.2f GiB in VRAM (the head's vocabulary over %zu GPUs)\n",
                 path.substr(path.find_last_of('/') + 1).c_str(), n_layer_, block_, n_draft_, targets_[0], targets_[1],
-                targets_[2], targets_[3], rank_, vram_bytes_ / double(1 << 30));
+                targets_[2], targets_[3], rank_, vram_bytes_ / double(1 << 30), parts_.size());
 }
 
 // ------------------------------------------------------------------------------------------------ injection
@@ -388,10 +422,10 @@ void InkSpark::feed(const float * feats, int n, int pos0) {
         Layer & L = layers_[il];
         mm(L.kvctx, mixed_.p + (size_t) il * chunk_ * E_, E_, n, kv_, 2 * KVD);
         const int rows = n * KVH_;
-        k_head_post<<<(rows + 7) / 8, 256, 0, st_>>>(kv_, 2 * KVD, n, KVH_, L.k_ctx_norm, eps_, true, true, pos0, rope_base_,
-                                                      L.K, L.ring, KVD);
+        k_head_post<<<(rows + 7) / 8, 256, 0, st_>>>(kv_, 2 * KVD, n, KVH_, L.k_ctx_norm, eps_, true, true, pos0, nullptr,
+                                                      rope_base_, L.K, L.ring, KVD);
         k_head_post<<<(rows + 7) / 8, 256, 0, st_>>>(kv_.p + KVD, 2 * KVD, n, KVH_, nullptr, eps_, false, false, pos0,
-                                                      rope_base_, L.V, L.ring, KVD);
+                                                      nullptr, rope_base_, L.V, L.ring, KVD);
     }
     check_launch("inkspark feed");
     fed_hi_ = pos0 + n;
@@ -410,31 +444,58 @@ void InkSpark::draft_block(int32_t anchor, int pos0) {
     DeviceScope ds(dev_);
     // the block: the anchor and the drafts the round will use (the layers see only these rows, as llama.cpp's block
     // of n_max masks: its quality does not depend on the masks after a row)
-    const int nb = 1 + std::max(1, std::min(n_draft_, n_use_)), KVD = KVH_ * D_, QD = H_ * D_, S = QD + 2 * KVD, V = n_vocab_;
-    // the draws: a uniform per row, 1 / temperature (0: greedy)
+    const int nb = 1 + std::max(1, std::min(n_draft_, n_use_)), V = n_vocab_;
+    // the draws: a uniform per row, 1 / temperature (0: greedy); the anchor and its position (pinned: a captured
+    // draft copies them in when it replays)
     std::uniform_real_distribution<double> ud(0.0, 1.0);
     for (int i = 0; i <= kMaxBlock; ++i) h_u_[i] = std::min((float) ud(rng_), std::nextafter(1.0f, 0.0f));
     h_u_[kMaxBlock] = temperature_ > 0.f ? 1.f / temperature_ : 0.f;
+    h_in_[0] = anchor;
+    h_in_[1] = pos0;
+    static const bool graphs = env_int("BNK_INK_SPARK_GRAPHS", 1) != 0;
+    if (graphs && warm_[nb]) {   // (the first draft of a size runs eagerly: top-k allocates its scratch then)
+        cudaGraphExec_t & g = graphs_[nb];
+        if (!g) {
+            cudaGraph_t gr;
+            CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+            enqueue_draft(nb);
+            CUDA_CHECK(cudaStreamEndCapture(st_, &gr));
+            CUDA_CHECK(cudaGraphInstantiate(&g, gr, 0));
+            cudaGraphDestroy(gr);
+        }
+        CUDA_CHECK(cudaGraphLaunch(g, st_));
+    } else {
+        enqueue_draft(nb);
+        warm_[nb] = true;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    finish_draft(anchor, pos0, nb, V);
+}
+
+// the draft's GPU work for blocks of nb rows, its inputs staged (h_u_, h_in_), its outputs into h_out_ / h_probs_
+void InkSpark::enqueue_draft(int nb) {
+    const int KVD = KVH_ * D_, QD = H_ * D_, S = QD + 2 * KVD;
     CUDA_CHECK(cudaMemcpyAsync(draw_u_.p, h_u_, (kMaxBlock + 1) * sizeof(float), cudaMemcpyHostToDevice, st_));
-    h_out_[0] = anchor;
-    CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_out_, 4, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(prev_.p, h_out_, 4, cudaMemcpyHostToDevice, st_));
-    k_embed_block<<<nb, 256, 0, st_>>>((const uint16_t *) tok_embd_.data, tok_embd_.row_bytes / 2, tok_dev_, tok_norm_,
+    CUDA_CHECK(cudaMemcpyAsync(in_dev_.p, h_in_, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(prev_.p, in_dev_.p, 4, cudaMemcpyDeviceToDevice, st_));
+    const int32_t * tok_dev = in_dev_.p;
+    const int * pos_dev = in_dev_.p + 1;
+    k_embed_block<<<nb, 256, 0, st_>>>((const uint16_t *) tok_embd_.data, tok_embd_.row_bytes / 2, tok_dev, tok_norm_,
                                        mask_embd_, E_, x_);
     for (int il = 0; il < n_layer_; ++il) {
         Layer & L = layers_[il];
         ink_rms(x_, E_, L.attn_norm, xn_, E_, nb, E_, eps_, st_);
         mm(L.qkv, xn_, E_, nb, qkv_, S);
-        k_head_post<<<(nb * H_ + 7) / 8, 256, 0, st_>>>(qkv_, S, nb, H_, L.q_norm, eps_, true, true, pos0, rope_base_,
+        k_head_post<<<(nb * H_ + 7) / 8, 256, 0, st_>>>(qkv_, S, nb, H_, L.q_norm, eps_, true, true, 0, pos_dev, rope_base_,
                                                          nullptr, 0, 0);
-        k_head_post<<<(nb * KVH_ + 7) / 8, 256, 0, st_>>>(qkv_.p + QD, S, nb, KVH_, L.k_norm, eps_, true, true, pos0,
+        k_head_post<<<(nb * KVH_ + 7) / 8, 256, 0, st_>>>(qkv_.p + QD, S, nb, KVH_, L.k_norm, eps_, true, true, 0, pos_dev,
                                                            rope_base_, L.K, L.ring, KVD);
         k_head_post<<<(nb * KVH_ + 7) / 8, 256, 0, st_>>>(qkv_.p + QD + KVD, S, nb, KVH_, nullptr, eps_, false, false,
-                                                           pos0, rope_base_, L.V, L.ring, KVD);
-        // every row over the context and the whole block; the window counted from the block's first row
-        const int keys = L.window ? std::min(pos0 + nb, L.window + nb) : pos0 + nb;
-        const int ns = std::max(1, std::min(16, keys / 2048));
-        ink_attention_plain(qkv_, S, L.K, L.V, L.ring, L.window ? L.window + nb - 1 : 0, nullptr, pos0, nb, H_, KVH_,
+                                                           0, pos_dev, rope_base_, L.V, L.ring, KVD);
+        // every row over the context and the whole block; the window counted from the block's first row (key splits
+        // fixed: the graph's grid; empty ones cost little)
+        const int ns = L.window ? 4 : 16;
+        ink_attention_plain(qkv_, S, L.K, L.V, L.ring, L.window ? L.window + nb - 1 : 0, pos_dev, 0, nb, H_, KVH_,
                             1.f / sqrtf((float) D_), true, ns, attn_, attn_scratch_, st_);
         mm(L.wo, attn_, QD, nb, o_, E_);
         ink_add(x_, x_, o_, (int64_t) nb * E_, st_);
@@ -445,30 +506,59 @@ void InkSpark::draft_block(int32_t anchor, int pos0) {
         ink_add(x_, x_, o_, (int64_t) nb * E_, st_);
     }
     ink_rms(x_, E_, out_norm_, hid_, E_, nb, E_, eps_, st_);
-    mm(head_, hid_.p + E_, E_, nb - 1, logits_, V);   // the draft rows' base logits
-    // the Markov chain over the draft rows
+    // the draft rows' base logits, on each part's GPU (part 1 gets a copy of the hidden rows)
+    Part & P0 = parts_[0];
+    const bool two = parts_.size() > 1;
+    if (two) {
+        CUDA_CHECK(cudaEventRecord(P0.evs[0], st_));
+        Part & P1 = parts_[1];
+        DeviceScope d1(P1.dev);
+        CUDA_CHECK(cudaStreamWaitEvent(P1.st, P0.evs[0], 0));
+        CUDA_CHECK(cudaMemcpyAsync(P1.hid.p, hid_.p, (size_t) nb * E_ * 4, cudaMemcpyDeviceToDevice, P1.st));
+        gemv_auto(P1.head, P1.hid.p + E_, E_, nb - 1, P1.logits, P1.vn, false, P1.act, P1.st);
+    }
+    gemv_auto(P0.head, hid_.p + E_, E_, nb - 1, P0.logits, P0.vn, false, act_, st_);
+    // the Markov chain over the draft rows: the state on GPU 0, each part's bias / column / top 64 where its rows are
     CUDA_CHECK(cudaMemsetAsync(state_.p, 0, rank_ * sizeof(float), st_));
     for (int i = 1; i < nb; ++i) {
         k_joint_in<<<(2 * rank_ + 2 * E_ + 255) / 256, 256, 0, st_>>>(state_, (const uint16_t *) w1_.data, prev_,
                                                                       hid_.p + (size_t) i * E_, f_rnn_, rank_, E_, joint_in_);
         mm(joint_, joint_in_, 2 * rank_ + 2 * E_, 1, joint_out_, 3 * rank_);
         k_joint_post<<<(rank_ + 255) / 256, 256, 0, st_>>>(joint_out_, joint_b_, state_, markov_, rank_);
-        mm(w2_, markov_, rank_, 1, bias_, V);
-        k_col<<<1024, 256, 0, st_>>>(logits_.p + (size_t) (i - 1) * V, bias_, w2_b_, softcap_, V, col_);
-        topk_rows(col_, 1, V, kCand, topi_, topv_, st_);
-        k_draw<<<1, kCand, 0, st_>>>(topv_, topi_, draw_u_.p + i, draw_u_.p + kMaxBlock, prev_, draw_tok_.p + i,
-                                     draw_ids_.p + (size_t) i * kCand, draw_p_.p + (size_t) i * kCand);
+        auto part_step = [&](Part & P, const float * mk, cudaStream_t s) {
+            gemv_auto(P.w2, mk, rank_, 1, P.bias, P.vn, false, P.act, s);
+            k_col<<<512, 256, 0, s>>>(P.logits.p + (size_t) (i - 1) * P.vn, P.bias, P.w2b, softcap_, P.vn, P.col);
+            topk_rows(P.col, 1, P.vn, kCand, P.topi, P.topv, s);
+        };
+        if (two) {
+            Part & P1 = parts_[1];
+            CUDA_CHECK(cudaEventRecord(P0.evs[i], st_));
+            DeviceScope d1(P1.dev);
+            CUDA_CHECK(cudaStreamWaitEvent(P1.st, P0.evs[i], 0));
+            CUDA_CHECK(cudaMemcpyAsync(P1.markov.p, markov_.p, (size_t) rank_ * 4, cudaMemcpyDeviceToDevice, P1.st));
+            part_step(P1, P1.markov, P1.st);
+            CUDA_CHECK(cudaEventRecord(P1.evs[i], P1.st));
+        }
+        part_step(P0, markov_, st_);
+        if (two) CUDA_CHECK(cudaStreamWaitEvent(st_, parts_[1].evs[i], 0));
+        k_draw<<<1, 2 * kCand, 0, st_>>>(P0.topv, P0.topi, two ? parts_[1].topv.p : nullptr, two ? parts_[1].topi.p : nullptr,
+                                         two ? parts_[1].v0 : 0, draw_u_.p + i, draw_u_.p + kMaxBlock, prev_,
+                                         draw_tok_.p + i, draw_ids_.p + (size_t) i * kCand, draw_p_.p + (size_t) i * kCand);
     }
     check_launch("inkspark draft");
     CUDA_CHECK(cudaMemcpyAsync(h_out_, draw_tok_.p, kMaxBlock * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_out_ + kMaxBlock, draw_ids_.p, (size_t) kMaxBlock * kCand * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_probs_, draw_p_.p, (size_t) kMaxBlock * kCand * 4, cudaMemcpyDeviceToHost, st_));
-    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+void InkSpark::finish_draft(int32_t anchor, int pos0, int nb, int V) {
     if (!dump_dir_.empty() && dumps_ < 4) {   // the draft: anchor, pos0, nb, hidden [nb][E], base logits [nb-1][V], tokens
         ++dumps_;
         std::vector<float> hh((size_t) nb * E_), lg((size_t) (nb - 1) * V);
         CUDA_CHECK(cudaMemcpy(hh.data(), hid_.p, hh.size() * 4, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(lg.data(), logits_.p, lg.size() * 4, cudaMemcpyDeviceToHost));
+        for (const Part & P : parts_)   // the parts' rows into the vocabulary-wide rows
+            CUDA_CHECK(cudaMemcpy2D(lg.data() + P.v0, (size_t) V * 4, P.logits.p, (size_t) P.vn * 4, (size_t) P.vn * 4, nb - 1,
+                                    cudaMemcpyDeviceToHost));
         if (FILE * f = fopen((dump_dir_ + "/draft" + std::to_string(dumps_) + ".bin").c_str(), "wb")) {
             fwrite(&anchor, 4, 1, f); fwrite(&pos0, 4, 1, f); fwrite(&nb, 4, 1, f);
             fwrite(hh.data(), 4, hh.size(), f); fwrite(lg.data(), 4, lg.size(), f); fwrite(h_out_ + 1, 4, nb - 1, f);

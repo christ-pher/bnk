@@ -34,10 +34,12 @@ public:
     static constexpr int kCand = 64;     // the draws' candidates (q for the verifier)
     static constexpr int kTaps = 4;
     ~InkSpark();
-    // the drafter GGUF; the target's token table and head rows [0, n_vocab) (from the target GGUF: a full copy here)
-    // and its E; on the current device, stream st; max_ctx: the full layer's cache; chunk: the longest feed
-    void load(const std::string & path, const GgufModel & target, const QMat & tok_embd, int n_vocab, int max_ctx,
-              int chunk, cudaStream_t st, bool verbose);
+    // the vocabulary's share of a GPU: the target's head rows [v0, v0 + head.rows) on device dev (its stream st)
+    struct HeadPart { int dev; cudaStream_t st; QMat head; int v0; };
+    // the drafter GGUF; the target's token table; the head parts (the first on the current device, where the drafter
+    // runs; one part: the whole vocabulary); max_ctx: the full layer's cache; chunk: the longest feed
+    void load(const std::string & path, const QMat & tok_embd, int n_vocab, const std::vector<HeadPart> & heads,
+              int max_ctx, int chunk, bool verbose);
     bool loaded() const { return loaded_; }
     const std::vector<int> & target_visits() const { return targets_; }   // 5, 23, 41, 48 (48: the normed output)
     size_t vram_bytes() const { return vram_bytes_; }
@@ -82,8 +84,22 @@ private:
         int ring = 0, window = 0;
     };
     std::vector<Layer> layers_;
-    QMat tok_embd_, head_, w1_, w2_, joint_;
-    const float * tok_norm_ = nullptr, * mask_embd_ = nullptr, * out_norm_ = nullptr, * w2_b_ = nullptr;
+    QMat tok_embd_, w1_, joint_;
+    const float * tok_norm_ = nullptr, * mask_embd_ = nullptr, * out_norm_ = nullptr;
+    // per vocabulary part (GPU): the target's head rows, markov_w2's rows and bias, the draft rows' logits, a step's
+    // bias / column / top 64; the second part also a copy of the block's hidden rows and of the step's Markov vector
+    struct Part {
+        int dev = 0, v0 = 0, vn = 0;
+        cudaStream_t st = nullptr;
+        QMat head, w2;
+        const float * w2b = nullptr;
+        DevBuf<float> logits, bias, col, topv, hid, markov;
+        DevBuf<int32_t> topi;
+        cudaEvent_t ev = nullptr;
+        cudaEvent_t evs[kMaxBlock + 1] = {};   // per step: the input is ready (part 0) / the step is done (part 1)
+        ActQ8 act;
+    };
+    std::vector<Part> parts_;
     const float * joint_b_ = nullptr, * mctx_mix_ = nullptr, * mctx_norm_ = nullptr;
     std::vector<float> h_mix_[5];                 // the mixes' weights on the host (layers, then the Markov head's)
 
@@ -95,8 +111,13 @@ private:
     DevBuf<int16_t> acts_;
     DevBuf<half> acth_;
     DevBuf<float> mixed_, kv_, x_, xn_, qkv_, attn_, o_, gu_, h_, hid_, logits_, f_rnn_, state_, joint_in_, joint_out_,
-        markov_, bias_, col_, attn_scratch_, topv_, draw_p_, draw_u_;
-    DevBuf<int32_t> tok_dev_, prev_, topi_, draw_tok_, draw_ids_, pos_dev_;
+        markov_, attn_scratch_, draw_p_, draw_u_;
+    DevBuf<int32_t> tok_dev_, prev_, draw_tok_, draw_ids_, pos_dev_, in_dev_;   // in_dev_: the anchor, its position
+    int32_t * h_in_ = nullptr;
+    cudaGraphExec_t graphs_[kMaxBlock + 1] = {};   // the draft per block rows
+    bool warm_[kMaxBlock + 1] = {};
+    void enqueue_draft(int nb);
+    void finish_draft(int32_t anchor, int pos0, int nb, int V);
     float * h_u_ = nullptr;                       // pinned: the draws' uniforms and 1/temperature
     int32_t * h_out_ = nullptr;                   // pinned: tokens [kMaxBlock], then ids [kMaxBlock][kCand]
     float * h_probs_ = nullptr;                   // pinned: [kMaxBlock][kCand]

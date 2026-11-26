@@ -82,7 +82,9 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
     if (!opt.mtp.empty() && env_int("BNK_INK_SPARK", 1) != 0) {
         DeviceScope ds(dev_);
         spark_ = std::make_unique<InkSpark>();
-        spark_->load(opt.mtp, model_.gguf, model_.tok_embd, model_.cfg.n_vocab, opt.max_ctx, chunk_, st_, opt.verbose);
+        std::vector<InkSpark::HeadPart> heads;   // each rank's vocabulary rows of the head, where they are
+        for (InkEngine * r : ranks()) heads.push_back({r->dev_, r->st_, r->model_.output, r->model_.cfg.vocab0});
+        spark_->load(opt.mtp, model_.tok_embd, model_.cfg.n_vocab, heads, opt.max_ctx, chunk_, opt.verbose);
         std::fill(std::begin(tap_of_visit_), std::end(tap_of_visit_), -1);
         const auto & tv = spark_->target_visits();
         for (int k = 0; k < (int) tv.size(); ++k)
