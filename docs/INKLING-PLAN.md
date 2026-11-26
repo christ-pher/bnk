@@ -124,3 +124,19 @@ reference (2,934 tokens: NLL 2.1130 vs 2.1101, top-1 97.0%).
   (55 / 51 / 48 before the drafter).
 * Next: the drafter's head and Markov bias split over both GPUs (GPU 1 idles while GPU 0 drafts), its block as a
   graph, cheaper verify rows (the window's experts), vision, more slots.
+
+### Next steps, first pass (2026-11-26)
+
+* Top-k over long rows in two stages (shared kernel: the sampler's head and the drafter's draws): K 64 460 -> 81 us,
+  K 1,024 472 -> 217 us for 3 rows of 200K.
+* The loop-control down product a block per row, the bias table a block per row for decode windows: plain decode
+  68.6 -> 71.9 tok/s.
+* The drafter's head over both GPUs (each rank's own vocabulary rows: no copy of the head, -0.9 GiB), its draft as one
+  graph per block size: 3.3 -> 1.7 ms a round. Drafts identical to the NumPy reference.
+* Through the server (temperature 1): prose 68 -> 78, code 92 -> 101, explanations 86 -> 100 tok/s; after 11K 80,
+  after 40K 69 -> 77.
+* Where a round goes now (2 drafts): verify ~19 ms (windows of 1 / 2 / 3 / 4 rows: 14.0 / 15.8 / 17.4 / 18.7 ms with
+  the same experts; different tokens add their experts), draft 1.7 ms. The BF16 GEMV re-reads x from L1 per token
+  (L1-bound for T > 1: +0.75 ms a window from 1 to 3 rows); the rest of the per-row cost is spread thin.
+* Not yet: images (inkling2v: a ViT with a CLS token, resized learned position embeddings, 2D RoPE, patch merge,
+  GELU projector; image rows enter as embeddings without the token norm), more conversation slots.
