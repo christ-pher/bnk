@@ -15,7 +15,8 @@ void ImageStore::open(const std::string & mmproj, int device, VramBudget * budge
 void ImageStore::add(int32_t id, const std::string & path, int H, int W) {
     if (!is_image_id(id)) throw std::runtime_error("image ids are negative");
     const int u = enc_.cfg().unit();
-    if (H <= 0 || W <= 0 || H % u || W % u) throw std::runtime_error("image sides must be multiples of " + std::to_string(u));
+    if (H <= 0 || W <= 0 || (!enc_.cfg().pads() && (H % u || W % u)))
+        throw std::runtime_error("image sides must be multiples of " + std::to_string(u));
     int gh, gw;
     enc_.cfg().grid(H, W, &gh, &gw);
     std::lock_guard<std::mutex> lk(mu_);

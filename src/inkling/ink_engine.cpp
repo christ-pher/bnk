@@ -79,6 +79,15 @@ void InkEngine::load(const std::string & path, const EngineOptions & opt) {
         rank1_->h_tau_ = h_tau_;
     }
     CUDA_CHECK(cudaSetDevice(dev_));   // rank 0's GPU current again (rank 1's load set its own)
+    if (!opt.mmproj.empty()) {
+        DeviceScope ds(dev_);
+        images_ = std::make_unique<ImageStore>();
+        images_->cache_limit = (size_t) (opt.vision_cache_gib * 1073741824.0);
+        images_->open(opt.mmproj, dev_, nullptr, opt.verbose);
+        if (images_->cfg().kind != Projector::Inkling2V || images_->cfg().out_dim != model_.cfg.E)
+            throw std::runtime_error("vision: " + opt.mmproj + " is not Inkling 2's encoder (inkling2v, out " +
+                                     std::to_string(model_.cfg.E) + ")");
+    }
     if (!opt.mtp.empty() && env_int("BNK_INK_SPARK", 1) != 0) {
         DeviceScope ds(dev_);
         spark_ = std::make_unique<InkSpark>();
@@ -636,6 +645,9 @@ void InkEngine::fwd_in(int T) {
     CUDA_CHECK(cudaMemcpyAsync(tau_.p, h_tau_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
     dequant_gather(model_.tok_embd, tok_dev_, T, x_, st_);
     ink_rms(x_, E, model_.tok_norm, x_, E, T, E, c.rms_eps, st_);
+    InkEngine * r0 = tp_rank_ == 0 ? this : peer_;   // the store and the sequence live on rank 0
+    if (r0->window_images_)   // image cells: the encoder's rows, not normed (llama.cpp: only token rows are)
+        r0->images_->put_rows(r0->seq_, *h_pos_, T, x_, st_);
     blk_next_ = 0;
     blocks_.clear();
     bank_.clear();
@@ -694,12 +706,22 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
     const int pos0 = pos();
     if (T < 1 || T > chunk_) throw std::runtime_error("inkling: window out of range");
     if (pos0 + T > opt_.max_ctx) throw std::runtime_error("inkling: context full");
-    memcpy(h_tok_, tokens, (size_t) T * 4);
+    window_images_ = false;
+    for (int t = 0; t < T; ++t) {
+        const bool img = is_image_id(tokens[t]);
+        window_images_ |= img;
+        h_tok_[t] = img ? 0 : tokens[t];   // an image cell's row is the encoder's (placed after the embedding)
+    }
+    if (window_images_) {
+        if (!images()) throw std::runtime_error("inkling: an image in the prompt, but no vision encoder (mmproj)");
+        seq_.assign(history_.begin(), history_.end());
+        seq_.insert(seq_.end(), tokens, tokens + T);
+    }
     *h_pos_ = pos0;
     for (int t = 0; t < T; ++t)
         h_tau_[t] = 1.f + c.log_alpha * logf(std::max(1.f, (float) (pos0 + t + 1) / c.log_floor));
     DeviceScope ds(dev_);
-    if (T <= kInkWin && graphs_on_ && !logits_hook) {
+    if (T <= kInkWin && graphs_on_ && !logits_hook && !window_images_) {
         cudaGraphExec_t & g = graphs_[T][keep ? 1 : 0];
         if (!g) {
             cudaGraph_t gr;
@@ -802,6 +824,10 @@ void InkEngine::enqueue(int T, bool keep) {
 
 void InkEngine::prefill(const std::vector<int32_t> & tokens) {
     if (pending_T_) throw std::runtime_error("inkling: prefill with a verify window pending");
+    if (images()) {   // encode the prompt's new images first
+        DeviceScope d0(dev_);
+        images_->encode_all(tokens.data(), (int) tokens.size());
+    }
     const double t0 = now_ms();
     for (size_t i = 0; i < tokens.size(); i += chunk_) {
         const int n = (int) std::min<size_t>(chunk_, tokens.size() - i);

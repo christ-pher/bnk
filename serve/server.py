@@ -66,9 +66,13 @@ class State:
         self.images = None
         self.image_pad = self.tok.id_of("<|image_pad|>")
         ds = None
+        ink = False
         if args.mmproj:
-            md = read_metadata(args.mmproj, {"clip.projector_type", "clip.vision.patch_size", "clip.vision.projector.scale_factor",
+            md = read_metadata(args.mmproj, {"clip.projector_type", "clip.vision.projector_type", "clip.vision.patch_size", "clip.vision.projector.scale_factor",
                                              "clip.vision.image_min_pixels"})
+            if md.get("clip.projector_type", md.get("clip.vision.projector_type")) == "inkling2v":   # Inkling 2: its template's image token, any size
+                self.image_pad = self.tok.id_of("<|unused_200054|>")
+                ink = True
             if md.get("clip.projector_type") == "deepseek41v":   # DeepSeek-V4.1: its own grid, at most 1,024 cells
                 self.image_pad = self.tok.id_of("<｜deepseek_image｜>")
                 ds = {"patch": int(md.get("clip.vision.patch_size", 14)), "merge": int(md.get("clip.vision.projector.scale_factor", 3)),
@@ -76,7 +80,9 @@ class State:
         if args.mmproj and self.image_pad is not None:
             self.images = Images(str(Path(args.cache_dir).expanduser() / "images"),
                                  max_tokens=min(args.image_max_tokens, 1024) if ds else args.image_max_tokens,
-                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0", deepseek=ds)
+                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0", deepseek=ds,
+                                 inkling={"patch": int(md.get("clip.vision.patch_size", 20)),
+                                          "merge": int(md.get("clip.vision.spatial_merge_size", 2))} if ink else None)
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})

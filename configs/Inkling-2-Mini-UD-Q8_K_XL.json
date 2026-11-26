@@ -1,5 +1,5 @@
 {
-  "notes": "Thinking Machines' Inkling 2 Mini (2026-11-20, Apache 2.0) as Unsloth's UD-Q8_K_XL, the largest of their quants (21.3 GiB: experts NVFP4 with per-expert scales, the rest BF16): a looped MoE, 26.2B parameters, 3.4B active a layer visit, 48 layer visits a token (the core 6-17 three times). Through the Inkling engine (docs/INKLING-PLAN.md): tensor parallel over both V100s (half the heads, of every expert and of the vocabulary each), one conversation slot. Matches llama.cpp's reference (next-token NLL 2.1124 vs 2.1101 over 2,934 tokens). Sampling is the model card's (temperature 1.0, no truncation). Thinking: the template's effort line (0-0.99; reasoning_effort none / minimal / low / medium / high / xhigh / max or 1-100); its card notes the minimum still reasons a little. Drafter: the model's own DSpark block drafter (dspark-Inkling-2-Mini-Q8_0.gguf from the same repository, src/inkling/ink_spark), 2 drafts a round (each verify row costs ~2.6 ms of experts: 2 measured fastest, temperature 1: prose 66 -> 75 tok/s, code 66 -> 98). Not yet: vision, more slots.",
+  "notes": "Thinking Machines' Inkling 2 Mini (2026-11-20, Apache 2.0) as Unsloth's UD-Q8_K_XL, the largest of their quants (21.3 GiB: experts NVFP4 with per-expert scales, the rest BF16): a looped MoE, 26.2B parameters, 3.4B active a layer visit, 48 layer visits a token (the core 6-17 three times). Through the Inkling engine (docs/INKLING-PLAN.md): tensor parallel over both V100s (half the heads, of every expert and of the vocabulary each), one conversation slot. Matches llama.cpp's reference (next-token NLL 2.1124 vs 2.1101 over 2,934 tokens). Sampling is the model card's (temperature 1.0, no truncation). Thinking: the template's effort line (0-0.99; reasoning_effort none / minimal / low / medium / high / xhigh / max or 1-100); its card notes the minimum still reasons a little. Drafter: the model's own DSpark block drafter (dspark-Inkling-2-Mini-Q8_0.gguf from the same repository, src/inkling/ink_spark), 2 drafts a round (each verify row costs ~2.6 ms of experts: 2 measured fastest, temperature 1: prose 66 -> 75 tok/s, code 66 -> 98). Images: the inkling2v encoder (mmproj-F16.gguf, src/vision: a 23-layer ViT, CLS token, resized position table, 2D RoPE, 2 x 2 merge), any size up to 4,096 cells of 40 x 40 pixels. Not yet: more slots.",
   "aliases": [
     "inkling",
     "inkling-q8"
@@ -10,7 +10,8 @@
     "files": [
       "Inkling-2-Mini-UD-Q8_K_XL.gguf",
       "dspark-Inkling-2-Mini-Q8_0.gguf"
-    ]
+    ],
+    "mmproj": "mmproj-F16.gguf"
   },
   "sampling": {
     "temperature": 1.0,

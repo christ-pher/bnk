@@ -24,6 +24,7 @@
 #include "inkling/ink_model.h"
 #include "inkling/ink_moe.h"
 #include "inkling/ink_spark.h"
+#include "vision/images.h"
 #include "kernels/gemm.h"
 #include "kernels/gemv.h"
 #include "kernels/moe.h"
@@ -100,6 +101,7 @@ public:
     int cache_resident() const override { return 0; }
     size_t cache_bytes() const override { return 0; }
     size_t kv_bytes_mapped() const override { return kv_bytes_; }
+    ImageStore * images() override { return images_ && images_->enabled() ? images_.get() : nullptr; }
 
     // tests: when set, every prompt row's logits (device, [n][n_vocab]) for rows pos0.. as they are computed
     std::function<void(int pos0, int n, const float * logits)> logits_hook;
@@ -114,6 +116,10 @@ private:
     // the DSpark drafter (opt.mtp: dspark-Inkling-2-Mini-*.gguf) on rank 0, and the target features it reads: the
     // stream at the input of visits 5, 23, 41 (in visit order) and the normed output, [chunk][4 E]
     std::unique_ptr<InkSpark> spark_;
+    // images (opt.mmproj: the inkling2v encoder) on rank 0's GPU; their rows replace the embedding's (unnormed)
+    std::unique_ptr<ImageStore> images_;
+    std::vector<int32_t> seq_;          // the sequence with the window (the image rows' placement)
+    bool window_images_ = false;
     DevBuf<float> feat_;
     int tap_of_visit_[64];
     DevBuf<float> inbox_[2][2];            // [point: attention / MoE][visit parity]: the peer's partial [W][E]
