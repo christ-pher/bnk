@@ -33,13 +33,18 @@ public:
     static constexpr int kMaxBlock = 8;
     static constexpr int kCand = 64;     // the draws' candidates (q for the verifier)
     static constexpr int kTaps = 4;
+    static constexpr int kMaxSlots = 4;
     ~InkSpark();
     // the vocabulary's share of a GPU: the target's head rows [v0, v0 + head.rows) on device dev (its stream st)
     struct HeadPart { int dev; cudaStream_t st; QMat head; int v0; };
     // the drafter GGUF; the target's token table; the head parts (the first on the current device, where the drafter
     // runs; one part: the whole vocabulary); max_ctx: the full layer's cache; chunk: the longest feed
+    // slots: conversations (each its own context caches, Markov context and last block)
     void load(const std::string & path, const QMat & tok_embd, int n_vocab, const std::vector<HeadPart> & heads,
-              int max_ctx, int chunk, bool verbose);
+              int max_ctx, int chunk, bool verbose, int slots = 1);
+    // the conversation the single-slot calls (feed, restart, save, load_state, run, step) work on
+    void select(int slot);
+    int current_slot() const { return cur_; }
     bool loaded() const { return loaded_; }
     const std::vector<int> & target_visits() const { return targets_; }   // 5, 23, 41, 48 (48: the normed output)
     size_t vram_bytes() const { return vram_bytes_; }
@@ -114,7 +119,7 @@ private:
         markov_, attn_scratch_, draw_p_, draw_u_;
     DevBuf<int32_t> tok_dev_, prev_, draw_tok_, draw_ids_, pos_dev_, in_dev_;   // in_dev_: the anchor, its position
     int32_t * h_in_ = nullptr;
-    cudaGraphExec_t graphs_[kMaxBlock + 1] = {};   // the draft per block rows
+    cudaGraphExec_t graphs_[kMaxSlots][kMaxBlock + 1] = {};   // the draft per slot and block rows
     bool warm_[kMaxBlock + 1] = {};
     void enqueue_draft(int nb);
     void finish_draft(int32_t anchor, int pos0, int nb, int V);
@@ -131,6 +136,13 @@ private:
         int next = 0;
     };
     Block blk_;
+
+    // conversations: the current one's state is live (layers_[].K / V, f_rnn_, fed_hi_, blk_); the others' are parked
+    // here (the current slot's entry holds nothing): select swaps them
+    struct Parked { std::vector<DevBuf<half>> K, V; DevBuf<float> f_rnn; int fed_hi = 0; Block blk; };
+    std::vector<Parked> parked_;
+    int cur_ = 0, n_slots_ = 1;
+    std::vector<int> item_slot_;   // run_multi / step_multi: each item's slot (the next call's prev indices)
 
     void mm(const QMat & W, const float * x, int64_t ldx, int T, float * y, int64_t ldy);
     QMat upload(const std::string & name);

@@ -196,8 +196,9 @@ __global__ void k_draw(const float * vals0, const int32_t * ids0, const float * 
 }  // namespace
 
 InkSpark::~InkSpark() {
-    for (auto & g : graphs_)
-        if (g) cudaGraphExecDestroy(g);
+    for (auto & row : graphs_)
+        for (auto & g : row)
+            if (g) cudaGraphExecDestroy(g);
     for (auto & P : parts_)
         for (cudaEvent_t e : P.evs)
             if (e) cudaEventDestroy(e);
@@ -270,8 +271,10 @@ void InkSpark::mm(const QMat & W, const float * x, int64_t ldx, int T, float * y
 }
 
 void InkSpark::load(const std::string & path, const QMat & tok_embd, int n_vocab, const std::vector<HeadPart> & heads,
-                    int max_ctx, int chunk, bool verbose) {
+                    int max_ctx, int chunk, bool verbose, int slots) {
     const cudaStream_t st = heads.at(0).st;
+    if (slots < 1 || slots > kMaxSlots) throw std::runtime_error("inkspark: slots out of range");
+    n_slots_ = slots;
     gguf_.open(path);
     if (gguf_.get_str("general.architecture") != "dflash" || !gguf_.get_bool("dflash.has_markov_context", false))
         throw std::runtime_error("inkspark: " + path + " is not an Inkling DSpark drafter (dflash with a Markov context)");
@@ -391,6 +394,19 @@ void InkSpark::load(const std::string & path, const QMat & tok_embd, int n_vocab
     act_.q = actq_; act_.d = actd_; act_.s = acts_; act_.h = acth_;
     gemm_.init(st_, (size_t) 2 * KVD * E_, (size_t) W * E_);
     if (const char * d = getenv("BNK_INK_SPARK_DUMP")) dump_dir_ = d;
+    // the other conversations' caches and Markov contexts (parked until selected)
+    parked_.resize(n_slots_);
+    for (int sl = 1; sl < n_slots_; ++sl) {
+        Parked & pk = parked_[sl];
+        pk.K.resize(layers_.size());
+        pk.V.resize(layers_.size());
+        for (size_t k = 0; k < layers_.size(); ++k) {
+            pk.K[k].alloc(layers_[k].K.n);
+            pk.V[k].alloc(layers_[k].V.n);
+            vram_bytes_ += 2 * layers_[k].K.n * sizeof(half);
+        }
+        pk.f_rnn.alloc(E_);
+    }
     loaded_ = true;
     if (verbose)
         fprintf(stderr, "bnk: inkling: DSpark drafter %s: %d layers, blocks of %d (%d drafts), taps at visits %d/%d/%d/%d, "
@@ -454,7 +470,7 @@ void InkSpark::draft_block(int32_t anchor, int pos0) {
     h_in_[1] = pos0;
     static const bool graphs = env_int("BNK_INK_SPARK_GRAPHS", 1) != 0;
     if (graphs && warm_[nb]) {   // (the first draft of a size runs eagerly: top-k allocates its scratch then)
-        cudaGraphExec_t & g = graphs_[nb];
+        cudaGraphExec_t & g = graphs_[cur_][nb];
         if (!g) {
             cudaGraph_t gr;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
@@ -611,20 +627,57 @@ int InkSpark::step(int32_t, int, float * prob) {
     return blk_.toks[blk_.next++];
 }
 
+static void swap_buf(DevBuf<half> & a, DevBuf<half> & b) { std::swap(a.p, b.p); std::swap(a.n, b.n); std::swap(a.owned, b.owned); }
+static void swap_buf(DevBuf<float> & a, DevBuf<float> & b) { std::swap(a.p, b.p); std::swap(a.n, b.n); std::swap(a.owned, b.owned); }
+
+// park the current conversation's state in its entry, bring slot's in (the drafter's stream is in order, so the
+// buffers change hands between its kernels)
+void InkSpark::select(int slot) {
+    if (slot == cur_) return;
+    if (slot < 0 || slot >= n_slots_) throw std::runtime_error("inkspark: slot out of range");
+    for (int pass = 0; pass < 2; ++pass) {
+        Parked & pk = parked_[pass == 0 ? cur_ : slot];
+        if (pk.K.empty()) { pk.K.resize(layers_.size()); pk.V.resize(layers_.size()); }
+        for (size_t k = 0; k < layers_.size(); ++k) {
+            swap_buf(layers_[k].K, pk.K[k]);
+            swap_buf(layers_[k].V, pk.V[k]);
+        }
+        swap_buf(f_rnn_, pk.f_rnn);
+        std::swap(fed_hi_, pk.fed_hi);
+        std::swap(blk_, pk.blk);
+    }
+    cur_ = slot;
+}
+
 void InkSpark::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, float * prob_out) {
+    const int keep = cur_;
+    item_slot_.assign(items.size(), 0);
     for (size_t i = 0; i < items.size(); ++i) {
         const RunItem & it = items[i];
+        select(it.slot);
+        item_slot_[i] = it.slot;
         tok_out[i] = run(it.R_rows, it.tokens, it.n, it.cell0, true, &prob_out[i]);
     }
+    select(keep);
 }
 
 void InkSpark::step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) {
-    for (size_t i = 0; i < items.size(); ++i) tok_out[i] = step(items[i].tok, items[i].cell, &prob_out[i]);
+    const int keep = cur_;
+    std::vector<int> next(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int sl = items[i].prev >= 0 && items[i].prev < (int) item_slot_.size() ? item_slot_[items[i].prev] : cur_;
+        select(sl);
+        next[i] = sl;
+        tok_out[i] = step(items[i].tok, items[i].cell, &prob_out[i]);
+    }
+    item_slot_ = next;
+    select(keep);
 }
 
-const std::vector<std::pair<int32_t, float>> * InkSpark::draft_dist(int, int i) const {
-    if (i < 0 || i >= (int) blk_.dist.size() || blk_.dist[i].empty()) return nullptr;
-    return &blk_.dist[i];
+const std::vector<std::pair<int32_t, float>> * InkSpark::draft_dist(int slot, int i) const {
+    const Block & b = slot == cur_ || slot < 0 || slot >= n_slots_ ? blk_ : parked_[slot].blk;
+    if (i < 0 || i >= (int) b.dist.size() || b.dist[i].empty()) return nullptr;
+    return &b.dist[i];
 }
 
 void InkSpark::save(std::vector<uint8_t> & out) const {

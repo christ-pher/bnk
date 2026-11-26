@@ -140,3 +140,19 @@ reference (2,934 tokens: NLL 2.1130 vs 2.1101, top-1 97.0%).
   (L1-bound for T > 1: +0.75 ms a window from 1 to 3 rows); the rest of the per-row cost is spread thin.
 * Not yet: images (inkling2v: a ViT with a CLS token, resized learned position embeddings, 2D RoPE, patch merge,
   GELU projector; image rows enter as embeddings without the token norm), more conversation slots.
+
+## 2026-11-26: images and slots
+
+- Images: the inkling2v encoder in src/vision (Projector::Inkling2V): 23 ViT blocks (1024 wide, 16 heads), patch 20,
+  a CLS token, the 32 x 32 position table resized with ggml's bilinear (half-pixel centers), 2D RoPE (dims 0-31 the
+  column + 1, 32-63 the row + 1, normal pairs), layer scales, a 2 x 2 merge, mm.1 -> GELU -> mm.2 (2304). Any size:
+  padded to 40-pixel cells with the reference's raw -1; the server scales down only past 4,096 cells. Image rows
+  are placed after the token norm (llama.cpp does not norm image embeddings); image windows run eagerly.
+  Test image: greedy reply identical to llama-mtmd-cli's, word for word; a 1,990 x 1,510 table (1,900 cells) read
+  correctly, its prompt in 2.7 s.
+- Slots (--slots, config 2): each conversation has its own visits (K/V, conv states, pending conv inputs) on both
+  ranks, history, checkpoints, drafter caches / f_rnn / block and graphs; select swaps buffers (no copies). A
+  batched round runs the windows one after the other, copying logits / features rows side by side (row0_of).
+  Greedy outputs together = alone; two together 81 tok/s total (one conversation's speed); alternating agents keep
+  their prompts (a 4K prompt 3.6 s once, then 0.3 s a turn). VRAM with 2 slots: 23.4 / 21.0 GB.
+- Next: windows of two slots in one forward (per-slot attention / conv / KV store inside a visit) for real batching.

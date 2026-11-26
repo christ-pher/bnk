@@ -33,6 +33,7 @@ namespace bnk {
 
 constexpr int kInkWin = 16;   // rows of a decode / verify window
 constexpr int kInkAttnSplits = 32;   // most key splits of the attention
+constexpr int kInkMaxSlots = 4;      // conversation slots (EngineOptions::slots)
 
 class InkEngine : public EngineApi {
 public:
@@ -59,11 +60,12 @@ public:
     int64_t graph_captures() const override { return captures_; }
     size_t graph_bytes() const override { return 0; }
 
-    int slots() const override { return 1; }
-    int current_slot() const override { return 0; }
-    void select(int slot) override {
-        if (slot != 0) throw std::runtime_error("inkling: one conversation slot");
-    }
+    // slots: each conversation its own caches and conv states on both GPUs, history, checkpoints, drafter state and
+    // graphs; select swaps the current one's buffers with the slot's (nothing is copied). A batched round runs the
+    // slots' windows one after the other, their logits / features rows side by side (row0_of)
+    int slots() const override { return n_slots_; }
+    int current_slot() const override { return cur_; }
+    void select(int slot) override;
     void reset() override;
     int pos() const override { return (int) history_.size(); }
     const std::vector<int32_t> & history() const override { return history_; }
@@ -83,9 +85,9 @@ public:
     void forward_pipe(const std::vector<BatchWin> &, int, const std::vector<BatchWin> &, int) override {
         throw std::runtime_error("inkling: no pipelined lanes");
     }
-    int row0_of(int) const override { return 0; }
+    int row0_of(int slot) const override { return slot >= 0 && slot < kInkMaxSlots ? row0_[slot] : 0; }
     void commit(int c) override;
-    const float * residual_dev() const override { return spark_ ? feat_.p : nullptr; }
+    const float * residual_dev() const override { return spark_ ? feat_out_ : nullptr; }
     void set_mtp_pending(const float *, int) override {}
     const float * mtp_pending_R() const override { return nullptr; }
     int mtp_pending_cell() const override { return -1; }
@@ -170,11 +172,23 @@ private:
     std::vector<Visit> visits_;
     std::vector<int32_t> history_;
     int pending_T_ = 0;      // rows of an uncommitted verify window
+    void alloc_visits(std::vector<Visit> & vs);
 
     // checkpoints: conv states and the window rings on the host
     struct Ckpt { int pos = -1; std::vector<float> conv; std::vector<half> ring; std::vector<uint8_t> spark; int64_t age = 0; };
     std::vector<Ckpt> ckpts_;
     int64_t ckpt_age_ = 0;
+
+    // the other slots' conversations, parked (the current slot's entry is empty); rank 1 parks its visits and
+    // checkpoints only
+    struct Parked { std::vector<Visit> visits; std::vector<int32_t> history; int pending_T = 0; std::vector<Ckpt> ckpts; int64_t ckpt_age = 0; };
+    std::vector<Parked> parked_;
+    int n_slots_ = 1, cur_ = 0;
+    void select_here(int slot);
+    int row0_[kInkMaxSlots] = {};
+    float * lg_ = nullptr;             // the logits the readers see: logits_, or a batched round's blogits_
+    const float * feat_out_ = nullptr; // the features the drafter reads: feat_, or a batched round's bfeat_
+    DevBuf<float> blogits_, bfeat_;
 
     // activations (capacity chunk_ rows)
     DevBuf<float> x_, ffn_inp_, mixed_, ins_[3], attn_, o_, tmp_,
@@ -203,7 +217,7 @@ private:
     DevBuf<TcBlock> tc_blocks_;
     DevBuf<float> mqd_;
     bool graphs_on_ = true;
-    cudaGraphExec_t graphs_[kInkWin + 1][2] = {};   // per window rows and commit (keep) mode
+    cudaGraphExec_t graphs_[kInkMaxSlots][kInkWin + 1][2] = {};   // per slot, window rows and commit (keep) mode
     int64_t captures_ = 0;
     void enqueue(int T, bool keep);
     std::vector<int32_t> h_ids_;
