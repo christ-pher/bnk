@@ -58,6 +58,28 @@ __global__ void k_rel_table(const float * R, int64_t ldr, const float * sink, in
     }
 }
 
+// decode windows (few rows): a block per (t, h) row, a thread per distance
+__global__ void k_rel_table_small(const float * R, int64_t ldr, const float * sink, int64_t lds, const float * rel_bias,
+                                  int H, int n_rel, int extent, float * table) {
+    __shared__ float r[16];
+    const int th = blockIdx.y, t = th / H, h = th % H;
+    if (threadIdx.x < 16) r[threadIdx.x] = R[(int64_t) t * ldr + h * n_rel + threadIdx.x];
+    __syncthreads();
+    const float sk = sink[(int64_t) t * lds + h];
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d > extent) return;
+    float b = 0;
+    if (d < extent) {
+        const float4 * rb = (const float4 *) (rel_bias + (int64_t) d * 16);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 v = rb[i];
+            b += r[4 * i] * v.x + r[4 * i + 1] * v.y + r[4 * i + 2] * v.z + r[4 * i + 3] * v.w;
+        }
+    }
+    table[(int64_t) th * (extent + 1) + d] = (b - sk) * kLog2e;
+}
+
 template <int G>
 __global__ void __launch_bounds__(32 * G) k_attn_tc(const float * __restrict__ q, const half * __restrict__ kc,
         const half * __restrict__ vc, const float * __restrict__ table, float * __restrict__ out,
@@ -315,8 +337,11 @@ void ink_attention_tc(const float * q, const float * R, const float * sink, cons
     float * part_o = scratch + (size_t) T * H * (extent + 1);
     float * part_ml = part_o + (size_t) nsplit * T * H * kD;
     if (n_rel != 16) throw std::runtime_error("ink_attention_tc: 16 relative channels");
-    k_rel_table<<<dim3((extent + 256) / 256, (T * H + 31) / 32), 256, 0, s>>>(R, ldr, sink, lds, rel_bias, T * H, H, n_rel,
-                                                                              extent, table);
+    if (T * H <= 256)
+        k_rel_table_small<<<dim3((extent + 256) / 256, T * H), 256, 0, s>>>(R, ldr, sink, lds, rel_bias, H, n_rel, extent, table);
+    else
+        k_rel_table<<<dim3((extent + 256) / 256, (T * H + 31) / 32), 256, 0, s>>>(R, ldr, sink, lds, rel_bias, T * H, H, n_rel,
+                                                                                  extent, table);
     const Pos0 p0{pos0, pos0_dev};
     switch (H / KVH) {
         case 1: launch<1>(q, K, V, table, out, part_o, part_ml, T, H, KVH, ring, extent, window, p0, scale, nsplit, ldq, 0, s); break;

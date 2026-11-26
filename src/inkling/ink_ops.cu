@@ -599,33 +599,40 @@ __device__ __forceinline__ void bf16x8(const uint4 q, float * w) {
     for (int k = 0; k < 4; ++k) { w[2 * k] = __uint_as_float(u[k] << 16); w[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u); }
 }
 
-// g[t][r] = down[r] . in2[t] (rank rows of 2E): a warp per (row, job), lanes over the row's 8-value chunks
+// g[t][r] = down[r] . in2[t] (rank rows of 2E): a block (256 threads) per (row, job), the threads over the row's
+// 8-value chunks, the tokens' sums reduced in shared memory (a warp a row left 24 blocks for a whole GPU)
 template <int NT>
 __global__ void k_ctrl_down(CtrlJobs J, int T, int E, int rank) {
+    __shared__ float red[8][NT];
     const InkCtrlJob & jb = J.j[blockIdx.y];
-    const int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
-    if (r >= rank) return;
+    const int r = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int K = 2 * E;
     const uint4 * row = (const uint4 *) ((const uint16_t *) jb.down + (int64_t) r * K);
     float acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
-    for (int c = lane; c < K / 8; c += 32) {
-        float w[8];
-        bf16x8(row[c], w);
+    for (int c = threadIdx.x; c < K / 8; c += blockDim.x) {
+        float wv[8];
+        bf16x8(row[c], wv);
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
             if (t >= T) break;
             const float4 a = *(const float4 *) (jb.in2 + (int64_t) t * K + c * 8);
-            const float4 b = *(const float4 *) (jb.in2 + (int64_t) t * K + c * 8 + 4);
-            acc[t] += w[0] * a.x + w[1] * a.y + w[2] * a.z + w[3] * a.w + w[4] * b.x + w[5] * b.y + w[6] * b.z + w[7] * b.w;
+            const float4 b2 = *(const float4 *) (jb.in2 + (int64_t) t * K + c * 8 + 4);
+            acc[t] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w + wv[4] * b2.x + wv[5] * b2.y + wv[6] * b2.z + wv[7] * b2.w;
         }
     }
 #pragma unroll
     for (int t = 0; t < NT; ++t) {
         if (t >= T) break;
         const float v = warp_sum(acc[t]);
-        if (lane == 0) jb.g[(int64_t) t * rank + r] = v;
+        if (lane == 0) red[w][t] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < T) {
+        float a = 0;
+        for (int i = 0; i < 8; ++i) a += red[i][threadIdx.x];
+        jb.g[(int64_t) threadIdx.x * rank + r] = a;
     }
 }
 
@@ -850,7 +857,7 @@ void ink_ctrl_concat(const InkCtrlJob * jobs, int n, int T, int E, cudaStream_t 
 }
 void ink_ctrl_down(const InkCtrlJob * jobs, int n, int T, int E, int rank, cudaStream_t s) {
     if (T > 16) throw std::runtime_error("ink_ctrl_down: window");
-    const dim3 g((rank + 7) / 8, n);
+    const dim3 g(rank, n);
     if (T == 1) k_ctrl_down<1><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
     else if (T <= 4) k_ctrl_down<4><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
     else k_ctrl_down<16><<<g, 256, 0, s>>>(ctrl_jobs(jobs, n), T, E, rank);
