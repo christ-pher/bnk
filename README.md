@@ -15,7 +15,12 @@ Since v0.5.0 it runs **DeepSeek-V4.1-Flash** (`deepseek41`, 763B parameters, 384
 (`docs/DEEPSEEK.md`): ISTA-DASLab's 2-bit GSQ-RCO builds on the two V100s and 192 GB of RAM, the 110 GB Engram
 tables read from the NVMe, experts split between VRAM and RAM without a copy, the resident set following the routing while serving (v0.6.0), conversations parked in RAM and kept on disk across restarts (v0.6.1), two conversation slots and faster sampling and drafting (v0.6.2); 30-45 tok/s decode, 650-830 tok/s on long prompts.
 
-All three read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
+Since v0.6.3 it runs **Inkling 2 Mini** (`inkling2_loop`, Thinking Machines' looped MoE: 24 layers, the core run three
+times, 48 layer visits a token) through a fourth engine (`docs/INKLING-PLAN.md`): Unsloth's UD-Q8_K_XL in VRAM,
+tensor parallel over the two V100s, with the model's own DSpark drafter; ~78 tok/s prose, ~101 code (temperature 1),
+~1,050 tok/s prompts out to 40K, a 262K context and two conversation slots. `./run.sh inkling`.
+
+All four read **images** too (screenshots, mockups, documents) when the model's vision encoder is downloaded: OpenAI
 `image_url` parts and Anthropic `image` blocks, also in tool results (`docs/VISION.md`; DeepSeek since 2026-10-28).
 
 On top of that: speculative decoding with the model's own MTP layer, a 256K context whose memory is lent to the

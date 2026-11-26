@@ -21,6 +21,13 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-11-26, v0.6.3: Inkling 2 Mini, the fourth engine** (`docs/INKLING-PLAN.md`, `src/inkling`): Unsloth's
+  UD-Q8_K_XL (NVFP4 experts, BF16 the rest) tensor parallel over both V100s (half the heads, of every expert and of the
+  vocabulary each; two all-reduces a visit by peer pushes; one CUDA graph over both GPUs a decode window), merged kernels
+  (1,977 -> 1,274 launches a token), the model's DSpark drafter (2 drafts a round, its head split over both GPUs),
+  images (the inkling2v encoder), two conversation slots. Matches llama.cpp (NLL 2.113 vs 2.110 over 2,934 tokens).
+  Decode 55 (one GPU) -> prose ~78, code ~101 tok/s at temperature 1; prompts ~1,050 tok/s to 40K. Shared: a two-stage
+  top-k, lookup drafts verified without a drafter. Next: two slots' windows in one forward (today they take turns).
 * **2026-11-25, v0.6.2: DeepSeek sampling, drafting and two slots** (`docs/PERF-SHARED-PLAN.md`): exact lazy-tail
   sampling (the GPU's head, the whole row only when a draw lands outside it; host sampling 9.4 -> 3.0 ms a round), the
   DSpark Markov step on the GPU, two conversation slots (lanes' window state fixed), warm start of the resident experts
