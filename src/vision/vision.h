@@ -28,7 +28,7 @@
 
 namespace bnk {
 
-enum class Projector { Qwen3VL, DeepSeek41V };
+enum class Projector { Qwen3VL, DeepSeek41V, Inkling2V };
 
 struct VisionConfig {
     Projector kind = Projector::Qwen3VL;
@@ -36,10 +36,17 @@ struct VisionConfig {
     float eps = 1e-6f;
     float mean[3] = {0.5f, 0.5f, 0.5f}, std[3] = {0.5f, 0.5f, 0.5f};
     int head_dim() const { return n_embd / n_head; }
-    // image sides are multiples of this (DeepSeek pads the patch grid to whole merge blocks itself)
+    // image sides are multiples of this (DeepSeek pads the patch grid to whole merge blocks itself; Inkling's
+    // encoder pads any size up to it)
     int unit() const { return kind == Projector::DeepSeek41V ? patch : patch * merge; }
+    bool pads() const { return kind == Projector::Inkling2V; }
     // the merged grid of an H x W image (rows, columns)
     void grid(int H, int W, int * gh, int * gw) const {
+        if (pads()) {
+            *gh = (H + unit() - 1) / unit();
+            *gw = (W + unit() - 1) / unit();
+            return;
+        }
         const int m = kind == Projector::DeepSeek41V ? merge : 1;
         *gh = (H / unit() + m - 1) / m;
         *gw = (W / unit() + m - 1) / m;
@@ -102,6 +109,11 @@ private:
     void fetch(int s, int buf);
     void load_ds();
     void encode_ds(const uint8_t * rgb, int H, int W, float * out);
+    // Inkling 2 (inkling2v): a ViT with a CLS token, a learned position table (bilinearly resized), 2D RoPE, layer
+    // scale; the patches merged 2 x 2 and projected
+    std::vector<float> pos_host_, cls_;           // the table [side^2][E] and CLS + its position (host)
+    void load_ink();
+    void encode_ink(const uint8_t * rgb, int H, int W, float * out);
     size_t ds_carve(int N, int M, size_t * offs) const;
 };
 

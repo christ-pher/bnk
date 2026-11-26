@@ -163,5 +163,7 @@ void bump_seq(uint32_t * seq, cudaStream_t st);
 // the decode path's SwiGLU clamp (moe_act: up to [-limit, limit], gate to <= limit; DeepSeek-V4), 0 = none
 void moe_set_swiglu_limit(float limit);
 void moe_tc_set_swiglu_limit(float limit);   // the same for the prompt path's tensor-core experts (moe_tc_gu)
+// SITU (Inkling 2) in place of moe_tc_gu's SiLU, on the current device; beta 0 = SiLU
+void moe_tc_set_situ(float beta, float lb);
 
 }  // namespace bnk

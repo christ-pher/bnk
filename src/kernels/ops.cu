@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 #include <cfloat>
 #include <stdexcept>
 #include <cstdio>
@@ -779,13 +781,10 @@ __device__ __forceinline__ unsigned order_key(float f) {
 // One block (1024 threads) per row: radix select of the K-th largest key (8 bits at a time from the top), then
 // everything above it and the lowest-index equal ones (each thread scans a contiguous range; block scans place
 // the picks). The same selection as qsa_topk_k, on order-preserving keys.
-__global__ void __launch_bounds__(1024) topk_rows_k(const float * x, int n, int K, int32_t * ids, float * vals) {
+// the selection of one row (one block of 1024): ids are positions in `row` + id_off, or idmap[position] when given
+__device__ void topk_select(const float * row, int n, int K, int32_t * oid, float * ov, const int32_t * idmap, int id_off) {
     __shared__ unsigned hist[256];
     __shared__ unsigned prefix_s, want_s;
-    const int t = blockIdx.x;
-    const float * row = x + (int64_t) t * n;
-    int32_t * oid = ids + (int64_t) t * K;
-    float * ov = vals + (int64_t) t * K;
     unsigned prefix = 0, mask = 0, want = K;
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
@@ -845,12 +844,12 @@ __global__ void __launch_bounds__(1024) topk_rows_k(const float * x, int n, int 
         const unsigned v = order_key(f);
         if (v > prefix) {
             const int slot = ia + min(ie, (int) want);
-            oid[slot] = b;
+            oid[slot] = idmap ? idmap[b] : b + id_off;
             ov[slot] = f;
             ++ia;
         } else if (v == prefix) {
             if (ie < (int) want) {
-                oid[ia + ie] = b;
+                oid[ia + ie] = idmap ? idmap[b] : b + id_off;
                 ov[ia + ie] = f;
             }
             ++ie;
@@ -858,9 +857,59 @@ __global__ void __launch_bounds__(1024) topk_rows_k(const float * x, int n, int 
     }
 }
 
+
+__global__ void __launch_bounds__(1024) topk_rows_k(const float * x, int n, int K, int32_t * ids, float * vals) {
+    const int t = blockIdx.x;
+    topk_select(x + (int64_t) t * n, n, K, ids + (int64_t) t * K, vals + (int64_t) t * K, nullptr, 0);
+}
+
+// two stages for long rows: G blocks a row each select their chunk's top K (fewer than K: all of it, padded with
+// -inf), then one block selects the row's top K from the G K candidates
+__global__ void __launch_bounds__(1024) topk_part_k(const float * x, int n, int K, int chunk, int G, int32_t * cid,
+                                                     float * cv) {
+    const int t = blockIdx.y, g = blockIdx.x;
+    const int c0 = g * chunk, len = max(0, min(chunk, n - c0));
+    int32_t * oid = cid + ((int64_t) t * G + g) * K;
+    float * ov = cv + ((int64_t) t * G + g) * K;
+    if (len <= K) {
+        for (int i = threadIdx.x; i < K; i += blockDim.x) {
+            oid[i] = i < len ? c0 + i : 0;
+            ov[i] = i < len ? x[(int64_t) t * n + c0 + i] : -FLT_MAX;
+        }
+        return;
+    }
+    topk_select(x + (int64_t) t * n + c0, len, K, oid, ov, nullptr, c0);
+}
+__global__ void __launch_bounds__(1024) topk_merge_k(const int32_t * cid, const float * cv, int GK, int K, int32_t * ids,
+                                                      float * vals) {
+    const int t = blockIdx.x;
+    topk_select(cv + (int64_t) t * GK, GK, K, ids + (int64_t) t * K, vals + (int64_t) t * K, cid + (int64_t) t * GK, 0);
+}
+
 void topk_rows(const float * x, int T, int n, int K, int32_t * ids, float * vals, cudaStream_t s) {
     if (T <= 0 || K <= 0) return;
-    topk_rows_k<<<T, 1024, 0, s>>>(x, n, K, ids, vals);
+    // one block a row reads a long row 6 times from one SM (a 200K vocabulary: ~530 us); split it over G blocks
+    const int G = std::max(1, std::min(64, n / (4 * K)));
+    if (G < 4 || getenv("BNK_TOPK_1BLOCK")) {
+        topk_rows_k<<<T, 1024, 0, s>>>(x, n, K, ids, vals);
+        return;
+    }
+    const int chunk = (n + G - 1) / G;
+    // the candidates' scratch, per device (grown as needed; never inside a capture: the callers run eagerly)
+    static thread_local std::vector<std::pair<void *, size_t>> scratch(16, {nullptr, 0});
+    int dev = 0;
+    cudaGetDevice(&dev);
+    auto & sc = scratch[dev & 15];
+    const size_t need = (size_t) T * G * K * 8;
+    if (need > sc.second) {
+        if (sc.first) cudaFree(sc.first);
+        if (cudaMalloc(&sc.first, need) != cudaSuccess) throw std::runtime_error("topk_rows: scratch");
+        sc.second = need;
+    }
+    int32_t * cid = (int32_t *) sc.first;
+    float * cv = (float *) ((char *) sc.first + (size_t) T * G * K * 4);
+    topk_part_k<<<dim3(G, T), 1024, 0, s>>>(x, n, K, chunk, G, cid, cv);
+    topk_merge_k<<<T, 1024, 0, s>>>(cid, cv, G * K, K, ids, vals);
 }
 
 // z[t] = sum of exp((x - max) / temp) over row t's values within 30 nats of its max, as the host sampler sums them:

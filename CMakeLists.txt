@@ -78,6 +78,12 @@ add_library(bnk_core STATIC
   src/deepseek/ds_prefill.cpp
   src/deepseek/ds_park.cpp
   src/deepseek/ds_spark.cpp
+  src/inkling/ink_model.cpp
+  src/inkling/ink_ops.cu
+  src/inkling/ink_moe.cu
+  src/inkling/ink_attn.cu
+  src/inkling/ink_spark.cu
+  src/inkling/ink_engine.cpp
 )
 target_include_directories(bnk_core PUBLIC src third_party/ggml/include third_party/ggml/src)
 target_link_libraries(bnk_core PUBLIC ggml ggml-base ggml-cpu CUDA::cudart CUDA::cublas CUDA::cuda_driver Threads::Threads)
@@ -100,6 +106,8 @@ add_executable(bench_ds_attn tests/bench_ds_attn.cu)
 target_link_libraries(bench_ds_attn PRIVATE bnk_core)
 add_executable(test_lora tests/test_lora.cu)
 target_link_libraries(test_lora PRIVATE bnk_core)
+add_executable(test_inkling tests/test_inkling.cpp)
+target_link_libraries(test_inkling PRIVATE bnk_core)
 add_executable(bnk tools/bnk_main.cpp)
 target_link_libraries(bnk PRIVATE bnk_core)
 add_executable(requant_experts tools/requant_experts.cpp)

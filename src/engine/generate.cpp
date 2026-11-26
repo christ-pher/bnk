@@ -201,7 +201,10 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     }
     use_slot();
     sp_ = sp;
-    if (mtp_) mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
+    if (mtp_) {
+        mtp_->set_temperature(sp.greedy() ? 0.f : sp.temperature);
+        mtp_->set_max_drafts(opt_.max_draft);
+    }
     if (sp.seed) sampler_.seed(sp.seed);
     emitted_tail_.clear();
     drafts_.clear();
@@ -284,7 +287,19 @@ int32_t Generator::start(const std::vector<int32_t> & prompt, const SamplingPara
     emitted_tail_.push_back(b);
     if (eng_.mtp_pending_cell() >= 0 && eng_.mtp_pending_cell() == eng_.pos() - 1)
         draft_from(eng_.mtp_pending_R(), b, eng_.mtp_pending_cell());
+    else if (!mtp_ && lookup_alone()) {
+        lookup_drafts(b);
+        choose_drafts(-1, 0.f);
+    }
     return b;
+}
+
+// An engine without a drafter (Inkling 2 so far) still verifies the prompt lookup's copies (a match with at least
+// lookup_agree tokens of shared context): copy-heavy turns (an agent quoting code) run several tokens a round.
+// BNK_LOOKUP_ALONE=0 turns it off.
+bool Generator::lookup_alone() const {
+    static const bool on = !getenv("BNK_LOOKUP_ALONE") || atoi(getenv("BNK_LOOKUP_ALONE")) != 0;
+    return on && eng_.max_window() > 1;
 }
 
 std::vector<int32_t> Generator::next() {
@@ -473,6 +488,10 @@ std::vector<int32_t> Generator::finish(bool draft) {
     drafts_from_lookup_ = false;
     job_.pending = false;
     if (mtp_ && opt_.max_draft > 0) lookup_drafts(bonus);   // what the lookup proposes after the bonus token
+    if (!mtp_ && lookup_alone()) {   // no drafter: the lookup's copies alone, on its own agreement rule
+        lookup_drafts(bonus);
+        choose_drafts(-1, 0.f);
+    }
     if (mtp_ && !draft) {   // left for draft_batch(): the residual rows stay valid until the next forward
         std::vector<int32_t> nxt(win.begin() + 1, win.begin() + 1 + a);
         nxt.push_back(bonus);

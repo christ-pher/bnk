@@ -273,9 +273,12 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
     budget_ = budget;
     const double t0 = now_ms();
     gguf_.open(path);
-    const std::string proj = gguf_.get_str("clip.projector_type");
+    // the projector's key: clip.projector_type (most converters), clip.vision.projector_type (newer mmproj files)
+    const std::string proj = gguf_.get_str("clip.projector_type", gguf_.get_str("clip.vision.projector_type"));
     if (proj == "deepseek41v") {
         load_ds();
+    } else if (proj == "inkling2v") {
+        load_ink();
     } else {
     if (proj != "qwen3vl_merger")
         throw std::runtime_error("vision: projector '" + proj + "' is not supported (qwen3vl_merger, deepseek41v)");
@@ -338,7 +341,7 @@ void VisionEncoder::load(const std::string & path, int device, VramBudget * budg
     BLAS_CHECK(cublasCreate(&blas_));
     BLAS_CHECK(cublasSetStream(blas_, st_));
     BLAS_CHECK(cublasSetMathMode(blas_, CUBLAS_TENSOR_OP_MATH));
-    if (budget_ && c.kind == Projector::Qwen3VL) arena_.reserve((size_t) 8 << 30, budget_, "vision scratch");
+    if (budget_ && c.kind != Projector::DeepSeek41V) arena_.reserve((size_t) 8 << 30, budget_, "vision scratch");
     loaded_ = true;
     size_t host = 0;
     for (auto & s : stages_) host += s.bytes;
@@ -381,6 +384,7 @@ void VisionEncoder::fetch(int s, int buf) {
 void VisionEncoder::encode(const uint8_t * rgb, int H, int W, float * out) {
     if (!loaded_) throw std::runtime_error("vision: no encoder loaded");
     if (cfg_.kind == Projector::DeepSeek41V) return encode_ds(rgb, H, W, out);
+    if (cfg_.kind == Projector::Inkling2V) return encode_ink(rgb, H, W, out);
     const auto & c = cfg_;
     if (H % c.unit() || W % c.unit() || H <= 0 || W <= 0) throw std::runtime_error("vision: image sides must be multiples of " + std::to_string(c.unit()));
     DeviceScope ds(dev_);
@@ -708,6 +712,253 @@ void VisionEncoder::encode_ds(const uint8_t * rgb, int H, int W, float * out) {
     ms += now_ms() - t0;
     ++images;
     tokens += c.cells(H, W);
+}
+
+}  // namespace bnk
+
+// ------------------------------------------------------------------------------------------------ Inkling 2
+namespace bnk {
+namespace {
+
+// x[0] = the CLS row; x[1 + p] = y[p] + the resized table's row p
+__global__ void ink_embed_k(const float * y, const float * table, const float * cls, float * x, int E) {
+    const int r = blockIdx.x;
+    for (int i = threadIdx.x; i < E; i += blockDim.x)
+        x[(int64_t) r * E + i] = r == 0 ? cls[i] : y[(int64_t) (r - 1) * E + i] + table[(int64_t) (r - 1) * E + i];
+}
+
+// LayerNorm of fp32 rows in place
+__global__ void ink_layernorm_inplace_k(float * x, const float * w, const float * b, int E, float eps) {
+    __shared__ float sh[32];
+    float * xr = x + (int64_t) blockIdx.x * E;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) s += xr[i];
+    const float mean = block_red<false>(s, sh) / E;
+    float v = 0.f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) { const float d = xr[i] - mean; v += d * d; }
+    const float rstd = rsqrtf(block_red<false>(v, sh) / E + eps);
+    for (int i = threadIdx.x; i < E; i += blockDim.x) xr[i] = (xr[i] - mean) * rstd * w[i] + b[i];
+}
+
+// qkv rows [n][3E] (fp32, bias not yet added) -> q, k, v fp16 [n][E]; q and k rotated (llama.cpp's build_rope_2d,
+// normal pairs): dims [0, D/2) by the column position, [D/2, D) by the row position, theta_i = pos 10000^(-2i/(D/2));
+// row 0 the CLS token (positions 0), patch p (r, c) of the gw-wide grid at (c + 1, r + 1)
+__global__ void ink_qkv_rope_k(const float * qkv, const float * bias, half * q, half * k, half * v, int E, int H,
+                               int gw, float base) {
+    const int row = blockIdx.x;
+    const int pw = row == 0 ? 0 : (row - 1) % gw + 1, ph = row == 0 ? 0 : (row - 1) / gw + 1;
+    const int D = E / H, hd = D / 2, npair = hd / 2;
+    const float * x = qkv + (int64_t) row * 3 * E;
+    for (int j = threadIdx.x; j < H * 2 * npair; j += blockDim.x) {
+        const int h = j / (2 * npair), sec = (j / npair) % 2, i = j % npair;   // section 0: the column, 1: the row
+        const float theta = (float) (sec ? ph : pw) * powf(base, -2.f * i / hd);
+        float sn, cs;
+        sincosf(theta, &sn, &cs);
+        const int a = h * D + sec * hd + 2 * i, b = a + 1;
+        for (int part = 0; part < 2; ++part) {
+            const float x0 = x[part * E + a] + bias[part * E + a], x1 = x[part * E + b] + bias[part * E + b];
+            half * o = part ? k : q;
+            o[(int64_t) row * E + a] = __float2half(x0 * cs - x1 * sn);
+            o[(int64_t) row * E + b] = __float2half(x0 * sn + x1 * cs);
+        }
+    }
+    for (int i = threadIdx.x; i < E; i += blockDim.x) v[(int64_t) row * E + i] = __float2half(x[2 * E + i] + bias[2 * E + i]);
+}
+
+// x += (y + b) * ls
+__global__ void ink_residual_ls_k(float * x, const float * y, const float * b, const float * ls, int E, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += (y[i] + b[i % E]) * ls[i % E];
+}
+
+// the merged rows: token (j, i) of the gh2 x gw2 merged grid = patches (2j, 2i), (2j, 2i + 1), (2j + 1, 2i),
+// (2j + 1, 2i + 1) side by side (llama.cpp's build_patch_merge_permute), without the CLS row, fp16
+__global__ void ink_merge_k(const float * x, half * h, int E, int gw) {
+    const int m = blockIdx.x, gw2 = gw / 2, j = m / gw2, i = m % gw2;
+    for (int t = threadIdx.x; t < 4 * E; t += blockDim.x) {
+        const int part = t / E, e = t % E;
+        const int r = 2 * j + part / 2, c = 2 * i + part % 2;
+        h[(int64_t) m * 4 * E + t] = __float2half(x[(int64_t) (1 + r * gw + c) * E + e]);
+    }
+}
+
+__global__ void ink_gelu_k(const float * y, half * o, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = y[i];
+    o[i] = __float2half(0.5f * x * (1.f + erff(x * 0.70710678f)));
+}
+
+}  // namespace
+
+void VisionEncoder::load_ink() {
+    auto & c = cfg_;
+    c.kind = Projector::Inkling2V;
+    c.n_embd = (int) gguf_.get_u64("clip.vision.embedding_length");
+    c.n_ff = (int) gguf_.get_u64("clip.vision.feed_forward_length");
+    c.n_layer = (int) gguf_.get_u64("clip.vision.block_count");
+    c.n_head = (int) gguf_.get_u64("clip.vision.attention.head_count");
+    c.patch = (int) gguf_.get_u64("clip.vision.patch_size", 20);
+    c.merge = (int) gguf_.get_u64("clip.vision.spatial_merge_size", 2);
+    c.out_dim = (int) gguf_.get_u64("clip.vision.projection_dim");
+    c.eps = (float) gguf_.get_f64("clip.vision.attention.layer_norm_epsilon", 1e-5);
+    auto mean = gguf_.get_f32_arr("clip.vision.image_mean"), sd = gguf_.get_f32_arr("clip.vision.image_std");
+    for (int i = 0; i < 3 && i < (int) mean.size() && i < (int) sd.size(); ++i) { c.mean[i] = mean[i]; c.std[i] = sd[i]; }
+    const TensorRef & pos = gguf_.get("v.position_embd.weight");
+    c.pos_side = (int) lrint(sqrt((double) pos.ne[1]));
+    if (c.pos_side * c.pos_side != pos.ne[1] || pos.ne[0] != c.n_embd || c.merge != 2 || c.head_dim() % 4)
+        throw std::runtime_error("vision: unexpected inkling2v shapes");
+    pos_host_ = to_f32(pos);
+    {
+        std::vector<float> a = to_f32(gguf_.get("v.class_embd")), b = to_f32(gguf_.get("v.class_position_embd.weight"));
+        cls_.resize(c.n_embd);
+        for (int i = 0; i < c.n_embd; ++i) cls_[i] = a[i] + b[i];
+    }
+    // stage 0: the patch embedding, the pre-norm
+    add_stage({{&gguf_.get("v.patch_embd.weight"), true}, {&gguf_.get("v.pre_ln.weight"), false}, {&gguf_.get("v.pre_ln.bias"), false}});
+    for (int il = 0; il < c.n_layer; ++il) {
+        const std::string b = "v.blk." + std::to_string(il) + ".";
+        auto V = [&](const char * n) { return to_f32(gguf_.get(b + n)); };
+        auto cat = [&](const char * a, const char * k, const char * v) {
+            std::vector<float> o = V(a), x = V(k), y = V(v);
+            o.insert(o.end(), x.begin(), x.end());
+            o.insert(o.end(), y.begin(), y.end());
+            return o;
+        };
+        // 0 qkv, 1 out, 2 up, 3 down, 4-7 their biases, 8/9 ln1, 10/11 ln2, 12/13 the layer scales
+        add_stage_vals({{cat("attn_q.weight", "attn_k.weight", "attn_v.weight"), true}, {V("attn_out.weight"), true},
+                        {V("ffn_up.weight"), true}, {V("ffn_down.weight"), true},
+                        {cat("attn_q.bias", "attn_k.bias", "attn_v.bias"), false}, {V("attn_out.bias"), false},
+                        {V("ffn_up.bias"), false}, {V("ffn_down.bias"), false}, {V("ln1.weight"), false},
+                        {V("ln1.bias"), false}, {V("ln2.weight"), false}, {V("ln2.bias"), false},
+                        {V("ls1.weight"), false}, {V("ls2.weight"), false}}, b);
+    }
+    add_stage({{&gguf_.get("mm.1.weight"), true}, {&gguf_.get("mm.2.weight"), true}});
+    if (gguf_.get("mm.1.weight").ne[0] != 4 * c.n_embd || gguf_.get("mm.2.weight").ne[1] != c.out_dim)
+        throw std::runtime_error("vision: inkling2v projector shapes do not match");
+}
+
+void VisionEncoder::encode_ink(const uint8_t * rgb, int H, int W, float * out) {
+    const auto & c = cfg_;
+    DeviceScope ds(dev_);
+    const double t0 = now_ms();
+    // padded to whole merged cells with the reference's raw -1 (normalized: (-1 / 255 - mean) / std)
+    const int U = c.unit(), Hp = (H + U - 1) / U * U, Wp = (W + U - 1) / U * U;
+    const int P = c.patch, gh = Hp / P, gw = Wp / P, N = gh * gw, NP = N + 1, M = N / 4;
+    const int E = c.n_embd, F = c.n_ff, D = c.head_dim(), Hn = c.n_head, K0 = 3 * P * P;
+    const int R = std::max(16, std::min(NP, (int) (((size_t) 128 << 20) / ((size_t) Hn * NP * 2))));
+    size_t off = 0;
+    auto carve = [&](size_t bytes) { off = (off + 255) / 256 * 256; const size_t o = off; off += bytes; return o; };
+    const size_t o_w0 = carve(stage_max_), o_w1 = carve(stage_max_);
+    const size_t o_x = carve((size_t) NP * E * 4), o_h = carve((size_t) NP * std::max({F, 4 * E, K0}) * 2);
+    const size_t o_y = carve((size_t) NP * std::max({3 * E, F, 4 * E}) * 4);
+    const size_t o_q = carve((size_t) NP * E * 2), o_k = carve((size_t) NP * E * 2), o_v = carve((size_t) NP * E * 2);
+    const size_t o_o = carve((size_t) NP * E * 2), o_s = carve((size_t) Hn * R * NP * 2);
+    const size_t o_t = carve((size_t) N * E * 4), o_c = carve((size_t) E * 4);
+    uint8_t * base = (uint8_t *) scratch(off);
+    wbuf_[0] = base + o_w0;
+    wbuf_[1] = base + o_w1;
+    float * x = (float *) (base + o_x), * y = (float *) (base + o_y), * table = (float *) (base + o_t), * cls = (float *) (base + o_c);
+    half * h = (half *) (base + o_h), * q = (half *) (base + o_q), * k = (half *) (base + o_k), * v = (half *) (base + o_v);
+    half * o = (half *) (base + o_o), * S = (half *) (base + o_s);
+
+    // patches row-major, normalized, fp16; the position table resized to gh x gw (ggml's bilinear, half-pixel centers)
+    std::vector<half> px((size_t) N * K0);
+    for (int p = 0; p < N; ++p) {
+        const int r = p / gw, cc = p % gw;
+        half * d = px.data() + (size_t) p * K0;
+        for (int ch = 0; ch < 3; ++ch)
+            for (int ky = 0; ky < P; ++ky)
+                for (int kx = 0; kx < P; ++kx) {
+                    const int yy = r * P + ky, xx = cc * P + kx;
+                    const float u = yy < H && xx < W ? (float) rgb[((size_t) yy * W + xx) * 3 + ch] : -1.f;
+                    d[(ch * P + ky) * P + kx] = __float2half((u / 255.f - c.mean[ch]) / c.std[ch]);
+                }
+    }
+    std::vector<float> tab((size_t) N * E);
+    {
+        const int sd = c.pos_side;
+        const float sx = (float) gw / sd, sy = (float) gh / sd;
+        for (int r = 0; r < gh; ++r) {
+            const float fy = (r + 0.5f) / sy - 0.5f;
+            int y0 = (int) floorf(fy), y1 = y0 + 1;
+            y0 = std::max(0, std::min(y0, sd - 1)); y1 = std::max(0, std::min(y1, sd - 1));
+            const float dy = std::max(0.f, std::min(fy - y0, 1.f));
+            for (int cc = 0; cc < gw; ++cc) {
+                const float fx = (cc + 0.5f) / sx - 0.5f;
+                int x0 = (int) floorf(fx), x1 = x0 + 1;
+                x0 = std::max(0, std::min(x0, sd - 1)); x1 = std::max(0, std::min(x1, sd - 1));
+                const float dx = std::max(0.f, std::min(fx - x0, 1.f));
+                const float * a = &pos_host_[(size_t) (y0 * sd + x0) * E], * b = &pos_host_[(size_t) (y0 * sd + x1) * E];
+                const float * c2 = &pos_host_[(size_t) (y1 * sd + x0) * E], * d2 = &pos_host_[(size_t) (y1 * sd + x1) * E];
+                float * t = &tab[(size_t) (r * gw + cc) * E];
+                for (int e = 0; e < E; ++e)
+                    t[e] = a[e] * (1 - dx) * (1 - dy) + b[e] * dx * (1 - dy) + c2[e] * (1 - dx) * dy + d2[e] * dx * dy;
+            }
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(h, px.data(), px.size() * 2, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(cls, cls_.data(), (size_t) E * 4, cudaMemcpyHostToDevice, st_));
+
+    auto gemm = [&](const half * Wm, int m, int kk, const half * X, int n, float * Y) {
+        const float one = 1.f, zero = 0.f;
+        BLAS_CHECK(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, m, n, kk, &one, Wm, CUDA_R_16F, kk, X, CUDA_R_16F, kk,
+                                &zero, Y, CUDA_R_32F, m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    };
+    const int ns = (int) stages_.size();
+    fetch(0, 0);
+    for (int s = 0; s < ns; ++s) {
+        const int b = s & 1;
+        if (s + 1 < ns) fetch(s + 1, b ^ 1);
+        CUDA_CHECK(cudaStreamWaitEvent(st_, copied_[b], 0));
+        const uint8_t * w = wbuf_[b];
+        const auto & so = stages_[s].off;
+        auto H16 = [&](int i) { return (const half *) (w + so[i]); };
+        auto F32 = [&](int i) { return (const float *) (w + so[i]); };
+        if (s == 0) {
+            gemm(H16(0), E, K0, h, N, y);
+            ink_embed_k<<<NP, 256, 0, st_>>>(y, table, cls, x, E);
+            ink_layernorm_inplace_k<<<NP, 256, 0, st_>>>(x, F32(1), F32(2), E, c.eps);
+        } else if (s <= c.n_layer) {
+            layernorm_k<<<NP, 256, 0, st_>>>(x, F32(8), F32(9), h, E, c.eps);
+            gemm(H16(0), 3 * E, E, h, NP, y);
+            ink_qkv_rope_k<<<NP, 256, 0, st_>>>(y, F32(4), q, k, v, E, Hn, gw, 10000.f);
+            const float scale = 1.f / sqrtf((float) D), one = 1.f, zero = 0.f;
+            for (int r0 = 0; r0 < NP; r0 += R) {
+                const int rn = std::min(R, NP - r0);
+                BLAS_CHECK(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, NP, rn, D, &scale, k, CUDA_R_16F,
+                                                      E, D, q + (size_t) r0 * E, CUDA_R_16F, E, D, &zero, S, CUDA_R_16F,
+                                                      NP, (long long) NP * rn, Hn, CUBLAS_COMPUTE_32F,
+                                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                softmax_k<<<Hn * rn, 256, 0, st_>>>(S, NP);
+                BLAS_CHECK(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_N, CUBLAS_OP_N, D, rn, NP, &one, v, CUDA_R_16F, E,
+                                                      D, S, CUDA_R_16F, NP, (long long) NP * rn, &zero,
+                                                      o + (size_t) r0 * E, CUDA_R_16F, E, D, Hn, CUBLAS_COMPUTE_32F,
+                                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+            gemm(H16(1), E, E, o, NP, y);
+            ink_residual_ls_k<<<nblk((int64_t) NP * E, 256), 256, 0, st_>>>(x, y, F32(5), F32(12), E, (int64_t) NP * E);
+            layernorm_k<<<NP, 256, 0, st_>>>(x, F32(10), F32(11), h, E, c.eps);
+            gemm(H16(2), F, E, h, NP, y);
+            gelu_k<false><<<nblk((int64_t) NP * F, 256), 256, 0, st_>>>(y, F32(6), h, F, (int64_t) NP * F);
+            gemm(H16(3), E, F, h, NP, y);
+            ink_residual_ls_k<<<nblk((int64_t) NP * E, 256), 256, 0, st_>>>(x, y, F32(7), F32(13), E, (int64_t) NP * E);
+        } else {
+            ink_merge_k<<<M, 256, 0, st_>>>(x, h, E, gw);
+            gemm(H16(0), 4 * E, 4 * E, h, M, y);
+            ink_gelu_k<<<nblk((int64_t) M * 4 * E, 256), 256, 0, st_>>>(y, h, (int64_t) M * 4 * E);
+            gemm(H16(1), c.out_dim, 4 * E, h, M, y);
+        }
+        CUDA_CHECK(cudaEventRecord(used_[b], st_));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(out, y, (size_t) M * c.out_dim * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    CUDA_CHECK(cudaStreamSynchronize(copy_));
+    release_scratch();
+    ms += now_ms() - t0;
+    ++images;
+    tokens += M;
 }
 
 }  // namespace bnk

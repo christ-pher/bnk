@@ -144,9 +144,12 @@ class Images:
 
     def __init__(self, dir: str, unit: int = 32, min_tokens: int = 8, max_tokens: int = 4096,
                  max_dir_bytes: int = 4 << 30, fetch_urls: bool = True, max_fetch_bytes: int = 32 << 20,
-                 deepseek: dict | None = None):
+                 deepseek: dict | None = None, inkling: dict | None = None):
         self.dir = dir
         self.deepseek = deepseek   # DeepSeek's grid: {"patch", "merge", "min_pixels"}; max_tokens caps its span
+        # Inkling 2: any size (the encoder pads to whole 40-pixel cells with the reference's raw -1); only an image of
+        # more than max_tokens cells is scaled down (aspect kept, to whole cells), as llama.cpp's preprocessor does
+        self.inkling = inkling
         self.unit, self.min_tokens, self.max_tokens = unit, min_tokens, max_tokens
         self.max_dir_bytes = max_dir_bytes
         self.fetch_urls, self.max_fetch_bytes = fetch_urls, max_fetch_bytes
@@ -206,7 +209,20 @@ class Images:
             bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
             im = Image.alpha_composite(bg, im)
         im = im.convert("RGB")
-        if self.deepseek:
+        if self.inkling:
+            u = self.inkling["patch"] * self.inkling["merge"]
+            w, h = im.width, im.height
+            cells = math.ceil(w / u) * math.ceil(h / u)
+            if cells > self.max_tokens:
+                scale = math.sqrt(self.max_tokens * u * u / (math.ceil(w / u) * u * math.ceil(h / u) * u))
+                w = max(u, int(w * scale) // u * u)
+                h = max(u, int(h * scale) // u * u)
+                while (w // u) * (h // u) > self.max_tokens:
+                    if w >= h: w -= u
+                    else: h -= u
+                im = im.resize((w, h), Image.BILINEAR)
+                cells = (w // u) * (h // u)
+        elif self.deepseek:
             d = self.deepseek
             gh, gw, h, w = deepseek_grid(im.width, im.height, d["patch"], d["merge"], self.max_tokens, d["min_pixels"])
             if (h, w) != (im.height, im.width):   # letterboxed in grey, as the reference (ImageOps.pad)

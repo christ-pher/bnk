@@ -15,6 +15,7 @@
 
 #include "dense/dense_engine.h"
 #include "deepseek/ds_engine.h"
+#include "inkling/ink_engine.h"
 #include "engine/engine.h"
 #include "engine/engine_api.h"
 #include "engine/generate.h"
@@ -94,6 +95,11 @@ static std::unique_ptr<EngineApi> make_engine(const std::string & model, const E
         return e;
     }
     if (!opt.lora.empty()) throw std::runtime_error("--lora: only the dense engine (qwen35) applies adapters; this model is " + arch);
+    if (arch == "inkling2_loop") {   // docs/INKLING-PLAN.md
+        auto e = std::make_unique<InkEngine>();
+        e->load(model, opt);
+        return e;
+    }
     if (arch == "deepseek41") {   // docs/DEEPSEEK.md; --ple-gguf names the Engram file (default: beside the model)
         auto e = std::make_unique<DsEngine>();
         e->load(model, opt);

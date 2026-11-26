@@ -19,7 +19,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import ChatTemplate, OutputParser, dsml_v41_template
+from .chat import ChatTemplate, InklingParser, OutputParser, dsml_v41_template, make_parser
 from .console import LEVELS, Console
 from .conversations import Conversations
 from .engine import Engine, EngineError
@@ -61,13 +61,18 @@ class State:
         # DeepSeek-V4.1 has no <|im_start|>: its turns start at <｜User｜> / <｜Assistant｜> (the snapshots below)
         self.ds_user = self.tok.id_of("<｜User｜>") if self.im_start is None else None
         self.ds_assistant = self.tok.id_of("<｜Assistant｜>") if self.im_start is None else None
+        self.ink_user = self.tok.id_of("<|message_user|>")   # Inkling 2's user turns
         # images (--mmproj): prepared here, encoded by the engine; their raw pixels go to a folder it reads
         self.images = None
         self.image_pad = self.tok.id_of("<|image_pad|>")
         ds = None
+        ink = False
         if args.mmproj:
-            md = read_metadata(args.mmproj, {"clip.projector_type", "clip.vision.patch_size", "clip.vision.projector.scale_factor",
+            md = read_metadata(args.mmproj, {"clip.projector_type", "clip.vision.projector_type", "clip.vision.patch_size", "clip.vision.projector.scale_factor",
                                              "clip.vision.image_min_pixels"})
+            if md.get("clip.projector_type", md.get("clip.vision.projector_type")) == "inkling2v":   # Inkling 2: its template's image token, any size
+                self.image_pad = self.tok.id_of("<|unused_200054|>")
+                ink = True
             if md.get("clip.projector_type") == "deepseek41v":   # DeepSeek-V4.1: its own grid, at most 1,024 cells
                 self.image_pad = self.tok.id_of("<｜deepseek_image｜>")
                 ds = {"patch": int(md.get("clip.vision.patch_size", 14)), "merge": int(md.get("clip.vision.projector.scale_factor", 3)),
@@ -75,7 +80,9 @@ class State:
         if args.mmproj and self.image_pad is not None:
             self.images = Images(str(Path(args.cache_dir).expanduser() / "images"),
                                  max_tokens=min(args.image_max_tokens, 1024) if ds else args.image_max_tokens,
-                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0", deepseek=ds)
+                                 fetch_urls=os.environ.get("BNK_IMAGE_URLS", "1") != "0", deepseek=ds,
+                                 inkling={"patch": int(md.get("clip.vision.patch_size", 20)),
+                                          "merge": int(md.get("clip.vision.spatial_merge_size", 2))} if ink else None)
         # stop tokens: EOS plus the chat turn end
         self.stop_ids = sorted({t for t in [self.tok.ids.get("eos_token_id"), self.tok.id_of("<|im_end|>"),
                                             self.tok.id_of("<|endoftext|>")] if t is not None})
@@ -210,7 +217,8 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
     generated so far). The engine parks its conversation meanwhile, so coming back costs well under a second and
     one long generation no longer holds every other agent up."""
     dec = StreamDecoder(S.tok)
-    parser = OutputParser(thinking, tools)
+    parser = make_parser(S.template, thinking, tools)
+    wrap_up = WRAP_UP.replace("\n</think>\n\n", InklingParser.WRAP_CLOSE) if S.template.inkling else WRAP_UP
     guard = ThinkingLoopGuard() if (thinking and S.args.think_guard) else None
     cguard = content_guard() if S.args.content_guard else None
     content_loop = False
@@ -249,6 +257,15 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                     cps.append(first)
             if last > 0:
                 cps.append(last)
+        elif S.template.inkling and allow_guard and ids:
+            # Inkling 2: its prompt ends at the last message (the model writes its own <|message_model|> header):
+            # a snapshot there (the next turn re-renders this answer without its thinking, sharing all before it)
+            # and before the first user message (other conversations with the same system prompt)
+            if S.ink_user is not None and S.ink_user in ids:
+                first = ids.index(S.ink_user)
+                if 0 < first < len(ids) - 1:
+                    cps.append(first)
+            cps.append(len(ids))
         elif S.ds_assistant is not None and allow_guard and S.ds_assistant in ids:
             # DeepSeek: before the last <｜Assistant｜> (the next turn re-renders this answer without its reasoning,
             # so it shares everything up to there) and before the first <｜User｜> (after the system prompt).
@@ -353,9 +370,9 @@ def run(prompt_ids: list[int], params: dict, max_tokens: int, stops: list[str], 
                                f"({guard.last_ratio:.0%} repeated): closing the reasoning, {room:,} tokens left to answer")
                 S.telemetry.bus.publish("log", {"t": time.time(), "line": f"thinking loop guard: intervened after "
                                                                            f"{guard.count} thinking tokens"})
-                for kind, txt in parser.feed(dec.flush() + WRAP_UP):
+                for kind, txt in parser.feed(dec.flush() + wrap_up):
                     emit(kind, txt)
-                tail.extend(S.tok.encode(WRAP_UP))
+                tail.extend(S.tok.encode(wrap_up))
                 if room > 0:
                     continue
                 outcome = "length"
@@ -464,6 +481,11 @@ def template_effort(eff):
     """A thinking level (OpenAI's minimal / low / medium / high / xhigh, max, or a number 1-100) in the model
     template's own terms, so a config or request can use any of them on any model."""
     num = eff if isinstance(eff, int) and not isinstance(eff, bool) else (int(eff) if isinstance(eff, str) and eff.isdigit() else None)
+    if S.template.inkling:
+        # Inkling 2: a number in [0, 0.99] or none / minimal / low / medium / high / xhigh / max
+        if num is not None:
+            return min(max(num, 0), 99) / 100
+        return eff if eff in ("none", "minimal", "low", "medium", "high", "xhigh", "max") else "high"
     if "DSML" in S.tok.chat_template:
         # DeepSeek-V4.1: an integer budget 1-100 or low / high / max (50 / 75 / 100)
         if num is not None:
@@ -507,6 +529,8 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     title = title_request(body)
     if title:
         thinking = False
+    if S.template.inkling and not thinking:
+        kwargs["reasoning_effort"] = "none"   # Inkling's effort 0 (its card: the minimum still reasons a little)
     kwargs["enable_thinking"] = bool(thinking)
     messages = body.get("messages", [])
     if S.template.native_system:   # DeepSeek's order of parallel tool results (and of the images in them)
@@ -515,7 +539,9 @@ def chat_prompt(body: dict) -> tuple[list[int], bool]:
     # the rendered prompt decides, not the request: some templates (CYBER-FROST's) always open a think block
     tail = text[max(text.rfind("<|im_start|>assistant"), text.rfind("<｜Assistant｜>")):]
     thinking = "<think>" in tail and "</think>" not in tail
-    if title and thinking:   # such a template's title request: an empty think block, as Qwen's own no-think renders
+    if S.template.inkling:   # the model opens its own thinking block; at effort 0 it seldom does
+        thinking = kwargs.get("reasoning_effort") not in ("none", 0, 0.0)
+    if title and thinking and not S.template.inkling:   # such a template's title request: an empty think block, as Qwen's own no-think renders
         text, thinking = text + "\n</think>\n\n", False
     t0 = time.perf_counter()
     ids = S.tok.encode_chat(text)

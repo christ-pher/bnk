@@ -17,6 +17,8 @@
 namespace bnk {
 
 __device__ float g_tc_limit = 0.f;   // SwiGLU clamp (DeepSeek-V4), 0 = none
+// SITU in place of SiLU (Inkling 2): beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb); beta 0 = SiLU
+__device__ float g_tc_situ_beta = 0.f, g_tc_situ_lb = 0.f;
 
 
 constexpr int kTcK = 128;         // K per step: 4 sub-blocks, one per quad pair
@@ -216,7 +218,12 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
                 if (row < nrows) {
                     float gv = c[0][g8][i] * sg, uv = c[1][g8][i] * su;
                     if (g_tc_limit > 0.f) { gv = fminf(gv, g_tc_limit); uv = fminf(fmaxf(uv, -g_tc_limit), g_tc_limit); }
-                    o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
+                    if (g_tc_situ_beta > 0.f) {
+                        const float b = g_tc_situ_beta, lb = g_tc_situ_lb;
+                        o[row] = __float2half(b * tanhf(gv / b) / (1.f + __expf(-gv)) * (lb > 0.f ? lb * tanhf(uv / lb) : uv));
+                    } else {
+                        o[row] = __float2half(gv / (1.f + __expf(-gv)) * uv);
+                    }
                 }
             } else {
 #pragma unroll
@@ -230,6 +237,10 @@ __global__ void __launch_bounds__(kTcThreads, 1) moe_tc_k(const TcItem * __restr
 }
 
 void moe_tc_set_swiglu_limit(float limit) { cudaMemcpyToSymbol(g_tc_limit, &limit, sizeof(float)); }
+void moe_tc_set_situ(float beta, float lb) {
+    cudaMemcpyToSymbol(g_tc_situ_beta, &beta, sizeof(float));
+    cudaMemcpyToSymbol(g_tc_situ_lb, &lb, sizeof(float));
+}
 
 void moe_tc_gu(const TcItem * items, const TcBlock * blocks, int nblocks, const MoeLayerDesc & d, const half * x,
                int64_t ldx, const int32_t * perm, half * h, int E, int F, cudaStream_t st) {

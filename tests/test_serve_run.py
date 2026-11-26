@@ -75,7 +75,8 @@ class Convs:
 
 def serve_fake(text_ids, reason, thinking=True):
     S = SimpleNamespace(engine=FakeEngine(text_ids, reason), console=Quiet(), convs=Convs(), lock=threading.Lock(),
-                        waiting=0, active=None, tok=tok, stop_ids=[1], im_start=None, recent=[],
+                        waiting=0, active=None, tok=tok, stop_ids=[1], im_start=None, recent=[], ds_assistant=None, usage=SimpleNamespace(add=lambda **k: None),
+                        template=SimpleNamespace(inkling=False, native_system=False),
                         telemetry=SimpleNamespace(bus=SimpleNamespace(publish=lambda *a: None),
                                                   prompt_read=lambda *a: None),
                         args=SimpleNamespace(slice=0, think_guard=True, content_guard=True))
