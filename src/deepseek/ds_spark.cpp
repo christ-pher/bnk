@@ -487,10 +487,23 @@ void DsSpark::run_multi(const std::vector<RunItem> & items, int32_t * tok_out, f
         select(it.slot);
         tok_out[i] = run(it.R_rows, it.tokens, it.n, it.cell0, true, &prob_out[i]);
     }
+    item_slot_.clear();
+    for (const auto & it : items) item_slot_.push_back(it.slot);
 }
 
+// items name their conversation by index into the previous call (StepItem::prev), not by slot: step each one in its own
+// slot's block (stepping cur_, the last run_multi item's slot, gave a two-slot round one conversation's drafts for both)
 void DsSpark::step_multi(const std::vector<StepItem> & items, int32_t * tok_out, float * prob_out) {
-    for (size_t i = 0; i < items.size(); ++i) tok_out[i] = step(items[i].tok, items[i].cell, &prob_out[i]);
+    std::vector<int> slots;
+    slots.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int prev = items[i].prev;
+        const int slot = prev >= 0 && prev < (int) item_slot_.size() ? item_slot_[prev] : cur_;
+        select(slot);
+        tok_out[i] = step(items[i].tok, items[i].cell, &prob_out[i]);
+        slots.push_back(slot);
+    }
+    item_slot_ = std::move(slots);
 }
 
 const std::vector<std::pair<int32_t, float>> * DsSpark::draft_dist(int slot, int i) const {

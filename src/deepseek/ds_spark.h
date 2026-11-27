@@ -136,6 +136,7 @@ private:
     };
     std::vector<Slot> slots_;
     int cur_ = 0;
+    std::vector<int> item_slot_;   // run_multi / step_multi: each item's slot (the next call's prev indices)
 
     // the block drafted last (per slot): tokens, their distributions, confidences
     struct Block {
