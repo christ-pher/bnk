@@ -1357,6 +1357,16 @@ __global__ void zero_half_k(half * p, size_t n) {
 __global__ void add_k(const float * a, const float * b, float * y, size_t n) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) y[i] = a[i] + b[i];
 }
+__global__ void add_scaled_rows_k(const float * x, const float * w, float * y, int E) {
+    const int t = blockIdx.y;
+    const float a = w[t];
+    if (a == 0.f) return;
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < E; e += gridDim.x * blockDim.x)
+        y[(int64_t) t * E + e] += a * x[(int64_t) t * E + e];
+}
+void ds_add_scaled_rows(const float * x, const float * w, float * y, int T, int E, cudaStream_t s) {
+    add_scaled_rows_k<<<dim3((E + 255) / 256, T), 256, 0, s>>>(x, w, y, E);
+}
 void ds_add(const float * a, const float * b, float * y, size_t n, cudaStream_t s) {
     add_k<<<(unsigned) std::min<size_t>((n + 255) / 256, 4096), 256, 0, s>>>(a, b, y, n);
 }

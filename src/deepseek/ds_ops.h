@@ -139,6 +139,8 @@ void ds_rows_gather(const float * x, const int32_t * tok, float * xc, int M, int
 void ds_zero_half(half * p, size_t n, cudaStream_t s);
 // y[i] = a[i] + b[i]
 void ds_add(const float * a, const float * b, float * y, size_t n, cudaStream_t s);
+// y[t][:] += w[t] * x[t][:] for T rows of E (w on the device; a row with w = 0 is skipped)
+void ds_add_scaled_rows(const float * x, const float * w, float * y, int T, int E, cudaStream_t s);
 // out[t][e] = mean over s of res[t][s*E + e] (row stride ldo): the hyper-connection copies collapsed by averaging, what
 // the DSpark drafter reads at its target layers' attention input
 void ds_hc_mean(const float * res, float * out, int64_t ldo, int T, int hc, int E, cudaStream_t s);

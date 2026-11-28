@@ -15,7 +15,11 @@
 
 namespace bnk {
 
-DsSpark::~DsSpark() = default;
+DsSpark::~DsSpark() {
+    if (vcp_ev_) cudaEventDestroy(vcp_ev_);
+    if (vdone_ev_) cudaEventDestroy(vdone_ev_);
+    if (vcp_st_) cudaStreamDestroy(vcp_st_);
+}
 
 QMat DsSpark::upload(const std::string & name, bool required) {
     const TensorRef * t = gguf_.find(name);
@@ -172,6 +176,7 @@ void DsSpark::load(const std::string & path, DsModel & m, CpuExpertPool & pool, 
                 throw std::runtime_error("dspark: confidence projection shape or type");
         }
     }
+    vram_init(verbose);
     CUDA_CHECK(cudaStreamSynchronize(st));
     if (verbose)
         fprintf(stderr, "bnk: DSpark drafter: %d stages, %d experts (%d used) a stage, blocks of %d, target layers %d-%d; dense %.2f GiB in VRAM, experts %.2f GiB in RAM (%s)\n",
@@ -286,12 +291,64 @@ void DsSpark::stage_forward(int il, int T) {
     CUDA_CHECK(cudaMemcpyAsync(ids.data(), rids_.p, ids.size() * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(w.data(), rw_.p, w.size() * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaMemcpyAsync(h_x_.data(), xn_.p, (size_t) T * E * 4, cudaMemcpyDeviceToHost, st_));
+    static const bool prof = getenv("BNK_DS_SPARK_PROF") != nullptr;
+    const double tp0 = prof ? now_ms() : 0;
     CUDA_CHECK(cudaStreamSynchronize(st_));
+    const double tp1 = prof ? now_ms() : 0;
     tasks_.clear();
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < k; ++j)
             if (ids[(size_t) t * k + j] >= 0) tasks_.push_back({t, j, ids[(size_t) t * k + j], w[(size_t) t * k + j]});
-    pool_->run(ev_, store_, il, T, h_x_.data(), tasks_, h_out_.data());
+    // the resident ones on this GPU (queued ahead of the CPU's share, so the two overlap), the rest on the pool
+    cpu_tasks_.clear();
+    vlist_.clear();
+    const bool vram = !vk_.empty() && vk_[il] > 0;
+    if (vram) {
+        for (const auto & tk : tasks_) {
+            vhits_[il][tk.expert] += 1.0;
+            if (vslot_of_[il][tk.expert] < 0) { cpu_tasks_.push_back(tk); continue; }
+            if (std::find(vlist_.begin(), vlist_.end(), tk.expert) == vlist_.end()) vlist_.push_back(tk.expert);
+        }
+    }
+    if (!vlist_.empty()) {
+        const LayerWeights & W = ev_.layers[il];
+        const int F = c_.n_ff;
+        const size_t blob = store_.blob_bytes(il);
+        h_vw_.assign((size_t) vlist_.size() * T, 0.f);
+        for (const auto & tk : tasks_) {
+            const auto it = std::find(vlist_.begin(), vlist_.end(), tk.expert);
+            if (it != vlist_.end()) h_vw_[(size_t) (it - vlist_.begin()) * T + tk.t] += tk.w;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(vw_.p, h_vw_.data(), h_vw_.size() * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemsetAsync(vout_.p, 0, (size_t) T * E * 4, st_));
+        for (size_t j = 0; j < vlist_.size(); ++j) {
+            const uint8_t * b = vslab_[il].p + (size_t) vslot_of_[il][vlist_[j]] * blob;
+            QMat gu, dn;
+            gu.data = b; gu.type = W.gate_type; gu.rows = 2 * F; gu.cols = E; gu.row_bytes = W.gate_bytes / F;
+            dn.data = b + W.gate_bytes + W.up_bytes; dn.type = W.down_type; dn.rows = E; dn.cols = F; dn.row_bytes = W.down_bytes / E;
+            gemv(gu, &act_, nullptr, 0, T, vgu_, 2 * F, false, st_);   // act_: xn_ quantized (ds_hc_pre_norm_q)
+            quantize_act_silu_mul(vgu_, vgu_.p + F, 2 * F, T, F, act2_, st_);
+            gemv(dn, &act2_, nullptr, 0, T, vdn_, E, false, st_);
+            ds_add_scaled_rows(vdn_, vw_.p + j * T, vout_, T, E, st_);
+        }
+    }
+    const std::vector<ExpertTask> & on_cpu = vram ? cpu_tasks_ : tasks_;
+    if (!on_cpu.empty()) pool_->run(ev_, store_, il, T, h_x_.data(), on_cpu, h_out_.data());
+    else std::fill(h_out_.begin(), h_out_.begin() + (size_t) T * E, 0.f);
+    if (prof) {
+        static double gpu_ms = 0, cpu_ms = 0; static long n = 0; static std::vector<std::vector<long>> hits;
+        if (hits.empty()) hits.assign(c_.n_layer, std::vector<long>(c_.n_expert, 0));
+        gpu_ms += tp1 - tp0; cpu_ms += now_ms() - tp1;
+        for (const auto & tk : tasks_) hits[il][tk.expert]++;
+        if (il == c_.n_layer - 1 && ++n % 200 == 0) {
+            fprintf(stderr, "PROF dspark %ld blocks: wait for GPU before MoE %.2f ms/block, CPU experts %.2f ms/block\n", n, gpu_ms / n, cpu_ms / n);
+            for (int l = 0; l < c_.n_layer; ++l) {
+                std::vector<long> h = hits[l]; std::sort(h.rbegin(), h.rend()); long tot = 0, a = 0; for (long v : h) tot += v;
+                std::string line; for (int k2 = 0; k2 < c_.n_expert; ++k2) { a += h[k2]; if (k2 == 7 || k2 == 15 || k2 == 31 || k2 == 63) line += " top" + std::to_string(k2 + 1) + " " + std::to_string(tot ? 100 * a / tot : 0) + "%"; }
+                fprintf(stderr, "PROF dspark stage %d expert share:%s\n", l, line.c_str());
+            }
+        }
+    }
     CUDA_CHECK(cudaMemcpyAsync(cpu_out_.p, h_out_.data(), (size_t) T * E * 4, cudaMemcpyHostToDevice, st_));
     if (L.sh_gu.valid()) gemv(L.sh_gu, &act_, nullptr, 0, T, sg_, Fx, false, st_, GemvSplit{Fx, su_, Fx});
     else {
@@ -302,6 +359,7 @@ void DsSpark::stage_forward(int il, int T) {
     gemv(L.sh_down, &act2_, nullptr, 0, T, shared_out_, E, false, st_);
     // moe_out = shared + routed
     ds_add(shared_out_, cpu_out_, moe_out_, (size_t) T * E, st_);
+    if (!vlist_.empty()) ds_add(moe_out_, vout_, moe_out_, (size_t) T * E, st_);
     if (dumps_left_ > 0) {
         dump(("ffn_in" + std::to_string(il)).c_str(), xn_.p, (size_t) T * E * 4);
         dump_host(("routed" + std::to_string(il)).c_str(), h_out_.data(), (size_t) T * E * 4);
@@ -343,6 +401,7 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
         stage_forward(il, T);
         dump(("res" + std::to_string(il)).c_str(), res_blk_.p, (size_t) T * c_.hc_dim() * 4);
     }
+    vram_step();
     // the head: collapse with the last FFN's pre-mix (no head mixer), norm, the target's output matrix
     ds_hc_pre_norm_q(res_blk_, pre_, F(out_norm_), mixed_, xn_, T, c_.hc, E, c_.eps, act_, st_);
     gemv(main_->output, &act_, nullptr, 0, T, logits_, V, false, st_);
@@ -456,6 +515,101 @@ void DsSpark::draft_block(int32_t anchor, int pos) {
         prev = tok;
     }
     draft_ms_ = 0.9f * draft_ms_ + 0.1f * (float) (now_ms() - t_draft0);
+}
+
+void DsSpark::vram_init(bool verbose) {
+    // default 32 a stage (1.7 GiB of the last GPU's expert cache): prose +12%, code / math unchanged (docs/DSPARK.md)
+    const char * env = getenv("BNK_DS_SPARK_VRAM");
+    if (!env) env = "32";
+    std::vector<int> k;
+    if (env) {
+        for (const char * p = env; *p;) {
+            k.push_back(std::max(0, atoi(p)));
+            while (*p && *p != ',') ++p;
+            if (*p == ',') ++p;
+        }
+    }
+    if (k.empty()) return;
+    while ((int) k.size() < c_.n_layer) k.push_back(k.back());
+    vk_.assign(c_.n_layer, 0);
+    vslab_.resize(c_.n_layer);
+    vslot_of_.assign(c_.n_layer, std::vector<int>(c_.n_expert, -1));
+    vexp_in_.resize(c_.n_layer);
+    vhits_.assign(c_.n_layer, std::vector<double>(c_.n_expert, 0.0));
+    for (int il = 0; il < c_.n_layer; ++il) {
+        const LayerWeights & W = ev_.layers[il];
+        // gate | up as one 2F-row matrix: the same format and row size
+        if (W.gate_type != W.up_type || W.gate_bytes != W.up_bytes || W.gate_type == GGML_TYPE_F32 || W.gate_type == GGML_TYPE_F16 ||
+            W.gate_type == GGML_TYPE_BF16)
+            continue;
+        vk_[il] = std::min(k[il], c_.n_expert);
+        if (!vk_[il]) continue;
+        vslab_[il].alloc((size_t) vk_[il] * store_.blob_bytes(il));
+        vexp_in_[il].assign(vk_[il], -1);
+        vram_experts_bytes_ += (size_t) vk_[il] * store_.blob_bytes(il);
+    }
+    if (!vram_experts_bytes_) { vk_.clear(); return; }
+    const int T = block_, E = c_.n_embd, F = c_.n_ff;
+    vgu_.alloc((size_t) T * 2 * F); vdn_.alloc((size_t) T * E); vout_.alloc((size_t) T * E);
+    vw_.alloc((size_t) c_.n_used * T * T);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&vcp_st_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&vcp_ev_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&vdone_ev_, cudaEventDisableTiming));
+    vram_bytes_ += vram_experts_bytes_;
+    if (verbose) {
+        std::string ks;
+        for (int il = 0; il < c_.n_layer; ++il) ks += (il ? "," : "") + std::to_string(vk_[il]);
+        fprintf(stderr, "bnk: DSpark drafter: %s hot experts a stage resident in VRAM (%.2f GiB, filled as the routing shows them)\n",
+                ks.c_str(), vram_experts_bytes_ / 1073741824.0);
+    }
+}
+
+// One copy at a time on its own stream: an expert's blob from the (pinned) store into a slot, after the blocks
+// already queued are done with whatever the slot held. A slot leaves the routing the moment its copy is decided
+// and joins it once the copy has landed.
+void DsSpark::vram_step() {
+    if (vk_.empty()) return;
+    ++vblocks_;
+    if (vblocks_ % 4096 == 0)
+        for (auto & h : vhits_) for (double & v : h) v *= 0.5;
+    if (vpend_stage_ >= 0) {
+        if (cudaEventQuery(vcp_ev_) == cudaErrorNotReady) return;
+        vexp_in_[vpend_stage_][vpend_slot_] = vpend_exp_;
+        vslot_of_[vpend_stage_][vpend_exp_] = vpend_slot_;
+        vpend_stage_ = -1;
+    }
+    // the stage whose hottest non-resident expert most outweighs what it would replace
+    int best_il = -1, best_slot = -1, best_e = -1;
+    double best_gain = 0.0;
+    for (int il = 0; il < c_.n_layer; ++il) {
+        if (!vk_[il]) continue;
+        int hot = -1;
+        for (int e = 0; e < c_.n_expert; ++e)
+            if (vslot_of_[il][e] < 0 && vhits_[il][e] > 0 && (hot < 0 || vhits_[il][e] > vhits_[il][hot])) hot = e;
+        if (hot < 0) continue;
+        int slot = -1;
+        double cold = 0.0;
+        for (int sl = 0; sl < vk_[il]; ++sl) {
+            const int e = vexp_in_[il][sl];
+            const double h = e < 0 ? -1.0 : vhits_[il][e];
+            if (slot < 0 || h < cold) { slot = sl; cold = h; }
+        }
+        // an empty slot takes any expert; an occupied one only for a clearly hotter one (no churn between equals)
+        const double gain = cold < 0 ? vhits_[il][hot] + 1e9 : vhits_[il][hot] - 1.25 * cold - 2.0;
+        if (gain > best_gain) { best_gain = gain; best_il = il; best_slot = slot; best_e = hot; }
+    }
+    if (best_il < 0) return;
+    const uint8_t * src = store_.blob(best_il, best_e);
+    if (!src) return;
+    const int old = vexp_in_[best_il][best_slot];
+    if (old >= 0) vslot_of_[best_il][old] = -1;
+    vexp_in_[best_il][best_slot] = -1;
+    const size_t blob = store_.blob_bytes(best_il);
+    CUDA_CHECK(cudaEventRecord(vdone_ev_, st_));   // the blocks queued so far may still read the old expert
+    CUDA_CHECK(cudaStreamWaitEvent(vcp_st_, vdone_ev_, 0));
+    CUDA_CHECK(cudaMemcpyAsync(vslab_[best_il].p + (size_t) best_slot * blob, src, blob, cudaMemcpyHostToDevice, vcp_st_));
+    CUDA_CHECK(cudaEventRecord(vcp_ev_, vcp_st_));
+    vpend_stage_ = best_il; vpend_slot_ = best_slot; vpend_exp_ = best_e;
 }
 
 int DsSpark::run(const float * R_rows, const int32_t * next_tokens, int n, int cell0, bool draft, float * prob) {
