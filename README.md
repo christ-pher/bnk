@@ -642,7 +642,6 @@ exactly these models, and `./models.sh` manages them:
 | Config | Model | Size |
 |---|---|---|
 | `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
-| `cyber-frost` | [peasantsmith CYBER-FROST-3.8-PS-GUFF Q5_K_M](https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF) (Blackfrost-AI's cybersecurity fine-tune) | 112.5 GB, 1 file; needs ~110 GB of RAM |
 | `qwen27b` | [unsloth Qwen3.8-27B-GGUF Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (the dense 27B; `docs/DENSE.md`) | 29 GB, 1 file; needs two V100s |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /
