@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: the October 25-27 repository updates
 
-`ds-xs` and `ds-xs-abl` are pinned to ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF at `85caaf74` (Oct 23). The
+(ds-xs-abl was removed 2026-11-28.) `ds-xs` and `ds-xs-abl` were pinned to ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF at `85caaf74` (Oct 23). The
 repository changed after that; the weights did not. Checked 2026-10-28: shards 2-4 of the 4-shard layout have the
 same SHA-256 at every later revision; shard 1 at `653a9874` differs only in `tokenizer.chat_template` (37 tensors
 sampled). In the new 6-shard layout every tensor has the same type and size as ours, and 64 KB samples at the start,

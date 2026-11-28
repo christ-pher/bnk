@@ -18,7 +18,6 @@ downloaded (`./models.sh download iq3_s` fetches it with the model). `BNK_VISION
 | Qwen3.8-27B-Q4, -Q8_0, -NVFP4 | `mmproj-BF16.gguf` (unsloth repo; NVFP4 through `"mmproj_from"`) |
 | CYBER-FROST-3.8 | none published |
 | DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS (ds-xs) | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` and `exp_probs_b_vl.f32` (ISTA-DASLab repo at `a419d74c`: `"mmproj_revision"`, `"mmproj_extra"`) |
-| Huihui-...-abliterated-IQ2_XS (ds-xs-abl) | the same files (`"mmproj_from"`: ds-xs; the abliteration leaves the router alone) |
 
 ```json
 "messages": [{"role": "user", "content": [

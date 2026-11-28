@@ -4,7 +4,7 @@ A config's `"chat_template_file"` (a path from the repository root) replaces the
 
 | File | Used by | Source |
 |---|---|---|
-| `deepseek-v4.1.jinja` | ds-xs, ds-xs-abl | ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF `chat_template.jinja` at `a419d74c` (based on Unsloth's) |
+| `deepseek-v4.1.jinja` | ds-xs | ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF `chat_template.jinja` at `a419d74c` (based on Unsloth's) |
 
 `deepseek-v4.1.jinja` replaces the V4 template embedded in our pinned GGUF (`85caaf74`). The old one, even with
 `dsml_v41_template`'s tag fix, left out the BOS token, rendered parallel tool results in arrival order instead of
