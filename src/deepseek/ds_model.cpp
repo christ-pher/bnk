@@ -222,12 +222,14 @@ DsModel::~DsModel() {
 }
 
 void DsModel::load(const std::string & path, const std::string & engram_path, bool verbose, int first, int end, bool embd,
-                   bool head) {
+                   bool head, int extra0) {
     gguf.open(path);
     ds = load_ds_config(gguf);
     const DsConfig & c = ds;
     l0 = first;
     l1 = end < 0 ? c.n_layer : end;
+    x0 = extra0 >= 0 && extra0 < l0 ? extra0 : -1;
+    auto loads = [&](int il) { return (il >= l0 && il < l1) || (x0 >= 0 && il >= x0 && il < l0); };
     // the shared Config: what the generator, the server and the expert machinery read
     cfg = Config{};
     cfg.n_layer = c.n_layer; cfg.n_embd = c.n_embd; cfg.n_vocab = c.n_vocab;
@@ -250,7 +252,7 @@ void DsModel::load(const std::string & path, const std::string & engram_path, bo
     layers.resize(c.n_layer);
     for (int il = 0; il < c.n_layer; ++il) {
         expert_src(il);
-        if (il < l0 || il >= l1) continue;
+        if (!loads(il)) continue;
         DsLayer & L = layers[il];
         const std::string b = "blk." + std::to_string(il) + ".";
         L.attn_norm = upload(b + "attn_norm.weight");
@@ -320,7 +322,7 @@ void DsModel::load(const std::string & path, const std::string & engram_path, bo
 
     // the Engram tables: a second GGUF, mapped; rows are read at hashed positions
     bool owns_engram = false;
-    for (int il : c.engram_layers) owns_engram |= il >= l0 && il < l1;
+    for (int il : c.engram_layers) owns_engram |= loads(il);
     if (owns_engram) {
         std::string ep = engram_path;
         if (ep.empty()) {

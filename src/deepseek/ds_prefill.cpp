@@ -135,7 +135,7 @@ void DsEngine::prefill_alloc(int N, int G) {
     CUDA_CHECK(cudaHostAlloc((void **) &p.h_par, (size_t) G * sizeof(WinParams), cudaHostAllocDefault));
     CUDA_CHECK(cudaMalloc((void **) &p.d_par, (size_t) G * sizeof(WinParams)));
     int n_eg = 0;
-    for (int il : c.engram_layers) n_eg += owns(il);
+    for (int il : c.engram_layers) n_eg += pf_owns(il);
     if (n_eg) {
         const int64_t cols = (int64_t) c.eg_cols() * c.eg_dim;
         p.eg_emb.alloc((size_t) N * cols);
@@ -184,7 +184,7 @@ void DsEngine::prefill_alloc(int N, int G) {
     }
     // GEMM workspace: the largest matrix dequantized at once, and a chunk x the widest input
     size_t maxw = 0;
-    for (int il = l0_; il < l1_; ++il) {
+    for (int il = pf_l0(); il < l1_; ++il) {
         const DsLayer & L = model_.layers[il];
         for (const QMat * m : {&L.q_a, &L.q_b, &L.kv, &L.o_b, &L.sh_gu, &L.sh_gate, &L.sh_up, &L.sh_down, &L.eg_wkv, &L.comp_kv,
                                &L.comp_gate, &L.idx_q_b, &L.idx_proj})
@@ -385,7 +385,7 @@ void DsEngine::pf_prefetch(int il, const std::vector<int> & r, int nbuf) {
     p.pre_list.clear();
     p.pre_bufs.clear();
     p.pre_pos.clear();
-    if (il < l0_ || il >= l1_ || r.empty() || nbuf <= 0) return;
+    if (!pf_owns(il) || r.empty() || nbuf <= 0) return;
     const size_t blob = store_->blob_bytes(il);
     const size_t cap = blob ? p.stage_bytes / blob : 0;
     // the ranked list was made at load: an expert the adaptive exchange has since made resident has no host copy
@@ -498,7 +498,16 @@ void DsEngine::pf_moe(int il, int N) {
     std::vector<int> nr;   // candidates for PCIe / CPU, most-used first
     for (int e = 0; e < NE; ++e)
         if (cnt[e] && cache_.slot_of(il, e) < 0 && !pre[e]) nr.push_back(e);
-    std::sort(nr.begin(), nr.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+    // a prompt-only layer (the helper, il < l0_): the experts resident on the first stage have no host copy; they come
+    // over from its VRAM by peer copy (R layout), first and never to the CPU
+    const bool borrowed = il < l0_;
+    auto peer = [&](int e) { return borrowed && !store_->blob(il, e); };
+    std::sort(nr.begin(), nr.end(), [&](int a, int b) { return peer(a) != peer(b) ? peer(a) : cnt[a] > cnt[b]; });
+    size_t n_peer = 0;
+    while (n_peer < nr.size() && peer(nr[n_peer])) ++n_peer;
+    const MoeLayerDesc dpeer = borrowed ? head_->cache_.desc(il) : MoeLayerDesc{};
+    const size_t cap_peer = borrowed && dpeer.blob ? p.stage_bytes / dpeer.blob : 0;
+    if (n_peer && !cap_peer) throw std::runtime_error("prefill: no staging room for the first stage's experts");
     double cpu_scale;
     {
         std::lock_guard<std::mutex> lk(head_->stats_mu_);
@@ -510,12 +519,14 @@ void DsEngine::pf_moe(int il, int N) {
                                                                               // constant was measured on 2.2 MB experts)
     auto t_cpu = [&](int e) { return t_tok * (cnt[e] + 1); };                 // one decode of the rows plus a dot per token
     double cpu_total = 0;
-    for (int e : nr) cpu_total += t_cpu(e);
-    size_t n_pcie = 0;
+    for (size_t i = n_peer; i < nr.size(); ++i) cpu_total += t_cpu(nr[i]);
+    size_t n_pcie = n_peer;
     // the link starts behind what it still has queued (the prefetched waves): the CPU and it finish together
     static const bool balance = env_int("BNK_DS_PF_BALANCE", 1) != 0;
-    double pcie_total = balance ? std::max(0.0, p.link_free - tp) : 0;
-    const size_t max_pcie = std::min(nr.size(), cap * (size_t) (kPfWaves - 1));
+    double pcie_total = (balance ? std::max(0.0, p.link_free - tp) : 0) + n_peer * t_pcie;
+    const size_t peer_waves = cap_peer ? (n_peer + cap_peer - 1) / cap_peer : 0;
+    if (peer_waves >= (size_t) kPfWaves - 1) throw std::runtime_error("prefill: too many peer waves");
+    const size_t max_pcie = std::min(nr.size(), n_peer + cap * (size_t) (kPfWaves - 1 - peer_waves));
     while (n_pcie < max_pcie) {
         const double cpu_after = cpu_total - t_cpu(nr[n_pcie]);
         if (std::max(pcie_total + t_pcie, cpu_after) >= std::max(pcie_total, cpu_total)) break;
@@ -527,8 +538,10 @@ void DsEngine::pf_moe(int il, int N) {
     // the waves: cap experts each, alternating buffers
     std::vector<std::pair<size_t, size_t>> waves;   // [from, to) into nr
     std::vector<int> wave_buf;
-    for (size_t i = 0; i < n_pcie; i += cap) {
-        waves.push_back({i, std::min(n_pcie, i + cap)});
+    for (size_t i = 0; i < n_pcie;) {
+        const size_t wcap = i < n_peer ? cap_peer : cap, wend = i < n_peer ? n_peer : n_pcie;   // peer waves first
+        waves.push_back({i, std::min(wend, i + wcap)});
+        i = waves.back().second;
         wave_buf.push_back(p.toggle);
         p.toggle ^= 1;
         for (size_t j = waves.back().first; j < waves.back().second; ++j) {
@@ -580,6 +593,8 @@ void DsEngine::pf_moe(int il, int N) {
         ds.up_bytes = Lw.up_bytes;
         ds.grow = ggml_row_size((ggml_type) Lw.gate_type, E);
         ds.drow = ggml_row_size((ggml_type) Lw.down_type, Fx);
+        ds.gate_type = Lw.gate_type;   // (a prompt-only layer's own descriptor holds no types: this cache has no slots there)
+        ds.down_type = Lw.down_type;
     }
     TcItem * h_it = (TcItem *) p.h_items;
     TcBlock * h_bl = (TcBlock *) (h_it + NE);
@@ -591,7 +606,8 @@ void DsEngine::pf_moe(int il, int N) {
         for (int e = 0; e < NE; ++e) {
             if (!cnt[e] || on_cpu[e] || !take(e)) continue;
             const int sl = cache_.slot_of(il, e);
-            const uint8_t * src = sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[(int) p.stage_buf[e]] + (size_t) p.stage_idx[e] * blob;
+            const size_t stride = peer(e) ? dpeer.blob : blob;
+            const uint8_t * src = sl >= 0 ? d.base + (size_t) sl * d.blob : p.stage[(int) p.stage_buf[e]] + (size_t) p.stage_idx[e] * stride;
             h_it[n_it] = TcItem{src, off[e], cnt[e], e};
             for (int t0 = 0; t0 < cnt[e]; t0 += kTcTile) h_bl[n_bl++] = TcBlock{n_it, t0};
             ++n_it;
@@ -627,25 +643,33 @@ void DsEngine::pf_moe(int il, int N) {
     // the PCIe waves: each one's copies after its buffer's last reader, its compute after its copies
     for (size_t w = 0; w < waves.size(); ++w) {
         const int b = wave_buf[w];
+        const bool pw = waves[w].first < n_peer;   // a peer wave: the first stage's resident experts, from its VRAM
         CUDA_CHECK(cudaStreamWaitEvent(p.copy, p.used[b], 0));
-        if (p.n_timed < kPfWaves) CUDA_CHECK(cudaEventRecord(p.wt0[p.n_timed], p.copy));
+        if (p.n_timed < kPfWaves && !pw) CUDA_CHECK(cudaEventRecord(p.wt0[p.n_timed], p.copy));
         for (size_t j = waves[w].first; j < waves[w].second; ++j) {
             const int e = nr[j];
-            CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) p.stage_idx[e] * blob, store_->blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
+            if (pw) {
+                const int sl = head_->cache_.slot_of(il, e);
+                if (sl < 0) throw std::runtime_error("prefill: an expert with neither a host copy nor a slot on the first stage");
+                CUDA_CHECK(cudaMemcpyPeerAsync(p.stage[b] + (size_t) p.stage_idx[e] * dpeer.blob, dev_, dpeer.base + (size_t) sl * dpeer.blob,
+                                               head_->dev_, dpeer.blob, p.copy));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(p.stage[b] + (size_t) p.stage_idx[e] * blob, store_->blob(il, e), blob, cudaMemcpyHostToDevice, p.copy));
+            }
         }
-        if (p.n_timed < kPfWaves) {
+        if (p.n_timed < kPfWaves && !pw) {
             CUDA_CHECK(cudaEventRecord(p.wt1[p.n_timed], p.copy));
             p.timed_mb += (waves[w].second - waves[w].first) * blob / 1048576.0;
             ++p.n_timed;
         }
-        g_prof.copy_mb += (waves[w].second - waves[w].first) * blob / 1048576.0;
-        p.link_free = std::max(now_ms(), p.link_free) + (waves[w].second - waves[w].first) * t_pcie;
+        g_prof.copy_mb += (waves[w].second - waves[w].first) * (pw ? dpeer.blob : blob) / 1048576.0;
+        if (!pw) p.link_free = std::max(now_ms(), p.link_free) + (waves[w].second - waves[w].first) * t_pcie;
         CUDA_CHECK(cudaEventRecord(p.copied[b], p.copy));
         const Set & s = sets[n_fixed + w];
         CUDA_CHECK(cudaStreamWaitEvent(st_, p.copied[b], 0));
         if (s.nbl) {
-            moe_tc_gu(d_it, d_bl + s.bl0, s.nbl, ds, p.xg, E, p.perm, p.hh, E, Fx, st_);
-            moe_tc_down(d_it, d_bl + s.bl0, s.nbl, ds, p.hh, p.dd, E, Fx, st_);
+            moe_tc_gu(d_it, d_bl + s.bl0, s.nbl, pw ? dpeer : ds, p.xg, E, p.perm, p.hh, E, Fx, st_);
+            moe_tc_down(d_it, d_bl + s.bl0, s.nbl, pw ? dpeer : ds, p.hh, p.dd, E, Fx, st_);
         }
         CUDA_CHECK(cudaEventRecord(p.used[b], st_));
     }
@@ -790,8 +814,11 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
         cur_->pending_T = 0;
         return;
     }
-    const int lend = yl >= 0 ? std::min(l1_, yl + 1) : l1_;
-    pf_lend_ = yl >= 0 ? std::min(l1_, yl) : l1_;   // (pf_moe's guessed prefetch: none past this stage or into the skip layer)
+    // with the prompt helper a skipped group stops at hand_ on the first stage and starts there on the helper
+    const int lstart = yl >= 0 ? pf_l0() : l0_;
+    const int hand = yl >= 0 && head_->hand_ >= 0 && head_->hand_ > l0_ && head_->hand_ < l1_ ? head_->hand_ : -1;
+    const int lend = hand >= 0 ? hand : yl >= 0 ? std::min(l1_, yl + 1) : l1_;
+    pf_lend_ = hand >= 0 ? hand : yl >= 0 ? std::min(l1_, yl) : l1_;   // (pf_moe's guessed prefetch: none past this stage or into the skip layer)
     // the chunks: pf_max_ rows each, the remainder last
     const int nc = (N + pf_max_ - 1) / pf_max_;
     std::vector<int> csz(nc), coff(nc);
@@ -815,7 +842,7 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
     std::thread eg_th;
     if (p.eg_rows) {
         std::vector<int> order;
-        for (int e = 0; e < n_eg; ++e) if (owns(c.engram_layers[e])) order.push_back(e);
+        for (int e = 0; e < n_eg; ++e) if (c.engram_layers[e] >= lstart && c.engram_layers[e] < lend) order.push_back(e);
         std::sort(order.begin(), order.end(), [&](int a, int b) { return c.engram_layers[a] < c.engram_layers[b]; });
         if (!order.empty())
             eg_th = std::thread([&, order, N, nc]() {
@@ -872,8 +899,8 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
     static const int rank_bufs = std::max(0, std::min(2, env_int("BNK_DS_PF_PREFETCH", 1)));
     static const int rank_min = env_int("BNK_DS_PF_RANK_MIN", 1024);
     p.pre_layer = -1;
-    if (!pf_rank_.empty() && N >= rank_min && l0_ != yl) pf_prefetch(l0_, pf_rank_[l0_], rank_bufs);
-    for (int il = l0_; il < lend; ++il) {
+    if (!pf_rank_.empty() && N >= rank_min && lstart != yl) pf_prefetch(lstart, pf_rank_[lstart], rank_bufs);
+    for (int il = lstart; il < lend; ++il) {
         const DsLayer & L = model_.layers[il];
         if (il == yl) {   // the skipped rows' compressed KV and index keys; the window rings of the layers from here
                           // on hold no positions of them (zeroed: only rows within the cone read those slots)
@@ -934,12 +961,51 @@ void DsEngine::prefill_group_here(const int32_t * tokens, int N, int buf, bool s
         fprintf(stderr, "bnk: prompt group %d tokens, %d chunks, layers %d-%d: %.0f ms (%.0f tok/s); engram host (overlapped) %.0f wait %.0f, setup %.0f, "
                         "attention+dense %.0f, route %.0f, enqueue %.0f, cpu %.0f, gather/wait %.0f, head/out %.0f ms; %.0f MiB over PCIe "
                         "(%.1f us/MB), experts %lld resident %lld staged, pairs %lld gpu %lld cpu, cpu scale %.2f\n",
-                N, nc, l0_, l1_ - 1, ms, N / (ms / 1000), (double) pf_eg_ms_, g_prof.eg_wait, g_prof.setup, g_prof.attn, g_prof.route, g_prof.enqueue,
+                N, nc, lstart, lend - 1, ms, N / (ms / 1000), (double) pf_eg_ms_, g_prof.eg_wait, g_prof.setup, g_prof.attn, g_prof.route, g_prof.enqueue,
                 g_prof.cpu, g_prof.gather, g_prof.head, g_prof.copy_mb, pf_pcie_us_mb_, (long long) g_prof.resident, (long long) g_prof.staged,
                 (long long) g_prof.gpu_pairs, (long long) g_prof.cpu_pairs, head_->pf_cpu_scale_);
     std::lock_guard<std::mutex> lk(head_->stats_mu_);
     pf_ms_ += ms;
     pf_tokens_ += N;
+}
+
+// ------------------------------------------------------------------------------------------------ the helper
+// The helper's mirror of layers [pl0, l0) and the first stage's own state of them, for positions [0, n): each
+// layer's window ring, the kv sources' compressed KV and index keys (n / ratio rows) and open groups. Before a long
+// prompt's skipped groups the mirror takes the conversation so far; after them the first stage takes back what the
+// helper wrote (the tail and decode run there). Pushed by the source GPU's stream (peer writes are the fast way).
+void DsEngine::help_sync(bool to_helper, int n) {
+    DsEngine * h = helper();
+    if (!h || h == this) return;
+    const DsConfig & c = model_.ds;
+    const int D = c.head_dim, ID = c.idx_dim;
+    DsEngine * src = to_helper ? this : h, * dst = to_helper ? h : this;
+    if (to_helper) h->ensure_ctx_here(n + kMaxWindow);
+    DeviceScope dsc(src->dev_);
+    cudaStream_t st = src->st_;
+    auto copy = [&](void * d, const void * s, size_t bytes) {
+        if (bytes) CUDA_CHECK(cudaMemcpyPeerAsync(d, dst->dev_, s, src->dev_, bytes, st));
+    };
+    size_t total = 0;
+    for (int il = h->pl0_; il < h->l0_; ++il) {
+        Seq & a = *src->cur_, & b = *dst->cur_;
+        copy(b.ring[il].p, a.ring[il].p, (size_t) kDsRing * D * sizeof(half));
+        total += (size_t) kDsRing * D * sizeof(half);
+        if (!c.is_kv_src(il)) continue;
+        const size_t rows = (size_t) n / c.ratio[il];
+        copy(b.ckc[il].p, a.ckc[il].p, rows * D * sizeof(half));
+        copy(b.ikc[il].p, a.ikc[il].p, rows * ID * sizeof(half));
+        total += rows * (D + ID) * sizeof(half);
+        if (c.ratio[il] > 1) {
+            copy(b.st_kv[il].p, a.st_kv[il].p, (size_t) (c.ratio[il] - 1) * D * sizeof(float));
+            copy(b.st_sc[il].p, a.st_sc[il].p, (size_t) (c.ratio[il] - 1) * D * sizeof(float));
+        }
+    }
+    const double t0 = now_ms();
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    if (g_pf_prof)
+        fprintf(stderr, "bnk: prompt helper: layers %d-%d's state for %d positions %s (%.1f MiB) in %.1f ms\n", h->pl0_, h->l0_ - 1, n,
+                to_helper ? "to the helper" : "back to the first stage", total / 1048576.0, now_ms() - t0);
 }
 
 // ------------------------------------------------------------------------------------------------ the prompt
@@ -984,10 +1050,21 @@ void DsEngine::prefill(const std::vector<int32_t> & tokens) {
             try { pf_worker_->wait(); } catch (...) {}
             posted = false;
         };
+        // the prompt helper: its mirror takes the conversation so far before the skipped groups (BNK_DS_PF_HELP)
+        const bool help = cut && hand_ >= 0 && helper();
         try {
+            if (help) help_sync(true, pos());
             // the skipped rows [0, cut) first, then the rest while at least prefill_min of it is left
             for (const bool skip : {true, false}) {
                 if (skip && !cut) continue;
+                if (!skip && help) {   // the skipped groups are through the helper: the first stage takes their state back
+                    if (posted) {
+                        pf_worker_->wait();
+                        posted = false;
+                        if (on_prefill_progress) on_prefill_progress(handed, n);
+                    }
+                    help_sync(false, pos());
+                }
                 const size_t end = skip ? cut : n, min_left = skip ? 1 : (size_t) std::max(1, opt_.prefill_min);
                 const size_t group = group_of(end - i);
                 while (end - i >= min_left || (!skip && i < img_end)) {
