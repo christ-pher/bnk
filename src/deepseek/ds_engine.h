@@ -138,6 +138,16 @@ private:
     std::unique_ptr<DsEngine> next_;
     bool first() const { return l0_ == 0; }
     bool owns(int il) const { return il >= l0_ && il < l1_; }
+    // the prompt helper (docs/PREFILL-SKIP-PLAN.md item 2b, BNK_DS_PF_HELP=s): the last stage also holds layers
+    // [s, l0_)'s dense weights and a mirror of their state, and runs them for a long prompt's skipped groups (the
+    // first stage stops at s for those: GPU 1 otherwise idles through them); decode keeps the split as it is
+    int pl0_ = -1;    // this stage's first prompt-only layer (-1: none)
+    int hand_ = -1;   // the first stage: where its skipped groups hand over (-1: no helper)
+    int pf_l0() const { return pl0_ >= 0 ? pl0_ : l0_; }
+    bool pf_owns(int il) const { return il >= pf_l0() && il < l1_; }
+    DsEngine * helper() { for (DsEngine * s = this; s; s = s->next_.get()) if (s->pl0_ >= 0) return s; return nullptr; }
+    // the mirror's state for positions [0, n): from the first stage (before the skipped groups) / back to it (after)
+    void help_sync(bool to_helper, int n);
     void load_stage(const std::string & path, const EngineOptions & opt);
     void init_cache(const Ranking & rank);
     // the residual rows (hc * E floats) and the pending pre-mix (hc floats) per row between stages: pinned host

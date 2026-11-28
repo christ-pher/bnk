@@ -75,8 +75,10 @@ struct DsModel {
     // dense weights of layers [l0, l1) to the current device; the token table with `embd`, the head with `head`;
     // every layer's expert sources either way. engram_path: the tables' GGUF (empty: beside the model, named
     // by deepseek41.engram.file).
+    // x0 >= 0: also the dense weights of layers [x0, l0) (a stage's prompt-only layers, docs/PREFILL-SKIP-PLAN.md 2b)
     void load(const std::string & path, const std::string & engram_path, bool verbose, int l0 = 0, int l1 = -1,
-              bool embd = true, bool head = true);
+              bool embd = true, bool head = true, int x0 = -1);
+    int x0 = -1;   // the prompt-only layers [x0, l0) (-1: none)
     ~DsModel();
 
     // a tensor of another GGUF (the DSpark drafter's) to this device by the same rules (BF16 -> F16 / F32, quantized as is)

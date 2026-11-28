@@ -145,6 +145,11 @@ void DsEngine::load(const std::string & path, const EngineOptions & opt) {
         s->l0_ = bounds[k];
         s->l1_ = bounds[k + 1];
         s->last_ = k + 1 == gpus.size();
+        static const int help = env_int("BNK_DS_PF_HELP", 0);
+        if (s->last_ && k == 1 && help > 0 && help < s->l0_) {
+            s->pl0_ = help;
+            hand_ = help;
+        }
         if (opt.verbose && gpus.size() > 1)
             fprintf(stderr, "bnk: stage %zu of %zu: GPU %d, layers %d-%s\n", k + 1, gpus.size(), s->dev_, s->l0_,
                     s->l1_ < 0 ? "end" : std::to_string(s->l1_ - 1).c_str());
@@ -255,9 +260,18 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     CUDA_CHECK(cudaEventCreateWithFlags(&ev_out_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreate(&ev_t0_));
     CUDA_CHECK(cudaEventCreate(&ev_t1_));
-    model_.load(path, opt.ple_gguf, opt.verbose, l0_, l1_, first(), last_);
+    model_.load(path, opt.ple_gguf, opt.verbose, l0_, l1_, first(), last_, pl0_);
     if (l1_ < 0) l1_ = model_.ds.n_layer;
     const DsConfig & c = model_.ds;
+    if (pl0_ >= 0) {   // the helper's layers start at a kv source and every one of them reads its sources among them
+        bool ok = c.is_kv_src(pl0_) && c.is_idx_src(pl0_);
+        for (int il = pl0_; il < l0_; ++il)
+            ok &= c.ratio[il] == 0 || (c.kv_src[il] >= pl0_ && c.topk_src[il] >= pl0_);
+        if (!ok) throw std::runtime_error("BNK_DS_PF_HELP=" + std::to_string(pl0_) + ": not a kv / index source boundary (8, 14)");
+        if (opt.verbose)
+            fprintf(stderr, "bnk: layers %d-%d: also on this GPU for long prompts' skipped groups (%.2f GiB of dense weights in all)\n",
+                    pl0_, l0_ - 1, model_.vram_dense_bytes / 1073741824.0);
+    }
     // the GPU kernels' SwiGLU clamp is a __device__ symbol: set on every stage's device (it was set on the head's only,
     // so the second GPU's shared experts and resident experts ran unclamped: found by the DSpark drafter's reference)
     moe_set_swiglu_limit(c.swiglu_limit);
@@ -368,7 +382,7 @@ void DsEngine::load_stage(const std::string & path, const EngineOptions & opt) {
     if (pf_max_ > 0) {   // the expert staging arena: elastic, charged to the budget before the cache takes the rest
         const DsConfig & cc = model_.ds;
         size_t worst = 0;
-        for (int il = l0_; il < l1_; ++il) {
+        for (int il = pf_l0(); il < l1_; ++il) {
             const LayerWeights & Lw = model_.ev.layers[il];
             worst = std::max(worst, (size_t) cc.n_expert * ((Lw.gate_bytes + Lw.up_bytes + Lw.down_bytes + 63) / 64 * 64));
         }
@@ -414,7 +428,7 @@ void DsEngine::init_cache(const Ranking & rank) {
     DeviceScope ds(dev_);
     const DsConfig & c = model_.ds;
     size_t ctx_full = 0;
-    for (int il = l0_; il < l1_; ++il)
+    for (int il = pf_l0(); il < l1_; ++il)
         if (c.is_kv_src(il)) ctx_full += vmem_round((size_t) (opt_.max_ctx / c.ratio[il] + kMaxWindow) * c.head_dim * sizeof(half)) +
                                          vmem_round((size_t) (opt_.max_ctx / c.ratio[il] + kMaxWindow) * c.idx_dim * sizeof(half));
     ctx_full *= seqs_.size();
@@ -463,7 +477,7 @@ void DsEngine::alloc_seq(Seq & q) {
     q.ikc.resize(c.n_layer);
     q.st_kv.resize(c.n_layer);
     q.st_sc.resize(c.n_layer);
-    for (int il = l0_; il < l1_; ++il) {
+    for (int il = pf_l0(); il < l1_; ++il) {
         q.ring[il].alloc((size_t) kDsRing * c.head_dim);
         if (c.is_kv_src(il)) {
             const size_t rows = (size_t) opt_.max_ctx / c.ratio[il] + kMaxWindow;
@@ -529,7 +543,7 @@ void DsEngine::ensure_ctx_here(int cells) {
 void DsEngine::map_ctx(int cells) {
     const DsConfig & c = model_.ds;
     const bool grow = cells > cur_->ctx_mapped;
-    for (int il = l0_; il < l1_; ++il) {
+    for (int il = pf_l0(); il < l1_; ++il) {
         if (!c.is_kv_src(il)) continue;
         const size_t rows = (size_t) cells / c.ratio[il] + kMaxWindow;
         if (grow) {

@@ -275,3 +275,46 @@ the open design question.
 2. Item 4 step 0 in the same GPU session (it's only a profile).
 3. Item 3 (a parameter of item 1), A/B in the same session.
 4. Item 2: the `--split` sweep in a second GPU session (it reloads the model per split, ~3-5 min each).
+
+## Item 2b built (2026-11-28, branch ds-pf-help): the prompt helper, BNK_DS_PF_HELP=14 (off by default)
+
+**First, a bug the work found (branch ds-pf-idx, also in this branch).** The prompt path's index picks and candidate
+blocks were chunk-sized buffers, but the layers that reuse their source's picks (topk_src: 3-7, 9-13, 15-19, 21-23,
+...; and the candidates after layer 20) run after all of the source layer's chunks. So in a group of several 2,048-row
+chunks every chunk used the group's last chunk's picks: earlier rows attended to compressed rows chosen for later
+ones (and written past their own positions: the attention does not mask the picks). Every prompt over 2,048 tokens
+was affected. `bnk nll`, a 6,144-token prefix read by the prompt path, the next 1,055 tokens scored by decode windows
+against the prefix read entirely by decode windows (the exact reference, NLL 1.927):
+
+| | NLL | KL to the reference (mean / max) | same top-1 |
+|---|---|---|---|
+| master | 2.008 | 0.088 / 0.51 | 87.0% |
+| one chunk a group (BNK_DS_PF_CHUNKS=1) | 1.928 | 0.0045 / 0.057 | 97.3% |
+| fixed (group-sized picks / candidates) | 1.925 | 0.0041 / 0.087 | 97.4% |
+
+The fix costs 268 MB of VRAM on the stage with layers 20+ (the candidates: a row of every block of the context per
+group row) and no speed (cold 19K 1,213-1,230, 84K 1,027 tok/s, master 1,170-1,220 / 1,015).
+
+**The helper.** The last stage also loads layers 14-19's dense weights (the next kv / index source boundary is 14:
+layers 14-19 read only layer 14's compressed KV and picks) and keeps a mirror of their state (rings, layer 14's
+compressed KV, index keys and open group). For a long prompt's skipped groups the first stage stops at layer 14 and
+hands the residual rows over (the existing transfer, at 14 instead of 20); the helper runs 14-19 and layer 20's
+kv-only. Its experts: those with a host copy stream over GPU 1's own link; the first stage's residents (no host copy)
+come over from GPU 0's cache slots by peer copy. Before the skipped groups the mirror takes the conversation's state
+(peer copy); after them the first stage takes back what the helper wrote (52 MiB at 84K, 4.7 ms), and the tail and
+decode run on the usual split. Exact: the same test, KL 0.0037 / 0.093, top-1 97.3%.
+
+Cold reads through the server (tok/s): 
+
+| | fix only | helper at 14 | helper at 8 |
+|---|---:|---:|---:|
+| ~17-19K | 1,213-1,230 | 1,279-1,438 | 1,150 |
+| ~84K | 1,027 | **1,366 (+33%)** | 1,287 |
+
+Per 7.6K group at 84K: GPU 0 (layers 0-13) 3.6 -> 6.5 s as the context grows, GPU 1 (14-20) 2.6-3.4 s: GPU 0 still
+sets the pace; at 8 GPU 1 does (it streams every expert of its layers) and loses.
+
+Cost: GPU 1 keeps 178 fewer resident experts (1,987 -> 1,809: the dense copy and the mirror's context reserve).
+Decode, one agent, 3 runs a prompt: code 38.7 -> 37.8, math 43.7 -> 41.3, prose 30.0 -> 29.5 tok/s (2-5%, about the
+noise, but all one way). Hence off by default: worth it for long cold reads (agents pasting big files), not for
+chat. BNK_DS_PF_HELP=14 turns it on.
