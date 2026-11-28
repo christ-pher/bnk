@@ -163,8 +163,17 @@ QMat Model::upload_data(const std::string & name, const uint8_t * data, int type
     // (not the router: its fp32 path picks the experts, and stays exact)
     // (the PLE conv taps are read as raw fp16 by their kernel, whatever their width: 4 per row)
     const bool must_f16 = name.find("ple_conv1d") != std::string::npos;
+    if (must_f16 && t->type == GGML_TYPE_F32) {   // Unsloth's GGUFs keep the taps F32
+        const int64_t n = t->nrows() * t->ne[0];
+        std::vector<ggml_fp16_t> h((size_t) n);
+        ggml_fp32_to_fp16_row((const float *) t->data, h.data(), n);
+        QMat m = upload_matrix(h.data(), GGML_TYPE_F16, t->nrows(), t->ne[0], (size_t) t->ne[0] * 2, repack, &d);
+        device_allocs_.push_back(d);
+        vram_dense_bytes += m.row_bytes * m.rows;
+        return m;
+    }
     if (must_f16 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)
-        throw std::runtime_error(name + ": expected F16 or BF16, got " + ggml_type_name((ggml_type) t->type));
+        throw std::runtime_error(name + ": expected F16, BF16 or F32, got " + ggml_type_name((ggml_type) t->type));
     if ((!keep_bf16 || must_f16) && t->type == GGML_TYPE_BF16 && t->nrows() >= 2 && (t->ne[0] % 32 == 0 || must_f16) &&
         (name.find("ffn_gate_inp") == std::string::npos || getenv("BNK_ROUTER_F16"))) {
         const int64_t n = t->nrows() * t->ne[0];

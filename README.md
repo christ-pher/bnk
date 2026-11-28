@@ -642,6 +642,7 @@ exactly these models, and `./models.sh` manages them:
 | Config | Model | Size |
 |---|---|---|
 | `iq3_s` (default) | [ISTA-DASLab Qwen3.8-Flash-Next-GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 84 GB, 2 shards |
+| `ud-iq3_xxs` | [unsloth Qwen3.8-Flash-Next-GGUF UD-IQ3_XXS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (Dynamic v3.1, the same size: NLL 1-5% lower than IQ3_S on held-out text, same decode speed) | 84 GB, 4 shards |
 | `qwen27b` | [unsloth Qwen3.8-27B-GGUF Q8_0](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (the dense 27B; `docs/DENSE.md`) | 29 GB, 1 file; needs two V100s |
 
 **Where models go.** By default into the Hugging Face cache (`~/.cache/huggingface/hub`, or `$HF_HOME` /

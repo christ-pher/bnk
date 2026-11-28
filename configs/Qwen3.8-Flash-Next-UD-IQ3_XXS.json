@@ -1,0 +1,36 @@
+{
+  "notes": "Qwen3.8-Flash-Next Unsloth Dynamic v3.1 UD-IQ3_XXS (83.6 GB, the same size as the GSQ-RCO IQ3_S). Added 2026-11-28 to A/B against iq3_s: Unsloth's own charts put it at 99.9% vs 99.0% average recovery over 12 benchmarks and ~20% lower KLD at the same size. Sampling, speculation and slots copied from iq3_s (not re-tuned).",
+  "aliases": [
+    "ud-iq3_xxs"
+  ],
+  "source": {
+    "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "revision": "f5d175de2cf7f720d45d6064019a81fcf056e986",
+    "files": [
+      "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf",
+      "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf",
+      "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf",
+      "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf"
+    ],
+    "mmproj": "mmproj-BF16.gguf"
+  },
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0
+  },
+  "speculation": {
+    "draft": 7,
+    "draft_min_p": 0.8
+  },
+  "thinking_loop_guard": true,
+  "server_args": [
+    "--model-id",
+    "Qwen3.8-Flash-Next-UD",
+    "--max-tokens",
+    "32768",
+    "--slots",
+    "3"
+  ]
+}
