@@ -24,6 +24,7 @@ InkEngine::~InkEngine() {
         for (auto & row : sl)
             for (auto & g : row)
                 if (g) cudaGraphExecDestroy(g);
+    for (auto & kv : bgraphs_) cudaGraphExecDestroy(kv.second);
     for (auto & evs : ev_)
         for (cudaEvent_t e : evs) cudaEventDestroy(e);
     for (cudaEvent_t e : {ev_head_, ev_fork_, ev_join_})
@@ -204,10 +205,10 @@ void InkEngine::load_rank(const std::string & path, const EngineOptions & opt, i
     h_ids_.resize(R); h_w_.resize(R);
     if (tp_rank == 0) {
         CUDA_CHECK(cudaHostAlloc((void **) &h_tok_, W * 4, cudaHostAllocPortable));
-        CUDA_CHECK(cudaHostAlloc((void **) &h_pos_, 4, cudaHostAllocPortable));
+        CUDA_CHECK(cudaHostAlloc((void **) &h_pos_, 2 * 4, cudaHostAllocPortable));   // a position per segment
         CUDA_CHECK(cudaHostAlloc((void **) &h_tau_, W * 4, cudaHostAllocPortable));
     }
-    d_pos_.alloc(1);
+    d_pos_.alloc(2);
     plan_buf_.alloc(sizeof(InkMoePlan));
     mh_.alloc((size_t) kInkMaxPairs * F); my_.alloc((size_t) kInkMaxPairs * E); mgu_.alloc((size_t) kInkMaxPairs * 2 * F);
     mq_.alloc((size_t) kInkMaxPairs * E); mqd_.alloc((size_t) kInkMaxPairs * E / 32);
@@ -552,43 +553,49 @@ void InkEngine::visit_a(int v, int ip, int T, int pos0, const InkLoop * loop, bo
         mm(qmat_rows(L.proj, L.off_v, S - L.off_v), a[2], E, T, P + L.off_v, S);
     }
     // k and v through their convolutions (one launch), then the clips and v's norm (one launch)
-    Visit & V = visits_[v];
-    {
+    for (int sg = 0; sg < nseg_; ++sg) {
+        const Seg & G = segs_[sg];
+        Visit & V = (*G.visits)[v];
         const float sc = 1.f / sqrtf((swa ? 1.f : 2.f) * c.n_conv + 1.f);
+        const size_t r0 = (size_t) G.r0;
         InkConvJob j[2];
         for (int i = 0; i < 2; ++i) {
-            j[i].x = P + (i ? L.off_v : L.off_k);
+            j[i].x = P + r0 * S + (i ? L.off_v : L.off_k);
             j[i].ldx = S;
-            j[i].y = i ? vc_.p : kc_.p;
+            j[i].y = (i ? vc_.p : kc_.p) + r0 * KVD;
             j[i].C = KVD;
             j[i].state = V.conv.p + i * KVD;
             j[i].w = i ? L.v_conv : L.k_conv;
-            j[i].dyn = swa ? nullptr : P + (i ? L.off_vp : L.off_kp);
+            j[i].dyn = swa ? nullptr : P + r0 * S + (i ? L.off_vp : L.off_kp);
             j[i].ld_dyn = S;
             j[i].H = KVH;
             j[i].scale = sc;
             j[i].win = keep ? nullptr : V.win_in.p + i * KVD;
         }
-        ink_conv_jobs(j, 2, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
+        ink_conv_jobs(j, 2, G.T, conv_ch_, conv_ch_, keep ? G.T : 0, conv_scratch_, st_);
     }
     float * q = P, * R = P + L.off_rel;
     const float * sink = P + L.off_sink, * gate = P + L.off_gate;
     ink_post_proj(q, R, S, L.q_clip, L.rel_clip, c.qk_clip, c.rel_clip, swa ? nullptr : tau_.p, kc_, vc_, T, H, KVH, D,
                   c.n_rel, c.rms_eps, st_);
 
-    ink_kv_store(kc_, vc_, V.K, V.V, V.ring, d_pos_, T, KVD, st_);
-    {
+    for (int sg = 0; sg < nseg_; ++sg) {
+        const Seg & G = segs_[sg];
+        Visit & V = (*G.visits)[v];
+        const size_t r0 = (size_t) G.r0;
+        const int Ts = G.T, p0 = G.pos0;
+        ink_kv_store(kc_.p + r0 * KVD, vc_.p + r0 * KVD, V.K, V.V, V.ring, d_pos_.p + sg, Ts, KVD, st_);
         // key splits: decode windows a fixed number (the graph's grid), prompt chunks by their keys
         int ns;
         if (T <= kInkWin) {
             ns = V.window ? env_int("BNK_INK_SPLITS_SWA", 8) : env_int("BNK_INK_SPLITS", 32);
         } else {
-            const int keys = V.window ? std::min(pos0 + T, V.window + T) : pos0 + T;
+            const int keys = V.window ? std::min(p0 + Ts, V.window + Ts) : p0 + Ts;
             ns = std::max(1, std::min(8, keys / 4096));   // the scratch holds 8 splits of a chunk
         }
         ns = std::max(1, std::min(ns, kInkAttnSplits));
-        ink_attention_tc(q, R, sink, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window, d_pos_, pos0, T,
-                         H, KVH, D, 1.f / sqrtf((float) D), ns, attn_, attn_scratch_, st_, S, S, S);
+        ink_attention_tc(q + r0 * S, R + r0 * S, sink + r0 * S, V.K, V.V, V.ring, L.rel_bias, c.extent(ip), c.n_rel, V.window,
+                         d_pos_.p + sg, p0, Ts, H, KVH, D, 1.f / sqrtf((float) D), ns, attn_.p + r0 * QD, attn_scratch_, st_, S, S, S);
     }
     ink_mul_sigmoid_rows(attn_, gate, S, T, QD, st_);
     mm(L.wo, attn_, QD, T, conv_in_, E);   // this rank's heads' share of the output (all-reduced next)
@@ -608,13 +615,17 @@ void InkEngine::visit_b(int v, int ip, int T, const InkLoop * loop, bool keep) {
         CUDA_CHECK(cudaMemcpyAsync(b, x_, TE * 4, cudaMemcpyDeviceToDevice, st_));
         blocks_.push_back(b);
     }
-    Visit & V = visits_[v];
-    InkConvJob j;
-    j.x = conv_in_; j.x2 = peer_in_[0]; j.ldx = E;
-    j.y = x_; j.y2 = ffn_inp_; j.res = start ? nullptr : x_.p;
-    j.C = E; j.state = V.conv.p + 2 * KVD; j.w = L.attn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
-    j.win = keep ? nullptr : V.win_in.p + 2 * KVD;
-    ink_conv_jobs(&j, 1, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
+    for (int sg = 0; sg < nseg_; ++sg) {
+        const Seg & G = segs_[sg];
+        Visit & V = (*G.visits)[v];
+        const size_t o = (size_t) G.r0 * E;
+        InkConvJob j;
+        j.x = conv_in_.p + o; j.x2 = peer_in_[0] ? peer_in_[0] + o : nullptr; j.ldx = E;
+        j.y = x_.p + o; j.y2 = ffn_inp_.p + o; j.res = start ? nullptr : x_.p + o;
+        j.C = E; j.state = V.conv.p + 2 * KVD; j.w = L.attn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
+        j.win = keep ? nullptr : V.win_in.p + 2 * KVD;
+        ink_conv_jobs(&j, 1, G.T, conv_ch_, conv_ch_, keep ? G.T : 0, conv_scratch_, st_);
+    }
     if (loop) {
         mix(blocks_, ffn_inp_, L.ffn_res_query, 1, T, mixed_);
         const float * cur[1] = {mixed_.p}, * msg[1] = {msg_.p + 3 * TE};
@@ -634,13 +645,17 @@ void InkEngine::visit_c(int v, int T, bool keep) {
     const InkConfig & c = model_.cfg;
     const int E = c.E, KVD = c.kv_dim();
     const int ip = v < c.n_layer ? v : c.loop_start + (v - c.n_layer) % c.n_core();
-    Visit & V = visits_[v];
-    InkConvJob j;
-    j.x = moe_; j.x2 = peer_in_[1]; j.ldx = E;
-    j.y = x_; j.res = ffn_inp_;
-    j.C = E; j.state = V.conv.p + 2 * KVD + E; j.w = model_.layers[ip].ffn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
-    j.win = keep ? nullptr : V.win_in.p + 2 * KVD + E;
-    ink_conv_jobs(&j, 1, T, conv_ch_, conv_ch_, keep ? T : 0, conv_scratch_, st_);
+    for (int sg = 0; sg < nseg_; ++sg) {
+        const Seg & G = segs_[sg];
+        Visit & V = (*G.visits)[v];
+        const size_t o = (size_t) G.r0 * E;
+        InkConvJob j;
+        j.x = moe_.p + o; j.x2 = peer_in_[1] ? peer_in_[1] + o : nullptr; j.ldx = E;
+        j.y = x_.p + o; j.res = ffn_inp_.p + o;
+        j.C = E; j.state = V.conv.p + 2 * KVD + E; j.w = model_.layers[ip].ffn_post_conv; j.scale = 1.f / sqrtf(c.n_conv + 1.f);
+        j.win = keep ? nullptr : V.win_in.p + 2 * KVD + E;
+        ink_conv_jobs(&j, 1, G.T, conv_ch_, conv_ch_, keep ? G.T : 0, conv_scratch_, st_);
+    }
 }
 
 // Loop controls j0 .. j0 + n - 1 of a visit, batched: out[i] = control(cur[i], msg[i]), RMS-normed by norm[i]
@@ -679,7 +694,7 @@ void InkEngine::fwd_in(int T) {
     const InkConfig & c = model_.cfg;
     const int E = c.E;
     CUDA_CHECK(cudaMemcpyAsync(tok_dev_.p, h_tok_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(d_pos_.p, h_pos_, 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaMemcpyAsync(d_pos_.p, h_pos_, (size_t) nseg_ * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(tau_.p, h_tau_, (size_t) T * 4, cudaMemcpyHostToDevice, st_));
     dequant_gather(model_.tok_embd, tok_dev_, T, x_, st_);
     ink_rms(x_, E, model_.tok_norm, x_, E, T, E, c.rms_eps, st_);
@@ -756,6 +771,10 @@ void InkEngine::run(const int32_t * tokens, int T, bool keep) {
         seq_.insert(seq_.end(), tokens, tokens + T);
     }
     *h_pos_ = pos0;
+    for (InkEngine * r : ranks()) {
+        r->nseg_ = 1;
+        r->segs_[0] = Seg{0, T, pos0, &r->visits_};
+    }
     lg_ = logits_.p;
     feat_out_ = feat_.p;
     for (int t = 0; t < T; ++t)
@@ -896,8 +915,13 @@ void InkEngine::forward_batch(const std::vector<BatchWin> & wins) {
     for (const auto & w : wins) total += w.T;
     if (total > kInkWin) throw std::runtime_error("inkling: windows too long");
     const bool many = wins.size() > 1;
-    if (many && !blogits_.p) blogits_.alloc((size_t) kInkWin * model_.cfg.n_vocab);
     const double t0 = now_ms();
+    if (many && run_batched(wins)) {
+        times.total_ms += now_ms() - t0;
+        times.calls++;
+        return;
+    }
+    if (many && !blogits_.p) blogits_.alloc((size_t) kInkWin * model_.cfg.n_vocab);
     int r0 = 0;
     for (const auto & w : wins) {
         select(w.slot);
@@ -924,6 +948,70 @@ void InkEngine::forward_batch(const std::vector<BatchWin> & wins) {
     }
     times.total_ms += now_ms() - t0;
     times.calls++;
+}
+
+// Two slots' windows in one forward (BNK_INK_BATCH=0: one after the other): the rows side by side (the first
+// window's slot current, the second's visits from its parked entry), each segment's convs / KV stores / attention
+// on its own caches at its own positions, everything row-wise shared. Decode windows only (a graph per pair of
+// (slot, rows) and keep mode); false when the round does not qualify (then the caller runs them in turn).
+bool InkEngine::run_batched(const std::vector<BatchWin> & wins) {
+    static const bool on = env_int("BNK_INK_BATCH", 1) != 0;
+    if (!on || wins.size() != 2 || !graphs_on_ || logits_hook) return false;
+    const BatchWin & A = wins[0], & B = wins[1];
+    if (A.slot == B.slot || A.commit_all != B.commit_all || A.T < 1 || B.T < 1 || A.T + B.T > kInkWin) return false;
+    for (const BatchWin * w : {&A, &B})
+        for (int t = 0; t < w->T; ++t)
+            if (is_image_id(w->tokens[t])) return false;
+    select(A.slot);
+    Parked & pb = parked_[B.slot];
+    if (pending_T_ || pb.pending_T) throw std::runtime_error("inkling: forward with a verify window pending");
+    const InkConfig & c = model_.cfg;
+    const int pa = pos(), pbp = (int) pb.history.size(), T = A.T + B.T;
+    if (pa + A.T > opt_.max_ctx || pbp + B.T > opt_.max_ctx) throw std::runtime_error("inkling: context full");
+    const bool keep = A.commit_all;
+    window_images_ = false;
+    for (int t = 0; t < A.T; ++t) h_tok_[t] = A.tokens[t];
+    for (int t = 0; t < B.T; ++t) h_tok_[A.T + t] = B.tokens[t];
+    h_pos_[0] = pa;
+    h_pos_[1] = pbp;
+    for (int t = 0; t < T; ++t) {
+        const int p = t < A.T ? pa + t : pbp + (t - A.T);
+        h_tau_[t] = 1.f + c.log_alpha * logf(std::max(1.f, (float) (p + 1) / c.log_floor));
+    }
+    for (InkEngine * r : ranks()) {
+        r->nseg_ = 2;
+        r->segs_[0] = Seg{0, A.T, pa, &r->visits_};
+        r->segs_[1] = Seg{A.T, B.T, pbp, &r->parked_[B.slot].visits};
+    }
+    lg_ = logits_.p;
+    feat_out_ = feat_.p;
+    DeviceScope ds(dev_);
+    const uint64_t key = ((uint64_t) A.slot << 24) | ((uint64_t) A.T << 16) | ((uint64_t) B.slot << 8) | ((uint64_t) B.T << 1) |
+                         (keep ? 1u : 0u);
+    cudaGraphExec_t & g = bgraphs_[key];
+    if (!g) {
+        cudaGraph_t gr;
+        CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+        enqueue(T, keep);
+        CUDA_CHECK(cudaStreamEndCapture(st_, &gr));
+        CUDA_CHECK(cudaGraphInstantiate(&g, gr, 0));
+        cudaGraphDestroy(gr);
+        ++captures_;
+    }
+    CUDA_CHECK(cudaGraphLaunch(g, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    for (InkEngine * r : ranks()) r->nseg_ = 1;
+    logits_rows_ = T;
+    last_T = T;
+    history_.insert(history_.end(), A.tokens, A.tokens + A.T);
+    pb.history.insert(pb.history.end(), B.tokens, B.tokens + B.T);
+    if (!keep) {
+        pending_T_ = A.T;
+        pb.pending_T = B.T;
+    }
+    row0_[A.slot] = 0;
+    row0_[B.slot] = A.T;
+    return true;
 }
 
 void InkEngine::commit(int cnt) {
