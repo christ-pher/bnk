@@ -156,3 +156,15 @@ reference (2,934 tokens: NLL 2.1130 vs 2.1101, top-1 97.0%).
   Greedy outputs together = alone; two together 81 tok/s total (one conversation's speed); alternating agents keep
   their prompts (a 4K prompt 3.6 s once, then 0.3 s a turn). VRAM with 2 slots: 23.4 / 21.0 GB.
 - Next: windows of two slots in one forward (per-slot attention / conv / KV store inside a visit) for real batching.
+
+## 2026-11-28: batched rounds
+
+A round with two conversations' windows now runs them in one forward (InkEngine::run_batched): the rows side by
+side, the first window's slot current and the second's visits read from its parked entry; per segment only the
+convs (their states and window inputs), the KV stores and the attention (each at its own positions: h_pos_ / d_pos_
+hold one per segment, tau per row); everything row-wise (projections, controls, MoE, head) shared, so the weights
+are read and the ~1,270 kernels launched once for both. A graph per (slot, rows) pair and keep mode. Decode windows
+only (images or a prompt chunk: one after the other, as before); BNK_INK_BATCH=0 turns it off.
+Greedy: each conversation's reply together identical to alone (code and prose, 400 tokens). Two agents, temperature
+1, 400 tokens each, 4 pairs: 76-90 -> 100-105 tok/s combined (+22%). One agent unchanged (code 90.0 vs 89.3, prose
+80.1 vs 79.4).

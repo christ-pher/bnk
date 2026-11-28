@@ -12,6 +12,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -170,6 +171,14 @@ private:
         DevBuf<float> conv, win_in;
     };
     std::vector<Visit> visits_;
+    // a forward's segments: each conversation's rows [r0, r0 + T) at its own positions, with its visits (caches, conv
+    // states): one segment, or two when a batched round runs two slots' windows in one forward (row-wise work is
+    // shared; only the convs, the KV stores and the attention run per segment)
+    struct Seg { int r0 = 0, T = 0, pos0 = 0; std::vector<Visit> * visits = nullptr; };
+    Seg segs_[2];
+    int nseg_ = 1;
+    std::map<uint64_t, cudaGraphExec_t> bgraphs_;   // batched windows: (slot, T) x 2 and the keep mode
+    bool run_batched(const std::vector<BatchWin> & wins);
     std::vector<int32_t> history_;
     int pending_T_ = 0;      // rows of an uncommitted verify window
     void alloc_visits(std::vector<Visit> & vs);
