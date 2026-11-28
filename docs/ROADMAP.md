@@ -21,6 +21,18 @@ A running list of where bnk's speed comes from next, in the order we plan to wor
 
 ## Done (two V100s)
 
+* **2026-11-28, v0.6.5: DeepSeek prompt fix, drafter experts on the GPU, Inkling batching**:
+  * **Fix (DeepSeek prompts over 2,048 tokens):** the prompt path's index picks and candidate blocks were chunk-sized,
+    so in a group of several chunks the layers that reuse their source's picks used the last chunk's for every chunk
+    (earlier rows attended to rows chosen for later ones). 6K prefix, next 1,055 tokens against the exact path: KL
+    0.088 -> 0.0041, same top-1 87% -> 97.4%. No speed cost (`docs/PREFILL-SKIP-PLAN.md`).
+  * **DeepSeek DSpark:** its 32 hottest routed experts a stage resident on GPU 1 (MXFP4 GEMV on the GPU): CPU expert
+    time 6.4 -> 1.2 ms a block, prose +12%, code / math unchanged (`docs/DSPARK.md`; BNK_DS_SPARK_VRAM=0 off).
+  * **Inkling:** two conversations' windows in one forward: two agents 76-90 -> 100-105 tok/s together, greedy
+    output identical to alone (`docs/INKLING-PLAN.md`; BNK_INK_BATCH=0 off).
+  * **DeepSeek prompt helper, off by default:** GPU 1 runs layers 14-19 of a long prompt's skipped groups: cold 84K
+    1,027 -> 1,366 tok/s, but decode 2-5% slower, so opt-in for read-heavy work (BNK_DS_PF_HELP=14).
+  * Fixed: `DsSpark::step_multi` stepped the last item's slot for every item (latent: rounds never batch drafts).
 * **2026-11-26, v0.6.4: top-k scratch fix**: `topk_rows` freed its scratch when a larger call grew it, under the
   Inkling drafter's captured graph (the engine's temperature-1 sampling top-k ran after the capture): an illegal
   access on the first request of most fresh starts. Outgrown buffers are kept now (8 MiB to start).
