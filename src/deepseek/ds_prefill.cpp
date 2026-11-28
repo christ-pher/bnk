@@ -117,8 +117,18 @@ void DsEngine::prefill_alloc(int N, int G) {
     p.score_rows = std::max(1, std::min(N, (int) ((128u << 20) / (lds_ * 4))));
     p.n_sub = (N + p.score_rows - 1) / p.score_rows;
     p.scores.alloc((size_t) p.score_rows * lds_);
-    if (n_blocks_max_) { p.cand_scratch.alloc((size_t) p.score_rows * n_blocks_max_); p.cand.alloc((size_t) N * n_blocks_max_); }
-    p.idx.alloc((size_t) N * c.idx_topk);
+    // the picks and candidate blocks: a row of every chunk of the group. The layers that reuse their index source's
+    // picks (topk_src: 3-7, 9-13, 15-19, 21-23 ...) and candidates (layers after cand_src) run after all of the
+    // source layer's chunks, so a chunk-sized buffer gave every chunk the group's last chunk's picks: earlier rows
+    // attended to compressed rows chosen for later ones (and written past their position). Candidates only where a
+    // stage owns the candidate source or a layer after it (NG x the context's blocks: ~268 MB at 8,192 rows and 262K)
+    bool cand_here = false;
+    for (int il = l0_; il < l1_; ++il) cand_here |= c.cand_src >= 0 && il >= c.cand_src;
+    if (n_blocks_max_) {
+        p.cand_scratch.alloc((size_t) p.score_rows * n_blocks_max_);
+        if (cand_here) p.cand.alloc((size_t) NG * n_blocks_max_);
+    }
+    p.idx.alloc((size_t) NG * c.idx_topk);
     p.pos.alloc((size_t) G * p.n_sub + 1);
     p.tok.alloc(N);
     p.sg.alloc((size_t) N * 2 * Fx); p.sh.alloc((size_t) N * Fx);
@@ -280,14 +290,16 @@ void DsEngine::pf_attn(int il, int c_, int N, int pos0) {
                 const int * pj = p.pos.p + c_ * p.n_sub + j;
                 ds_index_scores(p.iq.p + (size_t) r0 * IH * ID, cur_->ikc[ks], p.iw.p + (size_t) r0 * IH, p.scores, n, IH, ID, ratio, n_max,
                                 lds_, pj, st_);
+                const size_t row = (size_t) c_ * pf_max_ + r0;   // the chunk's rows in the group-sized buffers
                 if (il == c.cand_src)
                     ds_cand_blocks(p.scores, lds_, n, ratio, c.cand_bs, c.cand_blocks, (n_max + c.cand_bs - 1) / c.cand_bs, pj,
-                                   p.cand_scratch, p.cand.p + (size_t) r0 * n_blocks_max_, st_);
-                const uint8_t * cand = c.cand_src >= 0 && il > c.cand_src ? p.cand.p + (size_t) r0 * n_blocks_max_ : nullptr;
-                ds_topk_select(p.scores, lds_, n, ratio, c.idx_topk, pj, cand, c.cand_bs, p.idx.p + (size_t) r0 * c.idx_topk, st_);
+                                   p.cand_scratch, p.cand.p + row * n_blocks_max_, st_);
+                const uint8_t * cand = c.cand_src >= 0 && il > c.cand_src ? p.cand.p + row * n_blocks_max_ : nullptr;
+                ds_topk_select(p.scores, lds_, n, ratio, c.idx_topk, pj, cand, c.cand_bs, p.idx.p + row * c.idx_topk, st_);
             }
         }
-        ds_attention(p.q, p.kwin, cur_->ckc[ks], p.idx, c.idx_topk, F(L.sinks), p.attn_o, N, H, D, c.window, R, d_pos0, rope_of(il),
+        ds_attention(p.q, p.kwin, cur_->ckc[ks], p.idx.p + (size_t) c_ * pf_max_ * c.idx_topk, c.idx_topk, F(L.sinks), p.attn_o, N, H, D,
+                     c.window, R, d_pos0, rope_of(il),
                      scale, st_, origin);
     } else {
         ds_attention(p.q, p.kwin, nullptr, nullptr, 0, F(L.sinks), p.attn_o, N, H, D, c.window, R, d_pos0, rope_of(il), scale, st_,
