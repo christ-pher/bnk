@@ -274,7 +274,7 @@ Everything since v0.4.0 (all of 2026-10-19), each with its own section below or 
 * **Draft 7** for the IQ3_S release and the 27B (their verify windows are free): copy-heavy output +5%.
 * **Prompt-lookup drafting and prefix forking**, **lookahead pipelining** for one stream on two GPUs, and the
   **toks tokenizer**: the sections below.
-* **The RCO IQ3_S 27B** (`./run.sh qwen27b-rco`, the `-mtp` file) loads: the dense engine re-quantizes the few
+* **The RCO IQ3_S 27B** (the `-mtp` file; its config was removed 2026-11-28) loaded: the dense engine re-quantizes the few
   formats its kernels do not read (Q2_K, IQ1_M, BF16 matrices) to Q8_0 at load. Same speed as the Q8_0 27B at
   12 GB instead of 29 (its IQ-format GEMVs are unpack-bound), quality slightly below (NLL +1.3%).
 * A performance inventory with two orderings and the ideas behind this work: `docs/PERF-IDEAS-2026-10-19.md`.

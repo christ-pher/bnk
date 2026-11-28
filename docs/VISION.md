@@ -14,7 +14,6 @@ downloaded (`./models.sh download iq3_s` fetches it with the model). `BNK_VISION
 |---|---|
 | Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (ISTA-DASLab repo) |
 | Qwen3.8-Flash-Next-FP4-Local | the same file (`"mmproj_from"`: the IQ3_S config) |
-| Qwen3.8-27B-GSQ-RCO-IQ3_S | `mmproj-Qwen3.8-27B-BF16.gguf` (ISTA-DASLab repo) |
 | Qwen3.8-27B-Q4, -Q8_0, -NVFP4 | `mmproj-BF16.gguf` (unsloth repo; NVFP4 through `"mmproj_from"`) |
 | DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS (ds-xs) | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` and `exp_probs_b_vl.f32` (ISTA-DASLab repo at `a419d74c`: `"mmproj_revision"`, `"mmproj_extra"`) |
 
