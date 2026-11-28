@@ -159,3 +159,18 @@ next to the 99 GB arena (pinned, their own store).
 * Earlier the same day: branch and worktree (`/opt/engines/bnk-dspark`); the tensors fetched (`tools/dspark_fetch.py`,
   7.93 GB) and converted with upstream llama.cpp's `--dspark` (`tools/dspark_gguf.py`; the GGUF 8.5 GB, 78 tensors);
   the loader and the engine wiring.
+
+## Hot drafter experts in VRAM (2026-11-28)
+
+The drafter's routed experts ran on the CPU pool: 6.4 ms of a ~11.5 ms draft block (BNK_DS_SPARK_PROF=1 prints the
+split and the routing's concentration). Its routing is skewed: a stage's top 32 experts take 79% / 92% / 99% of the
+picks (stages 0 / 1 / 2). So each stage keeps 32 slots on the last GPU (1.7 GiB, taken from that GPU's expert cache
+at load: 2,008 -> 1,829 resident target experts), filled and refreshed from the routing counts (one 18 MB copy at
+a time on its own stream; a slot leaves the routing when its copy is decided, rejoins when it lands). Resident
+experts run as GEMVs on the GPU (MXFP4 GEMV added: dequantization bit-exact with ggml, GEMV 0.5% from the double
+reference, tests/test_dequant) while the CPU pool does the rest. CPU expert time 6.4 -> 1.2 ms a block.
+
+Server, one agent, temperature 1, 600 tokens, 3 runs a prompt (tok/s): baseline code 39.2 / math 40.0 / prose 29.8;
+32 a stage 39.2 / 39.8 / 33.6; 64,48,32 39.3 / 41.5 / 32.5. Prose (short rounds, so drafting is a larger share)
++12%, code and math unchanged; acceptance and target CPU misses unchanged. Default 32; BNK_DS_SPARK_VRAM=k0,k1,k2
+sets the slots per stage, 0 turns it off.

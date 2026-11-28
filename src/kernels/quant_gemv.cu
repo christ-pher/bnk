@@ -275,7 +275,8 @@ static void launch_dp4a(const QMat & W, const ActQ8 & a, int T, float * y, int64
         gemv_dp4a_k<FMT, NT><<<grid, 256, 0, s>>>((const uint8_t *) W.data, W.row_bytes, (int) W.rows, nsb, a.q, a.d,
                                                   a.cols_pad, T, y, ldy, acc ? 1 : 0);
     };
-    BNK_DISPATCH_DP4A(W.type, f);
+    if (W.type == QT_MXFP4) f.template operator()<QT_MXFP4>();   // ggml blocks only (no R layout)
+    else BNK_DISPATCH_DP4A(W.type, f);
 }
 
 // ------------------------------------------------------------------------------ float GEMV
@@ -548,6 +549,7 @@ static void dequant_launch(const QMat & W, const int32_t * ids, int64_t r0, int 
         case QT_F32: f.template operator()<QT_F32>(); break;
         case QT_F16: f.template operator()<QT_F16>(); break;
         case QT_BF16: f.template operator()<QT_BF16>(); break;
+        case QT_MXFP4: f.template operator()<QT_MXFP4>(); break;
         default: BNK_DISPATCH_DP4A(W.type, f);
     }
 }
@@ -575,7 +577,7 @@ QMat upload_matrix(const void * host, int type, int64_t rows, int64_t cols, size
     m.rows = rows;
     m.cols = cols;
     void * d = nullptr;
-    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0 || type == QT_NVFP4_16) ? 32 : (type == QT_Q2_0 || type == QT_NVFP4) ? 64 : 256;
+    const int64_t need = (type == QT_IQ4_NL || type == QT_Q8_0 || type == QT_NVFP4_16 || type == QT_MXFP4) ? 32 : (type == QT_Q2_0 || type == QT_NVFP4) ? 64 : 256;
     if (repack && r_supported(type) && cols % need == 0) {
         const RLayout L = r_layout(type, cols);
         std::vector<uint8_t> buf(L.row_bytes * rows);

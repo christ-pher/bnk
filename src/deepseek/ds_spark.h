@@ -138,6 +138,26 @@ private:
     int cur_ = 0;
     std::vector<int> item_slot_;   // run_multi / step_multi: each item's slot (the next call's prev indices)
 
+    // the hot routed experts resident on this GPU (BNK_DS_SPARK_VRAM=k0,k1,k2: slots per stage, default 32, 0 = every
+    // expert on the CPU pool). The routing is skewed (a stage's top 32 take 79-99% of its picks), so a few slots move most of
+    // the block's expert work off the CPU; slots follow the routing counts, one copy in flight on its own stream.
+    std::vector<int> vk_;                       // [stage] slots
+    std::vector<DevBuf<uint8_t>> vslab_;        // [stage] slots x the stage's blob
+    std::vector<std::vector<int>> vslot_of_;    // [stage][expert] -> a ready slot, -1
+    std::vector<std::vector<int>> vexp_in_;     // [stage][slot] -> its expert, -1 (empty or being filled)
+    std::vector<std::vector<double>> vhits_;    // [stage][expert] decayed routing counts
+    cudaStream_t vcp_st_ = nullptr;
+    cudaEvent_t vcp_ev_ = nullptr, vdone_ev_ = nullptr;
+    int vpend_stage_ = -1, vpend_slot_ = -1, vpend_exp_ = -1;
+    long vblocks_ = 0;
+    size_t vram_experts_bytes_ = 0;
+    DevBuf<float> vgu_, vdn_, vout_, vw_;
+    std::vector<float> h_vw_;
+    std::vector<int> vlist_;                    // the stage's resident experts this block uses
+    std::vector<ExpertTask> cpu_tasks_;
+    void vram_init(bool verbose);
+    void vram_step();                           // after a block: finish / start the next slot copy
+
     // the block drafted last (per slot): tokens, their distributions, confidences
     struct Block {
         std::vector<int32_t> toks;

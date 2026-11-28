@@ -20,7 +20,7 @@ namespace bnk {
 enum : int {
     QT_F32 = 0, QT_F16 = 1, QT_Q4_0 = 2, QT_Q8_0 = 8, QT_Q2_K = 10, QT_Q3_K = 11, QT_Q4_K = 12,
     QT_Q5_K = 13, QT_Q6_K = 14, QT_IQ2_XXS = 16, QT_IQ2_XS = 17, QT_IQ3_XXS = 18, QT_IQ4_NL = 20,
-    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_NVFP4 = 40, QT_Q2_0 = 42, QT_NVFP4_16 = 43,
+    QT_IQ3_S = 21, QT_IQ2_S = 22, QT_IQ4_XS = 23, QT_BF16 = 30, QT_MXFP4 = 39, QT_NVFP4 = 40, QT_Q2_0 = 42, QT_NVFP4_16 = 43,
 };
 
 // Loads that only assume 2-byte alignment (most ggml block sizes are not multiples of 4).
@@ -325,6 +325,29 @@ template <> struct QTraits<QT_NVFP4> {
     }
 };
 
+// MXFP4 (ggml block of 32: one E8M0 scale, then 16 bytes of e2m1 codes; byte i holds element i in the low nibble and
+// element i + 16 in the high one). ggml pairs the halved E8M0 scale with the doubled e2m1 table (kvalues_mxfp4 is
+// kvalues_fp4), so d * code is the weight. 17-byte blocks: byte loads.
+__device__ __forceinline__ float e8m0h(uint32_t x) {
+    return __uint_as_float(x < 2 ? 0x00200000u << x : (x - 1u) << 23);
+}
+template <> struct QTraits<QT_MXFP4> {
+    static constexpr int QK = 32, BYTES = 17;
+    static constexpr bool HAS_MIN = false;
+    __device__ static void unpack(const uint8_t * b, int, Unpacked & u) {
+        u.d0 = u.d1 = e8m0h(b[0]);
+        u.m0 = u.m1 = 0.f;
+        const uint8_t * q = b + 1;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t x = q[4 * i] | (q[4 * i + 1] << 8) | (q[4 * i + 2] << 16) | ((uint32_t) q[4 * i + 3] << 24);
+            const int2 v = lut16(x, kvalues_fp4);
+            u.w[i] = v.x;       // elements 4i .. 4i + 3
+            u.w[4 + i] = v.y;   // elements 16 + 4i ..
+        }
+    }
+};
+
 // NVFP4_16 (bnk, ggml type 43): 16-wide blocks of 1 UE4M3 scale + 8 code bytes, for rows that are not a multiple
 // of 64 (the PLE table: 160). A 32-wide sub-block is two consecutive blocks.
 template <> struct QTraits<QT_NVFP4_16> {
@@ -362,7 +385,7 @@ __host__ __device__ constexpr bool is_dp4a_format(int t) {
     return t == QT_Q4_K || t == QT_Q5_K || t == QT_Q6_K || t == QT_IQ2_S || t == QT_IQ2_XXS ||
            t == QT_IQ2_XS || t == QT_IQ3_XXS ||
            t == QT_IQ3_S || t == QT_IQ4_NL || t == QT_IQ4_XS || t == QT_Q8_0 || t == QT_Q2_0 || t == QT_NVFP4 ||
-           t == QT_NVFP4_16;
+           t == QT_NVFP4_16 || t == QT_MXFP4;
 }
 __host__ __device__ constexpr bool is_float_fmt(int t) { return t == QT_F32 || t == QT_F16 || t == QT_BF16; }
 
